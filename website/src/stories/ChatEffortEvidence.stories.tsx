@@ -7,6 +7,7 @@ import { Provider } from 'react-redux'
 import ChatInput from '../components/ChatInput'
 import ErrorNotice from '../components/ErrorNotice'
 import ModelEffortDropdown from '../components/ModelEffortDropdown'
+import RuntimeSelector from '../components/RuntimeSelector'
 import { filterInteractiveModels, shouldSeparateModelEffort } from '../hooks/useInteractiveModels'
 import { i18nT } from '../i18n/t'
 import chatReducer from '../store/chatSlice'
@@ -16,7 +17,7 @@ import notificationsReducer from '../store/notificationsSlice'
 /** Visual fixture: real composer controls with representative ACP capability data.
  *  Model + effort are ONE control: the effort slider lives inside the model
  *  picker (docs/decisions/2026-06-14-chat-composer-model-and-effort-are-one-control.md). */
-type State = 'default' | 'selected' | 'compact' | 'inherited-default' | 'tiny-split-pane' | 'tiny-split-pane-models' | 'models' | 'models-configured-default' | 'models-configured-default-override' | 'read-error'
+type State = 'default' | 'selected' | 'compact' | 'inherited-default' | 'tiny-split-pane' | 'tiny-split-pane-models' | 'models' | 'models-configured-default' | 'models-configured-default-override' | 'read-error' | 'mobile'
 
 const advertisedModels = [
   { name: 'gpt-6-sol[low]', description: '' },
@@ -28,9 +29,19 @@ const advertisedModels = [
 ]
 
 function ChatEffortEvidence({ state }: { state: State }) {
+  const mobile = state === 'mobile'
+  const [mobileModels, setMobileModels] = useState(false)
+  const [mobileEffort, setMobileEffort] = useState('high')
   const [value, setValue] = useState('')
   const [filter, setFilter] = useState('')
-  const [queryClient] = useState(() => new QueryClient({ defaultOptions: { queries: { retry: false } } }))
+  const [queryClient] = useState(() => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } })
+    client.setQueryData(['slot-runtimes', 'mobile-evidence'], {
+      runtime_agent: '', effective_runtime_agent: '', effective_backend: 'claude',
+      choices: [{ name: 'codex', label: 'Codex', supported: true, reason: '' }],
+    })
+    return client
+  })
   const [store] = useState(() => configureStore({
     reducer: { dashboard: dashboardReducer, chat: chatReducer, notifications: notificationsReducer },
   }))
@@ -55,7 +66,7 @@ function ChatEffortEvidence({ state }: { state: State }) {
   // "Default effort" marker sits on the track beside the switch.
   const configuredDefault = state === 'models-configured-default' || state === 'models-configured-default-override' || inheritedDefault
   const overridesDefault = state === 'models-configured-default-override'
-  const pickerOpen = !inheritedDefault && (state === 'models' || configuredDefault || tinySplitPaneModels)
+  const pickerOpen = mobileModels || (!inheritedDefault && (state === 'models' || configuredDefault || tinySplitPaneModels))
   const selected = state === 'selected' || state === 'compact' || state === 'models' || tinySplitPaneModels
   // The short pane's picker anchors to the chip the pane actually renders, so
   // the cap in the frame is the one the product computes for that geometry.
@@ -71,7 +82,7 @@ function ChatEffortEvidence({ state }: { state: State }) {
   // way and leaves the word "default" to its accessible name. The fixture must
   // hand the chip the same resolved pair or
   // the screenshot shows a state the product never renders.
-  const chipEffort = overridesDefault ? 'medium' : selected || configuredDefault ? 'high' : ''
+  const chipEffort = mobile ? mobileEffort : overridesDefault ? 'medium' : selected || configuredDefault ? 'high' : ''
   const chipEffortIsDefault = configuredDefault && !overridesDefault
   const pairIds = shouldSeparateModelEffort(true, advertisedModels)
   const groupedModels = filterInteractiveModels(advertisedModels, [], [], pairIds)
@@ -81,9 +92,9 @@ function ChatEffortEvidence({ state }: { state: State }) {
     <QueryClientProvider client={queryClient}>
       <Provider store={store}>
         <div ref={paneRef} style={{
-          width: tinySplitPane ? 157 : compact ? 312 : 680,
-          position: 'absolute', left: tinySplitPane ? 24 : compact ? 460 : 276,
-          ...(tinySplitPaneModels ? { top: 24 } : { bottom: 72 }),
+          width: mobile ? 'calc(100vw - 32px)' : tinySplitPane ? 157 : compact ? 312 : 680,
+          position: 'absolute', left: mobile ? 16 : tinySplitPane ? 24 : compact ? 460 : 276,
+          ...(tinySplitPaneModels ? { top: 24 } : { bottom: mobile ? 16 : 72 }),
           ...(tinySplitPane ? { height: tinySplitPaneModels ? 300 : 420, border: '1px solid var(--border)', display: 'flex', flexDirection: 'column' as const, justifyContent: 'space-between' } : {}),
         }}>
           {tinySplitPane && <div className="border-b border-border px-2 py-1 text-[11px] text-muted">Split pane · 157px</div>}
@@ -102,7 +113,13 @@ function ChatEffortEvidence({ state }: { state: State }) {
             providerId="acp"
             modelName="gpt-6-sol"
             modelIsInheritedDefault={inheritedDefault}
-            onModelClick={() => {}}
+            onModelClick={rect => { if (mobile) { setChipRect(rect); setMobileModels(true) } }}
+            {...(mobile ? {
+              backendControl: <RuntimeSelector slot="mobile-evidence" running={false} />,
+              agentName: 'native-bot', onAgentClick: () => {},
+              project: '', onProjectClick: () => {},
+              contextPct: 14, contextUsedTokens: 28000, contextWindowTokens: 200000,
+            } : {})}
             reasoningEffort={chipEffort}
             effortIsDefault={chipEffortIsDefault}
             hasEffort={!readError}
@@ -110,7 +127,7 @@ function ChatEffortEvidence({ state }: { state: State }) {
         </div>
         {pickerOpen && (!tinySplitPaneModels || chipRect) && (
           <ModelEffortDropdown
-            anchorRect={tinySplitPaneModels && chipRect ? chipRect : new DOMRect(686, 760, 190, 28)}
+            anchorRect={(mobile || tinySplitPaneModels) && chipRect ? chipRect : new DOMRect(686, 760, 190, 28)}
             dropdownRef={() => {}}
             inputRef={() => {}}
             models={shownModels}
@@ -118,12 +135,13 @@ function ChatEffortEvidence({ state }: { state: State }) {
             onSelectModel={() => {}}
             filter={filter}
             setFilter={setFilter}
-            onClose={() => {}}
+            onClose={() => setMobileModels(false)}
             hasEffort
             slot="evidence-preview"
-            currentEffort={overridesDefault ? 'medium' : configuredDefault ? '' : 'high'}
+            currentEffort={mobile ? mobileEffort : overridesDefault ? 'medium' : configuredDefault ? '' : 'high'}
             defaultEffort={configuredDefault ? 'high' : ''}
             effortLevelsOverride={['low', 'medium', 'high']}
+            writeEffort={mobile ? async level => { setMobileEffort(level); return { reasoning_effort: level } } : undefined}
             onListKeyDown={() => {}}
           />
         )}
@@ -144,6 +162,9 @@ type Story = StoryObj<typeof meta>
 export const Default: Story = {}
 export const Selected: Story = { args: { state: 'selected' } }
 export const Compact: Story = { args: { state: 'compact' } }
+export const Mobile: Story = { args: { state: 'mobile' } }
+export const Mobile320: Story = { render: () => <iframe title="Mobile composer preview" src="/iframe.html?id=evidence-acp-chat-effort--mobile&viewMode=story" style={{ width: 320, height: 680, border: 0 }} /> }
+export const Mobile390: Story = { render: () => <iframe title="Mobile composer preview" src="/iframe.html?id=evidence-acp-chat-effort--mobile&viewMode=story" style={{ width: 390, height: 760, border: 0 }} /> }
 export const InheritedDefault: Story = { args: { state: 'inherited-default' } }
 export const TinySplitPane: Story = { args: { state: 'tiny-split-pane' } }
 export const TinySplitPaneModels: Story = { args: { state: 'tiny-split-pane-models' } }

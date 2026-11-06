@@ -153,7 +153,10 @@ export function useComposerChips({
       ? effortCaps.effort_supported
       : effortSupportedForCrew(crewEffortLevels, shownModel === 'auto' ? '' : shownModel)
   )
-  const effortLevelsOverride = effortCaps?.effort_levels ?? crewEffortLevels
+  const advertisedEffortLevels = effortCaps?.effort_levels
+  const effortLevelsOverride = effortCaps?.effort_supported == null && advertisedEffortLevels?.length === 0
+    ? crewEffortLevels
+    : advertisedEffortLevels ?? crewEffortLevels
   // No effort control on `auto`: the picker says why instead (#11546).
   const effortAutoNote = effortOffOnAuto(
     provider.capabilities.reasoningEffort,
