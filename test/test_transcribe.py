@@ -276,12 +276,6 @@ class TestAvailabilityDetail:
         assert detail.ok is True
         assert detail.code == stt.CODE_OK
 
-    def test_bridge_requires_an_operator_command(self, monkeypatch):
-        monkeypatch.delenv(transcribe._BRIDGE_ENV, raising=False)
-        detail = self._detail(SttConfig(enabled=True, provider="bridge"))
-        assert detail.ok is False
-        assert detail.code == transcribe.CODE_BRIDGE_UNAVAILABLE
-
     def test_retired_provider_answers_on_the_local_floor(self, monkeypatch):
         """A hand-edited config naming a retired provider must not report a fault.
 

@@ -748,6 +748,21 @@ class TestAHarnessChangeReloadsTheLiveChat:
         assert (chat.slot.model, chat.slot.reasoning_effort) == ("claude-opus-4.8", "high")
         assert chat.slot.messages == before
 
+    @pytest.mark.asyncio
+    async def test_harness_save_names_the_execution_seat_that_still_overrides_it(self, chat):
+        chat.slot.runtime_agent = "crew-codex"
+        before = [dict(m) for m in chat.slot.messages]
+
+        status, data = await self._put(chat.app, {"acp_backend": "claude", "model": ""})
+
+        assert status == 200, data
+        assert KiroCrewConfig.load().agents["atlas"].acp_backend == "claude"
+        assert chat.slot.runtime_agent == "crew-codex"
+        assert chat.slot.messages[: len(before)] == before
+        notice = chat.slot.messages[-1]["content"]
+        assert "explicit backend selection" in notice
+        assert "runs on its new agent harness" not in notice
+
     @pytest.mark.parametrize("live_dm", [False, True])
     @pytest.mark.asyncio
     async def test_a_dormant_dm_reopens_without_old_harness_picks(self, dormant, live_dm):
@@ -1113,7 +1128,9 @@ class TestReadPath:
         assert body["harness"] == "claude"
         # What Inherited would give stays named while a harness is pinned.
         assert body["inherited_harness"] in {"kas", "kiro"}
-        assert set(body["harnesses"]) == {"kiro", "kas", "claude"}
+        # Kiro CLI is selectable but not crewmate-capable (no session control),
+        # so the picker does not offer it.
+        assert body["harnesses"] == ["claude", "kas"]
         assert set(body["worker_harnesses"]) == {"kas", "claude"}
 
     @pytest.mark.asyncio
@@ -1506,3 +1523,32 @@ class TestStoredPinDisplay:
         assert self.SECRET not in text + caplog.text
         record = KiroCrewConfig.load().agents[seeded]
         assert record.acp_backend == self.SECRET and getattr(record, field) == ""
+
+
+class TestSaveRefusesAnUncapableHarness:
+    @pytest.mark.parametrize("bad", ["kiro", "opencode"])
+    @pytest.mark.asyncio
+    async def test_a_selectable_but_uncapable_harness_is_refused(self, seeded, bad, monkeypatch):
+        from kiro_crew.agent_sdk import backends
+
+        monkeypatch.setattr(
+            backends, "selectable_backends", lambda: frozenset({"", "kas", "claude", "opencode"})
+        )
+        async with TestClient(TestServer(_app())) as client:
+            resp = await client.put(f"/api/agents/{seeded}", json={"acp_backend": bad})
+            assert resp.status == 400
+            assert (await resp.json())["code"] == "invalid_acp_backend"
+        assert KiroCrewConfig.load().agents[seeded].acp_backend == ""
+
+    @pytest.mark.asyncio
+    async def test_a_hand_edited_uncapable_pin_stays_named_in_the_readout(self, seeded):
+        """Not offered, and not hidden: the stored value is still read back."""
+        cfg = KiroCrewConfig.load()
+        cfg.agents[seeded].acp_backend = "kiro"
+        cfg.save()
+        async with TestClient(TestServer(_app())) as client:
+            body = await (
+                await client.get("/api/agents/resolved-model", params={"agent": seeded})
+            ).json()
+        assert body["acp_backend"] == "kiro"
+        assert "kiro" not in body["harnesses"]

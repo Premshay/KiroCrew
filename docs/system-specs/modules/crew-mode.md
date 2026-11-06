@@ -4102,8 +4102,15 @@ runs the agent it recorded. A `template` record (a worker included) stays exact
   (`kiro_crew.mate_worker`): its `prompt` is appended after the worker's own
   prompt; `mcpServers` the worker base lacks are added and mounted in `tools`
   (a base server of the same name always wins); `resources` and `skills`
-  entries the base lacks are added; `allowedTools` entries are taken only for
-  the servers the file adds. A file that copies the base adds nothing.
+  entries the base lacks are added; `tools` and `allowedTools` entries are taken
+  for the servers the file adds, and the file's EXPLICIT `@server` /
+  `@server/tool` entries for a server the base declares but does not select
+  (`mate_worker.base_server_selections`) are added too, so a Bot can switch on
+  a base server's tools. A `*` in the file never selects a base server, and
+  Crew's own managed servers keep the base's selection. Add abilities
+  (`mate_worker_kit`) writes a template's selectors for such a server into the
+  file the same way and lists them in its preview. A file that copies the base
+  adds nothing.
   **A whole-server switch-off is a restriction, not an addition:** a file entry
   for a server the base declares that reads as muted (`mcp_cleanup.mcp_entry_is_muted`:
   any `disabled` but absent or `false`) is carried by name
@@ -4306,10 +4313,18 @@ stamped by `session_send`), the thread is woken with ONE hidden turn
 `report_prompt`: the `[Worker report]` envelope, the worker's title and key, and
 its reply scrubbed (`member_goals.scrub_text`), capped at 4,000 characters (held
 cut, with its cut flag) and fenced between `<<<worker reply` / `>>>end of worker
-reply` as data. The wake ends on one Dashboard line (`page_line`, read off the
-loop just before the turn starts), because a worker report is where a dispatched
-job's state changes and the check-ins that otherwise ask for the page run only
-with a goal and a switch on: a page in force with fields the Bot writes
+reply` as data. A worker turn that ends through an applied `nothing_to_do` and
+wrote no reply text (a quiet loop cycle; the turn's `_terminal_directive_applied`
+with an empty `_turn_full_reply_text`, carried as `_TurnOutcome.quiet_end`)
+records no report and wakes nobody, and a report already pending for that worker
+stays as it was. The check reads the turn's whole reply, because a tool call
+flushes the text before it out of the trailing segment: a worker that writes and
+then calls `nothing_to_do` still reports, as does an empty reply without
+`nothing_to_do` (`worker_report.no_reply`). The wake ends on one Dashboard line
+(`page_line`, read off the loop just before the turn starts), because a worker
+report is where a dispatched job's state changes and the check-ins that
+otherwise ask for the page run only with a goal and a switch on: a page in force
+with fields the Bot writes
 gets `worker_report.dashboard_fields`, naming those fields and asking for them
 to be written with `dashboard_write` before the turn ends; a tab still on the
 suggestions page gets `dashboard_agentic.SUGGESTIONS_LINE`; no line with
@@ -4718,7 +4733,12 @@ default, inherits `agent.member_acp_backend` exactly as before the field existed
   the workers alike, while the stored value still reads `kiro`
   (`docs/decisions/2026-10-28-a-kiro-cli-choice-runs-on-kas.md`).
 - **Save time.** `PUT /api/agents/{name}` accepts `acp_backend` only as `""` or a
-  selectable harness, and judges `model` and `worker_model` against the harness
+  harness in `crewmate_harness.crewmate_harnesses(config)`: selectable now
+  (`selectable_backends()`, which the `agent_backend` governance scope narrows)
+  AND in `ACP_BACKENDS_MEMBER_CAPABILITIES` ∩ `ACP_BACKENDS_MEMBER_DISPATCH`,
+  judged on the runtime the pin resolves to (so `kiro` counts as KAS only where
+  `kiro_cli_pick_backend()` moves it there). A stored pin outside that list is
+  unchanged: it still starts if it can, or refuses at start as above. It judges `model` and `worker_model` against the harness
   the record will hold, re-judging the stored pins when the harness changes.
   Without a harness change, an inherit value and a value equal to the stored
   one judge nothing (`crewmate_harness.judges_a_model_edit`), both in the
@@ -4729,8 +4749,12 @@ default, inherits `agent.member_acp_backend` exactly as before the field existed
   factory (`refresh_defaults`), and so does an edit outside the dashboard
   (`session_parts.config_apply`).
 - **Read path.** Only the owner-only `GET /api/agents/resolved-model` reads the
-  pin (`acp_backend`, the effective `harness`, `harnesses`, `worker_harnesses`,
-  and `harness_error` when it cannot start). `GET /api/agents` and
+  pin (`acp_backend`, the effective `harness`, `harnesses` from
+  `crewmate_harnesses`, `worker_harnesses` (`ACP_BACKENDS_MATE_WORKER_KIT`), and
+  `harness_error` when it cannot start). The profile Settings **Agent harness**
+  row (no longer a feature preview) offers Inherited plus exactly `harnesses`,
+  says under a harness when its workers cannot start there, and shows a stored
+  pin outside `harnesses` as unavailable rather than hiding it. `GET /api/agents` and
   `GET /api/members` leave it out. `GET /api/models?backend=<harness>` lists one
   harness's models for the picker.
 - **When it applies.** A save that changes the pin reloads the Bot's live
@@ -4753,6 +4777,13 @@ default, inherits `agent.member_acp_backend` exactly as before the field existed
   that leaves the pin unchanged reloads nothing, and with no live chat it is a
   plain write. Workers already running keep their harness; new workers start on
   the new one.
+
+In this fork, an explicit composer backend selection overrides the Bot's default
+harness. A profile save preserves that selection and its reload notice states
+that the chat still uses the composer selection. Changing the default does not
+silently move a chat away from its specialized execution seat.
+The profile's save confirmation names the default change and the retained
+composer selection, rather than promising that every chat changes harness.
 
 ### Dynamic capabilities
 
@@ -5074,7 +5105,7 @@ Parent-change and impact previews use the server's redacted projection.
 | `test/test_cron_conductor_scripted.py` | A scripted `cron_add` from a Bot's conductor is dispatched like any caller's |
 | `test/test_mate_conductor_parity.py` | Every section of the root conductor's charter is a shared rule the Bot's conductor is told, a heading, or allowlisted with a reason; no Bot piece copies charter text; every MCP server, tool, auto-approve grant and mapped skill of `kirocrew-conductor` is on `kirocrew-mate-conductor`, both read through the per-session projection, or allowlisted; no allowlist entry is stale; a planted root-only section, server, tool, grant or skill is caught |
 | `test/test_mate_config_migration.py` | The upgrade migration carries a shared template's or a `crew-<hex>` copy's kit and nothing the worker base has, gives a default-template Bot a file that adds nothing, gives the conductor-bound first Bot what a default-template Bot gets, leaves a binding without a `member_id` alone without a log line above DEBUG, records the kit's source, skips and logs a Bot whose worker would differ (binding and disk untouched), changes nothing on a second run, leaves a hand-made rollback alone, and the carried capabilities read as already there |
-| `test/test_mate_thread_wakes.py` | A worker's turn end wakes its crewmate once; no wake for a session the crewmate did not create or that this process did not witness; a busy thread gets one report (the latest, with the turn count) after its turn ends; a held report waits for the thread's next turn end; the excerpt's end marker cannot be forged; only the creator's send witnesses the link; every top-level turn end reaches the wake path; `agent.worker_reports`: `every_turn` wakes on a plain turn end, `milestones` holds it and wakes after a ledger milestone (carrying the entry) or a missing-capability reply, `off` never wakes, an unreadable config reads as `every_turn` |
+| `test/test_mate_thread_wakes.py` | A worker's turn end wakes its crewmate once; no wake for a session the crewmate did not create or that this process did not witness; a busy thread gets one report (the latest, with the turn count) after its turn ends; a held report waits for the thread's next turn end; the excerpt's end marker cannot be forged; only the creator's send witnesses the link; every top-level turn end reaches the wake path; `agent.worker_reports`: `every_turn` wakes on a plain turn end, `milestones` holds it and wakes after a ledger milestone (carrying the entry) or a missing-capability reply, `off` never wakes, an unreadable config reads as `every_turn`; quiet worker ends report nothing and preserve pending reports |
 | `test/test_mate_upgrade_notice.py` | A moved Bot's notice is posted once and never on a later start, never by a Bot created after the upgrade or on a thread whose binding names another member, reaches a thread not open at startup at its next turn end, and is owed only by Bots the migration moved |
 | `website/src/components/chat/crewmateBubbles.test.ts` | What a Bot's chat draws (machinery dropped, speech and user-facing rows kept, same array back when nothing is dropped) and the run rule (first/middle/last, single, breaks on a user row and a pending approval but not on a long silence, reads through a resolved approval and an untimestamped streaming row, corners on the left side only); a queued message drawn where it was sent, the requeued twin, undrawn queued rows and injected (cron / app) queued rows dropped; when a send is still awaiting a reply |
 | `website/src/test/ChatPane.crewSteerLandsNow.test.tsx` | A Bot's responsive Send end to end, including one stable bubble through a queued receipt in either order with its push, a later reply drawn below a queued message and the drain keeping order and node, and the typing bubble from Send until a reply, a refusal or the answering turn's silent end |

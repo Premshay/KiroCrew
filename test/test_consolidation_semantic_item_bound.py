@@ -502,7 +502,7 @@ async def _pass_over(
                 lambda result, *_args, **_kwargs: (result, ()),
             )
         outcome, _ = await _run(c, item)
-    assert outcome is None
+    assert outcome.completed
     return store, _left_behind(store, list(caplog.records))
 
 
@@ -780,7 +780,7 @@ async def test_values_past_the_writers_window_are_never_screened(
     with caplog.at_level(logging.INFO, logger=_LOGGER):
         outcome, _ = await _run(c, *shorts, *longs)
 
-    assert outcome is None
+    assert outcome.completed
     assert _stored(store, shorts + longs) == [item["key"] for item in shorts]
     assert _size_refusals(caplog) == [], "no writer reads a value past the window"
     assert _audited(store) == []
@@ -798,7 +798,7 @@ async def test_a_refused_value_does_not_move_a_later_item_into_the_window(
     with caplog.at_level(logging.WARNING, logger=_LOGGER):
         outcome, _ = await _run(c, *items)
 
-    assert outcome is None
+    assert outcome.completed
     # What the pass writes without the bound, less the refused value: short item
     # _WINDOW stays past the window.
     assert _stored(store, items) == [_short(i)["key"] for i in range(1, _WINDOW)]
@@ -820,7 +820,7 @@ async def test_a_withheld_delete_still_frees_its_place_in_the_window(
     with caplog.at_level(logging.WARNING, logger=_LOGGER):
         outcome, _ = await _run(c, *items)
 
-    assert outcome is None
+    assert outcome.completed
     assert any("not in the rendered table" in r.getMessage() for r in caplog.records)
     assert _stored(store, items) == [_short(i)["key"] for i in range(1, _WINDOW)]
     assert _refusal_codes(caplog, f"project.long{_WINDOW}") == [_CODE]
@@ -838,7 +838,7 @@ async def test_a_key_refused_one_value_and_written_another_reports_the_value(
     with caplog.at_level(logging.WARNING, logger=_LOGGER):
         outcome, _ = await _run(c, _item("project.a", over), _item("project.a", "ok"))
 
-    assert outcome is None
+    assert outcome.completed
     row = store.get_semantic("project.a")
     assert row is not None and json.loads(row["value_json"]) == "ok"
     assert _size_refusals(caplog) == [
@@ -878,7 +878,7 @@ async def test_a_later_value_for_a_refused_key_meets_the_store_without_the_refus
                     lambda result, *_args, **_kwargs: (result, ()),
                 )
             outcome, _ = await _run(c, *answer)
-        assert outcome is None
+        assert outcome.completed
         stored[bound] = json.loads(store.get_semantic("project.a")["value_json"])
         with store._db_lock:
             proposals[bound] = store.db.execute(
@@ -894,9 +894,9 @@ async def test_a_later_value_for_a_refused_key_meets_the_store_without_the_refus
     ("change", "include_history", "outcome", "marked"),
     [
         ("writes-off-before-its-turn", False, _CONSOLIDATION_REFUSED, 0),
-        ("writes-off-after-its-turn", False, None, 0),
-        ("transcript-busy-after-its-turn", False, None, 0),
-        ("transcript-busy-after-its-turn", True, None, 1),
+        ("writes-off-after-its-turn", False, "consolidated", 0),
+        ("transcript-busy-after-its-turn", False, "consolidated", 0),
+        ("transcript-busy-after-its-turn", True, "consolidated", 1),
     ],
     ids=["writes-off-before", "writes-off-after", "busy-after-prefs-only", "busy-after-history"],
 )
@@ -960,7 +960,7 @@ async def test_a_refused_value_takes_its_writes_turn(
                     c._consolidate("k", include_history=include_history), "consolidation pass"
                 )
         stored = [key for key in ("project.big", "project.small") if store.get_semantic(key)]
-        seen[bound] = (seen_outcome, advance.await_count, stored)
+        seen[bound] = (getattr(seen_outcome, "status", seen_outcome), advance.await_count, stored)
 
     big = [] if change == "writes-off-before-its-turn" else ["project.big"]
     small = ["project.small"] if change == "writes-off-after-its-turn" else []
@@ -994,7 +994,7 @@ async def test_a_semantic_answer_that_is_not_a_list_is_left_to_its_writer(
         with patch.object(c, "_call_llm", side_effect=fake_llm):
             outcome = await finished(c._consolidate("k"), "consolidation pass")
 
-    assert outcome is None
+    assert outcome.completed
     assert store.get_semantic("project.x") is None
     assert _size_refusals(caplog) == []
     result = {"semantic": semantic}
@@ -1044,7 +1044,7 @@ async def test_a_refused_value_spends_none_of_the_inline_embedding_budget(
             if not bound:
                 _main_screen(patched)
             outcome, _ = await _run(c, *answer)
-        assert outcome is None
+        assert outcome.completed
         embedded[bound] = (calls, _stored(store, answer))
 
     assert embedded == {
@@ -1128,10 +1128,10 @@ async def test_a_refused_value_the_store_would_refuse_still_commits_the_run(
                 _main_screen(patched)
             outcome, _ = await _run(c, *answer)
         kept = json.loads(store.get_semantic("project.big")["value_json"])
-        seen[bound] = (outcome, kept, _stored(store, answer[1:]))
+        seen[bound] = (getattr(outcome, "status", outcome), kept, _stored(store, answer[1:]))
 
     assert seen == {
-        True: (None, "kept", ["project.small"]),
+        True: ("consolidated", "kept", ["project.small"]),
         False: (_CONSOLIDATION_REFUSED, "kept", []),
     }
 
@@ -1185,7 +1185,7 @@ async def test_enforce_refuses_a_state_item_over_the_bound_as_work_state(
     with caplog.at_level(logging.INFO, logger=_LOGGER):
         outcome, _ = await _run(c, _STATE, _tagged(_SMALL_KEY, "a short fact", "fact"))
 
-    assert outcome is None
+    assert outcome.completed
     assert store.get_semantic(_STATE_KEY) is None
     assert store.get_semantic(_SMALL_KEY) is not None, "the rest of the answer still lands"
     # Routing took it out before the bound read the answer: routing's code, never the size
@@ -1230,7 +1230,7 @@ async def test_routing_counts_and_samples_every_item_the_bound_refuses(
     with caplog.at_level(logging.INFO, logger=_LOGGER):
         outcome, _ = await _run(c, *answer)
 
-    assert outcome is None
+    assert outcome.completed
     log = _kind_log(store)
     assert log["counts"] == {mode: counts}
     if mode == "shadow":
@@ -1286,7 +1286,7 @@ async def test_the_bound_screens_the_answer_routing_returned(
     with caplog.at_level(logging.INFO, logger=_LOGGER):
         outcome, _ = await _run(c, *answer)
 
-    assert outcome is None
+    assert outcome.completed
     assert len(routed) == 1, "one routing per pass"
     assert _refusal_codes(caplog, "project.kept_out") == []
     assert _refusal_codes(caplog, "project.long") == [_CODE]
@@ -1348,7 +1348,7 @@ async def test_the_bound_refuses_only_what_the_store_would_accept(
     with caplog.at_level(logging.INFO, logger=_LOGGER):
         outcome, _ = await _run(c, _item(_SMALL_KEY, _SMALL), item)
 
-    assert outcome is None
+    assert outcome.completed
     assert store.get_semantic(key) is None
     assert store.get_semantic(_SMALL_KEY) is not None, "the rest of the answer still lands"
     assert _unvalidated_event_keys(store) == [], "no event may carry a key the store refuses"
@@ -1400,7 +1400,7 @@ async def test_a_non_ascii_list_is_measured_as_the_facts_block_shows_it(
     with caplog.at_level(logging.WARNING, logger=_LOGGER):
         outcome, _ = await _run(c, _item(_SMALL_KEY, _SMALL), _item("project.note", value))
 
-    assert outcome is None
+    assert outcome.completed
     assert store.get_semantic(_SMALL_KEY) is not None, "the rest of the answer still lands"
     if chars <= _BOUND:
         row = store.get_semantic("project.note")
@@ -1434,7 +1434,7 @@ async def test_a_confidence_is_read_the_way_its_writer_reads_it(
     with caplog.at_level(logging.INFO, logger=_LOGGER):
         outcome, _ = await _run(c, *items)
 
-    assert outcome is None
+    assert outcome.completed
     assert _stored(store, items) == []
     refused = ["project.over_one"] if path == "member" else []
     assert [item["key"] for item in items if _refusal_codes(caplog, item["key"])] == refused
@@ -1731,7 +1731,7 @@ async def test_an_item_the_member_store_skips_for_its_metadata_is_not_refused_fo
     with caplog.at_level(logging.WARNING):
         outcome, _ = await _run(c, item, _item(_SMALL_KEY, _SMALL))
 
-    assert outcome is None
+    assert outcome.completed
     assert store.get_semantic(_LARGE_KEY) is None
     assert store.get_semantic(_SMALL_KEY) is not None, "the rest of the answer still lands"
     named = [r.getMessage() for r in caplog.records if repr(_LARGE_KEY) in r.getMessage()]

@@ -16,11 +16,6 @@ BENIGN_PACKAGE_SPAWNS: frozenset[str] = frozenset(
         # shell body or cwd. gh needs the operator's existing forge login.
         "work_acceptance.py::_run",
         "work_acceptance.py::_pr_is_draft",
-        # The executable comes only from the operator's absolute STT bridge
-        # setting. transcribe vets the audio path before dispatch; remaining
-        # arguments are fixed flags, a gateway temp directory and language.
-        # This local speech service needs its operator-managed model/cache.
-        "transcribe_bridge.py::_transcribe_bridge",
         # boxd lifecycle: resolved operator CLI, fixed machine verbs, validated
         # generated names, saved snapshot/CPU and retention duration; no shell or
         # agent cwd, stdin DEVNULL. Needs the host login.

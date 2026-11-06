@@ -37,34 +37,6 @@ from kiro_crew.transcribe import _ProfileCredentialResolver, transcribe_audio
 
 
 class TestTranscribeAudio:
-    def test_bridge_requires_an_operator_command(self, monkeypatch):
-        monkeypatch.delenv(transcribe._BRIDGE_ENV, raising=False)
-        detail = transcribe.availability_detail(SttConfig(enabled=True, provider="bridge"))
-        assert detail.ok is False
-        assert detail.code == transcribe.CODE_BRIDGE_UNAVAILABLE
-
-    @pytest.mark.asyncio
-    async def test_bridge_collects_its_transcript(self, tmp_path, monkeypatch):
-        audio = tmp_path / "voice.wav"
-        audio.write_bytes(b"audio")
-        cfg = SttConfig(enabled=True, provider="bridge", language_code="en-US")
-        monkeypatch.setattr(transcribe, "_bridge_command", lambda: "/operator/bridge")
-
-        class Process:
-            returncode = 0
-
-            async def communicate(self):
-                return b"", b""
-
-        async def create(command, _audio, *args, **kwargs):
-            assert command == "/operator/bridge"
-            out_dir = args[args.index("--output_dir") + 1]
-            (Path(out_dir) / "voice.txt").write_text("  bridge transcript  ", encoding="utf-8")
-            return Process()
-
-        monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
-        assert await transcribe_audio(str(audio), cfg) == "bridge transcript"
-
     @staticmethod
     def _recogniser(monkeypatch, transcript="Hello world", available=True, seen=None):
         """Stand the recogniser up at the ``kiro_crew.stt`` seam.

@@ -240,6 +240,8 @@ path. New budget work goes to `ingestion_budget.py`, new re-embed or job-row wor
 | `DEFAULT_MAX_FILES` | `5000` | `folder_watcher.py` | Per-source file cap (newest-first) |
 | `CHUNK_TOKEN_SIZE` | `800` | `chunker.py` | Target chunk size in estimated tokens (`_word_count`): a space-separated word is 1.3; in a script written without spaces (`_UNSPACED`: CJK, kana, Thai, Lao, Myanmar, Khmer, full-width forms) each character is 1, and other characters in that run about 4 per token. A run with no unspaced script is one word however long. An unspaced run too large for one chunk is cut into slices of the source |
 | `CHUNK_OVERLAP` | `200` | `chunker.py` | Chunk overlap, in the same estimated tokens; an unspaced tail is cut to this budget rather than copied whole |
+| `MAX_CHUNKS_PER_FILE` | `50` | `chunker.py` | Most chunks one document becomes. A document that splits into more merges neighbouring chunks (`_merge_plan`, `_fit_cap`) instead of dropping its tail |
+| `MAX_MERGE_WIDTH` | `4` | `chunker.py` | Most pieces one stored chunk merges, so a stored chunk stays a few times `CHUNK_TOKEN_SIZE`. A document past `MAX_CHUNKS_PER_FILE` x `MAX_MERGE_WIDTH` pieces keeps the first ones and logs a warning naming how many were indexed |
 | `VECTOR_RRF_WEIGHT` | `2.0` | `retrieval.py` | Weight of the vector leg in RRF fusion |
 | `DEFAULT_MODEL` | `"qwen3-embedding:0.6b"` | `embedder.py` | Embedding model the in-process runtime loads, and the fallback id when the active backend cannot be reached to name itself; the live identity is `get_shared_embedder().model_id` |
 | `TIMEOUT` | `10` | `embedder.py` | Retained for config compatibility (`knowledge.embed_timeout_secs`, positive-only; 0/unset/negative → this default). The in-process runtime has no per-request call for it to bound |
@@ -291,6 +293,15 @@ Base metadata always carries `format`, `title` (file stem), `file_size`, `extens
 
 **Namespace routing**: folder/vault sources read their target namespace from `properties["namespace"]` (default `"default"`). The `add_source` handler accepts namespace either as a top-level body field or inside `properties`; a top-level `namespace` is folded into `properties` (if dict and not already set) before storage. This ensures FolderWatcher and Watcher resolve the correct namespace at scan time via `props.get("namespace", "default")`.
 `FolderWatcher.scan_source(source)` scans a folder-type source under a per-`source_id` `asyncio.Lock` (one scan per source at a time) and returns `{new, changed, deleted, skipped, capped, failed}`.
+
+`scanning_source_ids()` snapshots those locks for the Sources readout. A folder
+whose first file has landed still displays and polls as syncing until its scan
+ends; paused, error and pending-confirmation states retain their meaning.
+This live scan signal does not replace stale ingestion-job recovery.
+
+Uploaded documents retain the caller's original filename as their title when
+the reader otherwise supplies the staging file's stem; an explicit document
+title from the reader is preserved.
 
 **`_walk(root, ignore_patterns, extra_skip_dirs)`** (run via `asyncio.to_thread`) is the discovery step:
 - Prunes `HARD_SKIP_DIRS`, any per-source-type extra skip dirs (`SOURCE_TYPE_SKIP_DIRS["obsidian_vault"] = {.obsidian, .trash}`), and **all** dotfiles/dot-dirs in place during `os.walk`. Build-output trees are in `HARD_SKIP_DIRS` because a rebuild presents hundreds of regenerated files as changed content; `cdk.out` (AWS CDK synth output) needs its own entry because its name only *contains* a dot, so the dot-prefix rule never prunes it.

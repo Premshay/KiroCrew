@@ -381,6 +381,11 @@ between separately encoded response fields without changing response bytes.
 
 ### The dashboard transcript window (frontend)
 
+Inside a settled turn, a closed steps fold unmounts folded tool content in every
+fold mode while retaining each row's keyed wrapper. Opening it restores the
+content. MCP Apps and user-opened live pills stay mounted; assistant replies,
+cards and pinned rows retain their existing visibility rules.
+
 The dashboard renders the rows these pages return through one windowing hook,
 `website/src/hooks/virtualizer/useVirtualChat.ts`. The chat page, every
 `VirtualTranscript` host and the artifacts gallery use it. It is a projection

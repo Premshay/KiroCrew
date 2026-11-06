@@ -61,12 +61,39 @@ def _consolidator(log: ConversationLog) -> HistoryConsolidator:
     memory = MagicMock()
     memory.read_preferences.return_value = ""
     memory.read_projects.return_value = ""
-    return HistoryConsolidator(log=log, memory=memory, migrated=True, sessions=None)
+    return HistoryConsolidator(
+        log=log, memory=memory, migrated=True, sessions=None, auto_consolidation_enabled=True
+    )
 
 
 async def _settle(c: HistoryConsolidator) -> None:
     while c._tasks:
         await asyncio.gather(*list(c._tasks))
+
+
+@pytest.mark.asyncio
+async def test_partial_history_catchup_keeps_the_next_preference_window_pending(tmp_path):
+    from kiro_crew.history_consolidation import _HISTORY_LAG_THRESHOLD
+
+    log = _log(tmp_path)
+    total = _HISTORY_LAG_THRESHOLD + 1
+    await asyncio.to_thread(_bulk_rows, log, total, pad=2000)
+    c = _consolidator(log)
+
+    with patch.object(c, "_call_llm", AsyncMock(return_value={"history_entry": "entry"})):
+        c.maybe_consolidate(KEY)
+        await _settle(c)
+        committed = log.consolidated_offset(KEY)
+        assert 0 < committed < total
+        assert c._prefs_offset[KEY] == committed
+        assert c._prefs_generation[KEY] == log.rotation_generation(KEY)
+        assert KEY not in c._history_consolidated
+
+        c.maybe_consolidate(KEY)
+        await _settle(c)
+
+    assert committed < c._prefs_offset[KEY] < total
+    assert log.consolidated_offset(KEY) == committed
 
 
 async def _until(predicate, what: str) -> None:
@@ -142,7 +169,9 @@ async def test_the_threshold_fires_at_exactly_the_threshold(tmp_path):
         c.maybe_consolidate(KEY)
         await _settle(c)
 
-    run.assert_awaited_once_with(KEY, include_history=False)
+    run.assert_awaited_once()
+    assert run.await_args.args == (KEY,)
+    assert run.await_args.kwargs["include_history"] is False
     assert c._prefs_offset[KEY] == THRESHOLD
     assert not c._counting
 
@@ -536,7 +565,9 @@ async def test_the_idle_sweep_counts_through_the_same_claim(tmp_path, monkeypatc
         await _settle(c)
 
     assert held.peak == 1
-    run.assert_awaited_once_with(KEY, include_history=False)
+    run.assert_awaited_once()
+    assert run.await_args.args == (KEY,)
+    assert run.await_args.kwargs["include_history"] is False
 
 
 @pytest.mark.asyncio

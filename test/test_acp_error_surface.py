@@ -42,6 +42,7 @@ from kiro_crew.acp.client import (
 )
 from kiro_crew.acp.session_handle import AcpSessionHandle
 from kiro_crew.acp.types import JsonRpcMessage
+from kiro_crew.llm_helpers import is_context_overflow_error
 
 # The exact frame from the reported transcript, minus the request id value.
 _MODEL_UNAVAILABLE = {
@@ -264,6 +265,9 @@ class TestNoRawDictInUserFacingError:
         exc = await driver(_CONTEXT_WINDOW_EXCEEDED)
         assert isinstance(exc, AcpContextWindowExceeded)
         assert exc.transient is False
+        assert exc.context_overflow is True
+        assert exc.structural_terminal is True
+        assert is_context_overflow_error(exc) is True
         assert "context window is full" in str(exc)
 
     @pytest.mark.asyncio
@@ -272,6 +276,9 @@ class TestNoRawDictInUserFacingError:
         exc = await driver(_CONVERSATION_PAYLOAD_EXCEEDED)
         assert isinstance(exc, AcpConversationPayloadExceeded)
         assert exc.transient is False
+        assert exc.context_overflow is True
+        assert exc.structural_terminal is True
+        assert is_context_overflow_error(exc) is True
         assert "attachment data" in str(exc)
 
     @pytest.mark.asyncio
