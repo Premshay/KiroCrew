@@ -922,9 +922,7 @@ def is_valid_branch_name(name: str) -> bool:
     )
 
 
-def _live_remote_branches(
-    clone: Path, config: dict, *, timeout_s: int
-) -> list[str] | None:
+def _live_remote_branches(clone: Path, config: dict, *, timeout_s: int) -> list[str] | None:
     """The configured remote's branches, its default first, or ``None`` when unreachable.
 
     The clone's ``origin`` is neutralized (``DISABLED_NO_PUSH``), so its ``origin/*`` refs
