@@ -356,6 +356,13 @@ the same and the difference is the whole security story:
   certificate file to create or install manually. The action still refuses to
   replace a different service already mounted at `443/`.
 
+  A custom relay can serve the dashboard while remaining outside that ownership
+  check. When the phone dialog also offers the governed sign-in-link method, it
+  shows **Create sign-in link** directly for that case. Clicking it creates a QR
+  for the configured external dashboard address. It does not replace the relay,
+  assert ownership of the Serve mapping, or change authentication. If the link
+  method is unavailable, the existing setup guidance remains.
+
   The same click enrolls this machine's daemon-reported Tailscale login in the
   explicit allowlist and makes the phone session survive gateway restarts and
   application updates. Each request still has to resolve through the local

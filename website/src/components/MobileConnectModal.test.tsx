@@ -61,6 +61,31 @@ beforeEach(() => {
 })
 
 describe('MobileConnectModal', () => {
+  it('offers the configured-address sign-in QR when a custom proxy is unmanaged', async () => {
+    mocks.tailnetMobile.mockResolvedValue({ step: 'occupied' })
+    mocks.mobileLoginLink.mockResolvedValue({
+      url: 'https://gateway.example/?token=fixture', image: 'data:image/png;base64,x',
+    })
+    mount(['tailnet_qr', 'login_link'])
+    const create = await screen.findByText('Create sign-in link')
+    expect(await screen.findByText(/^Create a sign-in link to scan/)).toBeInTheDocument()
+    await waitFor(() => expect(screen.queryByText(/Tailscale setup is not complete yet/)).not.toBeInTheDocument())
+    expect(mocks.mobileLoginLink).not.toHaveBeenCalled()
+    expect(mocks.tailnetMobileQr).not.toHaveBeenCalled()
+    fireEvent.click(create)
+    expect(await screen.findByAltText('QR code for the sign-in link')).toBeInTheDocument()
+    expect(mocks.mobileLoginLink).toHaveBeenCalledTimes(1)
+    expect(mocks.tailnetMobileQr).not.toHaveBeenCalled()
+  })
+
+  it('keeps setup guidance when an unmanaged proxy has no allowed sign-in-link method', async () => {
+    mocks.tailnetMobile.mockResolvedValue({ step: 'occupied' })
+    mount(['tailnet_qr'])
+    expect(await screen.findByText(/Tailscale setup is not complete yet/)).toBeInTheDocument()
+    expect(screen.queryByText('Create sign-in link')).not.toBeInTheDocument()
+    expect(mocks.mobileLoginLink).not.toHaveBeenCalled()
+  })
+
   it('never mints a credential on mount — QR appears only after the explicit click', async () => {
     mocks.tailnetMobileQr.mockResolvedValue({
       url: 'https://host/?token=live',

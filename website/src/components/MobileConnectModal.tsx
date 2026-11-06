@@ -98,6 +98,17 @@ export default function MobileConnectModal({
   }, [onClose])
 
   const hasQr = kinds.includes('tailnet_qr')
+  const hasLoginLink = kinds.includes('login_link')
+  const { data: tailnetStatus } = useQuery({
+    queryKey: ['mobile-connect-tailnet-probe'],
+    queryFn: () => api.tailnetMobile(),
+    staleTime: 30_000,
+    retry: false,
+    enabled: hasQr && hasLoginLink,
+  })
+  // A custom proxy is outside the Serve ownership guard. The independently
+  // governed configured-address link already provides a QR without replacing it.
+  const showTailnetQr = hasQr && !(hasLoginLink && tailnetStatus?.step === 'occupied')
   // Only renderers whose kind this deployment actually offers: the endpoint has
   // already filtered every id through `capabilities.mobile_connect`, so a
   // registered renderer for a denied or absent method draws nothing.
@@ -112,7 +123,7 @@ export default function MobileConnectModal({
 
   const tokenSections = (
     <>
-      {hasQr && (
+      {showTailnetQr && (
         <p className="text-[12.5px] text-muted leading-relaxed mb-4">
           {t('components.mobileConnect.scan_with_your_phone_camera_to_continue_with_the_s')}
         </p>
@@ -130,9 +141,9 @@ export default function MobileConnectModal({
           <r.component onClose={onClose} />
         </ErrorBoundary>
       ))}
-      {hasQr && <TailnetQrSection onClose={onClose} />}
-      {kinds.includes('login_link') && (
-        <LoginLinkSection standalone={!hasQr && editionSections.length === 0} onClose={onClose} />
+      {showTailnetQr && <TailnetQrSection onClose={onClose} />}
+      {hasLoginLink && (
+        <LoginLinkSection standalone={!showTailnetQr && editionSections.length === 0} onClose={onClose} />
       )}
     </>
   )
