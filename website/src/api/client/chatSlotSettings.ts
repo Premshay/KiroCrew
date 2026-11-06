@@ -70,6 +70,7 @@ export function createChatSlotSettingsEndpoints({ get, post, put, j, jfetch: fet
         /** The seat the conversation already runs on when `runtime_agent` is
          *  unset, so the picker shows the backend in force instead of "Default". */
         effective_runtime_agent: string
+        effective_backend?: string
         choices: { name: string; label: string; supported: boolean; reason: string }[]
       }>,
     chatSlotRuntime: (slot: string, runtime_agent: string) =>

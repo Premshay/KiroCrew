@@ -5,6 +5,7 @@ import { useAppDispatch } from '../store'
 import { updateSlot } from '../store/dashboardSlice'
 import ErrorNotice from './ErrorNotice'
 import SimpleSelect from './SimpleSelect'
+import { acpBackendName } from '../api/acpBackend'
 
 type RuntimeSelectorProps = {
   slot: string
@@ -56,7 +57,7 @@ function SlotRuntimeSelector({ slot, value, running, remote = false }: RuntimeSe
       className="w-auto max-w-[13rem] field-sizing-content"
       contentClassName="w-60 max-w-[22rem]"
       aria-label={i18nT('components.webAppArtifactCard.backend')}
-      clearLabel={i18nT('components.modelDropdownList.auto_default')}
+      clearLabel={choices.data?.effective_backend ? acpBackendName({ id: choices.data.effective_backend }) : i18nT('components.modelDropdownList.auto_default')}
       options={runtimeChoices.map(choice => choice.name)}
       optionLabels={runtimeChoices.map(choice => choice.supported ? choice.label : `${choice.label} — ${choice.reason}`)}
       optionDisabled={runtimeChoices.map(choice => !choice.supported)}

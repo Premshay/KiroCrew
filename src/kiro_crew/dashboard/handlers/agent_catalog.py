@@ -396,7 +396,11 @@ async def api_agent_catalog(request: web.Request) -> web.Response:
         row["markdown_only"] = engine_identity in markdown_only_names
         if not redact:
             # The companion keys its policy on that same agent.
-            policy = _agent_runtime_policy(name, engine_identity)
+            policy = None if member.acp_backend else _agent_runtime_policy(name, engine_identity)
+            if member.acp_backend:
+                from kiro_crew.crewmate_harness import display_stored_harness
+
+                row["acp_backend"] = display_stored_harness(member.acp_backend)
             if policy is not None:
                 row["runtime_policy"] = policy
         rows.append(row)

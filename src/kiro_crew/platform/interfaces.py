@@ -133,7 +133,7 @@ class ProviderRegistry(Protocol):
         ...
 
     def session_account_state(
-        self, session_key: str, engine_identity: str = ""
+        self, session_key: str, engine_identity: str = "", *, backend: str | None = None
     ) -> dict[str, Any] | None:
         """Return per-session provider account choices and eligibility, or None.
 
@@ -141,11 +141,17 @@ class ProviderRegistry(Protocol):
         reads this seam to populate the session menu's account switch and to
         verify eligibility before switching. The public Default returns ``None``
         (no account switching offered in the standalone edition).
+        ``backend`` names an explicit native harness; None keeps engine-map eligibility.
         """
         ...
 
     def set_session_account(
-        self, session_key: str, account: str, engine_identity: str = ""
+        self,
+        session_key: str,
+        account: str,
+        engine_identity: str = "",
+        *,
+        backend: str | None = None,
     ) -> dict[str, Any]:
         """Record a per-session provider account choice and return updated state.
 

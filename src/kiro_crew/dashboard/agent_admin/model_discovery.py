@@ -42,13 +42,18 @@ def _agent_runtime_policy(
     return policy if isinstance(policy, dict) else None
 
 
-async def _discover_agent_models(state: DashboardState, name: str) -> dict[str, Any]:
+async def _discover_agent_models(
+    state: DashboardState, name: str, backend: str | None = None
+) -> dict[str, Any]:
     """Discover models once and always release the ephemeral provider ourselves."""
-    key = f"dashboard:model-discovery:{name}"
+    key = f"dashboard:model-discovery:{name}" + (f":{backend}" if backend is not None else "")
     try:
-        provider, _is_new, _resumed = await asyncio.wait_for(
-            state.sessions.get_or_create(key, agent=name), timeout=30
+        pending = (
+            state.sessions.get_or_create(key, agent=name, backend_override=backend)
+            if backend is not None
+            else state.sessions.get_or_create(key, agent=name)
         )
+        provider, _is_new, _resumed = await asyncio.wait_for(pending, timeout=30)
         available = await provider.discover_models()
         efforts: list[str] = getattr(provider, "get_valid_effort_levels", lambda: [])()
         configured_models = acp_model_config_options(getattr(provider, "acp_config_options", []))
@@ -77,9 +82,11 @@ async def _discover_agent_models(state: DashboardState, name: str) -> dict[str, 
             await state.sessions.destroy(key)
 
 
-async def _shared_agent_model_discovery(state: DashboardState, name: str) -> dict[str, Any]:
+async def _shared_agent_model_discovery(
+    state: DashboardState, name: str, backend: str | None = None
+) -> dict[str, Any]:
     """Coalesce overlapping discovery requests and briefly reuse successes."""
-    cache_key = (id(state.sessions), name)
+    cache_key = (id(state.sessions), name, backend)
     cached = _model_discovery_cache.get(cache_key)
     if cached is not None and time.monotonic() - cached[0] < _MODEL_DISCOVERY_CACHE_TTL_SECS:
         return cached[1]
@@ -88,7 +95,7 @@ async def _shared_agent_model_discovery(state: DashboardState, name: str) -> dic
     if task is None:
 
         async def run() -> dict[str, Any]:
-            result = await _discover_agent_models(state, name)
+            result = await _discover_agent_models(state, name, backend)
             _model_discovery_cache[cache_key] = (time.monotonic(), result)
             return result
 
@@ -116,7 +123,14 @@ async def api_kirocrew_agent_models(request: web.Request) -> web.Response:
             {"error": "agent not found", "code": "agent_not_found"}, status=404
         )
     policy = _agent_runtime_policy(request, name, cfg.agents[name].kiro_agent or name)
-    if policy is None or policy.get("model") != "selectable":
+    from kiro_crew.crewmate_harness import CrewmateHarnessUnavailable, crewmate_pin_for
+
+    pin = crewmate_pin_for(cfg, name)
+    try:
+        backend = pin.checked().backend if pin is not None else None
+    except CrewmateHarnessUnavailable as exc:
+        return web.json_response({"error": str(exc), "code": exc.code}, status=409)
+    if pin is None and (policy is None or policy.get("model") != "selectable"):
         return web.json_response({"models": [], "effort_levels": []})
     state: DashboardState | None = request.app.get("state")
     if state is None:
@@ -125,7 +139,7 @@ async def api_kirocrew_agent_models(request: web.Request) -> web.Response:
             status=503,
         )
     try:
-        result = await _shared_agent_model_discovery(state, name)
+        result = await _shared_agent_model_discovery(state, name, backend)
     except asyncio.TimeoutError:
         return web.json_response(
             {"error": "model discovery timed out", "code": "models_timeout"}, status=503

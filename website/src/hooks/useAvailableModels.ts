@@ -68,12 +68,13 @@ export function modelsQueryKey(providerId: string, backend?: string): readonly u
 
 type ModelPickerAgent = {
   name: string
+  acp_backend?: string
   runtime_policy?: { model?: 'selectable' | 'managed' | 'unsupported' } | null
 }
 
 /**
- * Read one agent's account-scoped catalog when its companion explicitly owns
- * model selection. Other callers retain the shared Kiro catalog and cache.
+ * Read an agent's catalog for its native pin or selectable companion runtime.
+ * Other callers retain the shared harness catalog and cache.
  */
 export function useAvailableModelsQuery({
   enabled,
@@ -88,12 +89,12 @@ export function useAvailableModelsQuery({
   fallback?: 'global' | 'none'
 } = {}) {
   const provider = useProvider()
-  const selectableAgent = agent?.runtime_policy?.model === 'selectable' ? agent : undefined
+  const selectableAgent = agent?.acp_backend || agent?.runtime_policy?.model === 'selectable' ? agent : undefined
   const canDiscover = Boolean(selectableAgent) || fallback === 'global'
   const isDegraded = useModelsDegraded(modelHealthKey(provider.id, backend))
   const query = useQuery({
     queryKey: selectableAgent
-      ? ['available-models', provider.id, 'agent', selectableAgent.name]
+      ? ['available-models', provider.id, 'agent', selectableAgent.name, selectableAgent.acp_backend ?? '']
       : fallback === 'global'
         ? modelsQueryKey(provider.id, backend)
         : ['available-models', provider.id, 'none'],

@@ -33,6 +33,17 @@ describe('useAvailableModels — selectable crew', () => {
     mocks.generic.mockReset()
   })
 
+  it('uses a native pin despite an inherited managed engine policy', async () => {
+    mocks.discover.mockResolvedValue({ models: [{ modelId: 'native-model', name: 'Native' }], effort_levels: ['high'] })
+    const { result } = renderHook(
+      () => useAvailableModelsQuery({ agent: { name: 'bot', acp_backend: 'codex', runtime_policy: { model: 'managed' } } }),
+      { wrapper: queryWrapper },
+    )
+    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    expect(mocks.discover).toHaveBeenCalledWith('bot')
+    expect(mocks.generic).not.toHaveBeenCalled()
+  })
+
   it('uses the named Codex crew catalog instead of the generic Kiro catalog', async () => {
     mocks.discover.mockResolvedValue({
       models: [{ modelId: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', description: 'Subscription' }],

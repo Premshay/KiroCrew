@@ -400,6 +400,7 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
             # has since become unstartable must not refuse an edit to an unrelated field.
             checked_model = pending_model if "model" in body else cfg.agents[name].model
             if judges_a_model_edit(checked_model, cfg.agents[name].model, harness_moves):
+                model_backend = _pin_entitlement_backend(cfg, name, pending_backend)
                 # Validated before the write, reusing the config loaded just above
                 # so this costs no extra read.
                 model_reason = _model_pin_rejected(
@@ -407,9 +408,13 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                     request,
                     cfg.agent.provider,
                     advertised_ids=(
-                        _cached_agent_advertised_ids(request, name) if not harness_moves else None
+                        _cached_agent_advertised_ids(
+                            request, name, backend=model_backend if harness_pinned else None
+                        )
+                        if not harness_moves
+                        else None
                     ),
-                    backend=_pin_entitlement_backend(cfg, name, pending_backend),
+                    backend=model_backend,
                     harness_pinned=harness_pinned,
                 )
                 if model_reason:
@@ -420,6 +425,9 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                 pending_worker_model if "worker_model" in body else cfg.agents[name].worker_model
             )
             if judges_a_model_edit(checked_worker, cfg.agents[name].worker_model, harness_moves):
+                worker_backend = _pin_entitlement_backend(
+                    cfg, name, pending_backend, for_workers=True
+                )
                 # Judged against the WORKER's harness: a crewmate's worker runs on
                 # its crewmate's backend (`mate_worker.crewmate_worker_backend`),
                 # and `create_session` trusts this pin for exactly that harness
@@ -428,7 +436,14 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                     checked_worker,
                     request,
                     cfg.agent.provider,
-                    backend=_pin_entitlement_backend(cfg, name, pending_backend, for_workers=True),
+                    advertised_ids=(
+                        _cached_agent_advertised_ids(
+                            request, name, backend=worker_backend if harness_pinned else None
+                        )
+                        if not harness_moves
+                        else None
+                    ),
+                    backend=worker_backend,
                     harness_pinned=harness_pinned,
                 )
                 if model_reason:
