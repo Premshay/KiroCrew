@@ -27,6 +27,11 @@ const choices = {
 }
 
 describe('RuntimeSelector', () => {
+  it('names the native bot harness instead of its old mapped seat', async () => {
+    vi.spyOn(api, 'chatSlotRuntimes').mockResolvedValue({ ...choices, effective_backend: 'claude' })
+    mount()
+    await waitFor(() => expect(screen.getByRole('combobox')).toHaveTextContent('Claude Code'))
+  })
   it('changes execution independently of the member identity', async () => {
     vi.spyOn(api, 'chatSlotRuntimes').mockResolvedValue(choices)
     const runtime = vi.spyOn(api, 'chatSlotRuntime').mockResolvedValue({ ok: true, runtime_agent: 'codex', model: '', reasoning_effort: '' })

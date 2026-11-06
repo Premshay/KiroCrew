@@ -32,7 +32,9 @@ re-exported by `interfaces.py`. A new extension point goes to the module of its
 kind.
 
 The execution catalog reads `ProviderRegistry.agent_runtime_policy(engine_identity)`
-through `current_context()` and `safe_context_call` for owner-visible member rows.
+through `current_context()` and `safe_context_call` for owner-visible, unpinned
+member rows. A native harness pin uses upstream model discovery and its own
+cache entry; template engine metadata cannot replace that choice.
 The lookup key is the agent the member runs: its `kiro_agent` through
 `dispatch_kiro_agent`, so a row that recorded an agent's file name keys on the
 name that file declares, falling back to its roster alias when the binding is
@@ -40,12 +42,15 @@ empty. Redacted requests neither query nor emit this metadata; template
 rows never carry it. The public adapter returns `None`; companion policy is
 advisory metadata, not an enforcement boundary or a public picker behavior.
 Composition failures propagate, while other lookup failures log at debug and
-omit the policy. `ProviderRegistry.session_account_state(session_key, agent_name=...)`
-and `ProviderRegistry.set_session_account(session_key, account, agent_name=...)`
+omit the policy. `ProviderRegistry.session_account_state(session_key, engine_identity, backend=...)`
+and `ProviderRegistry.set_session_account(session_key, account, engine_identity, backend=...)`
 likewise let an edition companion expose per-session subscription-account
 switching (such as `personal` vs `atlomy` Claude subscription seats) to the
-owner-only `/api/chat/slots/{slot}/account` endpoint; `DefaultProviderRegistry`
-returns `{"available": False}` and raises `ValueError` on mutation.
+owner-only `/api/chat/slots/{slot}/account` endpoint. An explicit native pin supplies
+the optional `backend` keyword; without it the companion keeps engine-map
+eligibility. An explicit execution seat keeps its mapped eligibility even when
+the bot has a native pin. `DefaultProviderRegistry` returns no account state and
+an unavailable mutation result.
 
 ## PlatformContext
 

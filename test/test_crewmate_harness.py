@@ -567,7 +567,10 @@ class TestSave:
     async def test_the_model_is_judged_against_the_pinned_harness(self, seeded, monkeypatch):
         seen: list[str | None] = []
 
-        def judge(model, request, provider, *, backend=None, harness_pinned=False):
+        def judge(
+            model, request, provider, *, backend=None, harness_pinned=False, advertised_ids=None
+        ):
+            assert advertised_ids is None
             seen.append(backend)
             return "not on this harness" if backend == "claude" and model == "kiro-only" else None
 
@@ -587,7 +590,10 @@ class TestSave:
         cfg.agents[seeded].model = "kiro-only"
         cfg.save()
 
-        def judge(model, request, provider, *, backend=None, harness_pinned=False):
+        def judge(
+            model, request, provider, *, backend=None, harness_pinned=False, advertised_ids=None
+        ):
+            assert advertised_ids is None
             return "not on this harness" if backend == "claude" and model == "kiro-only" else None
 
         monkeypatch.setattr("kiro_crew.dashboard.handlers.agents._model_pin_rejected", judge)

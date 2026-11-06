@@ -103,6 +103,83 @@ def _account_app(state: DashboardState) -> web.Application:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["claude", "codex"])
+async def test_native_account_read_and_write_receive_effective_harness(
+    account_state, monkeypatch, backend
+):
+    from kiro_crew.platform.context import current_context
+
+    state, slot, store, calls, reloaded = account_state
+    providers = current_context().providers
+    observed = []
+
+    def read(key, identity="", *, backend=None):
+        observed.append(("read", backend))
+        return {
+            "available": True,
+            "eligible": backend == "claude",
+            "current": store["current"],
+            "accounts": [{"id": "personal"}, {"id": "atlomy"}],
+        }
+
+    def write(key, account, identity="", *, backend=None):
+        observed.append(("write", backend))
+        store["current"] = account
+        return read(key, identity, backend=backend)
+
+    providers.session_account_state = read
+    providers.set_session_account = write
+    monkeypatch.setattr(
+        "kiro_crew.platform.context.current_context", lambda: SimpleNamespace(providers=providers)
+    )
+    monkeypatch.setattr(
+        "kiro_crew.crewmate_harness.crewmate_backend_pin",
+        lambda *args: SimpleNamespace(backend=backend),
+    )
+    async with TestClient(TestServer(_account_app(state))) as client:
+        response = await client.get(f"/api/chat/slots/{slot.key}/account")
+        assert response.status == 200
+        assert (await response.json())["eligible"] == (backend == "claude")
+        response = await client.post(
+            f"/api/chat/slots/{slot.key}/account", json={"account": "atlomy"}
+        )
+        assert response.status == (200 if backend == "claude" else 409)
+    assert ("read", backend) in observed
+    assert (("write", backend) in observed) == (backend == "claude")
+    assert reloaded.await_count == (1 if backend == "claude" else 0)
+
+
+@pytest.mark.asyncio
+async def test_explicit_execution_seat_keeps_account_eligibility(account_state, monkeypatch):
+    state, slot, store, calls, reloaded = account_state
+    slot.runtime_agent = "codex"
+    pin_read = MagicMock(side_effect=AssertionError("an explicit seat must not read the bot pin"))
+    monkeypatch.setattr("kiro_crew.crewmate_harness.crewmate_backend_pin", pin_read)
+    async with TestClient(TestServer(_account_app(state))) as client:
+        response = await client.get(f"/api/chat/slots/{slot.key}/account")
+        assert response.status == 200
+        assert not (await response.json())["eligible"]
+    pin_read.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_runtime_label_uses_native_bot_pin(account_state, monkeypatch):
+    state, slot, store, calls, reloaded = account_state
+    monkeypatch.setattr(
+        "kiro_crew.crewmate_harness.crewmate_backend_pin",
+        lambda *args: SimpleNamespace(backend="codex"),
+    )
+    app = _account_app(state)
+    app.router.add_get("/api/chat/slots/{slot}/runtime", chat_handlers.api_chat_slot_runtime)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get(f"/api/chat/slots/{slot.key}/runtime")
+        assert response.status == 200
+        result = await response.json()
+        assert result["effective_backend"] == "codex"
+        assert result["effective_runtime_agent"] == ""
+
+
+@pytest.mark.asyncio
 async def test_get_slot_account_returns_state_for_eligible_session(account_state) -> None:
     state, slot, _, calls, _ = account_state
     async with TestClient(TestServer(_account_app(state))) as client:

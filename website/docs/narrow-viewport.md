@@ -11,6 +11,11 @@ at.
 
 ## Layout and sizing
 
+**The composer shelf stays one horizontally scrollable row.** Collapse labels
+before scrolling, retain each chip's minimum usable width, and let the control
+cluster take the space left beside the fixed voice/send buttons. Keep the glass
+fade on its existing containing block; positioning the shelf clips that layer.
+
 **A collapsed side rail becomes a horizontal bar across the TOP, never a thin vertical
 strip.** Horizontal is the one axis a phone cannot spare; vertical it can. A 44px strip
 overflows nothing, so it looks fixed while the reading column still pays for it.

@@ -1633,7 +1633,7 @@ function ChatInput({
             still and the text column opens above them. */}
         <div data-testid="composer-bottom-row" className={inlineToolbar ? 'contents' : `flex items-center justify-between px-2.5 pb-2 pt-0.5${terminal.active ? ' flex-wrap gap-y-1' : ''}`}>
           {typingLock && <TypingLockBanner lock={typingLock} />}
-          <div ref={leftClusterRef} className={`flex items-center gap-0.5 min-w-0${inlineToolbar ? ' order-first pl-1.5 shrink-0 relative z-[1]' : ''}${typingLocked ? ' hidden' : ''}`}>
+          <div ref={leftClusterRef} className={`flex items-center gap-0.5 min-w-0${inlineToolbar ? ' order-first pl-1.5 shrink-0 relative z-[1]' : ' flex-1'}${typingLocked ? ' hidden' : ''}`}>
             <AttachMenu plus={plus} onUploadFiles={onUploadFiles} uploading={uploading} onCancelUpload={onCancelUpload} uploadCount={uploadCount} directFilePicker={directFilePicker} fileInputId={fileInputId} openPicker={openPicker} isMac={isMac} touchInput={touchInput} onScreenshot={onScreenshot} collapseMenuRow={collapseMenuRow} typedCommandMenus={typedCommandMenus && !terminal.active} onFileSelect={terminal.active ? undefined : onFileSelect} optimizeRow={busyOptimizeRow} appActionRows={appActions.rows} />
             {directFilePicker && collapsible && (
               /* The repo's own overflow mechanism, not a second spelling of it.
@@ -1871,7 +1871,7 @@ function ChatInput({
           // to be present — the control is declared, mounted and unreachable.
           !!sessionControls?.length || !!presence ||
           !!environmentSlot) && (
-        <div ref={shelfRef} data-testid="composer-context-shelf" className="glass-shelf pt-1 flex items-center gap-2 min-w-0" style={{ ['--glass-shelf-h' as string]: `${shelfHeight}px` }}>
+        <div ref={shelfRef} data-testid="composer-context-shelf" className="glass-shelf pt-1 flex items-center gap-2 min-w-0 overflow-x-auto overflow-y-hidden" style={{ ['--glass-shelf-h' as string]: `${shelfHeight}px` }}>
           {/* Where the session's files and commands live. Its own separated
               group, like the app session controls below, so neither crowds the
               agent/project chip group past `max-two-buttons-per-row`. */}
@@ -1893,7 +1893,7 @@ function ChatInput({
             <SessionControlChips sessionControls={sessionControls} shelfCompact={shelfCompact} onSessionControlClick={onSessionControlClick} />
           )}
           {backendControl && <div className="shrink-0 border-r border-border pr-2" data-testid="composer-backend-control">{backendControl}</div>}
-          <div className="flex items-center gap-2 min-w-0 flex-1">
+          <div className="flex items-center gap-2 flex-1">
           {!onAgentClick && agentBadge}
           {onAgentClick && agentName && (
             <AgentChip agentName={agentName} agentLabel={agentLabel} agentIsInheritedDefault={agentIsInheritedDefault} agentMemory={agentMemory} agentSource={agentSource} isRunning={isRunning} shelfCompact={shelfCompact} onAgentClick={onAgentClick} />

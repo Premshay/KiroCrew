@@ -890,8 +890,22 @@ async def api_chat_slot_account(request: web.Request) -> web.Response:
                 engine_identity = candidate
                 break
 
+    from kiro_crew.acp_backends import backend_to_stored
+    from kiro_crew.crewmate_harness import CrewmateHarnessUnavailable, crewmate_backend_pin
+
+    account_kwargs: dict[str, str] = {}
+    if not slot.runtime_agent:
+        try:
+            pin = crewmate_backend_pin(cfg, session_key)
+        except CrewmateHarnessUnavailable as exc:
+            return web.json_response({"error": str(exc), "code": exc.code}, status=409)
+        if pin is not None:
+            account_kwargs["backend"] = backend_to_stored(pin.backend)
+
     def _read_state() -> dict[str, Any] | None:
-        return current_context().providers.session_account_state(session_key, engine_identity)
+        return current_context().providers.session_account_state(
+            session_key, engine_identity, **account_kwargs
+        )
 
     account_info = await asyncio.to_thread(_read_state)
     empty_payload: dict[str, Any] = {
@@ -955,7 +969,7 @@ async def api_chat_slot_account(request: web.Request) -> web.Response:
 
     def _write_account() -> dict[str, Any]:
         return current_context().providers.set_session_account(
-            session_key, account, engine_identity
+            session_key, account, engine_identity, **account_kwargs
         )
 
     try:

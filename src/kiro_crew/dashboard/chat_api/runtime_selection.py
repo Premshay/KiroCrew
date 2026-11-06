@@ -108,10 +108,23 @@ async def api_chat_slot_runtime(request: web.Request) -> web.Response:
                         break
                 break
     if request.method == "GET":
+        from kiro_crew.acp_backends import backend_to_stored
+        from kiro_crew.crewmate_harness import CrewmateHarnessUnavailable, crewmate_backend_pin
+
+        effective_backend = ""
+        if not slot.runtime_agent:
+            try:
+                pin = crewmate_backend_pin(cfg, effective_session_key(slot))
+            except CrewmateHarnessUnavailable as exc:
+                return web.json_response({"error": str(exc), "code": exc.code}, status=409)
+            if pin is not None:
+                effective_backend = backend_to_stored(pin.backend)
+                effective_runtime_agent = ""
         return web.json_response(
             {
                 "runtime_agent": slot.runtime_agent,
                 "effective_runtime_agent": effective_runtime_agent,
+                "effective_backend": effective_backend,
                 "choices": choices,
             }
         )

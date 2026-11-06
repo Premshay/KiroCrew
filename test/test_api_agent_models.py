@@ -26,9 +26,10 @@ class _Sessions:
         self.release = MagicMock()
         self.destroy = AsyncMock()
 
-    async def get_or_create(self, key, agent=None):
+    async def get_or_create(self, key, agent=None, **kwargs):
         self.key = key
         self.agent = agent
+        self.kwargs = kwargs
         return self.provider, True, False
 
     def has_session(self, key):
@@ -45,6 +46,59 @@ def _app(policy, sessions):
     )
     app.router.add_get("/api/agents/{name}/models", api_kirocrew_agent_models)
     return app
+
+
+@pytest.mark.asyncio
+async def test_native_pin_overrides_managed_template_policy_and_separates_cache(monkeypatch):
+    from kiro_crew.agent_sdk import backends
+
+    monkeypatch.setattr(backends, "selectable_backends", lambda: frozenset({"codex", "claude"}))
+    cfg = _config()
+    cfg.agents["codex"].acp_backend = "codex"
+    provider = SimpleNamespace(
+        discover_models=AsyncMock(
+            side_effect=[
+                [{"modelId": "native-codex", "name": "Codex"}],
+                [{"modelId": "native-claude", "name": "Claude"}],
+            ]
+        ),
+    )
+    sessions = _Sessions(provider)
+    with patch("kiro_crew.dashboard.handlers.agents.KiroCrewConfig.load", return_value=cfg):
+        async with TestClient(TestServer(_app({"model": "managed"}, sessions))) as client:
+            first = await client.get("/api/agents/codex/models")
+            assert first.status == 200
+            assert (await first.json())["models"][0]["modelId"] == "native-codex"
+            assert sessions.kwargs == {"backend_override": "codex"}
+            cfg.agents["codex"].acp_backend = "claude"
+            second = await client.get("/api/agents/codex/models")
+            assert second.status == 200
+            assert (await second.json())["models"][0]["modelId"] == "native-claude"
+            assert sessions.kwargs == {"backend_override": "claude"}
+    assert provider.discover_models.await_count == 2
+    assert sessions.destroy.await_count == 2
+    from kiro_crew.dashboard.handlers.agents import _cached_agent_advertised_ids
+
+    request = SimpleNamespace(app={"state": SimpleNamespace(sessions=sessions)})
+    assert _cached_agent_advertised_ids(request, "codex", backend="codex") == ["native-codex"]
+    assert _cached_agent_advertised_ids(request, "codex", backend="claude") == ["native-claude"]
+    assert _cached_agent_advertised_ids(request, "codex") is None
+
+
+@pytest.mark.asyncio
+async def test_unavailable_native_pin_refuses_model_discovery(monkeypatch):
+    from kiro_crew.agent_sdk import backends
+
+    monkeypatch.setattr(backends, "selectable_backends", lambda: frozenset())
+    cfg = _config()
+    cfg.agents["codex"].acp_backend = "codex"
+    sessions = _Sessions(SimpleNamespace(discover_models=AsyncMock()))
+    with patch("kiro_crew.dashboard.handlers.agents.KiroCrewConfig.load", return_value=cfg):
+        async with TestClient(TestServer(_app({"model": "selectable"}, sessions))) as client:
+            response = await client.get("/api/agents/codex/models")
+            assert response.status == 409
+            assert (await response.json())["code"] == "crewmate_harness_unavailable"
+    sessions.provider.discover_models.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -29,6 +29,8 @@ export interface KiroCrewAgent {
   /** This agent's own default reasoning effort. '' means inherit the global
    *  default. Optional: older payloads predate the field. */
   reasoning_effort?: string
+  /** Explicit native Bot harness; absent while the companion owns routing. */
+  acp_backend?: string
   /** Optional companion-owned capabilities for this crew's runtime. */
   runtime_policy?: {
     runtime?: string

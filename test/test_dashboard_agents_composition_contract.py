@@ -510,9 +510,12 @@ def test_the_moved_names_keep_their_base_shapes() -> None:
     base_lines = [line for line in lines if line.split()[0] not in extension_names]
     assert len(base_lines) == 93
     assert hashlib.sha256("\n".join(base_lines).encode()).hexdigest() == _BASE_SHAPE_DIGEST
-    # Pin the fork's moved contracts separately while retaining upstream's digest.
+    # Native discovery adds an optional backend on the fork's two discovery helpers.
+    # Upstream's 93 moved contracts retain their original digest above.
+    for name in ("_discover_agent_models", "_shared_agent_model_discovery"):
+        assert inspect.signature(getattr(agents, name)).parameters["backend"].default is None
     assert hashlib.sha256("\n".join(lines).encode()).hexdigest() == (
-        "b3a3d3ba8347e4353c69cf38485c09772cb78910772c6e03988415a04aab31b1"
+        "e2b889634170be76ae07baf82a6be820909a238eb7bd6447bda3d03c27651a73"
     ), "\n".join(lines)
 
 

@@ -397,8 +397,8 @@ _MODEL_DISCOVERY_CACHE_TTL_SECS = 30.0
 # routinely overlap these requests, so the result and its in-flight task must be
 # shared per live SessionManager instead of each request tearing down a provider
 # that another request is still using.
-_model_discovery_cache: dict[tuple[int, str], tuple[float, dict[str, Any]]] = {}
-_model_discovery_tasks: dict[tuple[int, str], asyncio.Task[dict[str, Any]]] = {}
+_model_discovery_cache: dict[tuple[int, str, str | None], tuple[float, dict[str, Any]]] = {}
+_model_discovery_tasks: dict[tuple[int, str, str | None], asyncio.Task[dict[str, Any]]] = {}
 # How long one GET /api/models waits for a catalog before answering the degraded
 # 503. Unchanged: a remote hub still budgets its whole cold path against this
 # bound (see api_models), so raising it would move
@@ -1772,12 +1772,14 @@ async def _revalidate_crew_pin(
     return await _revalidate_role_pin_evidence(model, request, backend=backend)
 
 
-def _cached_agent_advertised_ids(request: web.Request, name: str) -> list[str] | None:
+def _cached_agent_advertised_ids(
+    request: web.Request, name: str, *, backend: str | None = None
+) -> list[str] | None:
     """Return a fresh target-agent discovery result, when available."""
     state: DashboardState | None = request.app.get("state")
     if state is None:
         return None
-    cached = _model_discovery_cache.get((id(state.sessions), name))
+    cached = _model_discovery_cache.get((id(state.sessions), name, backend))
     if cached is None or time.monotonic() - cached[0] >= _MODEL_DISCOVERY_CACHE_TTL_SECS:
         return None
     return advertised_model_ids(cached[1].get("models", []))

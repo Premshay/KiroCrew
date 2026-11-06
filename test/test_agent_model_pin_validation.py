@@ -432,7 +432,7 @@ class TestSavePathRefusesAnUnusablePin:
         monkeypatch.setattr(
             agents,
             "_cached_agent_advertised_ids",
-            lambda _request, _name: ["gemini-3.8-flash-high"],
+            lambda _request, _name, *, backend=None: ["gemini-3.8-flash-high"],
         )
         monkeypatch.setattr(
             core,

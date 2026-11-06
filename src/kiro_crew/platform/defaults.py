@@ -84,13 +84,18 @@ class DefaultProviderRegistry:
         return None
 
     def session_account_state(
-        self, session_key: str, engine_identity: str = ""
+        self, session_key: str, engine_identity: str = "", *, backend: str | None = None
     ) -> dict[str, Any] | None:
         """Public edition contributes no per-session provider accounts."""
         return None
 
     def set_session_account(
-        self, session_key: str, account: str, engine_identity: str = ""
+        self,
+        session_key: str,
+        account: str,
+        engine_identity: str = "",
+        *,
+        backend: str | None = None,
     ) -> dict[str, Any]:
         """Public edition contributes no per-session provider accounts."""
         return {"ok": False, "available": False}
