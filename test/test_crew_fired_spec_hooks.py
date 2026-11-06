@@ -68,11 +68,17 @@ def agents_dir(tmp_path, monkeypatch) -> Path:
 
 
 def _prepare(client, agent, *, is_new=False):
-    return asyncio.run(
-        chat_runner._prepare_spec_hooks(
+    async def prepare():
+        result = await chat_runner._prepare_spec_hooks(
             SimpleNamespace(), SimpleNamespace(), client, agent, is_new=is_new
         )
-    )
+        if is_new:
+            await chat_runner._notice_unread_steering(
+                SimpleNamespace(), SimpleNamespace(), client, agent
+            )
+        return result
+
+    return asyncio.run(prepare())
 
 
 @pytest.fixture
@@ -736,6 +742,36 @@ async def test_an_in_turn_switch_that_leaves_the_session_stale_stops_the_turn(
 
 _UNREAD_STEERING = "does not load them"
 _MIRRORED = [ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_OPENCODE, ACP_BACKEND_GOOSE]
+
+
+@pytest.mark.parametrize("backend", [ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX])
+def test_member_charter_prepared_in_context_does_not_get_unread_warning(
+    backend, agents_dir, notices
+):
+    charter = str(agents_dir.parent / "charter.md")
+    _write_spec(agents_dir, "member", resources=[f"file://{charter}", "file://missing.md"])
+    asyncio.run(
+        chat_runner._notice_unread_steering(
+            SimpleNamespace(),
+            SimpleNamespace(),
+            _client(backend),
+            "member",
+            prepared_sources=frozenset({charter}),
+        )
+    )
+    assert len(notices) == 1
+    assert "missing.md" in notices[0]
+    assert charter not in notices[0]
+
+
+def test_resource_warning_waits_until_context_preparation(agents_dir, notices):
+    _write_spec(agents_dir, "a1", resources=["file://charter.md"])
+    asyncio.run(
+        chat_runner._prepare_spec_hooks(
+            SimpleNamespace(), SimpleNamespace(), _client(ACP_BACKEND_CODEX), "a1", is_new=True
+        )
+    )
+    assert not any(_UNREAD_STEERING in text for text in notices)
 
 
 @pytest.mark.parametrize("backend", _MIRRORED)

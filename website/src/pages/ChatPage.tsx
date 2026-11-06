@@ -394,7 +394,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // in that order (see useStagedDraftPersistence).
   useStagedDraftPersistence({ activeSlot, composerSlotRef, stores: draftStores, staging })
   const {
-    isMac, voiceSubmitRef, composerRef, voiceCaretRef, voicePendingCaretRef, composerVoiceOptions,
+    isMac, voiceSubmitRef, voiceConversationSendRef, composerRef, voiceCaretRef, voicePendingCaretRef, composerVoiceOptions,
   } = useComposerVoiceHost({
     embedded, drafts, saveDrafts, activeSlotRef, composerSlotRef, inputRef,
   })
@@ -971,6 +971,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     const flag = slot ? slotBusySteer(store.getState(), slot, jevAutoConsented) : undefined
     if (flag) steer(flag === 'auto' ? { auto: true } : undefined)
     else void send(undefined, undefined, undefined, false, 'voice')
+  }
+  voiceConversationSendRef.current = text => {
+    if (crewModeSwitching || crewRootClosed) return
+    // The explicit-text path leaves an unsent keyboard draft intact.
+    void send(text, undefined, undefined, false, 'voice')
   }
   const {
     messageToDisplayIdx, navigateToTurn, chatNav, turnStepAnnouncement, chatPins, chatPinsLoading, isPinned, setPendingPinnedJump, handleEditLastRequest, handleJumpToPinnedMessage, handleJumpToQuote,

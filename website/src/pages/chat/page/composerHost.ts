@@ -233,6 +233,7 @@ export function useComposerVoiceHost({
   embedded, drafts, saveDrafts, activeSlotRef, composerSlotRef, inputRef,
 }: ComposerVoiceHostOptions) {
   const isMac = useAppSelector(s => s.dashboard.status?.platform) === 'darwin'
+  const assistantHoldsFloor = useAppSelector(s => s.chat.slotRunning || s.chat.voiceBusy)
   // Voice dictation is the Composer's Voice atom (chat-core P3-b): ChatPage no
   // longer runs the hook or wires 23 props. It supplies, through the `Composer`
   // root ComposerDockView renders, only what the atom cannot know on its own: which slot the
@@ -246,6 +247,7 @@ export function useComposerVoiceHost({
   // and steer) so the streaming endpointer's auto-submit callback — handed to
   // the atom here, above both — can fire it. Assigned in render after steer.
   const voiceSubmitRef = useRef<(() => void) | null>(null)
+  const voiceConversationSendRef = useRef<((text: string) => void) | null>(null)
   const composerRef = useRef<ComposerHandle>(null)
   // Live composer caret, kept current by ChatInput; the resources controller
   // splices a picked file token at it, and dictation splices the transcript at
@@ -283,11 +285,15 @@ export function useComposerVoiceHost({
     deliverOffScreen: voiceDeliverOffScreen,
     onAutoSubmit: voiceAutoSubmit,
     pushToTalk: true,
+    handsFree: {
+      send: (text: string) => { voiceConversationSendRef.current?.(text) },
+      assistantHoldsFloor,
+    },
     caretRef: voiceCaretRef,
     pendingCaretRef: voicePendingCaretRef,
     settingsRoute: embedded ? '/embed/settings' : settingsPath({ tab: 'voice' }),
-  }), [voiceIsComposerFor, voiceDeliverOffScreen, voiceAutoSubmit, embedded])
+  }), [voiceIsComposerFor, voiceDeliverOffScreen, voiceAutoSubmit, embedded, assistantHoldsFloor])
   return {
-    isMac, voiceSubmitRef, composerRef, voiceCaretRef, voicePendingCaretRef, composerVoiceOptions,
+    isMac, voiceSubmitRef, voiceConversationSendRef, composerRef, voiceCaretRef, voicePendingCaretRef, composerVoiceOptions,
   }
 }

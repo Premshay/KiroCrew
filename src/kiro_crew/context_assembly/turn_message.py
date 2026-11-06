@@ -270,6 +270,7 @@ def build_message(
     if execution_context is not None:
         _private_template = execution_context.template_id
     _native_envelopes: list[str] = []
+    _essential_sources: set[str] = set()
     _essentials = ""
     if _private_owner:
         if hook_result.action == ctx.HOOK_MODIFY:
@@ -289,6 +290,7 @@ def build_message(
             context_groups=context_groups,
             native_documents=native_documents,
             native_envelope_out=_native_envelopes,
+            sources_out=_essential_sources,
             execution_template=agent or "kirocrew",
             member_template=_private_template,
             trigger_text=_trigger_text,
@@ -1155,5 +1157,6 @@ def build_message(
             native_envelope=(
                 _native_envelopes[0].translate(ctx._MULTIBYTE_TABLE) if native_documents else None
             ),
+            sources=frozenset(_essential_sources),
         )
     return final, hook_result

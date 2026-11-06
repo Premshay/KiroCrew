@@ -38,7 +38,7 @@ const noticeText = (key: string) => label(key)
 
 test.use({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1, reducedMotion: 'reduce' })
 
-async function openChat(page: Page, baseURL: string) {
+async function openChat(page: Page, baseURL: string, handsFree = false) {
   const errors: string[] = []
   page.on('pageerror', error => errors.push(error.message))
   await page.route('**/*', route => new URL(route.request().url()).origin === new URL(baseURL).origin
@@ -68,8 +68,8 @@ async function openChat(page: Page, baseURL: string) {
       } else if (path === `/api/chat/slots/${slot}/source-links`) {
         await json(route, { links: [], total: 0 })
       } else if (path === '/api/config/stt') {
-        await json(route, { enabled: false, provider: 'local', model: 'base', language_code: 'auto',
-          available: true, streaming: true, silence_ms: 1200, partial_interval_ms: 700,
+        await json(route, { enabled: handsFree, provider: handsFree ? 'bridge' : 'local', model: 'base', language_code: 'auto',
+          available: true, streaming: !handsFree, silence_ms: 1200, partial_interval_ms: 700,
           endpointing: true, dictation_panel: true, transcribe_region: '', transcribe_profile: '',
           providers: ['local', 'transcribe'], streaming_providers: ['local', 'transcribe'],
           language_codes: ['auto', 'en-US'], prereqs: [], transcribe_unsupported: false,
@@ -172,6 +172,30 @@ for (const touch of [false, true]) {
     })
   })
 }
+
+test('batch bridge offers the conversation headset on desktop and mobile', async ({ browser, baseURL }, info) => {
+  for (const mobile of [false, true]) {
+    const context = await browser.newContext({
+      viewport: mobile ? { width: 390, height: 844 } : { width: 1440, height: 900 },
+      isMobile: mobile, hasTouch: mobile, locale: 'en-US', reducedMotion: 'reduce',
+    })
+    try {
+      const page = await context.newPage()
+      const { errors } = await openChat(page, baseURL!, true)
+      const headset = page.getByTestId('handsfree-toggle')
+      await expect(headset).toBeVisible()
+      await expect(headset).toHaveAttribute('aria-pressed', 'false')
+      const composer = page.locator('textarea[data-composer-input]')
+      await composer.fill(draft)
+      await expect(headset).toBeVisible()
+      await expect(composer).toHaveValue(draft)
+      await page.screenshot({ path: info.outputPath(`conversation-${mobile ? 'mobile' : 'desktop'}.png`) })
+      expect(errors).toEqual([])
+    } finally {
+      await context.close()
+    }
+  }
+})
 
 test('failed playback links to and highlights the text-to-speech provider', async ({ page, browser, baseURL }, info) => {
   const { errors, servedIndexHash } = await openChat(page, baseURL!)

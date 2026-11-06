@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     )
     from kiro_crew.dashboard.chat_turn.turn_entry import _stop_pressed
     from kiro_crew.dashboard.chat_turn.turn_locals import _ChatTurn
+    from kiro_crew.dashboard.chat_turn.turn_spec_hooks import _notice_unread_steering
 
 
 if TYPE_CHECKING:
@@ -1067,6 +1068,20 @@ async def _turn_build_prompt(turn: _ChatTurn) -> None:
                 directive_user_origin=bool(turn._directive_user_origin),
             )
             turn.full_message = full_message
+        if is_new:
+            from kiro_crew.agent_sdk import context_provider_of
+            from kiro_crew.essential_delivery import EssentialDelivery
+
+            provider = context_provider_of(client)
+            delivery = provider.essential_delivery if provider is not None else None
+            sources = (
+                delivery.prepared_sources(full_message)
+                if isinstance(delivery, EssentialDelivery)
+                else frozenset()
+            )
+            await _notice_unread_steering(
+                state, slot, client, kiro_agent or slot.agent or "", prepared_sources=sources
+            )
         slot_ctx_omitted = dict(_ctx_omitted)
         turn.slot_ctx_omitted = slot_ctx_omitted
         slot_ctx_receipts = dict(_ctx_receipts)
