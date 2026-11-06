@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { Loader2 } from "lucide-react";
 import { useState } from "react";
+import { api } from "../../api/client";
 import SimpleSelect from "../../components/SimpleSelect";
 import { Btn } from "../../components/ui";
 import ErrorNotice from "../../components/ErrorNotice";
@@ -58,8 +59,8 @@ export default function RepositoryAssessment({
     stop = false,
     area = selectedArea,
   ): Promise<Assessment> {
-    const response = await fetch(
-      `/api/apps/auto-improvement/repository/assessment${stop ? "/stop" : ""}${method === "GET" ? `?areaPath=${encodeURIComponent(area)}` : ""}`,
+    const response = await api.autoImprovementResponse(
+      `/repository/assessment${stop ? "/stop" : ""}${method === "GET" ? `?areaPath=${encodeURIComponent(area)}` : ""}`,
       {
         method,
         ...(method === "POST"

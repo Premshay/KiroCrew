@@ -119,17 +119,15 @@ export function sessionKey(kind: SubjectKind, id: string | number, repo: string)
   return `${kind}-${keySegment(repo, 'norepo')}-${keySegment(String(id), 'unknown')}`
 }
 
-const API = '/api/apps/auto-improvement'
-
 async function loadRecord(key: string): Promise<SessionRecord | null> {
-  const res = await fetch(`${API}/sessions/${encodeURIComponent(key)}`)
+  const res = await api.autoImprovementResponse(`/sessions/${encodeURIComponent(key)}`)
   if (!res.ok) return null
   const body = (await res.json()) as { session?: SessionRecord | null }
   return body.session ?? null
 }
 
 async function saveRecord(key: string, patch: Partial<SessionRecord>): Promise<SessionRecord | null> {
-  const res = await fetch(`${API}/sessions/${encodeURIComponent(key)}`, {
+  const res = await api.autoImprovementResponse(`/sessions/${encodeURIComponent(key)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(patch),

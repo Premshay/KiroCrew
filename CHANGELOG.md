@@ -204,16 +204,15 @@ sandbox limit.
 
 ## [0.11.0] - 2026-10-24
 
-Mates (a working name, final name TBD) become teammates with a setup of their
-own: each one gets its own configuration, a conductor that works with you and a
-worker that does the hands-on part, and "crewmate" now reads "Mate" wherever you
-see it. New installs
+Mates become teammates with a setup of their own: each one gets its own
+configuration, a conductor that works with you and a worker that does the
+hands-on part, and "crewmate" now reads "Mate" wherever you see it. New installs
 start on the KAS engine, which no longer needs kiro-cli, and chat gains Escape
 to stop, a manual sidebar order and forks from the message menu. The Schedule
 form sets time and failure limits per job, long chats stream lighter, and a long
 list of security and platform fixes lands.
 
-### Mates with a conductor and a worker of their own (name TBD)
+### Mates with a conductor and a worker of their own
 
 - **Mate 2.0**: every mate owns an agent file under `~/.kiro/mates/agents/`,
   talks to you through a conductor chat that keeps its notes, and hands hands-on
@@ -377,13 +376,12 @@ stream is redacted as one piece, and certifi is updated for an advisory.
 
 ## [0.10.0] - 2026-10-15
 
-Crewmates (a working name, final name TBD) start to plan with you: Mate greets
-a new user, goals carry milestones and check-ins, and a crewmate proposes
-changes you confirm as cards. Dashboards
+Crewmates start to plan with you: Mate greets a new user, goals carry milestones
+and check-ins, and a crewmate proposes changes you confirm as cards. Dashboards
 leave preview for everyone and a crewmate can write its own page, while chat,
 the sidebar and every backend get faster ways to move, steer and recover.
 
-### Crewmates that plan with you (Preview, name TBD)
+### Crewmates that plan with you (Preview)
 
 - **Meet Mate**: with Settings → Developer → Feature Previews → Crewmates on,
   your first visit to the Crewmates page opens Mate, a first crewmate that
@@ -557,8 +555,7 @@ start on a truncated signing key, and webapp previews run without `unsafe-eval`.
 
 ## [0.9.0] - 2026-10-09
 
-Crewmates (a working name, final name TBD) become colleagues you can check on
-at a glance. Opening one greets you
+Crewmates become colleagues you can check on at a glance. Opening one greets you
 with where its work stands, a profile card holds its permission, model and
 schedules, and in preview each crewmate gets a dashboard page read from its own
 record. The composer warns before a prompt outgrows the model, the sidebar hides
@@ -566,7 +563,7 @@ and tidies what you do not need, remote crews open as live windows onto the
 other machine, and the Usage tab estimates Kiro tokens and the day your credits
 run out.
 
-### Crewmates you can read at a glance (name TBD)
+### Crewmates you can read at a glance
 
 - **A crewmate greets you on open**: opening a crewmate on the Crewmates page
   shows a card with its goal, what is finished, running or waiting on you and
@@ -581,7 +578,7 @@ run out.
   action brings the column back, and the roster lists only crewmates you
   created, chatted with, starred or set as the default.
 
-### A dashboard for every crewmate (Preview, name TBD)
+### A dashboard for every crewmate (Preview)
 
 - **Twelve pages to choose from**: with Settings → Developer → Feature Previews
   → Dynamic Dashboard on, a crewmate's side panel opens a Dashboard tab that
@@ -734,8 +731,7 @@ locally.
 
 **Updates and agents.** The dashboard's Update and `kirocrew update` no longer
 fail with "could not fetch latest-cli.json" when they download a new version. A
-crewmate (a working name, final name TBD) whose template uses a name the KAS
-engine reserves, such as `default`,
+crewmate whose template uses a name the KAS engine reserves, such as `default`,
 now runs on KAS instead of being refused, and a tool that waits no longer holds
 up the other tools of its session.
 
@@ -844,7 +840,7 @@ one bar.
   day's credits used and its share of the plan allowance, and the balance is read
   automatically with no setting to flip.
 
-### Agent templates, and crewmates with names (name TBD)
+### Agent templates, and crewmates with names
 
 - **An Agent templates tab under Agent Capabilities**: see every installed
   template grouped by origin, create, duplicate, edit or delete your own, start a
@@ -888,7 +884,7 @@ one bar.
   conversation takes its crew log with it, the storage screen counts the log with
   the session, and `KIROCREW_CREW_LOG=0` switches the whole thing off.
 
-### Crewmates grow into teams (Preview, name TBD)
+### Crewmates grow into teams (Preview)
 
 - **Group crewmates into teams**: with the Crew Members preview on under
   Settings → Developer → Feature Previews, the roster's plus menu gains New team,
@@ -1121,8 +1117,8 @@ this build does not ship, and a server disabled in the shared agent
 configuration stays listed as disabled instead of vanishing. One unreadable
 lesson no longer stops every chat and scheduled job from starting, the bad row is
 skipped and the log names it; reinstalling a skill keeps the copy you had when the
-new one fails to write; a crewmate (working name, TBD) can be named with spaces,
-periods or letters outside ASCII; a crewmate whose Kiro CLI settings turn off inherited defaults no
+new one fails to write; a crewmate can be named with spaces, periods or letters
+outside ASCII; a crewmate whose Kiro CLI settings turn off inherited defaults no
 longer receives your global steering anyway; and a model pin is judged against the
 backend the crewmate actually runs on. An OpenCode session on a machine whose own
 configuration carries a per-tool rule starts, a pi release too old for the adapter

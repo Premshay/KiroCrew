@@ -3,10 +3,11 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router-dom'
 import { Provider } from 'react-redux'
-import SetupPanel from '../apps/auto-improvement/SetupPanel'
-import { createTestStore } from './helpers'
+import SetupPanel from './SetupPanel'
+import { createTestStore } from '../../test/helpers'
+import { i18nT } from '../../i18n/t'
 
-vi.mock('../components/SimpleSelect', () => ({
+vi.mock('../../components/SimpleSelect', () => ({
   default: ({ options, optionLabels, value, onChange, disabled, 'aria-label': label }: {
     options: string[]; optionLabels?: string[]; value: string; onChange: (value: string) => void
     disabled?: boolean; 'aria-label'?: string
@@ -103,7 +104,7 @@ describe('test environment setup', () => {
     assessmentRecord = { state: 'ready', revision: 'abc123', result: { partial: true, summary: 'One hypothesis', findings: [{ kind: 'benchmark_candidate', title: 'Review repeated queries', detail: 'Unmeasured', sourcePaths: ['customers/service.py'], testPaths: [], evidencePaths: ['customers/service.py'], command: 'python proposed.py' }] } }
     await act(async () => { await view.client.invalidateQueries({ queryKey: ['auto-improvement-repository-assessment'] }) })
     expect(await screen.findByText('Review repeated queries')).toBeInTheDocument()
-    expect(screen.getByText('Unvalidated command proposal:')).toBeInTheDocument()
+    expect(screen.getByText(i18nT('repositoryAssessment.unvalidated'))).toBeInTheDocument()
     expect(screen.getByText('python proposed.py')).toBeInTheDocument()
     expect(screen.getByText('Partial scan; some evidence is omitted')).toBeInTheDocument()
     expect(writes).toHaveLength(1)

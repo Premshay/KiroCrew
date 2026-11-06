@@ -27,7 +27,10 @@ vi.mock('../../store/chatSlice', () => ({
   requestSlotFolderOpen: (arg: unknown) => ({ type: 'requestSlotFolderOpen', arg }),
 }))
 vi.mock('react-router-dom', () => ({ useNavigate: () => vi.fn() }))
-vi.mock('../../api/client', () => ({ api: apiMock }))
+vi.mock('../../api/client', async (original) => {
+  const actual = await original<typeof import('../../api/client')>()
+  return { ...actual, api: { ...actual.api, ...apiMock } }
+})
 vi.mock('../../chat-core/transport/sendTurn', () => ({ sendTurn }))
 
 import { useAgentSession as useAutoImproveSession } from './lib/agentSession'

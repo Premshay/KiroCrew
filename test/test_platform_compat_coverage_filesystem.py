@@ -150,7 +150,7 @@ def _read_only_tree(root, names=("a", "b")):
 
 
 class TestRmtreeForceOnPosixReadOnlyDirectories:
-    """A directory left without its owner write bit no longer survives every sweep."""
+    """Sweeps remove directories without their owner write bit."""
 
     @_POSIX_NON_ROOT
     @pytest.mark.parametrize("relative", [False, True])

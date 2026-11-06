@@ -651,9 +651,9 @@ class TestReviewSectionIO(_SageRoutesBase):
 
     def test_write_seeds_the_layout_when_config_is_missing(self):
         self._cfg_path().unlink()
-        with unittest.mock.patch.object(self.mod, "_known_models", return_value=["opus-4.8"]):
-            review = self.mod._write_review_section({"model": "opus-4.8"})
-        self.assertEqual(review["model"], "opus-4.8")
+        with unittest.mock.patch.object(self.mod, "_known_models", return_value=["example-model"]):
+            review = self.mod._write_review_section({"model": "example-model"})
+        self.assertEqual(review["model"], "example-model")
         self.assertTrue(self._cfg_path().is_file())
 
     def _save_with_bom(self, cfg: dict) -> None:

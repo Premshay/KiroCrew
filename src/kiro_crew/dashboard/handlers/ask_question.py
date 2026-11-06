@@ -404,7 +404,7 @@ async def api_ask_question_pending(request: web.Request) -> web.Response:
     * a STATELESS card carries ``card_id`` — its redacted payload is kept on the
       slot's needs-input record. Without it a reloaded tab would show the
       session's "needs your answer" status with no card to answer, and no way to
-      dismiss it (the client no longer knows the ``card_id``) — a stuck state
+      dismiss it (the client lacks the ``card_id``) — a stuck state
       that only sending a message could clear.
 
     Open to the owner and every collaborator (``_deny_non_collaborator``): the

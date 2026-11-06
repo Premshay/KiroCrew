@@ -192,7 +192,7 @@ const API_KEY_ORDER = [
   'getGovernanceChannels', 'getTeamsConfig', 'saveTeamsConfig', 'getWeixinConfig',
   'saveWeixinConfig', 'weixinQrStart', 'weixinQrStatus', 'getWhatsAppConfig',
   'saveWhatsAppConfig', 'whatsAppQrStart', 'whatsAppQrStatus', 'whatsAppUnlink',
-  'getWhatsAppGroups', 'researchValidate', 'researchGrillExpand', 'appSessionStatus',
+  'getWhatsAppGroups', 'researchValidate', 'researchGrillExpand', 'autoImprovementResponse', 'appSessionStatus',
   'researchCampaigns', 'researchCampaign', 'researchCreate', 'researchAction',
   'researchGrillTree', 'researchNudge', 'researchAddQuestion', 'researchToKnowledge',
   'researchKnowledgeStatus', 'researchToArtifact', 'researchReportStatus', 'researchReport',
@@ -216,6 +216,7 @@ const NESTED_KEY_ORDER: Record<string, string[]> = {
 }
 
 const NO_SESSION_KEY = [
+  'autoImprovementResponse',
   'status', 'tunnelStatus', 'system', 'sessionCrewLogProjections',
   'telemetryStartup', 'telemetryContextTrace', 'usageTurns', 'wakatimeStats',
   'sessionSummary', 'dashboardCard', 'generateSessionSummary', 'beaconStatus', 'collectionStatus',

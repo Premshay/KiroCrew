@@ -25,9 +25,8 @@ import SimpleSelect from '../../components/SimpleSelect'
 import { Badge, Btn, Card, CardTitle, Input } from '../../components/ui'
 import { fmtDateFields } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
+import { api } from '../../api/client'
 import { useImeGuard } from '../../hooks/useImeGuard'
-
-const API = '/api/apps/auto-improvement'
 
 interface CloneResult {
   ok: boolean
@@ -127,7 +126,7 @@ function RepositorySetup({ config, repo }: { config?: Record<string, unknown>; r
   // Branch list only makes sense once a clone exists; the query is gated on it.
   const { data: branchResp } = useQuery({
     queryKey: ['auto-improvement-branches', repo],
-    queryFn: () => fetch(`${API}/branches`).then((r) => (r.ok ? r.json() : { branches: [] })),
+    queryFn: () => api.autoImprovementResponse('/branches').then((r) => (r.ok ? r.json() : { branches: [] })),
     enabled: configured,
   })
   const branches: string[] = branchResp?.branches ?? []

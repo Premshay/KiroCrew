@@ -29,7 +29,7 @@ function installApi(extra: (call: Call) => unknown = () => undefined) {
   return calls
 }
 
-const CONFIGURED = { clone: { path: '/tmp/c' }, target_display: 'owner/repo', branch: 'main', directCommit: false }
+const CONFIGURED = { clone: '/tmp/c', target_display: 'owner/repo', branch: 'main', directCommit: false }
 const CLONE = i18nT('autoImprovement.cloneBtn')
 const RUN = i18nT('autoImprovement.runBtn')
 const STOP = i18nT('autoImprovement.stopBtn')
@@ -61,6 +61,7 @@ describe('SetupPanel repository and branch steps', () => {
     renderWithProviders(<SetupPanel config={{}} />)
     expect(screen.getByRole('button', { name: CLONE })).toBeDisabled()
     fireEvent.change(screen.getByRole('textbox', { name: REPO }), { target: { value: '  https://github.com/o/r  ' } })
+    await waitFor(() => expect(screen.getByRole('button', { name: CLONE })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: CLONE }))
     expect(await screen.findByText('not a GitHub URL')).toBeInTheDocument()
     expect(calls).toContainEqual({ method: 'POST', path: '/setup-clone', body: { url: 'https://github.com/o/r' } })
@@ -70,10 +71,11 @@ describe('SetupPanel repository and branch steps', () => {
     installApi((c) => (c.path === '/setup-clone' ? new Response('{}', { status: 500 }) : undefined))
     const { queryClient } = renderWithProviders(<SetupPanel config={{}} />)
     fireEvent.change(screen.getByRole('textbox', { name: REPO }), { target: { value: 'https://github.com/o/r' } })
+    await waitFor(() => expect(screen.getByRole('button', { name: CLONE })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: CLONE }))
     await waitFor(() => {
       const failed = queryClient.getMutationCache().getAll().find((m) => m.state.status === 'error')
-      expect(failed?.state.error).toEqual(new Error('HTTP 500'))
+      expect(failed?.state.error).toEqual(new Error(i18nT('testEnvironment.failed', { status: 500 })))
     })
   })
 
@@ -91,7 +93,7 @@ describe('SetupPanel repository and branch steps', () => {
     const { queryClient } = renderWithProviders(<SetupPanel config={CONFIGURED} />)
     expect(await screen.findByText('owner/repo')).toBeInTheDocument()
     // The repo renders from props before the branch answer is read, so wait for that answer too.
-    await waitFor(() => expect(queryClient.getQueryData(['auto-improvement-branches', true])).toEqual({ branches: [] }))
+    await waitFor(() => expect(queryClient.getQueryData(['auto-improvement-branches', '/tmp/c'])).toEqual({ branches: [] }))
     expect(calls).toContainEqual({ method: 'GET', path: '/branches', body: undefined })
     expect(screen.queryByRole('checkbox', { name: AUTOCOMMIT })).toBeNull()
   })
@@ -101,7 +103,8 @@ describe('SetupPanel run control', () => {
   it('starts a run when idle', async () => {
     const calls = installApi()
     renderWithProviders(<SetupPanel config={CONFIGURED} />)
-    fireEvent.click(await screen.findByRole('button', { name: RUN }))
+    await waitFor(() => expect(screen.getByRole('button', { name: RUN })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: RUN }))
     await waitFor(() => expect(calls).toContainEqual({ method: 'POST', path: '/run', body: {} }))
   })
 

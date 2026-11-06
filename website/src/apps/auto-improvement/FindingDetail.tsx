@@ -14,7 +14,7 @@ import { Check, ExternalLink, Minus, X } from 'lucide-react'
 import { Badge } from '../../components/ui'
 import { i18nT } from '../../i18n/t'
 
-const API = '/api/apps/auto-improvement'
+import { api } from '../../api/client'
 
 // Wire-protocol prefix the backend puts on a `pr` value that is queued rather than
 // drafted. Named rather than inlined so it reads as protocol, not as display copy.
@@ -91,7 +91,7 @@ export default function FindingDetail({ fp }: { fp: string }) {
   const { data, isLoading, error } = useQuery({
     queryKey: ['auto-improvement-finding', fp],
     queryFn: async () => {
-      const res = await fetch(`${API}/findings/${encodeURIComponent(fp)}`)
+      const res = await api.autoImprovementResponse(`/findings/${encodeURIComponent(fp)}`)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       return (await res.json()).finding as FindingDetailData
     },

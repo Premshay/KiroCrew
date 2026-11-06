@@ -801,6 +801,11 @@ a segment joins `INLINE` in `ApiClient.refactor.facade.test.ts`.
 Trust boundary: the transport carries the session key. It is for the edition
 composition root, **never** for app or plugin-contributed frontend code.
 
+The bundled Auto Improvement page uses `api.autoImprovementResponse` for its
+backend requests. This domain method journals network
+failures and runs auth recovery while returning the raw response: the app owns
+diagnostic payloads and logical failures inside successful HTTP responses.
+
 ## Highlighting languages: a data module, not a registrar
 
 An edition adds a syntax-highlighting language with

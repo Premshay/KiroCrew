@@ -2,6 +2,7 @@ import { useEffect, useId, useState } from "react";
 import { Loader2 } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
+import { api } from "../../api/client";
 import ErrorNotice from "../../components/ErrorNotice";
 import SimpleSelect from "../../components/SimpleSelect";
 import { Badge, Btn, Input, PanelSectionHeader } from "../../components/ui";
@@ -105,7 +106,7 @@ export async function requestJson<T>(
   body: unknown,
   method = "POST",
 ): Promise<T> {
-  const response = await fetch(`/api/apps/auto-improvement${path}`, {
+  const response = await api.autoImprovementResponse(path, {
     method,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),

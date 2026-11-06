@@ -84,6 +84,7 @@ import { createBrowserHarnessEndpoints } from './client/browserHarness'
 import { createDecisionsEndpoints } from './client/decisions'
 import { createMessagingEndpoints } from './client/messaging'
 import { createAutoResearchEndpoints } from './client/autoResearch'
+import { createAutoImprovementEndpoints } from './client/autoImprovement'
 import { createBrowserLiveEndpoints } from './client/browserLive'
 import { createSharedCrewEndpoints } from './client/sharedCrew'
 import type { DecisionsConsentData } from './client/decisions'
@@ -1581,6 +1582,7 @@ const browserHarness = createBrowserHarnessEndpoints(transport)
 const decisions = createDecisionsEndpoints(transport)
 const messaging = createMessagingEndpoints(transport)
 const autoResearch = createAutoResearchEndpoints(transport)
+const autoImprovement = createAutoImprovementEndpoints(transport)
 const browserLive = createBrowserLiveEndpoints(transport)
 const sharedCrew = createSharedCrewEndpoints(transport)
 
@@ -1762,6 +1764,7 @@ export const api = {
   ...decisions.scopesAndFeedback,
   ...messaging.channelConfigs,
   ...autoResearch.drafts,
+  ...autoImprovement,
   ...apps.sessionStatus,
   ...autoResearch.campaigns,
   ...apps.fileMenu,
