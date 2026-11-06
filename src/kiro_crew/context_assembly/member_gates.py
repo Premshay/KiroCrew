@@ -151,6 +151,7 @@ def _build_v2_essentials(
     steering_dirs: tuple[str, ...] = (),
     desk_withheld: bool = False,
     provider_type: str | None = None,
+    sources_out: set[str] | None = None,
 ) -> str:
     """Refresh complete member essentials without opening learned memory.
 
@@ -176,4 +177,5 @@ def _build_v2_essentials(
         steering_dirs=steering_dirs,
         desk_withheld=desk_withheld,
         provider_type=provider_type,
+        sources_out=sources_out,
     )

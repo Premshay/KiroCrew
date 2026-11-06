@@ -119,6 +119,12 @@ validation strictness, whether bookkeeping may live in-spec, its
 shadowing/selection rules, its hook-event vocabulary, whether it can resolve an
 `"auto"` model, and its protocol-version shape.
 
+The dashboard checks unread `file://` resource notices after prompt preparation.
+A declared file already present in the trusted member-essential source set gets
+no unread warning, including on Claude and Codex. Sources omitted by the context
+budget retain the warning; template selection alone does not prove inclusion.
+The prepared source set describes assembled context, not acknowledged delivery.
+
 **One name, several files.** A package installer namespaces each agent it ships as
 `<package>-<name>.json` and keeps the declared `name` bare, so two packages can install
 differing specs under one name. Kiro Crew never picks among them. The operator pins one

@@ -644,6 +644,7 @@ def build_v2_essentials(
     steering_dirs: tuple[str, ...],
     desk_withheld: bool,
     provider_type: str | None,
+    sources_out: set[str] | None = None,
 ) -> str:
     """Refresh complete member essentials without opening learned memory.
 
@@ -828,6 +829,8 @@ def build_v2_essentials(
         )
         documents[folder_insert_at:folder_insert_at] = fitted
     envelope = render_essentials(documents, identity=identity)
+    if sources_out is not None:
+        sources_out.update(source for source, _ in documents)
     if native_envelope_out is not None:
         native = native_documents or {}
         native_envelope_out.append(

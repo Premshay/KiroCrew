@@ -6,13 +6,14 @@
  * actually takes that route (composerHost.ts, `voiceDeliverOffScreen`).
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { renderHook } from '@testing-library/react'
+import { act, renderHook } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import type { ReactNode } from 'react'
 import { createTestStore } from './helpers'
 import { useComposerVoiceHost } from '../pages/chat/page/composerHost'
 import { readCrewDraft, writeCrewDraft } from '../pages/chat/crew-window/crewWindowStore'
 import { crewWindowSlot } from '../pages/chat/crew-window/crewWindowRenderers'
+import { setVoiceBusy } from '../store/chatSlice'
 
 const target = { instanceId: 'devbox', key: 'chat-7' }
 const append = (text: string) => (base: string) => (base ? base + ' ' + text : text)
@@ -27,7 +28,7 @@ function renderHost() {
     drafts, saveDrafts, inputRef,
     activeSlotRef: { current: 'chat-1' }, composerSlotRef: { current: 'chat-1' },
   }), { wrapper })
-  return { deliver: view.result.current.composerVoiceOptions.deliverOffScreen!, drafts, saveDrafts, inputRef }
+  return { deliver: view.result.current.composerVoiceOptions.deliverOffScreen!, drafts, saveDrafts, inputRef, view, store }
 }
 
 describe('useComposerVoiceHost off-screen delivery', () => {
@@ -50,5 +51,28 @@ describe('useComposerVoiceHost off-screen delivery', () => {
     expect(h.drafts.current['chat-3']).toBe('local words')
     expect(h.saveDrafts).toHaveBeenCalledTimes(1)
     expect(readCrewDraft(target)).toBe('')
+  })
+})
+
+describe('main composer spoken conversation', () => {
+  it('offers hands-free capture and sends spoken text without replacing a draft', () => {
+    const h = renderHost()
+    h.inputRef.current = 'unfinished keyboard draft'
+    const send = vi.fn()
+    h.view.result.current.voiceConversationSendRef.current = send
+    const conversation = h.view.result.current.composerVoiceOptions.handsFree!
+    expect(conversation).toBeDefined()
+    expect(conversation.assistantHoldsFloor).toBe(false)
+    conversation.send('spoken request')
+    expect(send).toHaveBeenCalledWith('spoken request')
+    expect(h.inputRef.current).toBe('unfinished keyboard draft')
+  })
+
+  it('keeps the microphone closed while reply audio is busy', () => {
+    const h = renderHost()
+    act(() => { h.store.dispatch(setVoiceBusy(true)) })
+    expect(h.view.result.current.composerVoiceOptions.handsFree?.assistantHoldsFloor).toBe(true)
+    act(() => { h.store.dispatch(setVoiceBusy(false)) })
+    expect(h.view.result.current.composerVoiceOptions.handsFree?.assistantHoldsFloor).toBe(false)
   })
 })

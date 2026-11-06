@@ -177,8 +177,8 @@ async def _prepare_spec_hooks(
     (``spec_tools_settings_applied_nowhere``) gets one naming what of it goes
     unapplied. None of them runs silently.
     """
-    if is_new and spec_steering_read_nowhere(client):
-        await _notice_unread_steering(state, slot, client, agent)
+    # Resource notices run after context preparation: member essentials may
+    # carry files that the backend does not read from the spec itself.
     if not capabilities_of(client).crew_fires_spec_hooks:
         if is_new and spec_hooks_run_nowhere(client):
             await _notice_spec_hooks_run_nowhere(state, slot, client, agent)
@@ -534,7 +534,12 @@ def _unread_steering_notice(agent: str, entries: list[str]) -> str:
 
 
 async def _notice_unread_steering(
-    state: "DashboardState", slot: "_ChatSlot", client: Any, agent: str
+    state: "DashboardState",
+    slot: "_ChatSlot",
+    client: Any,
+    agent: str,
+    *,
+    prepared_sources: frozenset[str] = frozenset(),
 ) -> None:
     """One notice row naming the custom agent's ``file://`` steering *client* never loads.
 
@@ -543,6 +548,8 @@ async def _notice_unread_steering(
     could claim a loss that did not happen. Best-effort: a spec that cannot be
     read renders no row rather than failing the turn.
     """
+    if not spec_steering_read_nowhere(client):
+        return
     agent = session_agent(client, agent)
     if not agent or is_kirocrew_default_agent(agent):
         return
@@ -551,6 +558,7 @@ async def _notice_unread_steering(
     except Exception:  # noqa: BLE001 - an informational row must never fail a turn
         logger.debug("agent spec resources for %r could not be read", agent, exc_info=True)
         return
+    entries = [entry for entry in entries if entry.removeprefix("file://") not in prepared_sources]
     if entries:
         append_and_surface(
             state,

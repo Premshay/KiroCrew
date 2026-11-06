@@ -110,6 +110,20 @@ async def test_fresh_session_passes_resolved_dirs(tmp_path, monkeypatch):
     assert _passed_dirs(state) == (str(org.resolve()), str(repo.resolve()))
 
 
+@pytest.mark.asyncio
+async def test_resource_notice_runs_after_the_real_turn_prepares_context(tmp_path, monkeypatch):
+    state = _turn_state(tmp_path, monkeypatch)
+
+    async def notice(*args, **kwargs):
+        state.context_builder.build_message.assert_called_once()
+        assert kwargs["prepared_sources"] == frozenset()
+
+    seen = AsyncMock(side_effect=notice)
+    monkeypatch.setattr(chat_runner, "_notice_unread_steering", seen)
+    await _turn(state, _slot(state))
+    seen.assert_awaited_once()
+
+
 @_needs_pinned_walk
 @pytest.mark.asyncio
 async def test_reinjection_turn_passes_resolved_dirs(tmp_path, monkeypatch):

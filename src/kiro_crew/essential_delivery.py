@@ -58,6 +58,7 @@ class EssentialReceipt:
     native_envelope: str
     incarnation: object
     epoch: int
+    sources: frozenset[str] = frozenset()
 
 
 def _tool_call_ended(event: object) -> bool:
@@ -93,6 +94,18 @@ class EssentialDelivery:
         #: ``None`` until the first stream starts.
         self.request_floor: float | None = None
 
+    def prepared_sources(self, message: str) -> frozenset[str]:
+        """Source labels in the trusted member envelope prepared for this prompt.
+
+        This describes preparation, not acknowledged model delivery. User text
+        cannot supply evidence: the complete builder candidate must be present.
+        """
+        with self._lock:
+            candidate = self._pending
+        if candidate is None or candidate.envelope not in message:
+            return frozenset()
+        return candidate.sources
+
     def bind(
         self,
         envelope: str,
@@ -101,6 +114,7 @@ class EssentialDelivery:
         incarnation: object,
         force: bool = False,
         native_envelope: str | None = None,
+        sources: frozenset[str] = frozenset(),
     ) -> None:
         """Stage trusted builder output; retain complete text until wire dispatch.
 
@@ -115,7 +129,7 @@ class EssentialDelivery:
                 self._epoch += 1
                 self._acknowledged = None
             self._pending = EssentialReceipt(
-                envelope, digest, native_envelope or envelope, incarnation, self._epoch
+                envelope, digest, native_envelope or envelope, incarnation, self._epoch, sources
             )
 
     def invalidate(self) -> None:
