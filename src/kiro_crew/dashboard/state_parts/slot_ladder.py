@@ -342,6 +342,7 @@ def init_ladder_fields(self: _ChatSlot) -> None:
     # Peer interrupts claude held while a tool ran: retried at the next tool
     # boundary by dashboard.peer_interrupt_retry (their queued copy is the fallback).
     self._held_peer_interrupts = []
+    self._peer_interrupt_retry_task = None
     # Opaque id per in-flight steer, keyed by its text (the one-per-text
     # rule in chat_delivery makes that key unique). The requeue moves the id
     # onto the queue entry and the drain unions entry meta onto the row it

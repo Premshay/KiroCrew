@@ -82,6 +82,46 @@ async def test_fail_goes_to_all_but_author(world):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["FAIL", "DONE"])
+async def test_own_claim_closure_waits_for_brief(world, kind):
+    from kiro_crew import arcs
+    from kiro_crew.dashboard.handlers.arcs import _urgent_unseen
+
+    claim = json.loads((await _write(world, A, _claim("review"))).text)["entry"]
+    response = await _write(
+        world,
+        A,
+        {
+            "kind": kind,
+            "text": "closed",
+            "reply_to": claim["id"],
+            "link": "https://example.com/result",
+        },
+    )
+    closure = json.loads(response.text)
+    assert closure["delivery"] == {"recipients": [], "outcome": "skipped"}
+    world.channel.post.assert_not_awaited()
+    assert arcs.open_claims(world.arc["id"]) == []
+    assert closure["entry"] in arcs.unseen_entries(world.arc["id"], B)
+    assert _urgent_unseen(world.arc["id"], B) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parent_kind,parent_author", [("CLAIM", B), ("FACT", A), ("ASK", A)])
+async def test_failure_except_own_claim_closure_stays_urgent(world, parent_kind, parent_author):
+    from kiro_crew.dashboard.handlers.arcs import _urgent_unseen
+
+    body = _claim("review") if parent_kind == "CLAIM" else {"kind": parent_kind, "text": "parent"}
+    if parent_kind == "ASK":
+        body["to"] = C
+    parent = json.loads((await _write(world, parent_author, body)).text)["entry"]
+    response = await _write(world, A, {"kind": "FAIL", "text": "broken", "reply_to": parent["id"]})
+    failure = json.loads(response.text)
+    assert sorted(failure["delivery"]["recipients"]) == [B, C]
+    assert failure["entry"] in _urgent_unseen(world.arc["id"], C)
+
+
+@pytest.mark.asyncio
 async def test_reply_to_ask_goes_to_asker(world):
     asked = json.loads((await _write(world, A, {"kind": "ASK", "text": "why?", "to": B})).text)
     assert asked["delivery"]["recipients"] == [B]

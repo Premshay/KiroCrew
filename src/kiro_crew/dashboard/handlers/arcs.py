@@ -140,7 +140,11 @@ def _urgent_unseen(arc_id: str, key: str) -> list[dict[str, Any]]:
         if claim["author"] == key:
             colliding.update(c["id"] for c in arcs.claim_collisions(arc_id, claim))
     urgent = [
-        e for e in unseen if e["kind"] == "FAIL" or e["reply_to"] in my_asks or e["id"] in colliding
+        e
+        for e in unseen
+        if (e["kind"] == "FAIL" and not arcs.closes_own_claim(e, everything))
+        or e["reply_to"] in my_asks
+        or e["id"] in colliding
     ]
     return urgent
 
