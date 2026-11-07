@@ -76,6 +76,24 @@ may use `delivery: interrupt` only with `mention` when new information may
 invalidate a running peer's premise. The gateway steers a steer-capable running
 turn; otherwise it preserves the report and places its synthetic request at the
 head of that peer's queue. This is a delivery policy, not a fourth message type.
+Held interrupts retry after tool results in one slot-owned task, outside the
+turn's event consumer. The event consumer must keep reading the ACP steering
+acknowledgement while that task awaits it. Further tool results do not start a
+second retry while one is pending. On acceptance, the retry removes the queued
+fallback and inbox copy and marks the recipient receipt `steered`; a still-held
+request keeps its queue fallback. A retry scheduled for a replaced turn or client
+does not steer the replacement.
+Until acceptance, that existing queue entry owns recovery; the retry does not
+register a second pending steer that turn teardown could requeue.
+Acceptance is reconciled only while the original turn, client and queued fallback
+still own the request; a late acknowledgement cannot recreate a cancelled fallback.
+
+Arc board `FAIL` entries interrupt peers unless they reply to the author's own
+`CLAIM`. Such closures, including `DONE`, stay on the board for the next brief;
+they do not appear as urgent unseen failures in write responses. Standalone
+failures, failures on another author's claim, and replies to questions keep
+their existing urgent routing.
+
 The delivery bridge ignores a sender-addressed echo before it reaches a slot, so
 an outbound post or its receipt cannot create an empty self-wake.
 The envelope states that it is a peer-agent message, not a user instruction or

@@ -20,6 +20,7 @@ Every step is defensive: a failure here never disturbs the running turn.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -87,15 +88,17 @@ async def retry_held_peer_interrupts(state: Any, slot: Any) -> int:
         return 0
     if not getattr(slot, "turn_running", False):
         return 0
+    turn = slot.task
     from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
     from kiro_crew.dashboard.state import PEER_CHANNEL_REQUEST_KIND
 
     delivered = 0
     for held in list(pending):
+        if slot.task is not turn or slot._acp_client is not client or not slot.turn_running:
+            break
         if not _still_queued(slot, held.queue_id):
             pending.remove(held)
             continue
-        slot._pending_steers.append(held.text)
         try:
             steered = await client.steer(held.text)
         except Exception as exc:
@@ -104,12 +107,20 @@ async def retry_held_peer_interrupts(state: Any, slot: Any) -> int:
             logger.warning("held peer interrupt retry failed for slot %s", slot.key, exc_info=True)
             steered = False
         if not steered:
-            try:
-                slot._pending_steers.remove(held.text)
-            except ValueError:
-                pass
             # Still held (a tool call opened again): keep it for the next boundary.
             break
+        # The acknowledgement can arrive after teardown or queue cancellation.
+        # Only the original live turn and queued fallback may claim acceptance.
+        if (
+            slot.task is not turn
+            or slot._acp_client is not client
+            or not slot.turn_running
+            or not _still_queued(slot, held.queue_id)
+        ):
+            break
+        # Until acceptance the existing queue entry owns recovery. Registering a
+        # pending steer earlier lets turn teardown enqueue a second fallback.
+        slot._pending_steers.append(held.text)
         pending.remove(held)
         slot.queue_remove_by_id(held.queue_id)
         slot.append("inject", held.text, json.dumps({"kind": PEER_CHANNEL_REQUEST_KIND}))
@@ -126,7 +137,33 @@ async def retry_held_peer_interrupts(state: Any, slot: Any) -> int:
 
 
 async def retry_after_tool_result(state: Any, slot: Any) -> None:
-    """The turn loop's hook: never lets a retry failure reach the running turn."""
+    """Schedule one retry without blocking the turn's acknowledgement reader."""
+    if not held_interrupts(slot):
+        return
+    running = getattr(slot, "_peer_interrupt_retry_task", None)
+    if running is not None and not running.done():
+        return
+    turn = slot.task
+    client = slot._acp_client
+
+    async def run() -> None:
+        if slot.task is turn and slot._acp_client is client:
+            await _retry_safely(state, slot)
+
+    # The ACP stream consumes steering answers. Awaiting the RPC from its event
+    # handler prevents that read and turns an injected request into a timeout.
+    task = asyncio.create_task(run())
+    slot._peer_interrupt_retry_task = task
+
+    def finished(completed: asyncio.Task[None]) -> None:
+        if getattr(slot, "_peer_interrupt_retry_task", None) is completed:
+            slot._peer_interrupt_retry_task = None
+
+    task.add_done_callback(finished)
+
+
+async def _retry_safely(state: Any, slot: Any) -> None:
+    """Report retry failures without disturbing the running turn."""
     try:
         await retry_held_peer_interrupts(state, slot)
     except Exception:

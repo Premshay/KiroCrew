@@ -20,13 +20,16 @@ def urgent_recipients(arc_id: str, entry: dict[str, Any]) -> list[str]:
     """Member keys that must hear about ``entry`` now; the owner is never listed."""
     author = entry.get("author", "")
     kind = entry.get("kind")
+    earlier_entries = arcs.read_entries(arc_id, limit=10**9) if entry.get("reply_to") else []
+    if arcs.closes_own_claim(entry, earlier_entries):
+        return []
     found: list[str] = []
     if kind == "FAIL":
         found += list(arcs.read_arc(arc_id)["members"])
     if kind == "ASK" and entry.get("to") not in (None, arcs.OWNER):
         found.append(entry["to"])
     if entry.get("reply_to"):
-        for earlier in arcs.read_entries(arc_id, limit=10**9):
+        for earlier in earlier_entries:
             if earlier["id"] == entry["reply_to"] and earlier["kind"] == "ASK":
                 found.append(earlier["author"])
     if kind == "CLAIM":

@@ -624,6 +624,16 @@ def _parse_ts(ts: str) -> datetime:
     return datetime.fromisoformat(ts)
 
 
+def closes_own_claim(entry: dict[str, Any], entries: list[dict[str, Any]]) -> bool:
+    """Whether DONE or FAIL closes a CLAIM written by the same author."""
+    return entry.get("kind") in ("DONE", "FAIL") and any(
+        parent["id"] == entry.get("reply_to")
+        and parent["kind"] == "CLAIM"
+        and parent["author"] == entry.get("author")
+        for parent in entries
+    )
+
+
 def open_claims(arc_id: str) -> list[dict[str, Any]]:
     """CLAIMs whose author has not yet answered with DONE or FAIL."""
     entries = _entries(arc_id)

@@ -406,6 +406,8 @@ def test_running_and_turn_running_slot_readers_are_enumerated() -> None:
                 # A guide or card tool call is admitted only from the turn this
                 # slot is executing; a reservation has no tool call yet.
                 ("handlers/guide.py", "_resolve_agent_caller"),
+                # Held interrupts retry only while a turn is executing.
+                ("peer_interrupt_retry.py", "retry_held_peer_interrupts"),
                 # A responsive steer needs a turn executing now; a reserved
                 # slot keeps the queue path.
                 ("responsive_chat.py", "_steer_ready"),

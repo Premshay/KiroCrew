@@ -338,6 +338,7 @@ class _ChatSlot:
         "_steer_confirmed",
         "_pending_steers",
         "_held_peer_interrupts",
+        "_peer_interrupt_retry_task",
         "_steer_delivery_ids",
         "_steer_send_ids",
         "_steer_user_origin",
@@ -581,6 +582,7 @@ class _ChatSlot:
 
     # Initialised by state_parts/slot_ladder.py.
     _held_peer_interrupts: list[HeldInterrupt]
+    _peer_interrupt_retry_task: asyncio.Task[None] | None
     _pending_subagent_failures: list[str]
     _pending_synthesis: bool
     _synthesis_armers: set[str]
