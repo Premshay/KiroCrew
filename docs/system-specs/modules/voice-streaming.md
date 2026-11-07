@@ -57,10 +57,11 @@ because they read as pure argv rewriting or a cheap size test: the sandbox probe
 walks `PATH`, `cgroup_scope_argv` ensures the parent slice's limits through the
 cgroup filesystem, and validating the produced audio stats `TMPDIR`, which an
 operator can point at a network or FUSE mount. `sandboxed_spawn_argv_async`
-carries the first off-loop itself; `cgroup_scope_argv` is wrapped in
-`asyncio.to_thread` at both spawn sites, the synthesis path and the voice-listing
-probe; and `_produced_audio` exists so the existence and size checks are one
-function, offloaded in a single thread hop rather than two.
+prepares the sandbox and exactly one resource scope off-loop. Synthesis must
+not add another scope: nested anonymous `systemd-run --scope` commands exec
+in the same process and collide on their unit name before the engine starts.
+The voice-listing probe prepares its separate scope through `asyncio.to_thread`.
+`_produced_audio` keeps its existence and size checks in one worker-thread hop.
 
 Two properties are load-bearing:
 

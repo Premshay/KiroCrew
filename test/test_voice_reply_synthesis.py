@@ -31,6 +31,7 @@ from kiro_crew.voice_reply import (
     SYSTEM_ENGINE_SAY,
     VoiceSynthesisError,
     _produced_audio,
+    _run_tts_subprocess,
     _synthesize_polly,
     _synthesize_system,
 )
@@ -77,6 +78,39 @@ def _passthrough_wrap():
         return list(cmd), {}, None
 
     return patch("kiro_crew.voice_reply.sandboxed_spawn_argv_async", side_effect=identity)
+
+
+@pytest.mark.asyncio
+async def test_local_tts_uses_one_resource_scope(monkeypatch, tmp_path):
+    from kiro_crew import sandbox
+
+    scopes: list[list[str]] = []
+
+    def scope(argv):
+        scopes.append(list(argv))
+        return ["/usr/bin/systemd-run", "--user", "--scope", "--", *argv]
+
+    monkeypatch.setattr(sandbox, "wrap_argv", lambda argv, **kw: (list(argv), None))
+    monkeypatch.setattr(sandbox, "cgroup_scope_bus_env", lambda env: (env, ()))
+    monkeypatch.setattr(sandbox, "cgroup_scope_argv", scope)
+    monkeypatch.setattr("kiro_crew.voice_reply.cgroup_scope_argv", scope)
+    fake_exec, captured = _writing_exec("-o")
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+    output = str(tmp_path / "speech.wav")
+
+    assert await _run_tts_subprocess(
+        ["/usr/bin/espeak-ng", "-o", output],
+        output,
+        label="test",
+        display="Test TTS",
+        stdin_text="Read aloud works.",
+        extra_env={"KIROCREW_TTS_ENGINE": "pocket"},
+    )
+
+    assert len(scopes) == 1
+    assert captured["cmd"].count("/usr/bin/systemd-run") == 1
+    assert captured["kwargs"]["env"]["KIROCREW_TTS_ENGINE"] == "pocket"
+    assert captured["kwargs"]["env"]["KIROCREW_SPAWNED"] == "1"
 
 
 class TestSynthesizeSystem:
@@ -280,15 +314,17 @@ class TestSynthesizeSystem:
         loop_thread = threading.get_ident()
         threads: dict[str, int] = {}
 
-        def record_cgroup(argv: list[str]) -> list[str]:
-            threads["cgroup"] = threading.get_ident()
-            return list(argv)
+        from kiro_crew import sandbox
+
+        def record_prepare(argv: list[str], **kwargs):
+            threads["prepare"] = threading.get_ident()
+            return list(argv), {}, None
 
         def record_output(path: str) -> bool:
             threads["output"] = threading.get_ident()
             return _produced_audio(path)
 
-        monkeypatch.setattr("kiro_crew.voice_reply.cgroup_scope_argv", record_cgroup)
+        monkeypatch.setattr(sandbox, "sandboxed_spawn_argv", record_prepare)
         monkeypatch.setattr("kiro_crew.voice_reply._produced_audio", record_output)
         fake_exec, _captured = _writing_exec("-o")
         with (
@@ -297,12 +333,15 @@ class TestSynthesizeSystem:
                 return_value=(SYSTEM_ENGINE_SAY, "/usr/bin/say"),
             ),
             patch("asyncio.create_subprocess_exec", side_effect=fake_exec),
-            patch("kiro_crew.voice_reply.sandboxed_spawn_argv_async", side_effect=_prepared()),
+            patch(
+                "kiro_crew.voice_reply.sandboxed_spawn_argv_async",
+                side_effect=sandbox.sandboxed_spawn_argv_async,
+            ),
         ):
             result = await _synthesize_system("hello", voice="Alex")
         assert result is not None
         os.unlink(result)
-        assert set(threads) == {"cgroup", "output"}, f"a step was never reached: {threads}"
+        assert set(threads) == {"prepare", "output"}, f"a step was never reached: {threads}"
         for step, tid in threads.items():
             assert tid != loop_thread, f"{step} ran on the event-loop thread"
 

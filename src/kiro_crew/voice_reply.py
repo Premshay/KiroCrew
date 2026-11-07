@@ -695,9 +695,8 @@ async def _run_tts_subprocess(
     """
     sandbox_cleanup: str | None = None
     try:
-        # Both preparation steps stat the filesystem — the sandbox probe walks
-        # PATH, and the cgroup wrap ensures the parent slice's limits — so
-        # neither may run inline on the event loop.
+        # Preparation includes the filesystem sandbox and the resource scope;
+        # both must stay off the event loop because they stat the host.
         cmd, child_env, sandbox_cleanup = await sandboxed_spawn_argv_async(
             cmd,
             mode="standard",
@@ -705,7 +704,6 @@ async def _run_tts_subprocess(
         )
         if extra_env:
             child_env = {**(child_env or {}), **extra_env}
-        cmd = await asyncio.to_thread(cgroup_scope_argv, cmd)  # cgroup DoS ceiling
         proc = await create_subprocess_limited(
             *cmd,
             env=child_env,
