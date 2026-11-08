@@ -15,6 +15,8 @@ at.
 before scrolling, retain each chip's minimum usable width, and let the control
 cluster take the space left beside the fixed voice/send buttons. Keep the glass
 fade on its existing containing block; positioning the shelf clips that layer.
+The Ultra Mode chip keeps its label on one line inside the scrollable control row,
+including on mobile; the compact permission picker and voice/send controls remain fixed.
 
 **A collapsed side rail becomes a horizontal bar across the TOP, never a thin vertical
 strip.** Horizontal is the one axis a phone cannot spare; vertical it can. A 44px strip

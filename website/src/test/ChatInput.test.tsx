@@ -36,6 +36,15 @@ beforeEach(() => {
 })
 
 describe('ChatInput', () => {
+  it('keeps the mobile Ultra Mode control in the scrollable row beside fixed controls', () => {
+    mobileEnv.mobile = true
+    renderWithProviders(
+      <ChatInput {...defaultProps} afterApprovalMode={<button>Ultra Mode</button>} />,
+    )
+    expect(screen.getByTestId('composer-control-row')).toContainElement(
+      screen.getByRole('button', { name: 'Ultra Mode' }),
+    )
+  })
   it('remounts Send as Stop when a turn starts', () => {
     const onStop = vi.fn()
     const { rerender } = renderWithProviders(

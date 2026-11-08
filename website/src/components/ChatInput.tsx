@@ -1731,7 +1731,7 @@ function ChatInput({
               {!isMobile && approvalMode && (
                 <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} remote={approvalModeRemote} onPicked={focusComposerAfterPick} openSignal={approvalPickerSignal} nudge={approvalNudgeActive} onNudgeDismiss={dismissApprovalNudge} onNudgeHide={hideApprovalNudge} />
               )}
-              {!isMobile && afterApprovalMode}
+              {afterApprovalMode}
               </div>
               {/* Edge cues: the row itself fades out at a clipped edge (`edge-fade-x`,
                   driven by data-fade-left/right). A mask fades the buttons on any
@@ -1741,7 +1741,6 @@ function ChatInput({
             {isMobile && approvalMode && (
               <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} remote={approvalModeRemote} compact onPicked={focusComposerAfterPick} openSignal={approvalPickerSignal} nudge={approvalNudgeActive} onNudgeDismiss={dismissApprovalNudge} onNudgeHide={hideApprovalNudge} />
             )}
-            {isMobile && afterApprovalMode}
           </div>
           <div ref={rightClusterRef} className={`flex items-center gap-1 shrink-0${terminal.active ? ' ml-auto max-w-full justify-end [&>button]:shrink-0' : ''}${inlineToolbar ? ' order-last pr-1.5' : ''}`}>
             {onHandsFreeToggle && handsFreeAvailable && !typingLocked && (
