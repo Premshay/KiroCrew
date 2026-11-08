@@ -717,6 +717,15 @@ class ContinuationCoordinator(ManagerComponent):
         )
         if not isinstance(backend, str):
             backend = None
+        runtime_agent = (
+            original.runtime_agent
+            if original is not None
+            else ((read_state(conv_id) or {}) if _captured_state is ... else _captured_state).get(
+                "runtime_agent", ""
+            )
+        )
+        if not isinstance(runtime_agent, str):
+            runtime_agent = ""
         # Another turn of the same run sits at the same place in its tree.
         # Admission keeps the deeper of this and what the parent proves now,
         # so a run whose parent's record is gone cannot restart the count.
@@ -756,6 +765,7 @@ class ContinuationCoordinator(ManagerComponent):
             conversation_key=conv_key,
             delegation=dict(delegation or {}),
             backend=backend,
+            runtime_agent=runtime_agent,
             include_memory=inc_memory,
             include_lessons=inc_lessons,
             include_project=inc_project,

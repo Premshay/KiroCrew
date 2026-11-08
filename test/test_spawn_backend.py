@@ -575,7 +575,7 @@ class TestManager:
 # ── The run hands it to the factory ───────────────────────────────────────────
 
 
-def _run(backend: str | None) -> tuple[dict, AsyncMock]:
+def _run(backend: str | None, runtime_agent: str = "") -> tuple[dict, AsyncMock]:
     from kiro_crew.config.loader import AgentConfig, KiroCrewConfig
     from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
     from kiro_crew.subagent import SubagentInfo, SubagentManager
@@ -609,6 +609,7 @@ def _run(backend: str | None) -> tuple[dict, AsyncMock]:
         task="test",
         parent_session_key="parent-key",
         backend=backend,
+        runtime_agent=runtime_agent,
     )
     runner._log_spawned(info)
     sessions.is_session_sharing_eligible = MagicMock(return_value=True)

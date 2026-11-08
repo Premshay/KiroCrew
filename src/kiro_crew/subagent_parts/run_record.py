@@ -453,6 +453,7 @@ class SubagentInfo:
     # own id. Like ``model``, a value forces the dedicated-process path -- the
     # shared runtime is the PARENT's process, on the parent's backend.
     backend: str | None = None
+    runtime_agent: str = ""
     # The backend the caller asked for, when ``agent.acp_failover`` started this
     # run on ``backend`` instead; ``None`` when no hop happened. Informational:
     # ``spawn_status`` and ``spawn_list`` show it, nothing decides on it.

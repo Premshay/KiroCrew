@@ -211,6 +211,10 @@ async def _run_inner_impl(
 
     from kiro_crew.workflows.registry import _await_owned
 
+    if info.runtime_agent and captured_execution.member_id is not None:
+        raise RuntimeError(
+            "runtime_member_capabilities_unverified: execution seat cannot load a member kit"
+        )
     publication = asyncio.create_task(asyncio.to_thread(publish_execution))
     info._state_drain_active = True
     try:
@@ -350,6 +354,8 @@ async def _run_inner_impl(
     # is a Kiro request and must reach the factory under a non-Kiro default.
     if info.backend is not None:
         extra_kwargs["backend_override"] = info.backend
+    if info.runtime_agent:
+        extra_kwargs["runtime_agent"] = info.runtime_agent
     if info.bare:
         extra_kwargs["bare"] = True
     if info.allowed_tools:

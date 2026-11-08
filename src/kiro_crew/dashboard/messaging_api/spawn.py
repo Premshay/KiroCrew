@@ -381,8 +381,26 @@ async def api_spawn(request: web.Request) -> web.Response:
     task = (cleaned.get("task") or "").strip()
     if not task:
         return web.json_response({"error": "task is required"}, status=400)
-    backend, failover_from, backend_refusal = await _requested_backend(cleaned.get("backend"))
+    from kiro_crew.execution_seats import declared_execution_seats
+
+    try:
+        seats = await asyncio.to_thread(declared_execution_seats)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc), "code": "execution_seats_invalid"}, status=409)
+    requested_backend = cleaned.get("backend")
+    seat = seats.get(requested_backend)
+    runtime_agent = seat["runtime_agent"] if seat else ""
+    backend, failover_from, backend_refusal = await _requested_backend(
+        None if seat else requested_backend
+    )
     if backend_refusal is not None:
+        if seats and backend_refusal.status == 400:
+            import json
+
+            refusal = json.loads(backend_refusal.text)
+            refusal["execution_seats"] = list(seats)
+            refusal["error"] += f"; execution seats: {sorted(seats)}"
+            return web.json_response(refusal, status=backend_refusal.status)
         return backend_refusal
     # The name of the backend the run starts on, as the request spells it.
     ran_on = _backend_name(backend) if backend is not None else None
@@ -565,6 +583,7 @@ async def api_spawn(request: web.Request) -> web.Response:
             model=model or None,
             reasoning_effort=reasoning_effort,
             backend=backend,
+            runtime_agent=runtime_agent,
             # Only on a hop, so a spawn that did not fail over passes exactly
             # what it did before.
             **({"failover_from": failover_from} if failover_from else {}),
@@ -648,6 +667,10 @@ async def api_spawn(request: web.Request) -> web.Response:
     }
     if ran_on is not None:
         resp["backend"] = ran_on
+    if seat:
+        resp["execution_seat"] = seat["id"]
+        resp["runtime_agent"] = runtime_agent
+        resp["runtime_note"] = f"Execution seat: {seat['runtime']} ({seat['id']})."
     if failover_from is not None:
         # Moved by agent.acp_failover: the caller asked for one backend and the
         # prompt went to another vendor, so the receipt says so.

@@ -1720,6 +1720,7 @@ class _PumpMixin(ManagerComponent):
                 context_groups=_context_groups_field(info),
                 delegation=info.delegation,
                 backend=info.backend,
+                runtime_agent=info.runtime_agent,
                 depth=info.depth,
                 memory_store=info.memory_store,
                 execution_context=info.execution_context,

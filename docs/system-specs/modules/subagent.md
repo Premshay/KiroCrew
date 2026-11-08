@@ -84,6 +84,13 @@ when its parent supports session sharing. The registry's `agent_runtime_policy`
 names that engine; sharing a native runtime would bypass the mapped provider and
 its environment. Templates without an engine mapping retain ordinary sharing.
 
+`spawn_run(backend=...)` also accepts companion-declared execution seat IDs.
+Those IDs select a validated template runtime alias through `runtime_agent`,
+not a native ACP backend registration. Receipts identify the execution seat;
+queued starts and continuations preserve it, and the run uses a dedicated
+provider. Native backend validation and installation checks remain unchanged.
+Execution seats do not gain member-kit support from this selection path.
+
 Prompt construction receives the captured context explicitly and reads permanent
 rules/brief/profile documents directly. Learned database preparation is optional
 for this prompt; an explicit learned-memory operation fails on unavailable or
