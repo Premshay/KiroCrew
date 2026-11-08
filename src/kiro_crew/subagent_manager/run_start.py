@@ -87,6 +87,22 @@ def _should_use_session_sharing_impl(self: RunEventCoordinator, info: SubagentIn
         return False
     if not info.parent_session_key:
         return False
+    selected_agent = info.agent or getattr(info.execution_context, "template_id", "")
+    if selected_agent:
+        from kiro_crew.platform.context import current_context
+
+        lookup = getattr(current_context().providers, "agent_runtime_policy", None)
+        if callable(lookup):
+            binding = getattr(cfg, "agents", {}).get(selected_agent)
+            bound_agent = getattr(binding, "kiro_agent", "")
+            identity = (
+                bound_agent if isinstance(bound_agent, str) and bound_agent else selected_agent
+            )
+            policy = lookup(identity)
+            # A mapped engine owns its environment and provider lifecycle;
+            # an existing native runtime cannot apply either after sharing.
+            if isinstance(policy, dict) and policy.get("engine"):
+                return False
     return self._manager._sessions.is_session_sharing_eligible(info.parent_session_key)
 
 

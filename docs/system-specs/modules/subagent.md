@@ -79,6 +79,11 @@ recognition, cleanup identities, spawn approval and callback delivery remain
 unchanged. Member capability and native prompt documents still require a runtime
 prepared for that member before launch.
 
+A template bound to a companion engine takes the dedicated-provider path, even
+when its parent supports session sharing. The registry's `agent_runtime_policy`
+names that engine; sharing a native runtime would bypass the mapped provider and
+its environment. Templates without an engine mapping retain ordinary sharing.
+
 Prompt construction receives the captured context explicitly and reads permanent
 rules/brief/profile documents directly. Learned database preparation is optional
 for this prompt; an explicit learned-memory operation fails on unavailable or

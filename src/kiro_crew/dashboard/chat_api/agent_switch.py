@@ -856,6 +856,77 @@ async def switch_slot_agent(
         pinned = _channel_pin_refusal(slot, agent_name, new_agent_kind)
         if pinned is not None:
             return pinned
+        runtime_alias = ""
+        if (
+            assignment_resolved
+            and new_agent_kind == "template"
+            and caller.owner
+            and caller.request is not None
+        ):
+            from kiro_crew.platform.context import current_context
+
+            runtime_binding = cfg.agents.get(agent_name)
+            policy_getter = getattr(current_context().providers, "agent_runtime_policy", None)
+            if (
+                runtime_binding is not None
+                and not runtime_binding.member_id
+                and callable(policy_getter)
+            ):
+                runtime_policy = policy_getter(runtime_binding.kiro_agent or agent_name)
+                if (
+                    isinstance(runtime_policy, dict)
+                    and runtime_policy.get("template_selects_runtime") is True
+                ):
+                    runtime_alias = agent_name
+        runtime_changes = []
+        linked_fallback_changes = []
+        if runtime_alias:
+            from kiro_crew.messaging.link import canonical_key
+
+            runtime_views = [
+                other
+                for other in state._slots.values()
+                if canonical_key(effective_session_key(other)) == canonical_key(session_key)
+            ]
+            if any(
+                other.agent != slot.agent or other.memory_store != slot.memory_store
+                for other in runtime_views
+            ):
+                return web.json_response(
+                    {
+                        "error": "Linked views disagree on conversation identity",
+                        "code": "linked_views_disagree",
+                    },
+                    status=409,
+                )
+            for other in runtime_views:
+                if other is not slot:
+                    previous_walk = {
+                        field: getattr(other, field)
+                        for field in (
+                            "_fallback_candidate_idx",
+                            "_fallback_walked",
+                            "_active_fallback_model",
+                            "_fallback_primary_model",
+                            "_fallback_slot_model",
+                            "_fallback_pick_gen",
+                        )
+                    }
+                    clear_slot_model_binding(other)
+                    linked_fallback_changes.append(
+                        (other, previous_walk, other._active_fallback_model)
+                    )
+                for field, value in (
+                    ("runtime_agent", runtime_alias),
+                    ("model", ""),
+                    ("reasoning_effort", ""),
+                    ("served_model", ""),
+                ):
+                    prior = getattr(other, field)
+                    committed = _CommitToken(value)
+                    runtime_changes.append((other, field, prior, committed))
+                    setattr(other, field, committed)
+                other._dirty = True
         slot.agent = _CommitToken(agent_name)
         slot.agent_kind = _CommitToken(new_agent_kind)
         committed_agent = slot.agent
@@ -904,7 +975,7 @@ async def switch_slot_agent(
         prior_fallback_pick_gen = slot._fallback_pick_gen
         committed_active_fallback_model: str | None = None
         committed_model: str | None = None
-        if agent_changed:
+        if agent_changed or runtime_alias:
             # Model pins and fallback recovery belong to the replaced agent's
             # backend namespace, so neither may leak into its replacement.
             clear_slot_model_binding(slot)
@@ -981,6 +1052,14 @@ async def switch_slot_agent(
                     slot._fallback_pick_gen = prior_fallback_pick_gen
             if committed_model is not None and slot.model is committed_model:
                 slot.model = prior_model_state["model"]
+            for other, field, prior, committed in runtime_changes:
+                if getattr(other, field) is committed:
+                    setattr(other, field, prior)
+                other._dirty = True
+            for other, prior_walk, committed in linked_fallback_changes:
+                if other._active_fallback_model is committed:
+                    for field, prior in prior_walk.items():
+                        setattr(other, field, prior)
             if committed_workspace is not None and slot.workspace is committed_workspace:
                 slot.workspace = pre_await_workspace
             if committed_project is not None:
@@ -1157,6 +1236,15 @@ async def switch_slot_agent(
                             "agent_kind": slot.agent_kind,
                             "model": slot.model,
                             **(
+                                {
+                                    "runtime_agent": slot.runtime_agent,
+                                    "reasoning_effort": slot.reasoning_effort,
+                                    "served_model": slot.served_model,
+                                }
+                                if runtime_alias
+                                else {}
+                            ),
+                            **(
                                 {"crew_mode_agent": str(slot.crew_mode_agent or "")}
                                 if crew_stamp_moves
                                 else {}
@@ -1182,6 +1270,15 @@ async def switch_slot_agent(
                         "agent": agent_name,
                         "agent_kind": new_agent_kind,
                         "model": slot.model,
+                        **(
+                            {
+                                "runtime_agent": slot.runtime_agent,
+                                "reasoning_effort": slot.reasoning_effort,
+                                "served_model": slot.served_model,
+                            }
+                            if runtime_alias
+                            else {}
+                        ),
                         **(
                             {"crew_mode_agent": str(slot.crew_mode_agent or "")}
                             if crew_stamp_moves
@@ -1448,6 +1545,8 @@ async def switch_slot_agent(
         # The switch is committed and the session reset: mark the boundary in
         # the transcript, still inside both locks. A re-pick of the bound agent
         # changes nothing the row could name, so it appends none.
+        if runtime_alias:
+            state.sessions._session_map.mark_seat_switch(session_key)
         if caller.notice and agent_changed:
             await _append_session_switch_notice(slot, "agent", agent_name)
     # Crew Mode is a chat on the conductor TEMPLATE. Landing on it puts the work-ledger
@@ -1476,6 +1575,7 @@ async def switch_slot_agent(
         "agent": agent_name,
         "agent_kind": slot.agent_kind,
         "workspace": workspace,
+        **({"runtime_agent": slot.runtime_agent} if runtime_alias else {}),
     }
     if teardown_incomplete:
         # Advisory only — the switch itself succeeded and the response
