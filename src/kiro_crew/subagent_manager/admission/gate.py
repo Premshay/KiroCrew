@@ -438,6 +438,10 @@ class _GateMixin(ManagerComponent):
             app = execution.app
             memory_store = execution.store.legacy_name
             _memory_mode = execution.memory_mode
+            if runtime_agent:
+                from kiro_crew.execution_seats import validate_member_execution_seat
+
+                validate_member_execution_seat(runtime_agent, execution)
         except (OSError, ValueError) as exc:
             return _refuse_row(
                 SubagentInfo(
@@ -447,7 +451,11 @@ class _GateMixin(ManagerComponent):
                     agent=agent,
                     parent_session_key=parent_session_key,
                     done=True,
-                    error=f"memory_unavailable: {exc}",
+                    error=(
+                        str(exc)
+                        if getattr(exc, "code", "") == "runtime_member_capabilities_unverified"
+                        else f"memory_unavailable: {exc}"
+                    ),
                     batch_id=batch_id,
                     batch_total=max(0, int(batch_total)),
                 )

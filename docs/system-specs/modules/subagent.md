@@ -89,7 +89,14 @@ Those IDs select a validated template runtime alias through `runtime_agent`,
 not a native ACP backend registration. Receipts identify the execution seat;
 queued starts and continuations preserve it, and the run uses a dedicated
 provider. Native backend validation and installation checks remain unchanged.
-Execution seats do not gain member-kit support from this selection path.
+Member-bound runs require the selected seat's existing runtime policy to name
+a backend in the member-capability set or declare `member_capabilities`.
+A crewmate's own worker requires the worker-kit set or `member_worker_kit`
+instead. Admission refuses an unverified seat before registering or queueing
+the run, and dispatch rechecks it. The selected provider must still confirm
+the saved capability projection at allocation; declaring a seat does not
+bypass that check. An explicit worker seat is checked in place of the parent's
+backend, retaining the captured member, store and worker template.
 
 Prompt construction receives the captured context explicitly and reads permanent
 rules/brief/profile documents directly. Learned database preparation is optional

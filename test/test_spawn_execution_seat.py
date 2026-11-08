@@ -9,12 +9,14 @@ from unittest.mock import MagicMock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from kiro_crew.execution_context import execution_for_store
+from kiro_crew.execution_seats import (
+    declared_execution_seats,
+    validate_member_execution_seat,
+)
 from test_spawn_backend import TestFollowUps as _FollowUps
 from test_spawn_backend import _mgr, _real_request, _run
 from test_spawn_backend import selectable as _selectable_fixture
-
-from kiro_crew.execution_context import execution_for_store
-from kiro_crew.execution_seats import declared_execution_seats
 
 pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 
@@ -172,6 +174,103 @@ def test_native_backend_and_seat_cannot_both_be_selected():
     manager = _mgr()
     with pytest.raises(ValueError, match="both"):
         manager.spawn("hello", backend="claude", runtime_agent="crew-antigravity")
+
+
+def _member_execution(worker=False):
+    from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+
+    return ExecutionContext(
+        "member-owner",
+        MemoryStoreRef("member-owner", "member-owner"),
+        "template",
+        "kirocrew-mate-worker" if worker else "member-template",
+    )
+
+
+def _seat_policy(monkeypatch, policy):
+    lookup = MagicMock(return_value=policy)
+    monkeypatch.setattr(
+        "kiro_crew.platform.context.current_context",
+        lambda: SimpleNamespace(providers=SimpleNamespace(agent_runtime_policy=lookup)),
+    )
+    return lookup
+
+
+@pytest.fixture
+def member_seat_config(monkeypatch):
+    from kiro_crew.config import KiroCrewConfig
+
+    cfg = KiroCrewConfig()
+    cfg.agents["crew-antigravity"] = SimpleNamespace(member_id="", kiro_agent="agy-template")
+    monkeypatch.setattr(KiroCrewConfig, "load", lambda: cfg)
+    return cfg
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"backend": "claude"},
+        {"backend": "codex"},
+        {"backend": "antigravity_headless", "member_capabilities": True},
+    ],
+)
+def test_verified_member_seats_keep_memory_and_template(monkeypatch, member_seat_config, policy):
+    lookup = _seat_policy(monkeypatch, policy)
+    execution = _member_execution()
+    validate_member_execution_seat("crew-antigravity", execution)
+    lookup.assert_called_once_with("agy-template")
+    assert execution.member_id == "member-owner"
+    assert execution.template_id == "member-template"
+
+
+@pytest.mark.parametrize("worker_support", [True, False])
+def test_worker_requires_its_own_kit_support(monkeypatch, member_seat_config, worker_support):
+    _seat_policy(
+        monkeypatch,
+        {
+            "backend": "antigravity_headless",
+            "member_capabilities": True,
+            "member_worker_kit": worker_support,
+        },
+    )
+    if worker_support:
+        validate_member_execution_seat("crew-antigravity", _member_execution(worker=True))
+    else:
+        with pytest.raises(ValueError, match="runtime_member_capabilities_unverified"):
+            validate_member_execution_seat("crew-antigravity", _member_execution(worker=True))
+
+
+@pytest.mark.asyncio
+async def test_member_seat_refuses_before_run_registration(monkeypatch, member_seat_config):
+    manager = _mgr()
+    monkeypatch.setattr(
+        type(manager._admission), "resolve_spawn_execution", lambda _self, **kw: _member_execution()
+    )
+    _seat_policy(monkeypatch, None)
+    run = manager.spawn("hello", runtime_agent="crew-antigravity")
+    assert run.done
+    assert run.error.startswith("runtime_member_capabilities_unverified")
+    assert not manager._agents
+    assert not manager._queue
+
+
+def test_member_bound_run_reaches_selected_seat(monkeypatch):
+    import test_spawn_backend
+
+    execution = _member_execution()
+    published = MagicMock()
+    monkeypatch.setattr(test_spawn_backend, "execution_for_store", lambda store: execution)
+    monkeypatch.setattr("kiro_crew.execution_context.bind_session_execution", published)
+    monkeypatch.setattr("kiro_crew.subagent._vet_spawn_governance", lambda *a, **kw: None)
+    _seat_policy(monkeypatch, {"member_capabilities": True})
+    captured, shared = _run(
+        None,
+        runtime_agent="crew-antigravity",
+        agents={"crew-antigravity": SimpleNamespace(member_id="", kiro_agent="agy-template")},
+    )
+    assert captured["runtime_agent"] == "crew-antigravity"
+    shared.assert_not_called()
+    assert published.call_args.args[1] == execution
 
 
 @pytest.mark.parametrize(

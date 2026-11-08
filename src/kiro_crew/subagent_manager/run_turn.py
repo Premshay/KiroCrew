@@ -211,9 +211,11 @@ async def _run_inner_impl(
 
     from kiro_crew.workflows.registry import _await_owned
 
-    if info.runtime_agent and captured_execution.member_id is not None:
-        raise RuntimeError(
-            "runtime_member_capabilities_unverified: execution seat cannot load a member kit"
+    if info.runtime_agent:
+        from kiro_crew.execution_seats import validate_member_execution_seat
+
+        await asyncio.to_thread(
+            validate_member_execution_seat, info.runtime_agent, captured_execution
         )
     publication = asyncio.create_task(asyncio.to_thread(publish_execution))
     info._state_drain_active = True
@@ -258,7 +260,7 @@ async def _run_inner_impl(
     from kiro_crew.mate_worker import is_own_worker_execution
 
     own_worker = not info.agent and is_own_worker_execution(execution)
-    if own_worker:
+    if own_worker and not info.runtime_agent:
         # The worker's spec lives in the crewmate folder, which the agent roster
         # does not list, so it is not looked up by name; what it needs is a
         # backend that carries its per-session kit (the hand-off's own check).

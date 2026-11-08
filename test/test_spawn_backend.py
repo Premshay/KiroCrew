@@ -575,7 +575,7 @@ class TestManager:
 # ── The run hands it to the factory ───────────────────────────────────────────
 
 
-def _run(backend: str | None, runtime_agent: str = "") -> tuple[dict, AsyncMock]:
+def _run(backend: str | None, runtime_agent: str = "", agents=None) -> tuple[dict, AsyncMock]:
     from kiro_crew.config.loader import AgentConfig, KiroCrewConfig
     from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
     from kiro_crew.subagent import SubagentInfo, SubagentManager
@@ -600,7 +600,7 @@ def _run(backend: str | None, runtime_agent: str = "") -> tuple[dict, AsyncMock]
 
     sessions.get_or_create = fake_get_or_create
     client.stream = fake_stream
-    cfg = KiroCrewConfig(agent=AgentConfig(session_sharing=True))
+    cfg = KiroCrewConfig(agent=AgentConfig(session_sharing=True), agents=agents or {})
     runner = SubagentManager(sessions=sessions, ctx_builder=ctx_builder)
     shared = AsyncMock(side_effect=AssertionError("shared runtime used for a per-spawn backend"))
     info = SubagentInfo(
