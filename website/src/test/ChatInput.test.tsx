@@ -36,14 +36,20 @@ beforeEach(() => {
 })
 
 describe('ChatInput', () => {
-  it('keeps the mobile Ultra Mode control in the scrollable row beside fixed controls', () => {
+  it('keeps Ultra Mode first in the mobile scroll strip with the attachment and permission controls', () => {
     mobileEnv.mobile = true
     renderWithProviders(
-      <ChatInput {...defaultProps} afterApprovalMode={<button>Ultra Mode</button>} />,
+      <ChatInput {...defaultProps} onUploadFiles={vi.fn()} collapsible approvalMode="normal" afterApprovalMode={<button>Ultra Mode</button>} />,
     )
     expect(screen.getByTestId('composer-control-row')).toContainElement(
       screen.getByRole('button', { name: 'Ultra Mode' }),
     )
+    const strip = screen.getByTestId('composer-control-row')
+    expect(strip.firstElementChild).toBe(screen.getByRole('button', { name: 'Ultra Mode' }))
+    expect(strip).toContainElement(screen.getByTestId('composer-more-trigger'))
+    expect(strip).toContainElement(screen.getByRole('button', { name: /approval mode/i }))
+    fireEvent.keyDown(screen.getByTestId('composer-more-trigger'), { key: 'Enter' })
+    expect(screen.getByTestId('composer-more-optimize')).toBeInTheDocument()
   })
   it('remounts Send as Stop when a turn starts', () => {
     const onStop = vi.fn()
