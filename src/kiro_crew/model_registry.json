@@ -114,6 +114,14 @@
     "aliases": ["claude-fable-5.1", "claude-fable-5-1", "claude-fable-5-1[1m]"],
     "providers": { "claude_code": "global.anthropic.claude-fable-5-1[1m]" }
   },
+  "fable-5.2-1m": {
+    "display": "Fable 5.2 (1M context)",
+    "description": "Demanding reasoning and agentic work, 1M context",
+    "window": 1000000,
+    "supports_effort": true,
+    "aliases": ["claude-fable-5.2", "claude-fable-5-2", "claude-fable-5-2[1m]"],
+    "providers": { "claude_code": "claude-fable-5-2" }
+  },
   "auto": {
     "display": "Auto",
     "description": "Let the provider pick the model",
