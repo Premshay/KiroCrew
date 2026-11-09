@@ -9,14 +9,15 @@ from unittest.mock import MagicMock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from test_spawn_backend import TestFollowUps as _FollowUps
+from test_spawn_backend import _mgr, _real_request, _run
+from test_spawn_backend import selectable as _selectable_fixture
+
 from kiro_crew.execution_context import execution_for_store
 from kiro_crew.execution_seats import (
     declared_execution_seats,
     validate_member_execution_seat,
 )
-from test_spawn_backend import TestFollowUps as _FollowUps
-from test_spawn_backend import _mgr, _real_request, _run
-from test_spawn_backend import selectable as _selectable_fixture
 
 pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 
