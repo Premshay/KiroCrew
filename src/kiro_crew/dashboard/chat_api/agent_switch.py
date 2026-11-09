@@ -1056,8 +1056,8 @@ async def switch_slot_agent(
                 if getattr(other, field) is committed:
                     setattr(other, field, prior)
                 other._dirty = True
-            for other, prior_walk, committed in linked_fallback_changes:
-                if other._active_fallback_model is committed:
+            for other, prior_walk, committed_fallback in linked_fallback_changes:
+                if other._active_fallback_model is committed_fallback:
                     for field, prior in prior_walk.items():
                         setattr(other, field, prior)
             if committed_workspace is not None and slot.workspace is committed_workspace:

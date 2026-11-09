@@ -388,13 +388,13 @@ async def api_spawn(request: web.Request) -> web.Response:
     except ValueError as exc:
         return web.json_response({"error": str(exc), "code": "execution_seats_invalid"}, status=409)
     requested_backend = cleaned.get("backend")
-    seat = seats.get(requested_backend)
+    seat = seats.get(requested_backend) if isinstance(requested_backend, str) else None
     runtime_agent = seat["runtime_agent"] if seat else ""
     backend, failover_from, backend_refusal = await _requested_backend(
         None if seat else requested_backend
     )
     if backend_refusal is not None:
-        if seats and backend_refusal.status == 400:
+        if seats and backend_refusal.status == 400 and backend_refusal.text is not None:
             import json
 
             refusal = json.loads(backend_refusal.text)
