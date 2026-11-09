@@ -962,6 +962,20 @@ _CLAUDE_5X_IDS = [row[0] for row in _CLAUDE_5X_ROWS]
 
 
 class TestClaude55Rows:
+    def test_fable_5_2_pins_match_the_advertised_version(self, monkeypatch):
+        monkeypatch.setattr(
+            mr,
+            "_ADVERTISED_MODELS",
+            {"claude_code": ["default", "opus", "claude-fable-5-1[1m]", "claude-fable-5-2"]},
+        )
+        for pin in ("fable-5.2-1m", "claude-fable-5.2", "claude-fable-5-2[1m]"):
+            stored = mr.to_provider_id(pin, "claude_code")
+            assert mr.resolve_wire_model_id(stored, "claude_code") == "claude-fable-5-2"
+            assert mr.model_window(pin) == 1_000_000
+            assert mr.supports_effort(pin) is True
+            assert mr.lacks_acp_id(pin) is True
+        assert mr.from_provider_id("claude-fable-5-2", "claude_code") == "fable-5.2-1m"
+
     @pytest.mark.parametrize("key, aliases, pid, acp_id, wire", _CLAUDE_5X_ROWS, ids=_CLAUDE_5X_IDS)
     def test_every_spelling_resolves_to_its_own_1m_row(self, key, aliases, pid, acp_id, wire):
         for pin in (key, *aliases):

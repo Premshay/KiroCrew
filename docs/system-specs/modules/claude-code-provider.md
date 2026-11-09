@@ -1062,6 +1062,10 @@ aliases. `from_provider_id` uses that index to recover a canonical key from an
 advertised adapter ID. `TestModelRegistry.test_bare_advertised_ids_fold_to_canonical_key`
 pins the bare-ID case.
 
+Fable 5.2's `fable-5.2-1m` row maps to the adapter-advertised
+`claude-fable-5-2`, with a 1M context window and effort support. Its versioned
+aliases resolve to that row; existing family aliases and defaults are unchanged.
+
 `model_registry.available_models` and `display_list` sort default entries first
 rather than trusting JSON object order. This is load-bearing because the adapter
 uses the resulting allowlist when an automatic selection omits an explicit
