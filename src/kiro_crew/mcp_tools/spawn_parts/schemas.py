@@ -358,10 +358,12 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                     "backend": {
                         "type": "string",
                         "description": (
-                            "Optional backend (agent harness) for the subagent(s), e.g. "
+                            "Optional native backend or companion execution-seat ID for the subagent(s), e.g. "
                             "'kiro', 'claude', 'codex': the run starts on that harness "
                             "instead of the gateway default, so one orchestrator can hand "
-                            "each task to the harness that suits it. A backend that is "
+                            "each task to the harness that suits it. Companion seats use "
+                            "their configured runtime and are named as execution seats in "
+                            "the receipt; they are not native ACP registrations. A backend that is "
                             "unavailable AT SPAWN TIME is REFUSED with the list of "
                             "available ones (and its install command when it is only "
                             "missing), never replaced by the default. Pass 'model' as an "

@@ -211,6 +211,12 @@ async def _run_inner_impl(
 
     from kiro_crew.workflows.registry import _await_owned
 
+    if info.runtime_agent:
+        from kiro_crew.execution_seats import validate_member_execution_seat
+
+        await asyncio.to_thread(
+            validate_member_execution_seat, info.runtime_agent, captured_execution
+        )
     publication = asyncio.create_task(asyncio.to_thread(publish_execution))
     info._state_drain_active = True
     try:
@@ -254,7 +260,7 @@ async def _run_inner_impl(
     from kiro_crew.mate_worker import is_own_worker_execution
 
     own_worker = not info.agent and is_own_worker_execution(execution)
-    if own_worker:
+    if own_worker and not info.runtime_agent:
         # The worker's spec lives in the crewmate folder, which the agent roster
         # does not list, so it is not looked up by name; what it needs is a
         # backend that carries its per-session kit (the hand-off's own check).
@@ -350,6 +356,8 @@ async def _run_inner_impl(
     # is a Kiro request and must reach the factory under a non-Kiro default.
     if info.backend is not None:
         extra_kwargs["backend_override"] = info.backend
+    if info.runtime_agent:
+        extra_kwargs["runtime_agent"] = info.runtime_agent
     if info.bare:
         extra_kwargs["bare"] = True
     if info.allowed_tools:

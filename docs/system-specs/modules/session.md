@@ -891,6 +891,11 @@ Switches refuse active turns or attached children, synchronize linked slot views
 reset model/effort/fallback state and bypass warm allocation. The target runtime
 supplies its own default model; allocation and restore must not inherit the member's
 prior provider model. No automatic vendor fallback is introduced.
+An edition may mark a registered non-member template's runtime policy with
+`template_selects_runtime: true`. Selecting that template in the owner dashboard
+also selects its execution seat atomically, clears model/effort/live-model state,
+and synchronizes linked views. Refused switches restore the previous seat;
+ordinary templates and member identities retain the independent seat choice.
 The applied view also checks that each enabled MCP connection in that saved
 version has reported ready through the provider's own MCP report. Missing reports
 remain unverified, authentication requests remain pending, and initialization

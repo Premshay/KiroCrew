@@ -85,8 +85,26 @@ def _should_use_session_sharing_impl(self: RunEventCoordinator, info: SubagentIn
     # a run asked onto a backend of its own needs a process of its own.
     if info.backend is not None:
         return False
+    if info.runtime_agent:
+        return False
     if not info.parent_session_key:
         return False
+    selected_agent = info.agent or getattr(info.execution_context, "template_id", "")
+    if selected_agent:
+        from kiro_crew.platform.context import current_context
+
+        lookup = getattr(current_context().providers, "agent_runtime_policy", None)
+        if callable(lookup):
+            binding = getattr(cfg, "agents", {}).get(selected_agent)
+            bound_agent = getattr(binding, "kiro_agent", "")
+            identity = (
+                bound_agent if isinstance(bound_agent, str) and bound_agent else selected_agent
+            )
+            policy = lookup(identity)
+            # A mapped engine owns its environment and provider lifecycle;
+            # an existing native runtime cannot apply either after sharing.
+            if isinstance(policy, dict) and policy.get("engine"):
+                return False
     return self._manager._sessions.is_session_sharing_eligible(info.parent_session_key)
 
 
@@ -122,8 +140,16 @@ def _sharing_plan_impl(
     answer them keeps the decision above.
     """
     kind = _selection_kind(info)
-    eff_model = info.model or _subagent_default_model(cfg) or info.routed_model
-    eff_effort = info.reasoning_effort or _subagent_default_effort(cfg)
+    eff_model = (
+        info.model
+        if info.runtime_agent
+        else (info.model or _subagent_default_model(cfg) or info.routed_model)
+    )
+    eff_effort = (
+        info.reasoning_effort
+        if info.runtime_agent
+        else (info.reasoning_effort or _subagent_default_effort(cfg))
+    )
     # Not coerced: the eligibility answer is passed through as the run has
     # always read it, and admission prices a start shared only on a real
     # ``True``, so an answer it cannot trust is priced dedicated.

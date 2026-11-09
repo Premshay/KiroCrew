@@ -79,6 +79,25 @@ recognition, cleanup identities, spawn approval and callback delivery remain
 unchanged. Member capability and native prompt documents still require a runtime
 prepared for that member before launch.
 
+A template bound to a companion engine takes the dedicated-provider path, even
+when its parent supports session sharing. The registry's `agent_runtime_policy`
+names that engine; sharing a native runtime would bypass the mapped provider and
+its environment. Templates without an engine mapping retain ordinary sharing.
+
+`spawn_run(backend=...)` also accepts companion-declared execution seat IDs.
+Those IDs select a validated template runtime alias through `runtime_agent`,
+not a native ACP backend registration. Receipts identify the execution seat;
+queued starts and continuations preserve it, and the run uses a dedicated
+provider. Native backend validation and installation checks remain unchanged.
+Member-bound runs require the selected seat's existing runtime policy to name
+a backend in the member-capability set or declare `member_capabilities`.
+A crewmate's own worker requires the worker-kit set or `member_worker_kit`
+instead. Admission refuses an unverified seat before registering or queueing
+the run, and dispatch rechecks it. The selected provider must still confirm
+the saved capability projection at allocation; declaring a seat does not
+bypass that check. An explicit worker seat is checked in place of the parent's
+backend, retaining the captured member, store and worker template.
+
 Prompt construction receives the captured context explicitly and reads permanent
 rules/brief/profile documents directly. Learned database preparation is optional
 for this prompt; an explicit learned-memory operation fails on unavailable or

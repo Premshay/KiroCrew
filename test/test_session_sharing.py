@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -131,6 +132,53 @@ def _cfg_patch(session_sharing: bool = True):
 
 class TestSessionSharingDecision:
     """Tests for _should_use_session_sharing decision logic."""
+
+    @pytest.mark.parametrize(
+        ("policy", "expected"),
+        [
+            ({"engine": "antigravity", "backend": "antigravity_headless"}, False),
+            ({"engine": "claude-local", "backend": "claude"}, False),
+            (None, True),
+            ({}, True),
+        ],
+    )
+    def test_mapped_engine_uses_its_own_provider(self, monkeypatch, policy, expected):
+        sessions = _mock_sessions(sharing_eligible=True)
+        manager = SubagentManager(
+            sessions=sessions, ctx_builder=_mock_ctx_builder_auto(), is_yolo=lambda: True
+        )
+        lookup = MagicMock(return_value=policy)
+        monkeypatch.setattr(
+            "kiro_crew.platform.context.current_context",
+            lambda: SimpleNamespace(providers=SimpleNamespace(agent_runtime_policy=lookup)),
+        )
+        info = SubagentInfo(
+            id="mapped-child",
+            task="hello",
+            agent="crew-antigravity",
+            parent_session_key="dashboard:slot1",
+        )
+        with _cfg_patch(session_sharing=True):
+            assert manager._should_use_session_sharing(info) is expected
+        lookup.assert_called_once_with("crew-antigravity")
+
+    def test_registry_without_engine_policy_preserves_sharing(self, monkeypatch):
+        sessions = _mock_sessions(sharing_eligible=True)
+        manager = SubagentManager(
+            sessions=sessions, ctx_builder=_mock_ctx_builder_auto(), is_yolo=lambda: True
+        )
+        monkeypatch.setattr(
+            "kiro_crew.platform.context.current_context",
+            lambda: SimpleNamespace(providers=object()),
+        )
+        info = SubagentInfo(
+            id="unmapped-child",
+            task="hello",
+            agent="reviewer",
+            parent_session_key="dashboard:slot1",
+        )
+        with _cfg_patch(session_sharing=True):
+            assert manager._should_use_session_sharing(info) is True
 
     def test_private_crew_target_cannot_share_a_global_parent(self):
         sessions = _mock_sessions(sharing_eligible=True)
