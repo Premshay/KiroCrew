@@ -118,6 +118,7 @@ class _GateMixin(ManagerComponent):
         target_member: str | None = None,
         delegation: dict[str, str] | None = None,
         backend: str | None = None,
+        runtime_agent: str = "",
         failover_from: str | None = None,
         label: str = "",
         _execution_context: dict | None = None,
@@ -178,6 +179,8 @@ class _GateMixin(ManagerComponent):
         Returns:
             SubagentInfo | None: Agent metadata, or None if at capacity.
         """
+        if runtime_agent and backend is not None:
+            raise ValueError("A spawn cannot select both a native backend and an execution seat")
         # Identity is assigned ONCE, here, and used by every exit path — the
         # queued return, each rejection, and the started record. That is what
         # makes the id the caller is handed the id it will actually see again:
@@ -435,6 +438,10 @@ class _GateMixin(ManagerComponent):
             app = execution.app
             memory_store = execution.store.legacy_name
             _memory_mode = execution.memory_mode
+            if runtime_agent:
+                from kiro_crew.execution_seats import validate_member_execution_seat
+
+                validate_member_execution_seat(runtime_agent, execution)
         except (OSError, ValueError) as exc:
             return _refuse_row(
                 SubagentInfo(
@@ -444,7 +451,11 @@ class _GateMixin(ManagerComponent):
                     agent=agent,
                     parent_session_key=parent_session_key,
                     done=True,
-                    error=f"memory_unavailable: {exc}",
+                    error=(
+                        str(exc)
+                        if getattr(exc, "code", "") == "runtime_member_capabilities_unverified"
+                        else f"memory_unavailable: {exc}"
+                    ),
                     batch_id=batch_id,
                     batch_total=max(0, int(batch_total)),
                 )
@@ -617,6 +628,7 @@ class _GateMixin(ManagerComponent):
             # The drain re-enters ``spawn`` from this dict alone: a run that hit
             # the concurrency gate would otherwise start on the default backend.
             "backend": backend,
+            "runtime_agent": runtime_agent,
             # Same reason: a queued row would otherwise lose the hop it reports.
             "failover_from": failover_from,
             # Same reason: a queued row would otherwise start under its task text.
@@ -951,6 +963,7 @@ class _GateMixin(ManagerComponent):
             "model": model or "",
             "reasoning_effort": reasoning_effort or "",
             "backend": backend,
+            "runtime_agent": runtime_agent,
             "failover_from": failover_from,
             "allowed_tools": list(allowed_tools) if allowed_tools else [],
             "bare": bare,

@@ -945,7 +945,8 @@ function ChatInput({
   // prompt is written (issue #23572). Mid-turn it is a row in the "+" menu,
   // not a button: the busy send cluster already holds its cap of controls
   // (max-two-buttons-per-row), and Optimize would be one more beside them.
-  const busyOptimizeOffered = optimizeOffered && busySendSlot && !compactingSlot
+  const mobileUltraControl = isMobile && !!afterApprovalMode
+  const busyOptimizeOffered = optimizeOffered && (busySendSlot || mobileUltraControl) && !compactingSlot
   const optimizeRowLabel = optimizePending && !optimizing
     ? i18nT('components.chatInput.optimize_prompt_busy_optimizing_another_chat')
     : i18nT('components.chatInput.optimize_prompt')
@@ -962,7 +963,7 @@ function ChatInput({
       <div className="min-w-0 text-[12px] font-medium text-text">{optimizeRowLabel}</div>
     </button>
   ) : null
-  const optimizeButton = optimizeOffered ? (
+  const optimizeButton = optimizeOffered && !mobileUltraControl ? (
     <button
       className={`w-8 h-8 rounded-lg border-none flex items-center justify-center cursor-pointer transition-all disabled:cursor-not-allowed ${optimizing ? 'bg-accent/20 text-accent animate-pulse' : 'bg-transparent text-muted hover:text-accent hover:bg-accent/10 disabled:opacity-40 disabled:hover:text-muted disabled:hover:bg-transparent'}`}
       onClick={(e) => { e.stopPropagation(); e.preventDefault(); optimizeUnlessLocked() }}
@@ -1634,6 +1635,9 @@ function ChatInput({
         <div data-testid="composer-bottom-row" className={inlineToolbar ? 'contents' : `flex items-center justify-between px-2.5 pb-2 pt-0.5${terminal.active ? ' flex-wrap gap-y-1' : ''}`}>
           {typingLock && <TypingLockBanner lock={typingLock} />}
           <div ref={leftClusterRef} className={`flex items-center gap-0.5 min-w-0${inlineToolbar ? ' order-first pl-1.5 shrink-0 relative z-[1]' : ' flex-1'}${typingLocked ? ' hidden' : ''}`}>
+            <div className="relative min-w-0 flex-1">
+              <div ref={attachControlRow} data-testid="composer-control-row" data-fade-left={controlRowEdges.left ? 'true' : undefined} data-fade-right={controlRowEdges.right ? 'true' : undefined} className="edge-fade-x flex items-center gap-0.5 overflow-x-auto [&>*]:shrink-0">
+            {isMobile && afterApprovalMode}
             <AttachMenu plus={plus} onUploadFiles={onUploadFiles} uploading={uploading} onCancelUpload={onCancelUpload} uploadCount={uploadCount} directFilePicker={directFilePicker} fileInputId={fileInputId} openPicker={openPicker} isMac={isMac} touchInput={touchInput} onScreenshot={onScreenshot} collapseMenuRow={collapseMenuRow} typedCommandMenus={typedCommandMenus && !terminal.active} onFileSelect={terminal.active ? undefined : onFileSelect} optimizeRow={busyOptimizeRow} appActionRows={appActions.rows} />
             {directFilePicker && collapsible && (
               /* The repo's own overflow mechanism, not a second spelling of it.
@@ -1702,14 +1706,6 @@ function ChatInput({
                 </DropdownMenuContent>
               </DropdownMenu>
             )}
-            {/* The wrapper exists for the edge cues: absolutely-positioned
-                children of the scroller itself would travel with the scrolled
-                content, so the fades anchor to this non-scrolling parent. It
-                also owns the flex sizing so the scroller keeps filling the
-                row. */}
-            <div className="relative min-w-0 flex-1">
-              <div ref={attachControlRow} data-testid="composer-control-row" data-fade-left={controlRowEdges.left ? 'true' : undefined} data-fade-right={controlRowEdges.right ? 'true' : undefined} className="edge-fade-x flex items-center gap-0.5 overflow-x-auto">
-
               {onAutomationClick && (
                 <Suspense fallback={null}>
                   <SessionAutomationPopover
@@ -1732,16 +1728,11 @@ function ChatInput({
                 <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} remote={approvalModeRemote} onPicked={focusComposerAfterPick} openSignal={approvalPickerSignal} nudge={approvalNudgeActive} onNudgeDismiss={dismissApprovalNudge} onNudgeHide={hideApprovalNudge} />
               )}
               {!isMobile && afterApprovalMode}
-              </div>
-              {/* Edge cues: the row itself fades out at a clipped edge (`edge-fade-x`,
-                  driven by data-fade-left/right). A mask fades the buttons on any
-                  surface; a painted from-bg-elevated gradient drew an opaque block
-                  over the translucent composer. */}
-            </div>
             {isMobile && approvalMode && (
               <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} remote={approvalModeRemote} compact onPicked={focusComposerAfterPick} openSignal={approvalPickerSignal} nudge={approvalNudgeActive} onNudgeDismiss={dismissApprovalNudge} onNudgeHide={hideApprovalNudge} />
             )}
-            {isMobile && afterApprovalMode}
+              </div>
+            </div>
           </div>
           <div ref={rightClusterRef} className={`flex items-center gap-1 shrink-0${terminal.active ? ' ml-auto max-w-full justify-end [&>button]:shrink-0' : ''}${inlineToolbar ? ' order-last pr-1.5' : ''}`}>
             {onHandsFreeToggle && handsFreeAvailable && !typingLocked && (
