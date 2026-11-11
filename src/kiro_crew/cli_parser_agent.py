@@ -577,6 +577,7 @@ Examples:
   kirocrew arc answer ARC_ID ASK_ID "use the staging key"
   kirocrew arc accept ARC_ID
   kirocrew arc settings ARC_ID --repo OWNER/NAME --coordinator SESSION_KEY
+  kirocrew arc settings ARC_ID --channel CHANNEL_ID
   kirocrew arc sync [ARC_ID]
 """,
         formatter_class=_fmt,
@@ -597,10 +598,13 @@ Examples:
     arc_accept = arc_sub.add_parser("accept", help="Accept the current milestone")
     arc_accept.add_argument("arc_id", help="Arc id")
     arc_settings = arc_sub.add_parser(
-        "settings", help="Set the arc's GitHub repo and the coordinator who signs off for you"
+        "settings", help="Set the arc's repository, coordinator or existing channel"
     )
     arc_settings.add_argument("arc_id", help="Arc id")
     arc_settings.add_argument("--repo", help="owner/name whose merged arc PRs are recorded")
+    arc_settings.add_argument(
+        "--channel", help="Existing channel id to use; does not create a channel or move members"
+    )
     arc_settings.add_argument(
         "--coordinator", help="Member session key that may sign milestones off ('' clears it)"
     )

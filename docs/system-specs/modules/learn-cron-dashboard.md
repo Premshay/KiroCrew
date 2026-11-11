@@ -21,6 +21,13 @@ use the verified caller. Owner console `/note` accepts the same resolution field
 through its existing owner gate. Neither closure rewrites authorship nor accepts
 a milestone. The original claim and closure remain in the stream.
 
+The owner CLI accepts `kirocrew arc settings ARC_ID --channel CHANNEL_ID`.
+Channel, repository and coordinator edits share one locked store write. Adopting
+a different channel marks it as shared, so removing an arc member does not remove
+that person from the shared channel. Setting the current ID preserves ownership.
+The command does not create channels, close the old channel, or move members.
+An empty channel ID is refused; an invalid edit leaves all settings unchanged.
+
 ## Overview
 
 Agent model-key normalization belongs to `dashboard/agent_admin/model_discovery.py`.

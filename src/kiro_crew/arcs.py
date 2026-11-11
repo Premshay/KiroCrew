@@ -351,8 +351,10 @@ def set_channel(arc_id: str, channel_id: str, *, owned: bool) -> dict[str, Any]:
         return arc
 
 
-def update_settings(arc_id: str, *, repo: Any = None, coordinator: Any = None) -> dict[str, Any]:
-    """Set the arc's GitHub repo and/or its coordinator (owner only); return the arc.
+def update_settings(
+    arc_id: str, *, repo: Any = None, coordinator: Any = None, channel: Any = None
+) -> dict[str, Any]:
+    """Update owner settings atomically; adopting a channel does not claim ownership.
 
     The coordinator must be a member; an empty value clears it.
     """
@@ -367,6 +369,11 @@ def update_settings(arc_id: str, *, repo: Any = None, coordinator: Any = None) -
             if key and key not in arc["members"]:
                 raise ArcError("the coordinator must be a member of the arc")
             arc["coordinator"] = key
+        if channel is not None:
+            channel_id = _str(channel, 512, "channel_id", required=True)
+            if channel_id != arc["channel_id"]:
+                arc["channel_id"] = channel_id
+                arc["channel_owned"] = False
         _write_json(dir_path / "arc.json", arc)
         return arc
 

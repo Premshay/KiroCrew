@@ -143,10 +143,15 @@ def _arc(args: argparse.Namespace) -> None:
         elif action == "accept":
             arcs.accept_milestone(args.arc_id)
         elif action == "settings":
-            if args.repo is None and args.coordinator is None:
-                _fail("give --repo and/or --coordinator")
-            arc = arcs.update_settings(args.arc_id, repo=args.repo, coordinator=args.coordinator)
-            print(f"repo={arc['repo'] or '-'} coordinator={arc['coordinator'] or '-'}")
+            if args.repo is None and args.coordinator is None and args.channel is None:
+                _fail("give --repo, --coordinator and/or --channel")
+            arc = arcs.update_settings(
+                args.arc_id, repo=args.repo, coordinator=args.coordinator, channel=args.channel
+            )
+            print(
+                f"repo={arc['repo'] or '-'} coordinator={arc['coordinator'] or '-'}"
+                f" channel={arc['channel_id'] or '-'}"
+            )
         elif action == "sync":
             from kiro_crew import arc_github
 
