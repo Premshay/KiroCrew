@@ -100,16 +100,21 @@ def test_prefix_frames_and_redacts_entries():
 def test_prefix_caps_and_marks_seen():
     arc_id = _arc(decisions=["d" * 150] * 10)
     for i in range(20):
-        _fact(arc_id, f"entry-{i:02d} " + "x" * 90)
+        _fact(arc_id, f"entry-{i:02d} " + "x" * 250)
     first = arc_brief.arc_turn_prefix(SESSION)
     assert len(first) <= 4_000
     assert "entry-00" in first
     assert "entry-19" not in first
     assert "more entries follow on later turns" in first
-    second = arc_brief.arc_turn_prefix(SESSION)
-    shown = [i for i in range(20) if f"entry-{i:02d}" in first or f"entry-{i:02d}" in second]
+    pages = [first]
+    for _ in range(20):
+        if not arcs.unseen_entries(arc_id, SESSION):
+            break
+        pages.append(arc_brief.arc_turn_prefix(SESSION))
+    shown = [i for i in range(20) if any(f"entry-{i:02d}" in page for page in pages)]
     assert shown == list(range(20))
-    assert not any(f"entry-{i:02d}" in first and f"entry-{i:02d}" in second for i in range(20))
+    assert all(sum(f"entry-{i:02d}" in page for page in pages) == 1 for i in range(20))
+    assert all(len(page) <= 4000 for page in pages)
 
 
 def test_member_text_cannot_forge_a_brief_section():
@@ -127,13 +132,59 @@ def test_member_text_cannot_forge_a_brief_section():
     )
 
 
-def test_prefix_truncates_oversized_brief_and_marks_nothing_seen():
+def test_prefix_oversized_brief_keeps_verification_and_delivers_news():
     arc_id = _arc(goal="g" * 2_000, reason="r" * 2_000, lineage="l" * 2_000)
     _fact(arc_id, "late news")
     prefix = arc_brief.arc_turn_prefix(SESSION)
     assert len(prefix) <= 4_000
-    assert "late news" not in prefix
-    assert [e["text"] for e in arcs.unseen_entries(arc_id, SESSION)] == ["late news"]
+    assert "late news" in prefix
+    assert arc_brief._VERIFY in prefix
+    assert "arc_brief(" in prefix
+    assert arcs.unseen_entries(arc_id, SESSION) == []
+
+
+def test_three_large_arc_briefs_share_budget_and_deliver_entries():
+    ids = []
+    for i in range(3):
+        aid = _arc(
+            title=f"Arc-{i}",
+            decisions=["d" * 200] * 8,
+            rules=["r" * 200] * 8,
+            reuse=["x" * 200] * 8,
+        )
+        ids.append(aid)
+        arcs.append_entry(
+            aid, OTHER, {"kind": "CLAIM", "text": "work", "step": "schema", "checked": ["ADR"]}
+        )
+        arcs.append_entry(aid, OTHER, {"kind": "ASK", "text": "choose?", "to": SESSION})
+        _fact(aid, f"fresh-{i}")
+    prefix = arc_brief.arc_turn_prefix(SESSION)
+    assert len(prefix) <= 4000
+    assert prefix.count(arc_brief._VERIFY) == 3
+    assert prefix.count("Open claims (1)") == 3
+    assert prefix.count("Open asks (1)") == 3
+    for i, aid in enumerate(ids):
+        assert f"Arc-{i}" in prefix
+        # Catch up from the first fully delivered entry, without skipping unseen work.
+        for _ in range(4):
+            prefix = arc_brief.arc_turn_prefix(SESSION)
+        assert arcs.unseen_entries(aid, SESSION) == []
+
+
+def test_small_arc_share_delivers_a_maximum_size_entry():
+    aid = _arc(title="long title " * 10, goal="g" * 2000)
+    arcs.add_member(aid, OTHER, "reviewer" * 25)
+    arcs.update_settings(aid, coordinator=OTHER)
+    _fact(aid, "news " * 60)
+    arc = arcs.read_arc(aid)
+    entry = arcs.unseen_entries(aid, SESSION)[0]
+    assert len(arc_brief.entry_line(arc, entry)) == 500
+    block, last_id = arc_brief._arc_block(arc, SESSION, 1333)
+    assert len(block) <= 1333
+    assert arc_brief._VERIFY in block
+    assert "Questions: ASK to=coordinator." in block
+    assert arc_brief.entry_line(arc, entry) in block
+    assert last_id == entry["id"]
 
 
 def test_prefix_logs_store_error_once(monkeypatch, caplog):

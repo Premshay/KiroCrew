@@ -570,7 +570,18 @@ async def api_arc_board_note(request: web.Request) -> web.Response:
     if not isinstance(text, str):
         return _invalid("text is required")
     return await _owner_post(
-        request, "arc_board.note", arc_id, lambda: {"kind": "FACT", "text": text}
+        request,
+        "arc_board.note",
+        arc_id,
+        lambda: {
+            "kind": "FACT",
+            "text": text,
+            **(
+                {"resolution": body["resolution"], "reply_to": body.get("reply_to", "")}
+                if "resolution" in body
+                else {}
+            ),
+        },
     )
 
 

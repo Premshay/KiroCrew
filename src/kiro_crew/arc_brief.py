@@ -145,31 +145,82 @@ def brief_for(arc: dict[str, Any], member_key: str) -> str:
     return _defang(redact(render_brief(arc, member_key)))
 
 
+def _compact_brief(arc: dict[str, Any], key: str, budget: int) -> str:
+    """Keep verification and visible open-work summaries ahead of reference lists."""
+    pointer = f"Full context: arc_brief(arc_id='{arc['id']}'); arc_board_read for entries."
+    target = "coordinator" if arc.get("coordinator") else "owner"
+    fixed = f"Verify before you claim done:\n{_VERIFY}\nQuestions: ASK to={target}.\n{pointer}"
+    index = arc["milestone_index"]
+    current = arc["milestones"][index] if index < len(arc["milestones"]) else None
+    claims = arcs.open_claims(arc["id"])
+    asks = [a for a in arcs.open_asks(arc["id"]) if a["to"] == ledger_key(key)]
+    fields = [
+        ("Goal", arc["goal"]),
+        (
+            "Current milestone",
+            f"{current['name']}: {current['criteria']}" if current else "accepted",
+        ),
+        (f"Open asks ({len(asks)})", "; ".join(a["text"] for a in asks) or "none"),
+        (
+            f"Open claims ({len(claims)})",
+            "; ".join(f"{c['id'][:11]} {c['step']}" for c in claims) or "none",
+        ),
+        ("Autonomy", _AUTONOMY[arc["autonomy"]]),
+        ("Always escalates to the owner", _ESCALATES),
+    ]
+    labels = sum(len(label) + 3 for label, _ in fields)
+    room = max(0, budget - len(fixed) - labels)
+    values = [safe_line(str(value)) for _, value in fields]
+    # Short fields give their unused share back to the larger fields.
+    sizes = [0] * len(values)
+    while room and any(size < len(value) for size, value in zip(sizes, values)):
+        for i, value in enumerate(values):
+            if room and sizes[i] < len(value):
+                sizes[i] += 1
+                room -= 1
+    rendered = [
+        f"{label}: {value if size >= len(value) else (value[:size - 1] + '…' if size else '')}\n"
+        for (label, _), value, size in zip(fields, values, sizes)
+    ]
+    return "".join(rendered) + fixed
+
+
 def _arc_block(arc: dict[str, Any], session_key: str, budget: int) -> tuple[str, str | None]:
     """Return the block for one arc within ``budget`` chars and the last entry id it shows."""
-    head = f"[Arc board: {_defang(redact(_one_line(arc['title'])))}]\n{_FRAME}\n\n"
+    head = f"[Arc board: {safe_line(arc['title'])[:100]}]\n{_FRAME}\n\n"
     tail = f"\n{_END}\n"
     brief = _defang(redact(render_brief(arc, session_key)))
     room = budget - len(head) - len(tail)
     if room <= 0:
         return "", None
-    if len(brief) >= room:
-        return head + brief[:room] + tail, None
-    room -= len(brief)
     unseen = arcs.unseen_entries(arc["id"], session_key, ENTRY_LIMIT)
     lines = [_entry_line(arc, e) for e in unseen]
+    note = "\n(more entries follow on later turns; arc_board_read has full context)"
+    entry_header = "\n\nNew entries:\n"
+    reserve = len(entry_header) + len(note) + len(lines[0]) + 1 if lines else 0
+    if lines:
+        reserve = max(
+            reserve, min(room // 2, len(entry_header) + len(note) + sum(len(s) + 1 for s in lines))
+        )
+    if len(brief) + reserve > room:
+        minimum = len(_compact_brief(arc, session_key, 0))
+        reserve = min(reserve, max(0, room - minimum))
+        brief = _compact_brief(arc, session_key, room - reserve)
+    if len(brief) > room:
+        return "", None
+    room -= len(brief) + len(entry_header) + len(note)
     kept: list[int] = []
     for i, line in enumerate(lines):
         cost = len(line) + 1
-        if cost + 1 > room:
+        if cost > room:
             break
         room -= cost
         kept.append(i)
     if not kept:
         return head + brief + tail, None
-    body = "\n\nNew entries:\n" + "\n".join(lines[i] for i in kept)
+    body = entry_header + "\n".join(lines[i] for i in kept)
     if len(kept) < len(lines):
-        body += f"\n({len(lines) - len(kept)} more entries follow on later turns)"
+        body += note
     block = head + brief + body + tail
     if len(block) > budget:
         return head + brief + tail, None
@@ -196,9 +247,10 @@ def arc_turn_prefix(session_key: str) -> str:
         return ""
     parts: list[str] = []
     remaining = PREFIX_CAP
-    for arc in member_arcs:
+    for position, arc in enumerate(member_arcs):
         try:
-            block, last_id = _arc_block(arc, session_key, remaining)
+            share = remaining // (len(member_arcs) - position)
+            block, last_id = _arc_block(arc, session_key, share)
             if not block:
                 continue
             if last_id:

@@ -94,6 +94,36 @@ async def test_mine_lists_only_member_arcs(routes, arc):
 
 
 @pytest.mark.asyncio
+async def test_coordinator_resolution_uses_verified_caller(routes, arc):
+    from kiro_crew import arcs
+
+    arcs.update_settings(arc["id"], coordinator=MEMBER)
+    claim = arcs.append_entry(
+        arc["id"],
+        PEER,
+        {
+            "kind": "CLAIM",
+            "text": "work",
+            "step": "schema",
+            "checked": ["ADR"],
+            "work_type": "review",
+        },
+    )
+    body = {
+        "kind": "FACT",
+        "text": "review superseded",
+        "resolution": "superseded",
+        "reply_to": claim["id"],
+    }
+    denied = await routes.api_arc_entries_write(_post(arc["id"], body, PEER))
+    assert denied.status == 403
+    response = await routes.api_arc_entries_write(_post(arc["id"], body))
+    assert response.status == 200
+    assert json.loads(response.text)["entry"]["author"] == MEMBER
+    assert arcs.open_claims(arc["id"]) == []
+
+
+@pytest.mark.asyncio
 async def test_member_reads_brief_and_entries(routes, arc):
     from kiro_crew import arcs
 
