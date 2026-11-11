@@ -43,12 +43,8 @@ def collision_count(entries: list[dict[str, Any]]) -> int:
             if arcs.collides(open_claims, entry):
                 count += 1
             open_claims.append(entry)
-        elif entry["kind"] in ("DONE", "FAIL") and entry.get("reply_to"):
-            open_claims = [
-                c
-                for c in open_claims
-                if (c["author"], c["id"]) != (entry["author"], entry["reply_to"])
-            ]
+        elif entry.get("reply_to"):
+            open_claims = [c for c in open_claims if not arcs.claim_closed_by(c, entry)]
     return count
 
 

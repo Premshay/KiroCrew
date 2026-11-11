@@ -28,6 +28,12 @@ _ENTRY_RULES = (
     "post DONE yourself only for walks and for completes_milestone. "
     "The arc's coordinator posts FACT with signoff true to sign the current milestone off "
     "after the owner confirmed it."
+    " CLAIM work_type is implementation by default; use review for review-only work."
+    " A tagged PR can name Arc-Claim: <claim id> or Arc-Step: <exact step> to close"
+    " its implementation claim on merge; step matching requires the same branch lane."
+    " The owner or coordinator can post FACT with resolution completed, superseded or"
+    " abandoned, reply_to the claim, and text explaining why. This preserves authorship"
+    " and does not accept a milestone."
 )
 
 
@@ -90,6 +96,11 @@ def schemas() -> list[dict[str, Any]]:
                     "link": {"type": "string", "maxLength": 2000},
                     "completes_milestone": {"type": "boolean"},
                     "signoff": {"type": "boolean"},
+                    "work_type": {"type": "string", "enum": ["implementation", "review"]},
+                    "resolution": {
+                        "type": "string",
+                        "enum": ["completed", "superseded", "abandoned"],
+                    },
                 },
                 "required": ["arc_id", "kind", "text"],
             },

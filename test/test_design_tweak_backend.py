@@ -22,6 +22,7 @@ if sys.platform == "win32":  # pragma: no cover - platform-gated
     import _winapi
 
 from design_tweak_backend_helpers import isolated_queue_fixture  # noqa: F401
+from design_tweak_backend_helpers import preview_internal_dirs_fixture  # noqa: F401
 
 from conftest import requires_symlinks
 from kiro_crew.apps.builtins.design_tweak.backend import server
@@ -1326,12 +1327,14 @@ class TestCustomCrewHomeIsRefused:
     the two filenames we happened to think of.
     """
 
-    def test_default_home_is_covered_by_the_kiro_entry(self):
+    def test_default_home_is_covered_by_the_kiro_entry(self, preview_internal_dirs, monkeypatch):
+        monkeypatch.setattr(server, "_KIROCREW_INTERNAL_DIRS", preview_internal_dirs)
         home = Path(os.path.realpath(os.path.expanduser("~")))
         assert server._is_kirocrew_internal(home / ".kiro" / "crew" / "history" / "x.jsonl")
 
-    def test_the_resolved_crew_home_is_listed(self):
+    def test_the_resolved_crew_home_is_listed(self, preview_internal_dirs, monkeypatch):
         """Structural: the resolution must land in the tuple, not hold by accident."""
+        monkeypatch.setattr(server, "_KIROCREW_INTERNAL_DIRS", preview_internal_dirs)
         listed = {os.path.realpath(p) for p in server._KIROCREW_INTERNAL_DIRS}
         assert os.path.realpath(server._CREW_HOME) in listed
 

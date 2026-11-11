@@ -23,6 +23,8 @@ _ENTRY_FIELDS = [
     FieldSpec("link", str, max_len=2000),
     FieldSpec("completes_milestone", bool),
     FieldSpec("signoff", bool),
+    FieldSpec("work_type", str, allowed=frozenset({"implementation", "review"})),
+    FieldSpec("resolution", str, allowed=frozenset({"completed", "superseded", "abandoned"})),
 ]
 
 ARC_ENTRY_ROUTE_SCHEMA = ToolSchema(tool_name="arc_board_write", fields=list(_ENTRY_FIELDS))

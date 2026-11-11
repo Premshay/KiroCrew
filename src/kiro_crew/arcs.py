@@ -460,6 +460,10 @@ def _validate_entry(entry: dict[str, Any], arc: dict[str, Any]) -> dict[str, Any
         "reply_to": _str(entry.get("reply_to"), 64, "reply_to"),
     }
     if kind == "CLAIM":
+        work_type = entry.get("work_type", "implementation")
+        if work_type not in ("implementation", "review"):
+            raise ArcError("work_type must be implementation or review")
+        clean["work_type"] = work_type
         clean["step"] = _str(entry.get("step"), _MAX_STEP, "step", required=True)
         checked = entry.get("checked")
         if not isinstance(checked, list) or not 1 <= len(checked) <= _MAX_CHECKED:
@@ -485,6 +489,17 @@ def _validate_entry(entry: dict[str, Any], arc: dict[str, Any]) -> dict[str, Any
         if kind != "FACT":
             raise ArcError("only a FACT can sign a milestone off")
         clean["signoff"] = True
+    resolution = entry.get("resolution")
+    if resolution is not None:
+        if kind != "FACT" or resolution not in ("completed", "superseded", "abandoned"):
+            raise ArcError("resolution requires FACT and completed, superseded or abandoned")
+        if not clean["reply_to"]:
+            raise ArcError("resolution requires reply_to naming a claim")
+        if signoff:
+            raise ArcError("claim resolution cannot sign off a milestone")
+        clean["resolution"] = resolution
+    if "work_type" in entry and kind != "CLAIM":
+        raise ArcError("work_type is only valid on CLAIM")
     return clean
 
 
@@ -501,6 +516,12 @@ def append_entry(arc_id: str, author: str, entry: dict[str, Any]) -> dict[str, A
         clean = _validate_entry(entry, arc)
         if clean["reply_to"]:
             clean["reply_to"] = _resolve_reply_to(clean["reply_to"], _load_entries(dir_path))
+        if clean.get("resolution"):
+            if key not in (OWNER, arc.get("coordinator")):
+                raise ArcAccessDenied("only the owner or coordinator may resolve another claim")
+            parent = next(e for e in _load_entries(dir_path) if e["id"] == clean["reply_to"])
+            if parent["kind"] != "CLAIM":
+                raise ArcError("resolution must reference a CLAIM")
         milestone = entry.get("milestone", arc["milestone_index"])
         if not isinstance(milestone, int) or isinstance(milestone, bool) or milestone < 0:
             raise ArcError("milestone must be a non-negative integer")
@@ -578,6 +599,23 @@ def record_merged_pr(arc_id: str, pr: dict[str, Any]) -> dict[str, Any] | None:
             "verified": bool(reviewers),
             "lane": lane if lane in arc["members"] else "",
         }
+        claim_ref = str(pr.get("claim") or "")
+        step = str(pr.get("step") or "")
+        entries = _load_entries(dir_path)
+        candidates = [e for e in entries if e["kind"] == "CLAIM"]
+        if re.fullmatch(r"ae_[0-9a-f]{8,32}", claim_ref):
+            matches = [e for e in candidates if e["id"].startswith(claim_ref)]
+        elif step and lane in arc["members"]:
+            matches = [
+                e
+                for e in candidates
+                if e["author"] == lane and _normalize_step(e["step"]) == _normalize_step(step)
+            ]
+        else:
+            matches = []
+        if len(matches) == 1 and matches[0].get("work_type", "implementation") == "implementation":
+            stored["reply_to"] = matches[0]["id"]
+            stored["step"] = matches[0]["step"]
         _append_line(dir_path, stored)
         return stored
 
@@ -634,15 +672,37 @@ def closes_own_claim(entry: dict[str, Any], entries: list[dict[str, Any]]) -> bo
     )
 
 
+def claim_closed_by(claim: dict[str, Any], entry: dict[str, Any]) -> bool:
+    """Reduce validated, attributed closures without rewriting claim authorship."""
+    if entry.get("reply_to") != claim["id"]:
+        return False
+    if entry["kind"] == "FACT" and entry.get("resolution"):
+        return True
+    if entry["kind"] not in ("DONE", "FAIL"):
+        return False
+    if entry["author"] == claim["author"]:
+        return True
+    return (
+        entry["author"] == GITHUB
+        and entry["kind"] == "DONE"
+        and bool(entry.get("pr"))
+        and claim.get("work_type", "implementation") == "implementation"
+    )
+
+
 def open_claims(arc_id: str) -> list[dict[str, Any]]:
-    """CLAIMs whose author has not yet answered with DONE or FAIL."""
+    """Claims without an author closure, linked merge, or authorized resolution."""
     entries = _entries(arc_id)
-    closed = {
-        (e["author"], e["reply_to"])
+    replies: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        if entry.get("reply_to"):
+            replies.setdefault(entry["reply_to"], []).append(entry)
+    return [
+        e
         for e in entries
-        if e["kind"] in ("DONE", "FAIL") and e["reply_to"]
-    }
-    return [e for e in entries if e["kind"] == "CLAIM" and (e["author"], e["id"]) not in closed]
+        if e["kind"] == "CLAIM"
+        and not any(claim_closed_by(e, reply) for reply in replies.get(e["id"], []))
+    ]
 
 
 def open_asks(arc_id: str) -> list[dict[str, Any]]:

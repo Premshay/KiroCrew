@@ -221,14 +221,31 @@ async def test_tool_boundary_keeps_reading_while_one_retry_awaits_its_answer(mon
             await await_until(retry, what="retry teardown")
 
 
-def test_the_turn_loop_retries_after_every_tool_result() -> None:
-    import inspect
+@pytest.mark.asyncio
+async def test_the_turn_loop_retries_after_every_tool_result(monkeypatch) -> None:
+    from turn_harness import TurnScript, run_turn
 
+    from kiro_crew.acp.types import (
+        EVENT_COMPLETE,
+        EVENT_TOOL_RESULT,
+        STOP_REASON_END_TURN,
+        AcpEvent,
+    )
     from kiro_crew.dashboard import chat_runner
 
-    source = inspect.getsource(chat_runner)
-    i = source.index("elif event.kind == EVENT_TOOL_RESULT:")
-    assert "retry_after_tool_result(turn.state, turn.slot)" in source[i : i + 300]
+    retry = AsyncMock()
+    monkeypatch.setattr(chat_runner, "retry_after_tool_result", retry)
+    await run_turn(
+        TurnScript(
+            events=[
+                AcpEvent(kind=EVENT_TOOL_RESULT),
+                AcpEvent(kind=EVENT_TOOL_RESULT),
+                AcpEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN),
+            ]
+        )
+    )
+    assert retry.await_count == 2
+    assert retry.await_args_list[0].args == retry.await_args_list[1].args
 
 
 @pytest.mark.asyncio

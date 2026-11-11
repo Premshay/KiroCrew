@@ -23,6 +23,26 @@ NEW = "chat-arc-new"
 SECRET = "sk-ant-api03-" + "A" * 40
 
 
+@pytest.mark.asyncio
+async def test_owner_note_can_resolve_claim_with_reason(client: TestClient) -> None:
+    from kiro_crew import arcs
+
+    arc = arcs.create_arc({"title": "Pilot"})
+    arcs.add_member(arc["id"], MEMBER, "builder")
+    claim = arcs.append_entry(
+        arc["id"], MEMBER, {"kind": "CLAIM", "text": "work", "step": "schema", "checked": ["ADR"]}
+    )
+    response = await client.post(
+        f"/api/arc-board/arcs/{arc['id']}/note",
+        json={"text": "replaced by new work", "resolution": "superseded", "reply_to": claim["id"]},
+    )
+    assert response.status == 200
+    entry = (await response.json())["entry"]
+    assert entry["author"] == arcs.OWNER
+    assert entry["resolution"] == "superseded"
+    assert arcs.open_claims(arc["id"]) == []
+
+
 @pytest.fixture(autouse=True)
 def _isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))

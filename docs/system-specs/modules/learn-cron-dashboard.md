@@ -4,6 +4,23 @@ The gateway starts the standalone `arc_github_sync` service as a tracked
 background task. It records tagged merged PRs through `arc_github.sync_all`;
 its interval and logger belong to that service, outside the server facade owners.
 
+Arc turn prefixes share their 4,000-character cap between member arcs. Oversized
+standing briefs summarize goal, current criteria, open asks and claims, retaining
+the verification checklist and a full `arc_brief` pointer. Reference lists yield
+space to new entries; cursors advance only through delivered entries.
+
+Tagged PRs may add `Arc-Claim: <claim id>` or `Arc-Step: <exact step>` on its own
+line. A unique implementation claim closes on the attributed GitHub DONE receipt.
+Step matching requires the branch lane; ambiguous links and review claims do not
+close. CLAIM `work_type` defaults to implementation; use review for review work.
+Existing untyped claims retain the implementation default.
+
+The owner or coordinator may append FACT with `resolution` completed, superseded
+or abandoned, `reply_to` the claim, and `text` explaining why. Member MCP writes
+use the verified caller. Owner console `/note` accepts the same resolution fields
+through its existing owner gate. Neither closure rewrites authorship nor accepts
+a milestone. The original claim and closure remain in the stream.
+
 ## Overview
 
 Agent model-key normalization belongs to `dashboard/agent_admin/model_discovery.py`.

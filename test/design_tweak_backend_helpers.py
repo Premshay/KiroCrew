@@ -12,6 +12,15 @@ import pytest
 from kiro_crew.apps.builtins.design_tweak.backend import server
 
 
+@pytest.fixture(name="preview_internal_dirs", autouse=True)
+def preview_internal_dirs_fixture(tmp_path, monkeypatch):
+    """Keep project fixtures outside the simulated private tree, even in Crew scratch."""
+    original = server._KIROCREW_INTERNAL_DIRS
+    private = tmp_path / "operator" / ".kiro"
+    monkeypatch.setattr(server, "_KIROCREW_INTERNAL_DIRS", (str(private),))
+    return original
+
+
 class _JsonHandler(server.Handler):
     """A `Handler` with no socket, capturing `_json` responses.
 

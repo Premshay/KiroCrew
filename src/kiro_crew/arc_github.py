@@ -89,6 +89,22 @@ def tagged(body: str, arc_id: str) -> bool:
     return any(line.strip().strip("*_`").strip() == tag for line in str(body or "").splitlines())
 
 
+def claim_link(body: str) -> dict[str, str]:
+    """Accept a single explicit claim or step line; never infer scope from titles."""
+    found: dict[str, list[str]] = {"claim": [], "step": []}
+    for line in body.splitlines():
+        match = re.fullmatch(r"Arc-(Claim|Step):\s*(.+)", line.strip())
+        if match:
+            found[match[1].lower()].append(match[2].strip())
+    if len(found["claim"]) == 1 and not found["step"]:
+        value = found["claim"][0]
+        if re.fullmatch(r"ae_[0-9a-f]{8,32}", value):
+            return {"claim": value}
+    if len(found["step"]) == 1 and not found["claim"]:
+        return {"step": found["step"][0]}
+    return {}
+
+
 def sync_arc(arc_id: str, *, gh: GhRunner = _gh_json, limit: int = 50) -> list[dict[str, Any]]:
     """Record every merged, tagged PR not yet on the board; return the new entries."""
     arc = arcs.read_arc(arc_id)
@@ -140,6 +156,7 @@ def sync_arc(arc_id: str, *, gh: GhRunner = _gh_json, limit: int = 50) -> list[d
                 "merged_at": pr.get("mergedAt") or "",
                 "reviewers": clean_reviewers(detail.get("comments") or [], head),
                 "lane": lane_for_branch(arc, pr.get("headRefName") or ""),
+                **claim_link(pr.get("body") or ""),
             },
         )
         if entry is not None:

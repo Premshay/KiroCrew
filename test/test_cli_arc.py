@@ -92,9 +92,19 @@ def test_answer_with_gateway_down_still_stores(arc, capsys):
 def test_answer_too_long_exits_1(arc, capsys):
     ask = _ask(arc)
     with pytest.raises(SystemExit) as exc:
-        cli_arc._arc(_ns(arc_action="answer", arc_id=arc["id"], ask_id=ask["id"], text="x" * 101))
+        cli_arc._arc(_ns(arc_action="answer", arc_id=arc["id"], ask_id=ask["id"], text="x" * 301))
     assert exc.value.code == 1
     assert len(arcs.open_asks(arc["id"])) == 1
+
+
+@pytest.mark.parametrize("length", [100, 101, 300])
+def test_answer_within_fact_limit_is_stored(arc, length):
+    ask = _ask(arc)
+    text = "x" * length
+    with patch.object(cli_arc, "_request_delivery", return_value=None):
+        cli_arc._arc(_ns(arc_action="answer", arc_id=arc["id"], ask_id=ask["id"], text=text))
+    assert arcs.read_entries(arc["id"])[-1]["text"] == text
+    assert arcs.open_asks(arc["id"]) == []
 
 
 def test_answer_to_unknown_or_non_ask_id_exits_1_and_writes_nothing(arc, capsys):
@@ -124,7 +134,7 @@ def test_show_lists_open_asks_with_age(arc, capsys):
     assert "reviewer: review it" in out
     assert "builder -> owner" in out and "which key?" in out
     assert "seen by: reviewer" in out
-    assert "[ASK] builder (" in out
+    assert f"[ASK {ask['id'][:11]}] builder (" in out
 
 
 def _deliver_request(arc_id, entry_id, *, internal):
