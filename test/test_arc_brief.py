@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import ast
 import logging
-from pathlib import Path
 
 import pytest
 
@@ -200,38 +198,43 @@ def test_prefix_logs_store_error_once(monkeypatch, caplog):
     assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
 
 
-def test_turn_build_prompt_prepends_prefix():
-    """``_turn_build_prompt`` is not driven end to end by any existing test, so assert the
-    wiring structurally: the arc prefix is fetched off-loop after the peer inbox drain."""
-    import kiro_crew.dashboard.chat_turn.prompt_assembly as mod
+@pytest.mark.asyncio
+async def test_turn_build_prompt_prepends_prefix(monkeypatch):
+    from turn_harness import TurnScript, run_turn
 
-    tree = ast.parse(Path(mod.__file__).read_text())
-    func = next(
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.AsyncFunctionDef) and n.name == "_turn_build_prompt"
+    from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, STOP_REASON_END_TURN, AcpEvent
+    from kiro_crew.context import ContextBuilder
+    from kiro_crew.dashboard import chat_runner as mod
+
+    order = []
+
+    def drain(*args, **kwargs):
+        order.append("peer")
+        return "PEER-CONTEXT\n"
+
+    def prefix(key):
+        order.append("arc")
+        return "ARC-CONTEXT\n"
+
+    monkeypatch.setattr(mod, "drain_peer_channel_inbox", drain)
+    monkeypatch.setattr(mod, "arc_turn_prefix", prefix)
+
+    def setup(ctx):
+        ctx.state.context_builder = ContextBuilder()
+
+    record = await run_turn(
+        TurnScript(
+            message="current request",
+            setup=setup,
+            events=[
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text="done"),
+                AcpEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN),
+            ],
+        )
     )
-    drain = [
-        n.lineno
-        for n in ast.walk(func)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Name)
-        and n.func.id == "drain_peer_channel_inbox"
-    ]
-    arc = [
-        n
-        for n in ast.walk(func)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "to_thread"
-        and any(isinstance(a, ast.Name) and a.id == "arc_turn_prefix" for a in n.args)
-    ]
-    assert drain and len(arc) == 1
-    assert arc[0].lineno > drain[0]
-    assert any(
-        isinstance(n, ast.Name) and n.id == "arc_prefix" for n in ast.walk(func)
-    ), "prefix must be prepended to the message"
-    assert mod.arc_turn_prefix is arc_brief.arc_turn_prefix
+    [(prompt,)] = [call.args for call in record.calls("stream")]
+    assert "ARC-CONTEXT\nPEER-CONTEXT\ncurrent request" in prompt
+    assert order == ["peer", "arc"]
 
 
 def test_entry_cannot_spoof_the_frame():

@@ -16,6 +16,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest  # noqa: F401 (collection marker)
+from design_tweak_backend_helpers import preview_internal_dirs_fixture  # noqa: F401
 
 from kiro_crew.apps.builtins.design_tweak.backend import server
 from kiro_crew.platform_compat import IS_POSIX
