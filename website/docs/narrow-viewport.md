@@ -23,6 +23,13 @@ than taking a fixed toolbar slot.
 Browser checks must mount the voice slice and verify the chip's visible bounds;
 checking only DOM membership or page overflow misses a clipped strip.
 
+The context shelf below the input scrolls independently of the action row.
+Backend, agent/project, context and model groups retain their intrinsic widths;
+the backend selector must not squeeze the model or project controls to zero.
+Use the shared measured edge fades on the inner scroller, observe its content
+for late labels and harness icons, and keep the outer glass shelf unpositioned
+and unmasked so its transcript scrim remains intact.
+
 **A collapsed side rail becomes a horizontal bar across the TOP, never a thin vertical
 strip.** Horizontal is the one axis a phone cannot spare; vertical it can. A 44px strip
 overflows nothing, so it looks fixed while the reading column still pays for it.

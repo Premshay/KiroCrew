@@ -469,7 +469,7 @@ function ChatInput({
   // Re-read the durable choice on focus so sibling composers pick it up.
   const [listHintDismissed, setListHintDismissed] = useState(() => safeGetItem(LIST_HINT_DISMISSED_KEY) === '1')
   const [listHintSaveError, setListHintSaveError] = useState<string | null>(null)
-  const { shelfRef, shelfHeight, shelfCompact, shelfTiny } = useShelfMeasure()
+  const { shelfRef, shelfHeight, shelfCompact, shelfTiny, shelfScrollRef, shelfEdges, shelfContentRef } = useShelfMeasure()
   // Tooltip for the project chip. The chip itself shows the basename (plus the
   // branch when known); the tooltip carries the full path so nothing that was
   // previously discoverable is lost, and names the branch even when the label
@@ -1865,7 +1865,9 @@ function ChatInput({
           // to be present — the control is declared, mounted and unreachable.
           !!sessionControls?.length || !!presence ||
           !!environmentSlot) && (
-        <div ref={shelfRef} data-testid="composer-context-shelf" className="glass-shelf pt-1 flex items-center gap-2 min-w-0 overflow-x-auto overflow-y-hidden" style={{ ['--glass-shelf-h' as string]: `${shelfHeight}px` }}>
+        <div ref={shelfRef} data-testid="composer-context-shelf" className="glass-shelf pt-1 min-w-0" style={{ ['--glass-shelf-h' as string]: `${shelfHeight}px` }}>
+        <div ref={shelfScrollRef} data-testid="composer-shelf-scroll" data-fade-left={shelfEdges.left ? 'true' : undefined} data-fade-right={shelfEdges.right ? 'true' : undefined} className="edge-fade-x overflow-x-auto overflow-y-hidden">
+        <div ref={shelfContentRef} className="flex items-center gap-2 w-max min-w-full [&>*]:shrink-0">
           {/* Where the session's files and commands live. Its own separated
               group, like the app session controls below, so neither crowds the
               agent/project chip group past `max-two-buttons-per-row`. */}
@@ -1885,15 +1887,9 @@ function ChatInput({
             <SessionControlChips sessionControls={sessionControls} shelfCompact={shelfCompact} onSessionControlClick={onSessionControlClick} />
           )}
           {backendControl && <div className="shrink-0 border-r border-border pr-2" data-testid="composer-backend-control">{backendControl}</div>}
-          {/* Floor: the chips' content once every label has truncated to nothing.
-              Compact: 2 x (px-2.5 + 13px icon) + gap-2 = 74, + the pill's gap-1.5
-              before the AWS segment = 80 -> min-w-21. Wide, each chip also keeps
-              its gap-1.5 beside the empty label: 86, + the branch separator
-              (gap-1.5 + '·' + gap-1.5) = 102, + the AWS segment's gap-1.5 = 108
-              -> min-w-28. The AWS segment clips itself past that. Past the floor
-              the right group gives way, its model name truncating, so it never
-              covers the chips. */}
-          <div className={`flex items-center gap-2 flex-1 ${shelfCompact ? 'min-w-21' : 'min-w-28'}`}>
+          {/* Keep intrinsic chip widths: overflow belongs to the shelf scroller,
+              not to overlapping controls. Labels collapse before scrolling. */}
+          <div className="flex items-center gap-2 flex-auto shrink-0">
           {!onAgentClick && agentBadge}
           {onAgentClick && agentName && (
             <AgentChip agentName={agentName} agentLabel={agentLabel} agentIsInheritedDefault={agentIsInheritedDefault} agentMemory={agentMemory} agentSource={agentSource} isRunning={isRunning} shelfCompact={shelfCompact} onAgentClick={onAgentClick} />
@@ -1948,11 +1944,7 @@ function ChatInput({
               ? <Loader2 size={13} className="shrink-0 animate-spin" aria-hidden="true" data-testid="composer-project-switching" />
               : <FolderOpen size={13} className="shrink-0 opacity-70" />}
             {/* Budget favours the branch: the folder name is also in the tooltip
-                and the picker, whereas a clipped branch ("feat/pro…") is exactly
-                the ambiguity this label exists to remove. The enclosing shelf
-                group is flex-1 with a floor sized for the chips' icons and gaps
-                alone, so both segments still shrink below these caps on a
-                narrow window. */}
+                and picker. The whole group scrolls once labels have collapsed. */}
             {!shelfCompact && <span className="truncate max-w-[160px]">{projectSwitching ? i18nT('components.chatInput.switching_project') : project ? (pathBasename(stripTrailingSeparators(project)) || project) : i18nT('components.chatInput.project')}</span>}
           </button>
           {!shelfCompact && !!projectBranch && (
@@ -1979,7 +1971,7 @@ function ChatInput({
             <GitTreeBadge title={gitBadgeTitle} dirty={projectGitDirty} truncated={projectGitDirtyTruncated} ahead={projectGitAhead} behind={projectGitBehind} />
           )}
           </div>
-          <div className="flex items-center gap-2 min-w-0">
+          <div className="flex items-center gap-2 shrink-0">
           {presence}
           {contextPct != null && (
             <ContextUsageControl contextPct={contextPct} contextUnknown={contextUnknown} contextUsedTokens={contextUsedTokens} contextWindowTokens={contextWindowTokens} derivePctFromUsed={derivePctFromUsed} showContextPct={showContextPct} showContextTokens={showContextTokens} shelfCompact={shelfCompact} modelName={modelName} cacheSlot={sessionOnPeer ? null : activeSlot} ctxPopoverOpen={ctxPopoverOpen} setCtxPopoverOpen={setCtxPopoverOpen} autoCompactThreshold={autoCompactThreshold} />
@@ -1988,6 +1980,8 @@ function ChatInput({
             <ModelChip modelName={modelName} harnessBackend={harnessBackend} modelIsJevRouted={modelIsJevRouted} modelIsInheritedDefault={modelIsInheritedDefault} modelIsAutoChosen={modelIsAutoChosen} reasoningEffort={reasoningEffort} effortIsDefault={effortIsDefault} hasEffort={hasEffort} isRunning={isRunning} shelfCompact={shelfCompact} shelfTiny={shelfTiny} composerControl={composerControl} modelChipPressedFromComposerRef={modelChipPressedFromComposerRef} onModelClick={onModelClick} />
           )}
           </div>
+        </div>
+        </div>
         </div>
       )}
     </div>

@@ -27,12 +27,14 @@ import { withMemorySource } from '../../utils/agentLabel'
 import { harnessManagedNoteBackend, type useAutoCompactThreshold } from './autoCompact'
 import { uiLocation } from '../../uiLocations/uiLocation'
 import { useGuidePredicate } from '../../guide/guidePredicates'
+import { useScrollEdges } from '../../hooks/useScrollEdges'
 
 /* The context shelf under the composer: its measured width (which collapses
    the chips to icons) and the controls that stand on it -- app session
    controls, the agent chip, the context readout with its popover, and the
    model chip. The shelf row and the project pill are the composer's own. */
 export function useShelfMeasure() {
+  const [shelfScrollRef, shelfEdges, , shelfContentRef] = useScrollEdges<HTMLDivElement>()
   // Shelf responsiveness: measure the shelf row width and collapse chips to
   // icon-only (agent/project) + drop the model effort label when space is tight.
   // Truncation handles the in-between cases. Only the width's band is state,
@@ -76,7 +78,7 @@ export function useShelfMeasure() {
   }, [])
   const shelfCompact = shelfBand !== 'wide'
   const shelfTiny = shelfBand === 'tiny'
-  return { shelfRef, shelfHeight, shelfCompact, shelfTiny }
+  return { shelfRef, shelfHeight, shelfCompact, shelfTiny, shelfScrollRef, shelfEdges, shelfContentRef }
 }
 
 /** The context popover: open state and its outside-click dismissal. */
