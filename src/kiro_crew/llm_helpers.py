@@ -65,6 +65,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.agent_sdk.drivers.acp_vocab import classify_stop_reason  # noqa: F401
     from kiro_crew.llm_helpers_parts.backend_errors import (  # noqa: F401
         _CONNECTION_MARKERS,
+        _EXPIRED_TOKEN_CODES,
         _FRAME_DATA_TAIL_RE,
         _JITTER_RNG,
         _PROMPT_BUSY_DELAY,
@@ -87,10 +88,12 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _is_transient_acp_error,
         acp_error_after_tool_activity,
         acp_error_is_connection_failure,
+        acp_error_is_pipe_death,
         acp_error_is_session_not_found,
         acp_error_is_throttle,
         acp_error_is_transient,
         acp_error_needs_fresh_credentials,
+        acp_error_needs_sign_in,
         connection_recovery_open,
         connection_retry_delay,
         credential_give_up_text,
@@ -103,9 +106,14 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.llm_helpers_parts.background_turns import (  # noqa: F401
         _background_crew_log_owner,
         _cleanup_memory_consolidation_session,
+        _lite_resets_failed,
+        _lite_rewrite_tasks,
+        _lite_rewrites,
         _lite_spec_unconfirmed,
         _raise_if_unfinished,
         _record_background_crew_log,
+        _refuse_while_memory_critical,
+        _rewrite_lite_spec,
         _start_fresh_conversation,
         background_turn,
         run_bg_oneliner,
@@ -179,6 +187,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         StepIncomplete,
         ToolCallLimitExceeded,
         TurnNotCompleted,
+        _join_continued,
         stream_and_collect,
         stream_and_collect_json,
         unfinished_turn_error,
@@ -218,6 +227,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         EVENT_TEXT_CHUNK,
         EVENT_TOOL_CALL,
         EVENT_TOOL_RESULT,
+        AcpAuthRequired,
         AcpError,
         AcpPromptBusy,
         LLMEvent,
@@ -229,9 +239,11 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew.agent_sdk.drivers.acp_vocab import (  # noqa: F401
         STOP_REASON_STALE_RECOVER,
         STOP_REASON_TIMEOUT,
+        STOP_RECOVERY_MAX_RETRIES,
         AcpTimeoutError,
         engine_served_model,
         same_model,
+        timed_out_continuation,
         tracker_of,
         walk_outcome,
     )
@@ -242,12 +254,14 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         DENY_CAUSE_INVALID_NAME,
         DENY_CAUSE_POLICY,
         DENY_CAUSE_SURFACE_POLICY,
+        DENY_CAUSE_UNREADABLE_IDENTITY,
     )
     from kiro_crew.credential_errors import (  # noqa: F401
         is_credential_propagation_delay,
     )
     from kiro_crew.deny_notice import (  # noqa: F401
         steer_refusal_notice,
+        unreadable_identity_clause,
     )
     from kiro_crew.executors import (  # noqa: F401
         run_in_tool_gate_pool,
@@ -294,6 +308,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         sensitive_path_refusal,
         sensitive_write_path_refusal,
     )
+    from kiro_crew.security.paths_resolver import bounded_judgment  # noqa: F401
     from kiro_crew.security.readonly_bash import (  # noqa: F401
         command_invokes_git,
         is_read_only_bash,
@@ -305,3 +320,4 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew.tool_gate_busy import (  # noqa: F401
         hook_gate_busy,
     )
+    from kiro_crew.tracing import surfaces as trace_surfaces  # noqa: F401

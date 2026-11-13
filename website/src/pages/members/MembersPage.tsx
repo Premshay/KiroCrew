@@ -86,6 +86,7 @@ import { FACE_FLIGHT_EASE, FACE_FLIGHT_SECS, MembersPageProfileCard, useMembersP
 import { MembersPageRosterColumn, useMembersPageRosterView } from './MembersPageRoster'
 import { MembersPageSidePanel, useMembersPageSidePanel } from './MembersPageSidePanel'
 import { MembersPageThreadColumn, useMembersPageThread, useMembersPageThreadView } from './MembersPageThread'
+import { wantsMateSessions } from '../../lib/crewMode'
 import { MEMBER_PARAM, ROSTER_DRAWER_UNCOVERED_PX, type GoneNotice, type PostCreateFailure, type ProfileCardOpen } from './membersPageModel'
 import { useMembersPageCrewEditor } from './useMembersPageCrewEditor'
 import { useMembersPageDrawers, useMembersPageDrawerSwipes, useMembersPageTrackpadSwipe } from './useMembersPageDrawers'
@@ -474,9 +475,20 @@ export default function MembersPage() {
     [activeName, threadOutcome],
   )
   const layout = useMembersPageLayout({ rosterRead, teamsRead, activeName })
-  const { isMobile, winW, rosterShown } = layout
+  const { isMobile, winW, rosterShown, panelVisible, showOpener } = layout
   const profileCard = useMembersPageProfile({ layout, activeName, profile, setProfile })
   const { schedGuardRef, schedAtStakeRef, openMemberRef } = profileCard
+  // A mate session's breadcrumb asks for the named crewmate's Profile on
+  // Sessions. Declared after the card's own reset-on-switch effect, so it opens
+  // once that member is active; the state is then cleared so a reload does not
+  // reopen it.
+  const openMateSessions = wantsMateSessions(location.state)
+  const { openProfile } = profileCard
+  useEffect(() => {
+    if (!openMateSessions || !urlMember || activeName !== urlMember) return
+    openProfile('sessions')
+    navigate({ pathname: location.pathname, search: location.search }, { replace: true, state: null })
+  }, [openMateSessions, urlMember, activeName, openProfile, navigate, location.pathname, location.search])
   const drawers = useMembersPageDrawers({
     teamsRead, layout, navigate, location, activeName, createOpen, navigationType, active,
   })
@@ -523,6 +535,11 @@ export default function MembersPage() {
   // The profile card (opened from the header pill) holds the Permissions row a
   // "crewmate tools" guide points at (`members.permissions`).
   useGuideRevealScope('members.profile', !!profile)
+  // The side panel (drawn only with a crewmate open), whose first tab is the
+  // Dashboard (`members.dashboard-tab`), and whether its header opener
+  // (`members.details`) is drawn.
+  useGuideRevealScope('members.panel', !!active && panelVisible)
+  useGuidePredicate('crewmate_panel_not_docked', showOpener)
   const rosterView = useMembersPageRosterView({
     rosterRead, teamsRead, t, queryClient, activeName, slotKeyOf, liveSlots, active,
   })

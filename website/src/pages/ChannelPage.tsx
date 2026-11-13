@@ -13,6 +13,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api/client'
 import { FALLBACK_PRESETS, channelTaskPrompt } from '../prompts/channelPresets'
 import { ApiError } from '../api/apiError'
+import { RadioChipGroup, radioChip } from '../components/RadioChipGroup'
 import { useConfirm } from '../components/ConfirmDialog'
 import { fmtList } from '../i18n/format'
 import AgentSelector from '../components/AgentSelector'
@@ -197,24 +198,20 @@ function NewChannelDialog({ onClose, onCreate, onClosedError, presets }: {
         * have no reader. */}
       <Input ref={topicRef} id="new-channel-topic" aria-label={i18nT('pages.channelPage.topic')} value={topic} readOnly={save.saving} onChange={e => { if (!save.saving) setTopic(e.target.value) }}
         className="w-full mb-4"
-        placeholder={i18nT('pages.channelPage.e_g_investigate_gamma_deployment_failure')}
-      />
-      <span id="new-channel-preset-label" className="block text-[13px] font-medium text-muted mb-1">
-        {i18nT('pages.channelPage.team_preset')}
-      </span>
-      <div role="radiogroup" aria-labelledby="new-channel-preset-label" className="space-y-1.5">
+        placeholder={i18nT('pages.channelPage.e_g_investigate_gamma_deployment_failure')} />
+      <span id="new-channel-preset-label" className="block text-[13px] font-medium text-muted mb-1">{i18nT('pages.channelPage.team_preset')}</span>
+      {/* The shared group, not a bare role="radiogroup": it gives each option its
+          checked state and one Tab stop with arrow keys, so the picked preset is
+          announced, not shown by colour alone. */}
+      <RadioChipGroup ariaLabelledBy="new-channel-preset-label" className="space-y-1.5">
         {presets.map(p => (
-          <Btn key={p.id} onClick={() => { if (!save.saving) setPreset(p.id) }} aria-disabled={save.saving}
+          <Btn key={p.id} {...radioChip(preset === p.id)} onClick={() => { if (!save.saving) setPreset(p.id) }} aria-disabled={save.saving}
             className={`w-full text-left px-3 py-2 !rounded-lg text-sm ${preset === p.id ? '!border-accent bg-accent/10 text-text-strong' : '!border-border text-muted hover:bg-bg-hover'}`}>
             <span className="font-medium">{presetLabel(p)}</span>
-            {p.agents.length > 0 && (
-              <span className="text-[13px] text-muted ml-2">
-                ({p.agents.map((a) => a.role).join(', ')})
-              </span>
-            )}
+            {p.agents.length > 0 && <span className="text-[13px] text-muted ml-2">({fmtList(p.agents.map(a => a.role))})</span>}
           </Btn>
         ))}
-      </div>
+      </RadioChipGroup>
     </Modal>
   )
 }
@@ -681,7 +678,7 @@ export default function ChannelPage() {
   // Keyed by thread id: a draft belongs to one thread, so switching threads or
   // channels neither discards it nor hands it to a different conversation.
   const [threadDrafts, setThreadDrafts] = useState<Record<string, string>>({})
-  const messagesEndRef = useRef<HTMLDivElement>(null)
+  const messagesRef = useRef<HTMLDivElement>(null)
 
   const channel = channels.find(c => c.id === activeId) || channels[0] || null
   // Mirrored into a ref because the clear-result callbacks are `[]`-dep and would otherwise
@@ -788,11 +785,16 @@ export default function ChannelPage() {
       const { type, data } = (e as CustomEvent).detail
       if (type === 'channel_message' && data.message) {
         const msg = mapMsg(data.message)
-        setChannels((prev) =>
-          prev.map((c) =>
-            c.id === data.channel_id ? { ...c, messages: [...c.messages, msg] } : c,
-          ),
-        )
+        // The server bumps a thread parent's reply_count but broadcasts only the
+        // reply, so the parent's "N replies" button is kept in step here. A message
+        // already held (the channel read raced the event) is not counted twice.
+        setChannels(prev => prev.map(c => c.id !== data.channel_id || c.messages.some(m => m.id === msg.id) ? c : {
+          ...c,
+          messages: [
+            ...c.messages.map(m => msg.threadId && m.id === msg.threadId ? { ...m, replyCount: m.replyCount + 1 } : m),
+            msg,
+          ],
+        }))
       } else if (type === 'channel_agent_status') {
         setChannels((prev) =>
           prev.map((c) =>
@@ -857,8 +859,11 @@ export default function ChannelPage() {
     return () => window.removeEventListener('kirocrew-channel', handler)
   }, [reload])
 
+  // Scroll the list itself: `scrollIntoView` would also scroll every scrollable
+  // ancestor, dragging the page past the composer.
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    const el = messagesRef.current
+    el?.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
   }, [channel?.messages.length, activeId])
 
   // Resolves true only when the post was accepted; callers keep the composer
@@ -1088,7 +1093,7 @@ export default function ChannelPage() {
         title={i18nT('pages.channelPage.channels')}
         subtitle={i18nT('pages.channelPage.multi_agent_collaboration_spaces')}
       />
-      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0 flex flex-col">
         {/* Failed create / add-agent / clear-context / load requests. Every input
             behind these was already submitted (or never existed), so the hand-off
             risks nothing; the composer's own failure renders beside it instead.
@@ -1112,7 +1117,7 @@ export default function ChannelPage() {
           testId="clear-context-error"
         />
       </div>
-        <div className={`flex h-full relative ${isMobile ? '-mx-4 -mb-8' : ''}`}>
+        <div className={`flex flex-1 min-h-0 relative ${isMobile ? '-mx-4 -mb-8' : ''}`}>
           {showNew && (
             <NewChannelDialog
               onClose={() => setShowNew(false)}
@@ -1181,7 +1186,7 @@ export default function ChannelPage() {
                 {clearDone.roles
                   ? i18nT('pages.channelPage.clear_context_cleared_roles', { roles: clearDone.roles })
                   : clearDone.messagesDeleted
-                    ? `${i18nT('pages.channelPage.clear_context_done')} ${i18nT('pages.channelPage.clear_context_messages_deleted')}`
+                    ? i18nT('pages.channelPage.clear_context_done_messages_deleted')
                     : i18nT('pages.channelPage.clear_context_done')}
                 {clearDone.messagesDeleted && (
                   <Btn
@@ -1271,6 +1276,7 @@ export default function ChannelPage() {
 
               <div className="flex flex-1 min-h-0">
                 <div
+                  ref={messagesRef}
                   className={`flex-1 overflow-y-auto py-3 space-y-1 ${isMobile ? 'px-0' : 'px-2'} ${isMobile && (showAgents || threadId) ? 'hidden' : ''}`}
                 >
                   {topLevelMessages.length === 0 && (
@@ -1313,7 +1319,6 @@ export default function ChannelPage() {
                           : i18nT('pages.channelPage.is_working')}
                       </div>
                     ))}
-                  <div ref={messagesEndRef} />
                 </div>
 
                 {/* Thread panel */}

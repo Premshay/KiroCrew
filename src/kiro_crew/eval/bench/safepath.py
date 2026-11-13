@@ -32,6 +32,7 @@ from pathlib import Path
 
 from kiro_crew import pinned_fs
 from kiro_crew.atomic_write import replace_with_retry
+from kiro_crew.bounded_read import bounded_read
 
 from .errors import BenchRefusal
 
@@ -564,7 +565,12 @@ def _sync_dir(dir_fd: int) -> None:
 
 
 def read_text_nofollow(path: str | Path, *, what: str, max_bytes: int | None = None) -> str:
-    """Read one regular file as UTF-8 through a single validated descriptor.
+    """Read one regular file as UTF-8 through :func:`read_bytes_nofollow`."""
+    return read_bytes_nofollow(path, what=what, max_bytes=max_bytes).decode("utf-8")
+
+
+def read_bytes_nofollow(path: str | Path, *, what: str, max_bytes: int | None = None) -> bytes:
+    """Read one regular file's bytes through a single validated descriptor.
 
     The path is guarded, resolved and opened once. All properties that must match
     the bytes returned -- hardlink count, file type and size -- are then checked on
@@ -673,7 +679,7 @@ def read_text_nofollow(path: str | Path, *, what: str, max_bytes: int | None = N
         fh = os.fdopen(fd, "rb")
         fd = -1
         with fh:
-            data = fh.read() if max_bytes is None else fh.read(max_bytes + 1)
+            data = fh.read() if max_bytes is None else bounded_read(fh, max_bytes + 1)
     except BaseException:
         if fd >= 0:
             os.close(fd)
@@ -684,4 +690,4 @@ def read_text_nofollow(path: str | Path, *, what: str, max_bytes: int | None = N
             f"refusing to read the {what}: content is too large; it exceeds "
             f"the {max_bytes}-byte limit."
         )
-    return data.decode("utf-8")
+    return data

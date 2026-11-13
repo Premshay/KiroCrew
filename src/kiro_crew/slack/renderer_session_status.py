@@ -17,6 +17,8 @@ from kiro_crew.slack.agent_sessions.status import (
     set_session_status,
 )
 
+_STATUS_WORKING = "is working on your request"
+
 
 class _DecisionNotifier(Protocol):
     def on_decided(self, request_id: str | int, callback: Callable[[], None]) -> bool: ...

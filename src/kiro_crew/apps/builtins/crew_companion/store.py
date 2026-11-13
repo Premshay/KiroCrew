@@ -67,7 +67,7 @@ from kiro_crew.apps.builtins.crew_companion.reminders import (
     to_iso,
 )
 from kiro_crew.atomic_write import read_bytes_with_retry, replace_with_retry
-from kiro_crew.platform_compat import chmod_safe
+from kiro_crew.owner_only_files import restrict_file_to_owner_soft
 from kiro_crew.user_json import loads_user_json
 
 logger = logging.getLogger(__name__)
@@ -185,6 +185,14 @@ class _State:
 
 def _day_key_local(moment: datetime) -> str:
     return f"{moment.year:04d}-{moment.month:02d}-{moment.day:02d}"
+
+
+def _require_readable(fire_at: str) -> None:
+    """Refuse a ``fireAt`` the tick could not parse; :meth:`CompanionStore.add` says why."""
+    try:
+        parse_iso(fire_at)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"fireAt is not a readable instant: {fire_at!r}") from exc
 
 
 class CompanionStore:
@@ -387,11 +395,9 @@ class CompanionStore:
                 )
             self._path.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_text(serialized, "utf-8")
-            # chmod_safe, not os.chmod: docs/system-specs/common/platform-compat.md
-            # mandates the
-            # platform_compat shim, which is a no-op where POSIX modes mean
-            # nothing (Windows) instead of raising or silently misleading.
-            chmod_safe(tmp, 0o600)
+            # 0600 on POSIX, an owner-only DACL on Windows (chmod_safe would
+            # be a no-op there); the rename keeps it.
+            restrict_file_to_owner_soft(tmp)
             replace_with_retry(tmp, self._path)
         except OSError as exc:
             logger.warning("crew-companion: store write failed: %s", exc)
@@ -540,10 +546,7 @@ class CompanionStore:
         cleaned = text.strip()
         if not cleaned:
             raise ValueError("text is required")
-        try:
-            parse_iso(fire_at)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(f"fireAt is not a readable instant: {fire_at!r}") from exc
+        _require_readable(fire_at)
         reminder = Reminder(
             id=str(uuid.uuid4()),
             text=cleaned,
@@ -585,11 +588,20 @@ class CompanionStore:
         cleaned = text.strip()
         if not cleaned:
             raise ValueError("text is required")
+        return self._edit(ident, text=cleaned)
+
+    def reschedule(self, ident: str, fire_at: str, every_minutes: int | None) -> dict[str, Any]:
+        """Give a reminder a new schedule in place, keeping its id and text."""
+        _require_readable(fire_at)
+        recurrence = Recurrence(every_minutes) if every_minutes else None
+        return self._edit(ident, fire_at=fire_at, recurrence=recurrence)
+
+    def _edit(self, ident: str, **changes: Any) -> dict[str, Any]:
         with self._lock:
             rows = self._state.reminders.reminders
             if not any(r.id == ident for r in rows):
                 return {"ok": False}
-            edited = tuple(replace(r, text=cleaned) if r.id == ident else r for r in rows)
+            edited = tuple(replace(r, **changes) if r.id == ident else r for r in rows)
             self._state = replace(
                 self._state, reminders=replace(self._state.reminders, reminders=edited)
             )

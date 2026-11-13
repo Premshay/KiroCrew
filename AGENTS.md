@@ -31,6 +31,18 @@ the `internal-content-scan` check (blocking on pull requests, forks included) an
 the
 `no-new-builtin-apps` rule in `AUTOSDE.yaml`.
 
+## Own the codebase
+
+This codebase is yours: what it's for and how it's built are your call, and you'll keep building on it.
+
+Treat every change as something you'll own and maintain long-term. Don't just add code around existing problems. Fix the underlying causes, consolidate duplicated logic, and improve the architecture when it makes the implementation simpler and more reliable.
+
+You have the authority to make related improvements without asking for permission, as long as you preserve intended behavior, compatibility, and user expectations.
+
+Don't stop at reporting problems. Fix them, test your changes, and drive the implementation to green.
+
+This never overrides the security invariants or another rule in the root `AGENTS.md`, the skill or agent charter you follow, or an explicit stop from the user.
+
 ## Read before you touch
 
 Load the doc for the row you are working in **before** you change code. Update it
@@ -63,7 +75,7 @@ in the **same commit** when you change what it documents.
 | cron, learn, dashboard handlers | [learn-cron-dashboard](docs/system-specs/modules/learn-cron-dashboard.md) |
 | Slack, Discord, any channel, messaging, approvals | [messaging](docs/system-specs/modules/messaging.md) + [slack-gateway](docs/system-specs/modules/slack-gateway.md) |
 | subagents, spawn, orphan recovery | [subagent](docs/system-specs/modules/subagent.md) |
-| crews, `select_crew`, crew bindings, Crew Mode slots | [crew-mode](docs/system-specs/modules/crew-mode.md) |
+| crews, `select_crew`, crew bindings, Ultra Mode slots | [crew-mode](docs/system-specs/modules/crew-mode.md) |
 | the pipeline conductor agent or its skill | [pipeline-conductor](docs/system-specs/modules/pipeline-conductor.md) |
 | task runner | [task](docs/system-specs/modules/task.md) + [taskrunner](docs/system-specs/modules/taskrunner.md) |
 | `workflows/` (the dynamic-workflow engine) | [workflows](docs/system-specs/modules/workflows.md) |
@@ -178,7 +190,7 @@ Detail and rationale: [security](docs/system-specs/modules/security.md),
   #14436 had to revert a tightening whose sweep missed such a client.
 - **Computer use is governed by one on/off row only**: the operator opt-in on the
   keystone `computer_use.json`, ANDed with `capabilities.computer_use`
-  ([rfc-crew-enterprise-edition](docs/request-for-change/rfc-crew-enterprise-edition.md),
+  ([rfc-crew-lts-edition](docs/request-for-change/rfc-crew-lts-edition.md),
   appendix "Desktop control"). Never add finer `computer_use.*` scopes, more
   capability rows, approval ordinals or pointer permits. Its refusals run **in band** on
   `tools._dispatch`, never at the fail-OPEN `hooks` gate, because a pre-authorized
@@ -192,8 +204,8 @@ Detail and rationale: [security](docs/system-specs/modules/security.md),
 fallback fails at runtime for anyone not entitled to it, silently until the first
 prompt. The default is `"auto"`; resolve a substitute choice through
 `acp.client.resolve_usable_model`; pin a cheaper model for the worker roles only
-via `agent.role_models.<role>` (and, for one mate's dispatched sessions, via
-that mate's `worker_model`). `code-review.yml` fails on a newly added hardcoded
+via `agent.role_models.<role>` (and, for one Bot's dispatched sessions, via
+that Bot's `worker_model`). `code-review.yml` fails on a newly added hardcoded
 literal. Rules and the one exception:
 [model-selection](docs/system-specs/common/model-selection.md).
 
@@ -226,7 +238,8 @@ or internal-secret path row (`dashboard/server_internal_paths.py`) in core. A ne
 app, first-party included, ships from a dedicated GitHub repository listed in the
 official registry ([kirodotdev/KiroCrewApps](https://github.com/kirodotdev/KiroCrewApps)).
 The built-ins that still ship are being moved out under #26967; fixing one in place
-until it leaves is fine. An app moves out COMPLETELY: no part of it (backend, UI,
+until it leaves is fine, but once `apps/adoption-pins.json` pins it the fix lands in its
+app repository first and the PR names it (`App repo: <owner>/<repo>@<sha>`, PR Hygiene). An app moves out COMPLETELY: no part of it (backend, UI,
 scripts, CI, specs) stays in core, and core never imports or hard-codes a specific
 app (`kiro_crew.apps.builtins.<app>`, an app id) outside the built-in tables being
 emptied. A capability an app cannot get from outside core is an App Kit seam gap:
@@ -264,7 +277,7 @@ seams: [app-kit-platform](docs/system-specs/modules/app-kit-platform.md).
 <body — what and why, not how; wrapped at 72>
 ```
 
-Types the PR-title gate in `code-review.yml` accepts: `feat`, `fix`, `docs`,
+Types the PR-title gate in `pr-hygiene.yml` accepts: `feat`, `fix`, `docs`,
 `style`, `refactor`, `perf`, `test`, `chore`, `ci`, `build`, `revert`. **One
 logical change per commit**, and at most two commits per PR.
 

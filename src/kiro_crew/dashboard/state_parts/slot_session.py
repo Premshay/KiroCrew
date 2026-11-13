@@ -11,8 +11,10 @@ Writes: ``_app``, ``_auto_tagged``, ``_binding``, ``_channel_runtime_origin``, `
 ``_created_by_sid``, ``_crew_log_opened_sid``, ``_crew_log_pending_channel``,
 ``_crew_log_previous_from_mapping``, ``_crew_log_previous_sid``,
 ``_crew_log_previous_undecided``, ``_detail_render_lock``, ``_eager_spawn_failures``,
-``_eager_spawn_retry_at``, ``_eager_spawn_task``, ``_effort_pick_gen``, ``_fork_lock``,
-``_human_seen``, ``_last_stop_reason``, ``_lineage_minted``, ``_mcp_banner_shown``, ``_mcp_report``,
+``_eager_spawn_reported_resume``, ``_eager_spawn_retry_at``, ``_eager_spawn_task``,
+``_effort_pick_gen``, ``_fork_lock``, ``_fork_title_spent``,
+``_hidden_scratch_notice_shown``, ``_human_seen``, ``_last_stop_reason``, ``_lineage_minted``,
+``_mcp_banner_shown``, ``_mcp_report``,
 ``_mcp_report_session_id``, ``_memory_assignment_from_history``, ``_model_pick_gen``,
 ``_model_pick_lock``, ``_model_runtime_pick_gen``, ``_model_withheld``,
 ``_model_withheld_for``, ``_origin``, ``_pending_discard_conversation_key``,
@@ -21,13 +23,13 @@ Writes: ``_app``, ``_auto_tagged``, ``_binding``, ``_channel_runtime_origin``, `
 ``_reports_to_creator``, ``_revived_by``, ``_saved_created_by``,
 ``_session_requested_model``,
 ``_slack_channel``, ``_slack_linked``, ``_slack_thread_ts``, ``_summary_in_flight``,
-``_summary_turn_mark``, ``_tab_id``, ``_title_epoch``, ``_title_in_flight``,
+``_summary_turn_mark``, ``_tab_id``, ``_telemetry_notice_shown``, ``_title_epoch``, ``_title_in_flight``,
 ``_title_low_signal``, ``_title_origin``, ``_title_refresh_mark``,
-``_title_retry_pending``, ``_title_task``, ``_titled``, ``_turn_timeout_hydrated``,
-``_welcomed_agent``, ``agent_kind``, ``app_agent_owner``, ``autocompact_pct``,
+``_title_retry_pending``, ``_title_task``, ``_titled``,
+``_welcome_preview``, ``_welcomed_agent``, ``agent_kind``, ``app_agent_owner``, ``backend``,
 ``channel_origin``, ``created_at``, ``crew_mode_agent``, ``executor``, ``forked_from``, ``instance_id``,
 ``jev_route``, ``memory_store``,
-``remote_slot``, ``served_model``, ``turn_timeout_secs``.
+``remote_slot``, ``served_model``.
 Reads only: ``model``.
 
 A function whose first parameter is ``self`` is a ``_ChatSlot`` method: the
@@ -108,6 +110,11 @@ def init_session_fields(self: _ChatSlot) -> None:
     # the picker; never an authorization input.
     self.agent_kind = ""
     self.runtime_agent = ""
+    # The harness the session was created on (``session_create(backend=...)``),
+    # in the stored spelling (``"kiro"``, ``"claude"``, ...); "" = no pick, so the
+    # selection gate decides as before. Set at birth and restored with the slot;
+    # every allocation passes it as ``backend_override``.
+    self.backend = ""
     # The agent Crew Mode turned on with ("" when the chat never turned it on):
     # stamped by the agent switch (``crew_mode.stamp_for_switch``) and persisted,
     # so the chat stays in Crew Mode after ``agent.crew_mode_agent`` changes.
@@ -127,6 +134,11 @@ def init_session_fields(self: _ChatSlot) -> None:
     # itself is, and a re-emit after a gateway restart costs one duplicated
     # notice rather than a per-turn repeat.
     self._welcomed_agent = ""
+    # The greeting the welcome page shows before the first message, as
+    # ``(agent, agent_kind, project, text)`` for the binding it was read for
+    # (``dashboard/agent_welcome.py``). Not persisted: it is read again at the
+    # next create or pick, and from the first row on the row carries it.
+    self._welcome_preview = ("", "", "", "")
     # Whether the owner asked Jev to pick this turn's model tier
     # (`decisions.points.model_route`), set by the picker's "Auto (Jev)" entry
     # and cleared by any concrete pick. A FLAG beside `model`, never a
@@ -201,17 +213,6 @@ def init_session_fields(self: _ChatSlot) -> None:
     # choice landed even when that choice returned to the level it saw.
     self._effort_pick_gen = 0
     self._reasoning_effort = ""
-    # Per-session auto-compact threshold override (percent). None = follow
-    # the global session.autocompact_pct. Persisted with the slot and
-    # re-seeded into the SessionManager after restore.
-    self.autocompact_pct = None
-    # Per-session turn time limit (seconds). None = follow the global
-    # agent.chat_turn_timeout_secs. Persisted with the slot; read by the turn
-    # dispatch (turn_dispatch.resolve_turn_limit) when each turn starts.
-    self.turn_timeout_secs = None
-    # False while a reopened tab's own limit is still unread from its
-    # transcript: its saves carry the on-disk value forward meanwhile.
-    self._turn_timeout_hydrated = True
     # The crew's memory silo, or "" for the global store. Held on the slot
     # rather than re-resolved per save because it is SLOT-OWNED metadata:
     # absence retracts it, so a save that could not name it would drop the
@@ -276,6 +277,11 @@ def init_session_fields(self: _ChatSlot) -> None:
     self._title_task = None
     # Records a chat_done retry that arrived during the on-send attempt.
     self._title_retry_pending = False
+    # True once this fork child's title pass from its first person-typed
+    # message has started (chat_title_fork.fork_title_pending), so a SKIP or a
+    # failed generation is not retried on every later message. Never
+    # persisted: a restart allows one more pass while the born name stands.
+    self._fork_title_spent = False
     # Excludes concurrent session-summary generations for this slot. A
     # summary pass outlives the turn that triggered it, so a fast follow-up
     # turn would otherwise start a second pass over the same transcript.
@@ -306,8 +312,9 @@ def init_session_fields(self: _ChatSlot) -> None:
     self._attribution = None
     #: The ``created_by`` the session's saved metadata line names, read on every
     #: hydration (restore, recent, resume). DISPLAY ONLY: the Crew Mode stamp reads
-    #: it to keep a reopened worker under its root (``crew_mode.stamp_rows``). It
-    #: grants nothing: session-control ownership reads ``_created_by`` alone.
+    #: it to keep a reopened worker under its root (``crew_mode.stamp_rows``), and a
+    #: save writes it back in place of ``unverified:creator``. It grants nothing:
+    #: session-control ownership reads ``_created_by`` alone.
     self._saved_created_by = ""
     #: The creator's ACP session id, FROZEN at mint (see ``session_control``).
     #: Read at the child's first turn to stamp ``parent_sid`` on the immutable
@@ -351,10 +358,14 @@ def init_session_fields(self: _ChatSlot) -> None:
     # (digest of the ACP session id, sign-in round, digest of the text). In
     # memory only and bounded; see dashboard.mcp_banner_dedupe.
     self._mcp_banner_shown = {}
+    self._hidden_scratch_notice_shown = False
+    self._telemetry_notice_shown = ""
     # Set by api_chat_slot_project; consumed in _run_chat instead of
     # inline because the endpoint can be reached from inside the kiro-cli
     # process group via the set_project MCP tool.
     self._pending_reset_history_key = None
+    # True only while the queued reset is a project clear's, so a model-only reset keeps the cwd.
+    self._pending_reset_clears_cwd = False
     # Set by the reset_conversation directive; consumed alongside the
     # project-change reset above. Deferred for the same reason: the tool is
     # called from inside the turn it wants to end, and the immediate route
@@ -380,6 +391,10 @@ def init_session_fields(self: _ChatSlot) -> None:
     # At most one per slot: scheduling a new one cancels the previous, so
     # rapid signals (create + project set) collapse into a single spawn.
     self._eager_spawn_task = None
+    # Whether that task is a resume start whose signal waits on its end (a
+    # reload's respawn, armed with on_ended): a focus frame keeps such a task
+    # rather than re-arm the same load.
+    self._eager_spawn_reported_resume = False
     # Consecutive failed background starts, and the monotonic time before
     # which the next one waits (chat_runner._note_eager_spawn_failure).
     self._eager_spawn_failures = 0
@@ -390,6 +405,7 @@ def init_session_fields(self: _ChatSlot) -> None:
     self._slack_linked = False  # True when linked to a Slack thread
     self._slack_channel = ""
     self._slack_thread_ts = ""
+    self._pending_thread_parent = None
     # Explicit model-pick generation. Bumped ONLY by the explicit set-model
     # surfaces (single-slot pick, bulk switch, provider-switch clear) —
     # never by the automatic provider backfill — so the fallback restore
@@ -431,6 +447,9 @@ def init_session_fields(self: _ChatSlot) -> None:
     # than being silently classified as user-initiated. Deny-by-default.
     self._origin = ""
     self.forked_from = None  # parent slot key if this is a fork
+    # The parent transcript's created_at when forked: a chat later created
+    # on the parent's key after a permanent delete has another.
+    self.forked_from_created_at = ""
     self._fork_lock = asyncio.Lock()  # serialises concurrent forks on this slot
     # Serialises explicit model-pick transactions (check → mutate → live
     # switch → rollback) on this slot: picks interleaving at the set_model

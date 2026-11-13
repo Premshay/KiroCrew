@@ -43,6 +43,51 @@ SCRIPT = SKILL_DIR / "scripts" / "accept_eval.py"
 PRODUCT_SOURCE = Path(work_acceptance.__file__).resolve()
 PRODUCT_SRC_ROOT = PRODUCT_SOURCE.parents[1]
 
+
+def test_accept_eval_admitted_batch_uses_product_evaluator(monkeypatch):
+    from kiro_crew import mcp_work
+
+    monkeypatch.setattr(mcp_work, "_strict_caller", lambda: ("chat-test", None))
+    monkeypatch.setattr(mcp_work, "_get", lambda *a, **kw: {"items": []})
+    result = json.loads(
+        mcp_work._call_tool_inner(
+            "accept_eval", {"items": [{"id": "review", "accept": {"kind": "human_approval"}}]}
+        )
+    )
+    assert result["results"][0]["verdict"] == "pending"
+
+
+def test_accept_eval_published_ledger_waits_for_checks(monkeypatch):
+    from kiro_crew import mcp_work
+
+    calls = []
+    monkeypatch.setattr(mcp_work, "_strict_caller", lambda: ("channel-test", None))
+
+    def get(path, **kwargs):
+        calls.append((path, kwargs))
+        if len(calls) == 1:
+            return {"published_fields_only": True, "items": [{"state": "done"}]}
+        return {"results": [{"id": "review", "verdict": "pending"}]}
+
+    monkeypatch.setattr(mcp_work, "_get", get)
+    result = json.loads(mcp_work._call_tool_inner("accept_eval", {}))
+    assert result["results"][0]["verdict"] == "pending"
+    assert calls[1][1]["timeout"] == 630
+
+
+def test_channel_permission_prompts_contain_private_tools():
+    from kiro_crew.channel_policy import _blocked_tool_named
+
+    for name in (
+        "dismiss_notification",
+        "session_set_note",
+        "read_slack_history",
+        "session_queue",
+        "accept_eval",
+    ):
+        assert _blocked_tool_named(f"kirocrew-work___{name}")
+
+
 #: A release that accepts a spec ``permissions`` block, and one that refuses it.
 #: Expressed against the floor rather than as literals so raising the floor
 #: cannot leave a test asserting the old boundary.
@@ -104,17 +149,12 @@ class TestConductorInstaller(conductor_agent_checks.PromptDoesNotCarryTheRetired
     def test_prompt_drives_patrol_with_monitor_start_not_wait(self, tmp_path, monkeypatch):
         """A patrol round outlives a turn, so the loop must own the turn boundary.
 
-        An in-turn ``wait`` + re-poll loop spends the turn budget on latency and
-        dies at the turn cap mid-round, which loses the loop. Three halves of the
-        contract are pinned: ``monitor_start`` arms the round, ``wait`` is the
-        single-round fallback for a refused arm rather than the primary
-        mechanism, and the conductor knows the tool it needs to stop the loop it
-        armed. Whitespace is normalised so re-wrapping the prompt cannot fail
-        this for a formatting reason.
+        An in-turn ``wait`` loop dies at the turn cap mid-round; ``wait`` is only the
+        fallback for a refused arm. Whitespace is normalised so re-wrapping cannot fail it.
         """
         data = self._install(tmp_path, monkeypatch)
         prompt = " ".join(data["prompt"].split())
-        assert "Arm a loop on your own session with `monitor_start`" in prompt
+        assert "arm a loop on your own session with `monitor_start`" in prompt
         assert "If arming is refused outright" in prompt
         assert "drive that one round with `wait`" in prompt
         assert "autonudge_stop" in prompt
@@ -122,15 +162,8 @@ class TestConductorInstaller(conductor_agent_checks.PromptDoesNotCarryTheRetired
     def test_prompt_names_the_tools_it_expects_to_be_used(self, tmp_path, monkeypatch):
         """The charter mounts whole servers, so the prompt must name what it wants.
 
-        ``@kirocrew-core`` puts 74 registered tools in front of this agent. Naming
-        only the session-control ones left the rest unaddressed, which is how a
-        conductor talks itself into running a work item in its own turn. Both
-        directions are pinned: the tools the four jobs need, and the four that
-        would end-run the no-write property by executing the work here.
-
-        Those four are also the reason the core grant is per-verb rather than
-        server-wide — the prompt PROHIBITS them, so a blanket auto-approve
-        contradicted the charter it shipped with.
+        Pins both the tools the four jobs need and the four that would run the work
+        here; those four are why the core grant is per-verb, not server-wide.
         """
         prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
         for named in (
@@ -403,15 +436,10 @@ class TestConductorInstaller(conductor_agent_checks.PromptDoesNotCarryTheRetired
         assert "autoApprove" not in data["mcpServers"]["kirocrew-work"]
 
     def test_the_work_mount_lands_on_all_four_surfaces(self, tmp_path, monkeypatch):
-        """A mount is four separate facts, and only three of them are visible.
+        """A mount is four separate facts: tools, mcpServers, allowedTools, rules[].match.
 
-        ``tools`` mounts the server, ``mcpServers`` gives it a command to launch,
-        ``allowedTools`` decides which verbs skip the approval prompt, and
-        ``permissions.rules[].match`` is what the KAS backend reads INSTEAD of
-        ``allowedTools``. The last one is the one that silently survives an
-        incomplete edit: a spec can look correctly mounted on kiro-cli while the
-        KAS projection grants nothing, and every patrol cycle then stalls on an
-        approval nobody is there to give.
+        KAS reads ``permissions.rules[].match`` instead of ``allowedTools``; missing it
+        grants nothing there, and every patrol cycle stalls on an unanswered approval.
         """
         data = self._install(tmp_path, monkeypatch)
         assert "@kirocrew-work" in data["tools"]
@@ -423,10 +451,10 @@ class TestConductorInstaller(conductor_agent_checks.PromptDoesNotCarryTheRetired
         assert "kirocrew-work/work_ledger_read" in match
         assert "kirocrew-work/work_ledger_record" in match
         assert "kirocrew-work/work_brief" in match
-        # ``work_report`` WRITES into a parent's record across a dispatch
-        # relationship, so it is mounted and gated on every surface that grants.
-        assert "@kirocrew-work/work_report" not in data["allowedTools"]
-        assert "kirocrew-work/work_report" not in match
+        # ``work_report``, the grant every worker holds, so a nested conductor's
+        # round-boundary report wakes its parent without a prompt, on both backends.
+        assert "@kirocrew-work/work_report" in data["allowedTools"]
+        assert "kirocrew-work/work_report" in match
         # And never the whole server, which would hand over the worker half by
         # the back door on either backend.
         assert "@kirocrew-work" not in data["allowedTools"]
@@ -466,18 +494,36 @@ class TestConductorInstaller(conductor_agent_checks.PromptDoesNotCarryTheRetired
         assert "ledger_entry" not in prompt
 
     def test_prompt_and_skill_filter_the_batch_to_done_items(self, tmp_path, monkeypatch):
-        """``accept_batch`` is status-blind by design (it is the promotion seam), so
-        the procedure must filter it. Unfiltered, a ``progress`` worker whose stub
-        already satisfies a ``file`` condition earns a genuine ``pass`` and can be
-        closed under itself. Both the prompt and the skill have to state the
-        filter, because the agent copies whichever it read last.
+        """Only a ``done`` item may be evaluated. A ``progress`` worker whose stub
+        already satisfies a ``file`` condition would earn a genuine ``pass`` and be
+        closed under itself. Called with no document, ``accept_eval`` applies that
+        rule itself, and both the prompt and the skill say so. ``accept_batch`` is
+        status-blind by design (it is the promotion seam), so the skill still states
+        the filter for a document the conductor hands over itself.
         """
-        prompt = self._install(tmp_path, monkeypatch)["prompt"]
-        assert "Filter the `accept_batch`" in prompt
-        assert "whose status is `done`" in prompt
+        prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
+        assert "Call the `accept_eval` tool with no arguments" in prompt
+        assert "It never evaluates an item that is not `done`" in prompt
         body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
+        assert "Call the `accept_eval` tool with NO arguments" in body
+        assert "It evaluates `done` items only" in body
         assert "keep only the entries whose item is currently `status: done`" in body
         assert "Never pipe the unfiltered document" in body
+
+    def test_prompt_and_skill_settle_a_pass_with_one_write(self, tmp_path, monkeypatch):
+        """A pass is recorded and closed by one ``close`` that carries the verdict,
+        and a ``done`` wake goes straight to the evaluator. Both texts have to say
+        it, because the agent copies whichever it read last."""
+        prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
+        one_write = "`action=close` `state=accepted` `verdict=pass`"
+        assert one_write in prompt
+        assert "A wake naming a `done` item needs no read" in prompt
+        assert "Each answer carries `reported`" in prompt
+        body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
+        assert one_write in body
+        assert "A wake that names a `done` item is the one exception" in body
+        assert "returns the worker's report beside the verdict" in body
+        assert "A `done` whose report (`reported.summary` beside its verdict)" in body
 
     def test_prompt_and_skill_make_a_nested_conductor_report_upward(self, tmp_path, monkeypatch):
         """A second-level conductor is bound as its parent's worker, and the parent
@@ -504,8 +550,7 @@ class TestConductorInstaller(conductor_agent_checks.PromptDoesNotCarryTheRetired
         """A loop without ``watch="work-ledger"`` is a plain timer that pays a turn
         every interval, and a 30-minute interval leaves a worker's report unread
         for half an hour. Both the prompt and the skill must make the watch
-        mandatory and keep the interval inside the band ``patrol_budget.py``
-        enforces.
+        mandatory and fix the interval at 300 s, the gateway's one patrol interval.
         """
         prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
         body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
@@ -513,7 +558,8 @@ class TestConductorInstaller(conductor_agent_checks.PromptDoesNotCarryTheRetired
         assert '`watch="work-ledger"` is mandatory' in body
         for text in (prompt, body):
             assert 'monitor_update(watch="work-ledger")' in text
-            assert "300..900" in text
+            assert "300 seconds" in text
+            assert "300..900" not in text
             assert "interval_secs=1800" not in text
             assert "on a timer today" not in text
 
@@ -534,7 +580,7 @@ class TestConductorInstaller(conductor_agent_checks.PromptDoesNotCarryTheRetired
         assert "Needs-human checklist" in body
         for text in (prompt, body):
             assert "Round-0 go-ahead" in text
-            assert "runaway backstop, not a stop signal" in text
+            assert "7-day runaway backstop" in text
             assert "credentials, spend, deleting or overwriting someone's work" in text
             assert "Park just this item" in text
 
@@ -554,9 +600,8 @@ class TestConductorInstaller(conductor_agent_checks.PromptDoesNotCarryTheRetired
 
     def test_back_to_back_rounds_keep_a_spend_bound(self, tmp_path, monkeypatch):
         """Without a pause between rounds, a default concurrency cap and a no-progress
-        back-off are the only hard spend gates when the user set no bound; the item
-        total is the conductor's to manage, said to the user once when it is passed,
-        never a running meter in every report.
+        back-off are the only hard spend gates when the user set no bound. The item
+        total has no cap and no notice; it stays readable as ``goal_items_used``.
         """
         prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
         body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
@@ -565,51 +610,15 @@ class TestConductorInstaller(conductor_agent_checks.PromptDoesNotCarryTheRetired
             assert "two rounds in a row" in text
             assert "goal_concurrency_cap_reached" in text
             assert "concurrency_cap=<N>" in text
-            assert "cap_exceeded" in text
-            # The count stays out of routine reports and surfaces once, at the cap.
-            assert "keep it out of round reports" in text
-            assert "first report after `cap_exceeded` turns true" in text
-            # "Once" survives the per-round reset only through a persisted marker
-            # that records delivery, not cap state: items are created at dispatch,
-            # after the report, so the round-close read usually already shows
-            # cap_exceeded true before any notice was given. Re-recorded at every
-            # round close, the marker cannot age out of the ledger's bounded
-            # artifacts map. A statement (not a question) never holds that reset up.
-            assert "every round-close `session_ledger_record`" in text
-            assert "re-record `item_cap_notice` in `artifacts` so it never ages out" in text
-            assert (
-                "Record `none` if a fresh `work_ledger_read` shows `cap_exceeded` false"
-            ) in text
-            assert ("`told the user at N` only if this turn's report gave the notice") in text
-            assert "otherwise the stored value, carried forward unchanged" in text
-            # A notice given in a turn that pauses instead of closing the round
-            # (no progress, a question to the user) must still be recorded.
-            assert (
-                "The turn whose report gives the notice records `item_cap_notice` as "
-                "`told the user at N` with `session_ledger_record` in that same turn, "
-                "whether or not it closes a round"
-            ) in text
-            assert "does not start with `told`" in text
-            # The old cap-state rule wrote `told` with no notice given.
-            assert "while `cap_exceeded` is true, include" not in text
-            # A replaced goal or changed cap can pass the cap before the next round
-            # close, so the goal write itself clears the marker.
-            assert (
-                "A `goal` write that sets `new_goal=true` or changes `item_cap` also "
-                "records `item_cap_notice` as `none`, in that same turn and before "
-                "any dispatch"
-            ) in text
-            assert "set `item_cap_notice` to `none`" not in text
+            assert "goal_items_used" in text
+            # The advisory item cap and its one-time notice are gone
+            # (rfc-drop-goal-item-cap.md).
+            assert "item_cap" not in text
+            assert "cap_exceeded" not in text
             assert "keep going?" not in text.lower()
-            assert "items used: N of" not in text
-            assert "in every round report" not in text
-            # The old refusal is gone from both, so neither tells the conductor to
-            # stop and ask when the total is passed.
             assert "goal_item_cap_reached" not in text
         assert "at most 6 ledger items OPEN at once" in prompt
-        assert "at most 20 ledger items in all" in prompt
         assert "at most **6 ledger items open at once**" in body
-        assert "at most **20 ledger items** in total" in body
 
     def test_prompt_names_its_own_skill_and_not_the_deprecated_alias(self, tmp_path, monkeypatch):
         """The procedure lives in ``goal-conductor``. ``goal-ledger-conductor`` is a
@@ -621,14 +630,10 @@ class TestConductorInstaller(conductor_agent_checks.PromptDoesNotCarryTheRetired
         assert "goal-ledger-conductor" not in prompt
 
     def test_skill_body_matches_the_prompt_on_the_load_bearing_rules(self, tmp_path, monkeypatch):
-        """The prompt is the summary and the skill is the procedure; a disagreement
-        between them is resolved nondeterministically by whichever the model weighs
-        more. These four are the rules that make this flow what it is.
+        """Prompt and skill must agree on the load-bearing rules, or the model picks one.
 
-        The read-first rule is asserted on BOTH sides, because that is the one a
-        wake can contradict: a wake carries a pointer to the ledger rather than a
-        copy of it, so a surface telling the conductor a turn may arrive holding the
-        board has it act on a one-line notification as if it were the state.
+        Read-first is checked on both sides: a wake carries a pointer to the ledger,
+        not the board, so neither may say a turn arrives holding the board.
         """
         body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
         prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
@@ -645,14 +650,9 @@ class TestConductorInstaller(conductor_agent_checks.PromptDoesNotCarryTheRetired
     def test_prompt_and_skill_name_the_template_dispatch_for_a_shadowed_worker(
         self, tmp_path, monkeypatch
     ):
-        """On installs where an older agent sync enrolled ``kirocrew-worker`` as a crew
-        member with private memory, a conductor running as a crew member on the
-        shared store (or a child a parent conductor created) is refused
-        ``memory_delegation_denied`` for every leaf dispatch. Left unsaid, the
-        conductor invents a remedy that does not exist (a memory-store setting), so
-        both the summary and the procedure name the real one -- ``agent_kind:
-        "template"`` -- as the way EVERY worker is dispatched, not as a retry after
-        the refusal, and say the binding is not a setting.
+        """Where ``kirocrew-worker`` is enrolled as a member with private memory, a
+        member dispatch is refused ``memory_delegation_denied``. Both texts name
+        ``agent_kind: "template"`` for every dispatch and say no setting changes it.
         """
         prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
         body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
@@ -770,7 +770,10 @@ class TestConductorInstaller(conductor_agent_checks.PromptDoesNotCarryTheRetired
             "@kirocrew-work/work_ledger_read",
             "@kirocrew-work/work_ledger_record",
             "@kirocrew-work/work_ledger_rebuild",
+            "@kirocrew-work/work_ask_record",
             "@kirocrew-work/work_brief",
+            "@kirocrew-work/work_report",
+            "@kirocrew-work/accept_eval",
         ]
 
     def test_kas_permissions_are_derived_from_the_filtered_grants(self, tmp_path, monkeypatch):
@@ -809,10 +812,13 @@ class TestConductorInstaller(conductor_agent_checks.PromptDoesNotCarryTheRetired
             "kirocrew-dashboard/session_status",
         ]
         work_resources = [
+            "kirocrew-work/accept_eval",
+            "kirocrew-work/work_ask_record",
             "kirocrew-work/work_brief",
             "kirocrew-work/work_ledger_read",
             "kirocrew-work/work_ledger_rebuild",
             "kirocrew-work/work_ledger_record",
+            "kirocrew-work/work_report",
         ]
         data = self._install(tmp_path, monkeypatch)
         assert data["permissions"] == {
@@ -826,12 +832,10 @@ class TestConductorInstaller(conductor_agent_checks.PromptDoesNotCarryTheRetired
         }
         assert "kirocrew-core/*" not in data["permissions"]["rules"][0]["match"]
         assert "kirocrew-dashboard/*" not in data["permissions"]["rules"][0]["match"]
-        # The work server is narrowed the same way, and for a sharper reason: a
-        # ``kirocrew-work/*`` wildcard would re-grant ``work_report`` — the one
-        # verb that writes across a dispatch relationship — on the backend where
-        # nobody reads ``allowedTools``.
+        # The work server is narrowed the same way: a ``kirocrew-work/*`` wildcard
+        # would grant verbs the tuple does not name, on the backend where nobody
+        # reads ``allowedTools``.
         assert "kirocrew-work/*" not in data["permissions"]["rules"][0]["match"]
-        assert "kirocrew-work/work_report" not in data["permissions"]["rules"][0]["match"]
 
         governed = self._install(
             tmp_path,
@@ -962,7 +966,10 @@ class TestConductorInstaller(conductor_agent_checks.PromptDoesNotCarryTheRetired
             "@kirocrew-work/work_ledger_read",
             "@kirocrew-work/work_ledger_record",
             "@kirocrew-work/work_ledger_rebuild",
+            "@kirocrew-work/work_ask_record",
             "@kirocrew-work/work_brief",
+            "@kirocrew-work/work_report",
+            "@kirocrew-work/accept_eval",
         ]
 
     def test_skill_gates_the_plan_once_instead_of_interrogating(self):
@@ -992,18 +999,15 @@ class TestConductorInstaller(conductor_agent_checks.PromptDoesNotCarryTheRetired
         text = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
         assert "Reads and creates do not prompt" in text
         assert "`session_send` and `session_stop` are deliberately NOT auto-approved" in text
-        assert "accept_eval.py` invocation" in text
+        # The checks run as granted tools; only their shell fallback prompts.
+        assert "`accept_eval` tool" in text
+        assert "each such call blocks on one approval" in text
 
     def test_skill_keeps_item_state_in_the_store_and_not_in_artifacts(self):
         """One record per item, in the one place the evaluator batch reads.
 
-        Encoding items into ``session_ledger`` ``artifacts`` as well would give
-        two records that can disagree, and the ledger is the one
-        ``work_ledger_read`` returns and the Crew page will render. The codec
-        that squeezed an item into a 2000-character ``artifacts`` value under an
-        entry cap belongs to a conductor with no item store, so the skill must
-        not send a reader to it. Pinned as a doc ratchet because the
-        instruction, not the code, is what would drift.
+        Items also encoded into ``session_ledger`` artifacts would be a second record
+        that can disagree with the one ``work_ledger_read`` returns.
         """
         text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
         assert "Do not encode items into `session_ledger` artifacts" in text
@@ -1177,13 +1181,8 @@ class TestAcceptEvaluator:
     def test_file_rejects_a_non_boolean_exists(self, tmp_path):
         """``bool()`` coercion would read ``{"exists": "false"}`` as ``True``.
 
-        The reported shape: an acceptance assembled from text carries string
-        booleans, and a truthy ``"false"`` silently inverts an absence check
-        into a presence check — the evaluator reports ``pass`` for exactly the
-        state the spec asked to reject. ``1``/``0`` are rejected too, on
-        purpose: the ``pr`` guard already refuses ``bool`` as an ``int``, so
-        accepting ``int`` as a ``bool`` here would contradict the sibling
-        field. A malformed spec gets a loud ``error``, never a coerced verdict.
+        A truthy ``"false"`` turns an absence check into a presence check. ``1``/``0``
+        are refused too, matching the ``pr`` guard that refuses ``bool`` as ``int``.
         """
         mod = work_acceptance
         present = tmp_path / "made"
@@ -1401,14 +1400,8 @@ class TestAcceptEvaluatorAdapter:
     def test_the_skill_prose_names_the_verdict_this_evaluator_returns(self, monkeypatch):
         """Doc ratchet: ``SKILL.md`` and this script must agree on a pending draft.
 
-        The conductor acts on the prose, not on the code, so a doc naming the
-        wrong verdict is the same defect as a wrong return - and every
-        behavioural test in this class is blind to it, because none of them read
-        the doc.
-
-        So derive the word by RUNNING the evaluator, then hold the shipped file's
-        draft sentences to it. A rewording that keeps the fact passes; one that
-        promises a pending wait, or claims a draft cannot pass, fails.
+        The conductor acts on the prose, so the verdict word comes from RUNNING the
+        evaluator and the skill's draft sentences are held to it.
         """
         mod = work_acceptance
         self._wire(monkeypatch, [(8, "still running", ""), (0, "true", "")])

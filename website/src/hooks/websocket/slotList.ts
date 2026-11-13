@@ -13,6 +13,7 @@ import { clearIdleRowRefreshes, recordIdleRowRefresh } from './idleRowRefresh'
 import { CHAT_FOLDERS_WRITE_KEY } from '../../api/chatFoldersWrite'
 import { autoBatched } from '../../lib/streamBatch'
 import { noteAppSlotRows } from '../../utils/appSlotPush'
+import { createSlotStorageSweep } from '../../utils/slotStorageSweep'
 
 export interface SlotListSync {
   /** A new connection: forget the last-seen generations and raw frame. */
@@ -87,6 +88,7 @@ export function useSlotListSync(
   const resyncPendingRef = useRef(false)
 
   return useMemo<SlotListSync>(() => {
+    const sweepSlotStorage = createSlotStorageSweep()
     const resetForConnection = (): void => {
       // Forget the last-seen allowlist generation: it is process-local to the
       // gateway, so after a restart an equal number can mean a different
@@ -175,14 +177,35 @@ export function useSlotListSync(
         buffers.flushChunks()
       }
       // Query keys this frame has made stale; flushed once at the end.
-      const staleKeys = new Set<'chat-folders' | 'dashboardConfig' | 'chat-tags' | 'tag-columns'>()
+      const staleKeys = new Set<
+        'chat-folders' | 'dashboardConfig' | 'chat-tags' | 'tag-columns' | 'decisionsProvider' | 'decisionsConsent'
+      >()
       const beforeSettle = store.getState().chat
       // Ahead of `sseSlots` so its notification covers them too. Neither
       // reducer reads the slot list, nor does `sseSlots` read either flag.
       if (msg.yolo !== undefined) dispatch(autoBatched(sseYolo(msg.yolo)))
       if (msg.channelTrusted !== undefined) dispatch(autoBatched(setChannelTrusted(msg.channelTrusted)))
+      const snapshotSeenBefore = beforeSettle.slotsSnapshotSeen === true
       dispatch(sseSlots(data))
       lastSlotsArrayRef.current = store.getState().dashboard.slots
+      // localStorage is a side effect, so the orphan sweep runs here, after the
+      // reducers have applied this frame's hold fields and rows.
+      if (Array.isArray(data)) {
+        const { chat: applied, dashboard: list } = store.getState()
+        try {
+          sweepSlotStorage({
+            rows: data,
+            keptKeys: list.slots.map(slot => slot.key),
+            activeSlot: applied.activeSlot,
+            hold: {
+              partial: applied.slotListPartial,
+              heldKeys: applied.slotListHeldKeys ?? [],
+              holdChannels: applied.slotListHoldChannels,
+            },
+            snapshotSeenBefore,
+          })
+        } catch { /* best-effort: storage may be unavailable */ }
+      }
       // The frame may predate a create or fork this tab just made; if the
       // reducer kept that session, one list read settles it.
       dispatch(readUnlistedMembers())
@@ -299,12 +322,18 @@ export function useSlotListSync(
       // swaps it mid-session and bumps this generation, and the config
       // endpoint derives `social_share_enabled` from that ceiling. Without
       // this the cached answer would keep offering the Share entry for the
-      // rest of its stale window after the fleet withdrew it.
+      // rest of its stale window after the fleet withdrew it. The decision-model
+      // picker and the Decisions card read the same ceiling through their own
+      // answers (`provider_permitted` on the provider read, `permits` on the
+      // consent read), so a model the administrator just allowed or refused is
+      // read again too rather than kept for the provider read's unbounded window.
       if (typeof msg.governanceGeneration === 'number') {
         const prevGovGen = lastGovernanceGenRef.current
         lastGovernanceGenRef.current = msg.governanceGeneration
         if (prevGovGen === null || prevGovGen !== msg.governanceGeneration) {
           staleKeys.add('dashboardConfig')
+          staleKeys.add('decisionsProvider')
+          staleKeys.add('decisionsConsent')
         }
       }
       // One invalidation per key per frame. Several arms above can each

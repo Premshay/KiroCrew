@@ -40,7 +40,7 @@ def _source_label() -> str:
 
 
 def _is_harness_refusal(exc: BaseException) -> bool:
-    """Whether *exc* is the enterprise pool's harness refusal (RFC D6).
+    """Whether *exc* is the LTS pool's harness refusal (RFC D6).
 
     It is not an extraction failure to store past: no chunk can be extracted, so it
     reaches the ingest, which fails the job rather than commit empty metadata.
@@ -50,7 +50,20 @@ def _is_harness_refusal(exc: BaseException) -> bool:
     return isinstance(exc, KnowledgeHarnessUnavailable)
 
 
+def _fails_the_ingest(exc: BaseException) -> bool:
+    """The harness refusal, or the pool shut down under the extraction.
+
+    Either way no reply comes, so the error reaches the ingest instead of an
+    empty extraction it would store under the document's hash.
+    """
+    from kiro_crew.knowledge.llm_pool import LLMPoolClosed
+
+    return _is_harness_refusal(exc) or isinstance(exc, LLMPoolClosed)
+
+
 _PAYLOAD_KEYS = frozenset({"title", "entities", "relations", "category", "summary"})
+# Fields of an entity or relation record that the ingest treats as text.
+_RECORD_TEXT_KEYS = frozenset({"name", "type", "description", "source", "target"})
 
 
 def _extraction_shaped(value: object) -> bool:
@@ -66,8 +79,20 @@ EXTRACTION_PROMPT = """Extract structured information from this text chunk.
 
 Return valid JSON with:
 - title: short descriptive title for this chunk (5-10 words, specific to content)
-- entities: list of {{"name": str, "type": str, "description": str}}
+- entities: list of {{"name": str, "type": str, "description": str, "aliases": list[str]}}
   Types: person|service|api|concept|org|technology
+  Language rules:
+    * name MUST be the bare source-language canonical form of the entity
+      (e.g. "뮤직뱅크", NOT "뮤직뱅크 (Music Bank)")
+    * aliases contains established alternate names a user would naturally search for:
+      - official English name (for non-Latin entities, e.g. "Music Bank")
+      - common acronym (e.g. "BTS"), for lookup only, never as merge evidence
+      - widely used transliteration (e.g. "Nintendo" for "任天堂")
+    * Do NOT include parenthetical formatting variants as aliases
+      (e.g. "뮤직뱅크 (Music Bank)" is NOT a valid alias — "Music Bank" is)
+    * Latin-script names need no translation; aliases may include abbreviations for lookup
+    * Automatic alias-based identity reuse requires full names across scripts
+      (e.g. "뮤직뱅크" and "Music Bank"); short abbreviations never establish identity
 - relations: list of {{"source": str, "target": str, "type": str, "description": str}}
   Types: owns|uses|works_on|part_of|calls|depends_on
 - category: one of design_doc|runbook|meeting_notes|code_doc|presentation|report|policy|personal_notes|external_reference
@@ -112,7 +137,7 @@ class EntityExtractor:
             )
             response = await self._pool.send(prompt, timeout=EXTRACTION_TIMEOUT)
         except Exception as exc:
-            if _is_harness_refusal(exc):
+            if _fails_the_ingest(exc):
                 raise
             # The type only: an exception's message can echo the prompt, which
             # carries the document text.
@@ -152,7 +177,7 @@ class EntityExtractor:
         try:
             responses = await self._pool.send_batch(prompts, timeout=EXTRACTION_TIMEOUT)
         except Exception as exc:
-            if _is_harness_refusal(exc):
+            if _fails_the_ingest(exc):
                 raise
             # The type only: an exception's message can echo the prompt, which
             # carries the document text.
@@ -215,10 +240,27 @@ class EntityExtractor:
 
     @staticmethod
     def _validate(data: dict) -> dict:
+        # A model reply can parse as JSON yet carry the wrong types. Each field
+        # keeps its default unless it has the shape the ingest reads, so one
+        # odd reply cannot fail the whole document.
+        def _text(key: str, default: str) -> str:
+            value = data.get(key, default)
+            return value if isinstance(value, str) else default
+
+        def _records(key: str) -> list[dict]:
+            value = data.get(key, [])
+            if not isinstance(value, list):
+                return []
+            return [
+                {k: v for k, v in rec.items() if k not in _RECORD_TEXT_KEYS or isinstance(v, str)}
+                for rec in value
+                if isinstance(rec, dict)
+            ]
+
         return {
-            "title": data.get("title", ""),
-            "entities": data.get("entities", []),
-            "relations": data.get("relations", []),
-            "category": data.get("category", "document"),
-            "summary": data.get("summary", ""),
+            "title": _text("title", ""),
+            "entities": _records("entities"),
+            "relations": _records("relations"),
+            "category": _text("category", "document"),
+            "summary": _text("summary", ""),
         }

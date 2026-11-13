@@ -132,7 +132,7 @@ async def world(monkeypatch, tmp_path, close_skills_loaders):
         persist_member_config(cfg, member, create=True)
         key = f"dashboard:{member}"
         bind_private_session_store(key, stores[member])
-        log.update_metadata(key, {"memory_store": stores[member]})
+        await asyncio.to_thread(log.update_metadata, key, {"memory_store": stores[member]})
         vectors = await builder.ensure_store(stores[member])
         vectors.write_lesson(f"{member.upper()}_LEARNED_MARKER", "tool", None, "test")
         from kiro_crew.members import member_slug, write_member_rules

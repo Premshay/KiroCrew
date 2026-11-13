@@ -56,7 +56,11 @@ Two structural properties of the runner:
   it owned had been classified as an unknown.
 - **A script that cannot run is exit 2, not a finding.** A spawn error, a signal
   kill, or a stdout-buffer overflow means the table would be built from truncated
-  text a regex might read as a pass, so the runner bails out instead.
+  text a regex might read as a pass, so the runner bails out instead. The same goes
+  for a script still running after five minutes (`SCRIPT_TIMEOUT_MS` in
+  `scripts/lib/i18n-run-script.mjs`; the slowest takes about a minute): it is killed
+  and its `FATAL` line names it, so a hung script ends the step within minutes
+  instead of holding it silent until the job's 20-minute cap.
   Symmetrically, a script that exits 0 while printing nothing a row recognises is
   `MISSING` and **fails** the step: a check that quietly stopped measuring is the
   defect the runner exists to remove.
@@ -177,7 +181,11 @@ The diff-scoped checks read the branch against a base ref, supplied as
 
 `actions/checkout` fetches depth 1, so the base is not present and a `git show`
 against it would fail. `.github/scripts/resolve-i18n-base.sh` fetches exactly that
-one ref, and the three call sites `|| exit 1` on it.
+one ref, and the three call sites `|| exit 1` on it. It fetches at depth 1 only when
+the checkout is already shallow, so a full clone (a local run, or a `fetch-depth: 0`
+job such as `frontend-ratchets`) and the worktrees sharing it keep their full history.
+The local form measures from the merge-base, as the local gate does:
+`I18N_BASE_REF="$(.github/scripts/resolve-i18n-base.sh "$(git merge-base HEAD origin/main)")"`.
 
 **A gate that cannot run must fail, not pass.** `check-source-strings.mjs` skips
 itself and exits 0 when the base ref is unreadable, and a failed fetch used to sail
@@ -360,10 +368,12 @@ Known limits of the render gate, named rather than papered over:
 - **A PR whose base is not `main` never runs `ci.yml` at all**, because
   `pull_request: branches: [main]` filters on the base branch. A stacked PR gets no
   render gate until it is rebased.
-- **`main` verdicts are sampled, not per-commit, when `MERGE_QUEUE_ENABLED` is
-  not `'true'`.** The concurrency group permits one pending run and GitHub evicts
-  it when a newer one queues, so a commit whose run was evicted has its delta fall
-  between two `github.event.before` boundaries and is never diffed. With the merge
+- **`main` verdicts are sampled, not per-commit, on a push the merge queue did
+  not land** (`MERGE_QUEUE_ENABLED` not `'true'`, or a push by anyone but
+  `github-merge-queue[bot]`). The concurrency group permits one pending run and
+  GitHub evicts it when a newer one queues, so a commit whose run was evicted has
+  its delta fall between two `github.event.before` boundaries and is never
+  diffed. With the merge
   queue on, each merge group is diffed against its own `base_sha` before it lands.
 - **Truncation measurement is not fully deterministic.** It compares a measured
   truncation ratio against a budget, so a label within roughly 10% of its budget can

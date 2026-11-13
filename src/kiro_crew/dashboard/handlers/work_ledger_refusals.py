@@ -45,6 +45,10 @@ _CODE_STATUS: dict[str, int] = {
     work_ledger.CODE_INVALID_ACTION: 400,
     work_ledger.CODE_INVALID_STATUS: 400,
     work_ledger.CODE_INVALID_VALUE: 400,
+    work_ledger.CODE_WAKE_AT_REQUIRES_PROGRESS: 400,
+    work_ledger.CODE_WAKE_AT_INVALID: 400,
+    work_ledger.CODE_WAKE_AT_IN_PAST: 400,
+    work_ledger.CODE_WAKE_AT_TOO_FAR: 400,
     # Raised only by ``work_ledger.purge_conductor``, the maintenance primitive
     # behind ``kirocrew ledger-sweep``, which no route calls. Mapped
     # anyway because this map is asserted EXHAUSTIVE over the store's ``CODE_*``
@@ -72,6 +76,7 @@ ROUTE_CODES: frozenset[str] = frozenset(
         "invalid_json",
         "invalid_body",
         "ledger_write_failed",
+        "ledger_unreadable",
         "crew_log_off",
         "crew_log_unit_unknown",
         "crew_log_unreadable",

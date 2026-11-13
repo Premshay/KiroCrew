@@ -41,7 +41,17 @@ vi.mock('framer-motion', async () => {
       }
       return React.createElement(tag, { ...clean, ref }, props.children as React.ReactNode)
     })
-  const motion = new Proxy({}, { get: (_t, tag: string) => make(tag) })
+  // One component per tag, so `motion.div` is the same type on every render. A
+  // fresh type per read remounts Modal's dialog on each sidebar commit, and a
+  // dialog node a test holds goes stale before its click: the click reaches no
+  // handler and the confirmation never settles.
+  const byTag = new Map<string, ReturnType<typeof make>>()
+  const motion = new Proxy({}, {
+    get: (_t, tag: string) => {
+      if (!byTag.has(tag)) byTag.set(tag, make(tag))
+      return byTag.get(tag)
+    },
+  })
   return {
     motion,
     AnimatePresence: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
@@ -78,6 +88,7 @@ Object.defineProperty(window, 'matchMedia', {
 import ChatSidebar from '../pages/ChatSidebar'
 import { RESUME_ALL_CONFIRM_ABOVE, RESUME_ALL_MAX_RUNNING, interruptedIdleSlots, resumeAllResultText } from '../pages/chat-sidebar/resumeAll'
 import { MORE_BELOW_MASK } from '../components/ModelEffortDropdown'
+import { RESUME_ALL_DISMISSED_KEY } from '../lib/resumeAllDismissed'
 import { RESUME_ALL_DONE_EVENT } from '../lib/resumeAllEvent'
 import { isChatPageSurface } from '../utils/channelOrigin'
 import { crewModeView } from '../lib/crewMode'
@@ -181,6 +192,31 @@ describe('chat sidebar — Resume all interrupted sessions', () => {
     const button = getByTestId('resume-all-button')
     expect(button.textContent).toBe('Resume 2 sessions')
     expect(button).not.toBeDisabled()
+  })
+
+  it('names each session a press would resume, before the press (#30846)', async () => {
+    const { getByTestId } = renderSidebar([
+      slot('a', { interrupted: true, title: 'Fix the login page' }),
+      slot('c', { interrupted: true, running: true, title: 'Still running' }),
+      slot('b', { interrupted: true, title: '' }),
+      slot('d', { title: 'Not interrupted' }),
+    ])
+    await settle()
+    const names = getByTestId('resume-all-names')
+    // An untitled session falls back to its key, as the problems notice does.
+    expect(Array.from(names.querySelectorAll('li')).map(li => li.textContent)).toEqual(['Fix the login page', 'b'])
+    expect(names.querySelector('li')).toHaveAttribute('title', 'Fix the login page')
+  })
+
+  it('names the sessions up to the threshold, and leaves it to the confirmation above it', async () => {
+    const few = Array.from({ length: RESUME_ALL_CONFIRM_ABOVE }, (_, i) => slot(`s${i}`, { interrupted: true }))
+    const first = renderSidebar(few)
+    await settle()
+    expect(first.getByTestId('resume-all-names').querySelectorAll('li')).toHaveLength(RESUME_ALL_CONFIRM_ABOVE)
+    first.unmount()
+    const many = renderSidebar([...few, slot('extra', { interrupted: true })])
+    await settle()
+    expect(many.queryByTestId('resume-all-names')).toBeNull()
   })
 
   it('one press is one POST; the row is pending until the run outcome arrives', async () => {
@@ -436,7 +472,84 @@ describe('chat sidebar — Resume all interrupted sessions', () => {
   })
 })
 
-type CountRow = Pick<ChatSlot, 'mode' | 'surface' | 'running' | 'interrupted' | 'subagents_running' | 'executor' | 'crew_root'>
+describe('chat sidebar — closing the interrupted-sessions banner', () => {
+  it('hides the banner for the listed sessions and keeps the choice', async () => {
+    const rows = [slot('a', { interrupted: true }), slot('b', { interrupted: true })]
+    const first = renderSidebar(rows)
+    await settle()
+    fireEvent.click(first.getByTestId('resume-all-dismiss'))
+    expect(first.queryByTestId('resume-all-row')).toBeNull()
+    expect(resumeAll).not.toHaveBeenCalled()
+    expect(JSON.parse(localStorage.getItem(RESUME_ALL_DISMISSED_KEY) ?? '[]')).toEqual(['a', 'b'])
+    first.unmount()
+    // A reload reads the choice back.
+    const second = renderSidebar(rows)
+    await settle()
+    expect(second.queryByTestId('resume-all-row')).toBeNull()
+  })
+
+  it('reports when the dismissal cannot be saved while hiding the current banner', async () => {
+    const view = renderSidebar([slot('a', { interrupted: true })])
+    await settle()
+    const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('Storage is disabled', 'SecurityError')
+    })
+    try {
+      fireEvent.click(view.getByTestId('resume-all-dismiss'))
+      expect(view.queryByTestId('resume-all-row')).toBeNull()
+      const notice = view.getByTestId('resume-all-dismiss-error')
+      expect(notice.textContent).toContain('Could not save your choice')
+      expect(notice.textContent).toContain('The banner is closed for now, but it will come back when you reload.')
+    } finally {
+      setItem.mockRestore()
+    }
+  })
+
+  it('names what the close button commits to', async () => {
+    const { getByTestId } = renderSidebar([slot('a', { interrupted: true })])
+    await settle()
+    const label = 'Dismiss: hide this notice until another session is interrupted'
+    expect(getByTestId('resume-all-dismiss')).toHaveAttribute('aria-label', label)
+    expect(getByTestId('resume-all-dismiss')).toHaveAttribute('title', label)
+  })
+
+  it('returns for a session that becomes interrupted later, and resumes that one alone', async () => {
+    resumeAll.mockResolvedValue({ ok: true, total: 1, run_id: 'run-1' })
+    const view = renderSidebar([slot('a', { interrupted: true })])
+    await settle()
+    fireEvent.click(view.getByTestId('resume-all-dismiss'))
+    expect(view.queryByTestId('resume-all-row')).toBeNull()
+    view.setSlots([slot('a', { interrupted: true }), slot('b', { interrupted: true })])
+    await settle()
+    expect(view.getByTestId('resume-all-row').getAttribute('data-resume-all-count')).toBe('1')
+    expect(Array.from(view.getByTestId('resume-all-names').querySelectorAll('li')).map(li => li.textContent)).toEqual(['b'])
+    await act(async () => { fireEvent.click(view.getByTestId('resume-all-button')) })
+    expect(resumeAll).toHaveBeenCalledWith(false, ['b'])
+  })
+
+  it('forgets a closed session once it is no longer interrupted, so the next interruption shows', async () => {
+    const view = renderSidebar([slot('a', { interrupted: true })])
+    await settle()
+    fireEvent.click(view.getByTestId('resume-all-dismiss'))
+    expect(localStorage.getItem(RESUME_ALL_DISMISSED_KEY)).not.toBeNull()
+    view.setSlots([slot('a')])
+    await settle()
+    expect(localStorage.getItem(RESUME_ALL_DISMISSED_KEY)).toBeNull()
+    view.setSlots([slot('a', { interrupted: true })])
+    await settle()
+    expect(view.getByTestId('resume-all-row').getAttribute('data-resume-all-count')).toBe('1')
+  })
+
+  it('offers no close button while a run is in flight', async () => {
+    resumeAll.mockResolvedValue({ ok: true, total: 1, run_id: 'run-1' })
+    const { getByTestId, queryByTestId } = renderSidebar([slot('a', { interrupted: true })])
+    await act(async () => { fireEvent.click(getByTestId('resume-all-button')) })
+    await waitFor(() => expect(getByTestId('resume-all-button')).toBeDisabled())
+    expect(queryByTestId('resume-all-dismiss')).toBeNull()
+  })
+})
+
+type CountRow = Pick<ChatSlot, 'mode' | 'surface' | 'running' | 'interrupted' | 'interrupted_stale' | 'subagents_running' | 'executor' | 'crew_root'>
 type CountCase = { name: string; crew_mode?: boolean; slots: { key: string; row: CountRow | null }[]; expected: string[] }
 
 describe('the shared count fixture (test/fixtures/resume_all_candidates.json)', () => {

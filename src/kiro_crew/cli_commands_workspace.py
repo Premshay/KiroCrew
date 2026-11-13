@@ -38,7 +38,7 @@ from kiro_crew.validation import WORKSPACE_NAME_RE
 # keystone policy files. The refusal is deliberate — say so, and say what to pass
 # instead, rather than a bare "invalid directory path".
 _WS_DIR_OUTSIDE_HOME = (
-    "Error: --dir must resolve inside the KiroCrew data home ({home}); got {given!r}. "  # brand-ok -- moved verbatim; user-visible refusal text, respelling is a separate change
+    "Error: --dir must resolve inside the Kiro Crew data home ({home}); got {given!r}. "
     "Pass a relative directory name (e.g. 'workspace-myproject')."
 )
 
@@ -428,10 +428,17 @@ def _handle_workspace(args: argparse.Namespace) -> None:
                     )
                 try:
                     platform_compat.publish_dir_noreplace(staged_path, dst_path)
-                except (FileExistsError, OSError) as exc:
+                except FileExistsError as exc:
                     raise _CliConflict(
                         f"destination directory '{ws_dir}' already exists; "
                         "choose another dir or remove it first"
+                    ) from exc
+                except OSError as exc:
+                    # Not an occupied destination: a Windows sharing violation
+                    # (a file in the copy held open) or similar. Name it.
+                    raise _CliConflict(
+                        f"could not move the copied workspace into '{ws_dir}': {exc}. "
+                        "Nothing was registered; retry the create"
                     ) from exc
                 install_state["installed"] = True
             # A create with no copy source still needs a usable provider cwd and

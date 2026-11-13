@@ -266,6 +266,10 @@ class _Sessions:
         self.targeted.append(("try_acquire", key))
         return False
 
+    def is_retiring(self, key: str) -> bool:
+        self.targeted.append(("is_retiring", key))
+        return False
+
     def clear_queue(self, key: str, owned_by: Any = None) -> None:
         self.targeted.append(("clear_queue", key))
 
@@ -326,6 +330,9 @@ class _ConversationLog:
     def list_sessions(self) -> list[dict]:
         self.list_calls += 1
         return list(self.rows)
+
+    def list_sessions_indexed(self) -> list[dict]:
+        return self.list_sessions()
 
     def search_sessions(self, query: str, limit: int = 50) -> list[dict]:
         """Mirror KiroCrewHistory.search_sessions' FIELD COVERAGE and phrase

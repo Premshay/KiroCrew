@@ -38,8 +38,13 @@ from kiro_crew.dashboard.chat_utils import (
     reject_if_slot_under_construction,
     slot_history_key,
 )
-from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
+from kiro_crew.dashboard.kiro_readiness import (
+    refuse_rerun_after_signed_out_turn,
+    reject_if_kiro_unverified,
+    rerun_signs_in_via_kiro_cli,
+)
 from kiro_crew.dashboard.relay_archive import relay_archive_refusal
+from kiro_crew.dashboard.slot_buffers import flush_restored_hold
 from kiro_crew.dashboard.slot_ownership import (
     audit_app_slot_denial,
     checkpoint_slot_replaced,
@@ -124,12 +129,15 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
     """
     # Destructive: this truncates and PERSISTS history before the background
     # turn runs, so a failed turn cannot undo it. Unlike an ordinary send, the
-    # readiness latch must be honored BEFORE the mutation.
-    blocked = await reject_if_kiro_unverified(request)
-    if blocked is not None:
-        return blocked
+    # readiness latch must be honored BEFORE the mutation, when that turn signs
+    # in via kiro-cli.
     state: DashboardState = request.app["state"]
     name = request.match_info["slot"]
+    kiro_turn = await rerun_signs_in_via_kiro_cli(state.sessions, state._slots.get(name))
+    if kiro_turn:
+        blocked = await reject_if_kiro_unverified(request)
+        if blocked is not None:
+            return blocked
     slot = state._slots.get(name)
     request_app = request.get("app", "")
     # The readiness await above can outlast a close and a same-name create; the
@@ -171,9 +179,29 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
     if len(content) > 32_768:
         return web.json_response({"error": "content too long (max 32768 chars)"}, status=400)
 
+    # The stored Ultra Mode pause is read (off the loop) before the pause
+    # check under the lock, so a paused crew's history is not rewritten
+    # right after a restart.
+    from kiro_crew import crew_pause as _crew_pause
+
+    await _crew_pause.ensure_loaded()
     async with slot._lock:
         if request_app and state._slots.get(name) is not slot:
             return slot_not_found()
+        # Whether this chat has sub-agent work that a discard would end. With none,
+        # the rewind discards exactly as it always has; with some, it first tries to
+        # swap the conversation on the live process (``swap_conversation``), which
+        # keeps them running and reporting to this chat. The same predicate the
+        # reset route and the deferred discard read, failing toward "attached".
+        # It awaits a store read, and a send, a pause or a cron append can land
+        # meanwhile without this lock, so it runs BEFORE every check and every
+        # read of the window below.
+        from kiro_crew.dashboard.chat_utils_completion import subagents_attached_async
+
+        probed_session_key = effective_session_key(slot)
+        keep_children = state.sessions is not None and await subagents_attached_async(
+            state, slot, probed_session_key, "chat.rewind"
+        )
         if slot.running:
             return web.json_response({"error": "slot is running"}, status=409)
         if slot.is_closing:
@@ -185,6 +213,19 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": "slot is closing", "code": "slot_closing"}, status=409
             )
+        from kiro_crew import crew_pause
+
+        if crew_pause.holds_slot(slot):
+            # Nothing is truncated: a rewind whose replacement turn cannot run
+            # while the crew is paused would leave a rewritten chat unanswered.
+            return web.json_response(
+                {"error": "this crew is paused; resume it from the Board", "code": "crew_paused"},
+                status=409,
+            )
+        if not kiro_turn:
+            signed_out = refuse_rerun_after_signed_out_turn(slot)
+            if signed_out is not None:
+                return signed_out
 
         msgs = slot.messages
 
@@ -265,6 +306,16 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
         # Capture orphan info before any mutation, so we can clean up the
         # kiro-cli session file even if the swap path errors out partway.
         session_key = effective_session_key(slot)
+        if session_key != probed_session_key:
+            # A cron injection re-linked the slot during the probe, so its answer
+            # is about another session.
+            return web.json_response(
+                {
+                    "error": "the conversation changed while saving; retry the edit",
+                    "code": "rewind_slot_rebound",
+                },
+                status=409,
+            )
 
         # An app may rewind only the slot's OWN dashboard session. An
         # app-owned slot can carry a channel link (``linked_session_key``),
@@ -277,6 +328,26 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
                 request_app, "chat.slot_rewind", name, "app cannot rewind a channel-linked slot"
             )
             return slot_not_found()
+
+        # A hold a restart restored into this idle slot is owed to this turn, above
+        # its user row. Flushed on the LIVE slot, not the scratch copy below: the
+        # copy shares the hold and its note dicts, so a flush there would retire
+        # notes from the live hold for rows a refused rewind then throws away. A
+        # refused rewind leaves the notes delivered here, as the next seam would.
+        rewound_row = msgs[index]
+        pre_flush_rows = list(slot.messages)
+        pre_flush_ids = {id(row) for row in pre_flush_rows}
+        flush_restored_hold(slot, logger=logger)
+        restored_rows = [row for row in slot.messages if id(row) not in pre_flush_ids]
+        # The flush's append can trim the window's front, which moves the index
+        # and the archived count it is offset by.
+        index = next((i for i, row in enumerate(slot.messages) if row is rewound_row), -1)
+        disk_older = getattr(slot, "_disk_older_count", 0)
+        if index < 0:
+            return web.json_response(
+                {"error": "user message not found", "code": "user_message_not_found"},
+                status=400,
+            )
 
         # The transcript this rewind was authorized against. A concurrent
         # rebinding (a cron injection re-linking the slot) moves the slot to
@@ -296,7 +367,8 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
         # while either durable boundary below is pending, so exposing a truncated
         # live window here could make a rejected edit permanent.
         prospective_slot = copy.copy(slot)
-        prospective_slot.messages = list(slot.messages[:index])
+        # The restored notes' rows follow the kept prefix, above the rewound row.
+        prospective_slot.messages = list(slot.messages[:index]) + restored_rows
         prospective_slot._queue = []
         prospective_slot._pending = list(slot._pending)
         prospective_slot._question_pending = dict(slot._question_pending)
@@ -466,6 +538,9 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
         # Durably clear the native resume sid before committing the edited
         # history. A failure leaves the original branch intact and dispatches
         # no replacement turn.
+        # True once the conversation was swapped on the live process, which has
+        # then already started the fresh one: there is no cold start to fork.
+        swapped = False
         try:
             if state.sessions is not None:
                 # Shielded and drained for the same reason the history save below
@@ -478,15 +553,32 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
                 # gone and nothing recorded. The shield does not make the teardown
                 # slower -- it was always going to run to completion -- it only
                 # keeps this handler alive long enough to learn the outcome.
-                discard_task = asyncio.ensure_future(
+                sessions = state.sessions
+
+                async def _drop_native_conversation() -> bool:
                     # ``skip_if_busy``: an inbound channel turn (a Slack reply
                     # on the linked session) holds the session semaphore while
                     # ``slot.running`` reads False, so the idle check above
                     # cannot see it -- an unconditional discard would tear
                     # down its provider mid-reply. The refusal is atomic with
-                    # the busy probe inside the lifecycle service.
-                    state.sessions.discard_conversation(session_key, skip_if_busy=True)
-                )
+                    # the busy probe inside the lifecycle service; the swap
+                    # refuses on the same probe.
+                    nonlocal swapped
+                    if not keep_children:
+                        return await sessions.discard_conversation(session_key, skip_if_busy=True)
+                    outcome = await sessions.swap_conversation(session_key)
+                    if outcome == "swapped":
+                        swapped = True
+                        return True
+                    if outcome == "busy":
+                        return False
+                    return await sessions.discard_conversation(
+                        session_key,
+                        skip_if_busy=True,
+                        teardown_reason="the edit could not reuse the chat's process",
+                    )
+
+                discard_task = asyncio.ensure_future(_drop_native_conversation())
                 try:
                     discarded = await asyncio.shield(discard_task)
                 except asyncio.CancelledError:
@@ -1005,7 +1097,7 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
             # Read by the replacement turn's cold start, which the reserved
             # dispatch only begins once ``dispatch_ready`` is set below.
             # Best-effort: a fork that is never armed falls back to the replay.
-            if orphan_kiro_session_id and native_fork_point:
+            if orphan_kiro_session_id and native_fork_point and not swapped:
                 try:
                     state.sessions._session_map.set_native_fork(
                         session_key, orphan_kiro_session_id, native_fork_point

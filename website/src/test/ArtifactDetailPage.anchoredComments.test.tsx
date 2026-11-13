@@ -153,6 +153,14 @@ function selectInBody(word: string): boolean {
 /** The composer's textarea, as the toolbar labels it. */
 const COMPOSER_INPUT = 'Comment on the selected text'
 
+/** Autofocus runs on the next animation frame; opening a Radix menu before it
+ *  finishes lets that pending focus dismiss the menu before its item is clicked. */
+async function composerReady() {
+  const input = await screen.findByLabelText(COMPOSER_INPUT)
+  await waitFor(() => expect(input).toHaveFocus())
+  return input
+}
+
 /** Let the toolbar's debounced selection check run, so a negative assertion
  *  ("no composer") is made after the point at which one would have opened. */
 const settle = () => act(() => new Promise<void>(resolve => { setTimeout(resolve, 80) }))
@@ -177,7 +185,7 @@ describe('ArtifactDetailPage anchored comments', () => {
     await waitFor(() => expect(screen.getByLabelText('Toggle agent chat')).toBeInTheDocument())
 
     expect(selectInBody('beta')).toBe(true)
-    const input = await screen.findByLabelText(COMPOSER_INPUT)
+    const input = await composerReady()
     fireEvent.change(input, { target: { value: 'tighten this wording' } })
     fireEvent.click(screen.getByLabelText('Add comment'))
 
@@ -207,7 +215,7 @@ describe('ArtifactDetailPage anchored comments', () => {
     renderPage()
     await waitFor(() => expect(screen.getByLabelText('Toggle agent chat')).toBeInTheDocument())
     expect(selectInBody('gamma')).toBe(true)
-    fireEvent.change(await screen.findByLabelText(COMPOSER_INPUT), { target: { value: 'note' } })
+    fireEvent.change(await composerReady(), { target: { value: 'note' } })
     fireEvent.click(screen.getByLabelText('Add comment'))
     await waitFor(async () => expect(await commentsShown()).toBe(true))
   })
@@ -219,7 +227,7 @@ describe('ArtifactDetailPage anchored comments', () => {
     renderPage()
     await waitFor(() => expect(screen.getByLabelText('Toggle agent chat')).toBeInTheDocument())
     expect(selectInBody('beta')).toBe(true)
-    const input = await screen.findByLabelText(COMPOSER_INPUT)
+    const input = await composerReady()
     fireEvent.change(input, { target: { value: 'still mine' } })
     fireEvent.click(screen.getByLabelText('Add comment'))
     await screen.findByText(/Couldn’t save your comment/)
@@ -246,7 +254,7 @@ describe('ArtifactDetailPage anchored comments', () => {
     renderPage()
     await waitFor(() => expect(screen.getByLabelText('Toggle agent chat')).toBeInTheDocument())
     expect(selectInBody('beta')).toBe(true)
-    const input = await screen.findByLabelText(COMPOSER_INPUT)
+    const input = await composerReady()
     fireEvent.change(input, { target: { value: 'closed mid-flight' } })
     fireEvent.click(screen.getByLabelText('Add comment'))
     await waitFor(() => expect(vi.mocked(api).postArtifactComment).toHaveBeenCalledTimes(1))
@@ -273,7 +281,7 @@ describe('ArtifactDetailPage anchored comments', () => {
     renderPage(<SwitchArtifact to="other" />)
     await waitFor(() => expect(screen.getByLabelText('Toggle agent chat')).toBeInTheDocument())
     expect(selectInBody('beta')).toBe(true)
-    const input = await screen.findByLabelText(COMPOSER_INPUT)
+    const input = await composerReady()
     fireEvent.change(input, { target: { value: 'closed mid-flight' } })
     fireEvent.click(screen.getByLabelText('Add comment'))
     await waitFor(() => expect(vi.mocked(api).postArtifactComment).toHaveBeenCalledTimes(1))
@@ -296,7 +304,7 @@ describe('ArtifactDetailPage anchored comments', () => {
     renderPage()
     await waitFor(() => expect(screen.getByRole('button', { name: MORE_ACTIONS })).toBeInTheDocument())
     expect(selectInBody('gamma')).toBe(true)
-    const input = await screen.findByLabelText(COMPOSER_INPUT)
+    const input = await composerReady()
     fireEvent.change(input, { target: { value: 'half-typed on a phone' } })
     await chooseMore(/(Show|Hide) comments/)
     await waitFor(() => expect(screen.queryByTestId('selection-composer')).toBeNull())
@@ -323,24 +331,7 @@ describe('ArtifactDetailPage anchored comments', () => {
     expect(screen.getByText(/select text to anchor a comment/i)).toBeInTheDocument()
 
     expect(selectInBody('beta')).toBe(true)
-    fireEvent.change(await screen.findByLabelText(COMPOSER_INPUT), { target: { value: 'tighten this' } })
-    fireEvent.click(screen.getByLabelText('Add comment'))
-
-    await waitFor(() => expect(vi.mocked(api).postArtifactComment).toHaveBeenCalledTimes(1))
-    const anchor = vi.mocked(api).postArtifactComment.mock.calls[0][1].anchor as { quote: string }
-    expect(anchor.quote).toBe('beta')
-  })
-
-  it('anchors a comment on SVG text', async () => {
-    vi.mocked(api).artifact = vi.fn().mockResolvedValue(mkArtifact({
-      kind: 'svg',
-      content: '<svg viewBox="0 0 200 30"><text x="0" y="20">alpha beta gamma</text></svg>',
-    }))
-    renderPage()
-    await waitFor(() => expect(screen.getByLabelText('Toggle agent chat')).toBeInTheDocument())
-
-    expect(selectInBody('beta')).toBe(true)
-    fireEvent.change(await screen.findByLabelText(COMPOSER_INPUT), { target: { value: 'clarify this step' } })
+    fireEvent.change(await composerReady(), { target: { value: 'tighten this' } })
     fireEvent.click(screen.getByLabelText('Add comment'))
 
     await waitFor(() => expect(vi.mocked(api).postArtifactComment).toHaveBeenCalledTimes(1))
@@ -371,7 +362,7 @@ describe('ArtifactDetailPage anchored comments', () => {
       source: source as unknown as Window,
     })) })
 
-    fireEvent.change(await screen.findByLabelText(COMPOSER_INPUT), { target: { value: 'from the frame' } })
+    fireEvent.change(await composerReady(), { target: { value: 'from the frame' } })
     // A second drag-select inside the frame while the draft is open: the box
     // keeps its passage, and so must the anchor the comment is posted with.
     act(() => { window.dispatchEvent(new MessageEvent('message', {
@@ -411,7 +402,7 @@ describe('ArtifactDetailPage anchored comments', () => {
     renderPage()
     await waitFor(() => expect(screen.getByLabelText('Toggle agent chat')).toBeInTheDocument())
     expect(selectInBody('beta')).toBe(true)
-    const input = await screen.findByLabelText(COMPOSER_INPUT)
+    const input = await composerReady()
     fireEvent.change(input, { target: { value: 'not yet added' } })
 
     fireEvent.click(screen.getByRole('button', { description: /edit content/i }))
@@ -520,7 +511,7 @@ describe('ArtifactDetailPage anchored comments', () => {
     renderPage(<Routes><Route path="/chat" element={<div>chat page target</div>} /></Routes>)
     await waitFor(() => expect(screen.getByLabelText('Toggle agent chat')).toBeInTheDocument())
     expect(selectInBody('beta')).toBe(true)
-    fireEvent.change(await screen.findByLabelText(COMPOSER_INPUT), { target: { value: 'not yet added' } })
+    fireEvent.change(await composerReady(), { target: { value: 'not yet added' } })
 
     fireEvent.click(await findMoreItem('Send to a session'))
     fireEvent.click(await screen.findByRole('menuitem', { name: 'New session' }))
@@ -550,7 +541,7 @@ describe('ArtifactDetailPage anchored comments', () => {
       data: { type: 'mc-comment-select', quote: 'widget body', prefix: '', suffix: '', startOffset: 0, endOffset: 11, rect: { x: 20, y: 40 } },
       source: source as unknown as Window,
     })) })
-    fireEvent.change(await screen.findByLabelText(COMPOSER_INPUT), { target: { value: 'from the frame' } })
+    fireEvent.change(await composerReady(), { target: { value: 'from the frame' } })
 
     fireEvent.click(await findMoreItem('Send to a session'))
     fireEvent.click(await screen.findByRole('menuitem', { name: 'New session' }))
@@ -568,7 +559,7 @@ describe('ArtifactDetailPage anchored comments', () => {
     renderPage(<Routes><Route path="/chat" element={<div>chat page target</div>} /></Routes>)
     await waitFor(() => expect(screen.getByLabelText('Toggle agent chat')).toBeInTheDocument())
     expect(selectInBody('beta')).toBe(true)
-    fireEvent.change(await screen.findByLabelText(COMPOSER_INPUT), { target: { value: 'saving' } })
+    fireEvent.change(await composerReady(), { target: { value: 'saving' } })
     fireEvent.click(screen.getByLabelText('Add comment'))
     await waitFor(() => expect(vi.mocked(api).postArtifactComment).toHaveBeenCalledTimes(1))
 

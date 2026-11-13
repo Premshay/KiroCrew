@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import subprocess
 import sys
 from functools import partial
@@ -175,11 +176,17 @@ def _mark_bedrock_searchable(sources: list[dict]) -> None:
     recovery. Every other cause is ``unknown`` and the dashboard offers no
     recovery for it, because ``knowledge.db`` is agent-writable and a row the
     gateway never registered must not be presented as one to add again.
+
+    A searchable row also gets ``last_search`` once a search has reached it
+    since the gateway started (:func:`bedrock_kb.last_searches`).
     """
     rows = [s for s in sources if s.get("source_type") == "bedrock_kb"]
     if not rows:
         return
     from kiro_crew import aws_consent as consent_mod
+    from kiro_crew.knowledge.connectors import bedrock_kb
+
+    last_searches = bedrock_kb.last_searches()
 
     try:
         grant, attested = consent_mod.bedrock_authorization_snapshot()
@@ -201,6 +208,8 @@ def _mark_bedrock_searchable(sources: list[dict]) -> None:
             source["searchable"] = bool(
                 consent_mod.source_matches_attestation(attested, sid, uri, props)
             )
+            if source["searchable"] and sid in last_searches:
+                source["last_search"] = last_searches[sid]
             if not source["searchable"]:
                 entry = recorded.get(sid)
                 other_account = (
@@ -798,6 +807,38 @@ async def add_source(request: web.Request) -> web.Response:
     if existing:
         return _source_exists_response(source_type, existing["id"])
 
+    # A folder typed with a trailing separator or a "." segment names the same
+    # directory as its plain spelling, but the check above matches spellings
+    # exactly. When a row already holds one of those spellings, answer with that
+    # row instead of adding a second one that would ingest the folder again.
+    # The new row keeps the spelling it was given, as before. Lexical only: ".."
+    # is never collapsed, since that can change which directory a symlinked
+    # path names.
+    if source_type in ("local_folder", "obsidian_vault") and probe is not None and probe.is_dir:
+        plain = str(Path(uri))
+        for spelling in dict.fromkeys((plain, plain + os.sep, plain + os.sep + ".")):
+            if spelling == uri:
+                continue
+            same = await asyncio.to_thread(store.get_source_by_uri, spelling)
+            if same:
+                logger.warning(
+                    "Folder source %s is already registered as %s; not adding it again",
+                    uri,
+                    spelling,
+                )
+                # The row's id under "id" too, the key every caller reads: the
+                # md-notebook app confirms the id it gets back, as it does for a
+                # 409, and the Knowledge tab's follow-up sync is a no-op for a
+                # folder (its connector never reports changes; the watcher
+                # scans it).
+                return web.json_response(
+                    {
+                        "id": same["id"],
+                        "status": "exists",
+                        "warning": f"This folder is already a source ({spelling}).",
+                    }
+                )
+
     # The name every insert below stores, resolved once the uri is final; a
     # blank name falls back to the uri. Only a bedrock_kb name is cut, and it
     # is cut rather than refused: the search reads those rows through
@@ -815,6 +856,18 @@ async def add_source(request: web.Request) -> web.Response:
         from kiro_crew.platform import redact_via_context
 
         stored_name = redact_via_context(stored_name)[:bedrock_name_cap]
+    # JSON allows escaped lone surrogates; UTF-8, which SQLite binds the name
+    # as, does not. Every path below that answers 2xx inserts it.
+    try:
+        stored_name.encode("utf-8")
+    except UnicodeEncodeError:
+        return web.json_response(
+            {
+                "error": "name contains characters that cannot be encoded",
+                "code": "text_not_encodable",
+            },
+            status=400,
+        )
 
     # Folder sources: discovery walk + pending_confirmation (no auto-scan)
     if source_type in ("local_folder", "obsidian_vault"):
@@ -988,37 +1041,82 @@ async def delete_source(request: web.Request) -> web.Response:
 
 
 async def rename_source(request: web.Request) -> web.Response:
-    """PATCH /api/knowledge/sources/{id} -- rename a source (name only).
+    """PATCH /api/knowledge/sources/{id} -- rename a source, or set a folder
+    source's ``ignore_patterns``.
 
-    Only ``name`` is editable; ``uri`` (the source identity) stays immutable.
+    ``name`` is required unless ``ignore_patterns`` is sent; ``uri`` (the source
+    identity) stays immutable. Every field sent is checked before anything is
+    written.
     """
     owner_denied = await _require_knowledge_owner(request, "knowledge.source.rename")
     if owner_denied is not None:
         return owner_denied
     store = _store(request)
     source_id = request.match_info["id"]
-    if not await asyncio.to_thread(_source_row, store, source_id):
+    row = await asyncio.to_thread(_source_row, store, source_id)
+    if not row:
         return web.json_response({"error": "not found"}, status=404)
     body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
     assert body is not None  # read_bounded_json returns (dict, None) on success
     name = body.get("name")
-    if not isinstance(name, str):
-        return web.json_response({"error": "name must be a string"}, status=400)
-    name = name.strip()
-    if not name:
-        return web.json_response({"error": "name cannot be empty"}, status=400)
-    if len(name) > _MAX_SOURCE_NAME_LEN:
-        return web.json_response(
-            {"error": f"name must be {_MAX_SOURCE_NAME_LEN} characters or fewer"}, status=400
+    patterns = body.get("ignore_patterns")
+    if name is not None or patterns is None:
+        if not isinstance(name, str):
+            return web.json_response({"error": "name must be a string"}, status=400)
+        name = name.strip()
+        if not name:
+            return web.json_response({"error": "name cannot be empty"}, status=400)
+        if len(name) > _MAX_SOURCE_NAME_LEN:
+            return web.json_response(
+                {"error": f"name must be {_MAX_SOURCE_NAME_LEN} characters or fewer"}, status=400
+            )
+        # JSON allows escaped lone surrogates; UTF-8, which SQLite binds the
+        # name as, does not.
+        try:
+            name.encode("utf-8")
+        except UnicodeEncodeError:
+            return web.json_response(
+                {
+                    "error": "name contains characters that cannot be encoded",
+                    "code": "text_not_encodable",
+                },
+                status=400,
+            )
+    if patterns is not None:
+        if row["source_type"] not in ("local_folder", "obsidian_vault"):
+            return web.json_response(
+                {
+                    "error": "ignore_patterns can only be set on a folder source",
+                    "code": "ignore_patterns_not_folder_source",
+                },
+                status=400,
+            )
+        if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
+            return web.json_response(
+                {
+                    "error": "ignore_patterns must be a list of strings",
+                    "code": "ignore_patterns_invalid",
+                },
+                status=400,
+            )
+        patterns = [p.strip() for p in patterns if p.strip()]
+    result: dict = {"ok": True}
+    if name is not None:
+        await _audited_write(
+            partial(store.update_source, source_id, name=name),
+            event="source.rename",
+            fields={"source_id": source_id},
         )
-    await _audited_write(
-        partial(store.update_source, source_id, name=name),
-        event="source.rename",
-        fields={"source_id": source_id},
-    )
-    return web.json_response({"ok": True, "name": name})
+        result["name"] = name
+    if patterns is not None:
+        # The next sweep applies the patterns; what is already indexed stays
+        # (FolderWatcher._do_scan keeps a file the patterns alone exclude).
+        if not await asyncio.to_thread(_set_ignore_patterns_row, store, source_id, patterns):
+            return web.json_response({"error": "not found", "code": "source_not_found"}, status=404)
+        result["ignore_patterns"] = patterns
+    return web.json_response(result)
 
 
 def _adopt_source(store, source_id: str, *, event: str):
@@ -1066,6 +1164,16 @@ def _adopt_source(store, source_id: str, *, event: str):
         return "missing", None, {}
     _sel_log(event, source_id=source_id)
     return "ok", row, props
+
+
+def _set_ignore_patterns_row(store, source_id: str, patterns: list[str]) -> bool:
+    """Save a folder source's ignore patterns, in ONE off-loop take. False when
+    the row is gone (deleted since the handler read it): nothing was written, so
+    nothing is audited."""
+    if store.merge_source_properties(source_id, set_keys={"ignore_patterns": patterns}) is None:
+        return False
+    _sel_log("source.ignore_patterns", source_id=source_id)
+    return True
 
 
 def _pause_source_row(store, source_id: str) -> bool:
@@ -1200,9 +1308,10 @@ async def list_source_files(request: web.Request) -> web.Response:
         }
         for r in rows
     ]
-    # Also count totals
+    # Also count totals. A deduped file was read; its text lives in the copy it
+    # matched, so it is finished work and counts as done.
     total = len(files)
-    done = sum(1 for f in files if f["status"] == "done")
+    done = sum(1 for f in files if f["status"] in ("done", "deduped"))
     failed = sum(1 for f in files if f["status"] == "failed")
     skipped = sum(1 for f in files if f["status"] == "skipped")
     return web.json_response(

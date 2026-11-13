@@ -170,6 +170,7 @@ def _usable(target: str) -> str:
     """
     from kiro_crew.config import KiroCrewConfig
     from kiro_crew.config.loader_agents import resolve_agent_bindings
+    from kiro_crew.config.loader_snapshots import refresh_materialized_agents
     from kiro_crew.validation_parts.input_bounds import is_registered_agent_name
 
     if not is_registered_agent_name(target):
@@ -184,6 +185,12 @@ def _usable(target: str) -> str:
         bindings = resolve_agent_bindings(
             cfg, target, None, validate_memory_files=False, selection_kind="template"
         )
+        if not bindings.requested_resolved:
+            # The snapshot may lack a template whose file is on disk.
+            refresh_materialized_agents()
+            bindings = resolve_agent_bindings(
+                cfg, target, None, validate_memory_files=False, selection_kind="template"
+            )
     except Exception:
         return "agent_unresolved"
     return "" if bindings.requested_resolved else "agent_not_found"
@@ -515,7 +522,17 @@ async def _await_restore(state: Any, *, limit: float = RESTORE_WAIT_SECS) -> Non
 
 async def run(state: Any, *, start_delay: float = 2.0) -> None:
     """The dashboard's background task, started once its restore has rebuilt the slot
-    set: the start pass, then retry busy roots. A headless gateway never starts it."""
+    set: the start pass, then retry busy roots. A headless gateway never starts it.
+
+    It first reads the Ultra Mode pause file off-loop, so the sidebar and the sends
+    that consult it find it in memory.
+    """
+    from kiro_crew import crew_pause
+
+    try:
+        await asyncio.to_thread(crew_pause.load)
+    except Exception:
+        logger.warning("crew pause preload failed", exc_info=True)
     await asyncio.sleep(start_delay)
     await _await_restore(state)
     try:

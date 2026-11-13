@@ -17,6 +17,7 @@ head notice is invisible to the receipt digest, so a committed sub-slice replays
 cleanly across the migration.
 """
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -63,6 +64,7 @@ class _RecordingStore:
             messages,
             facets,
             kind_routing=None,
+            lesson_dedup_mode="off",
         ):  # noqa: ANN001
             receipts[source_id] = {
                 "source_total": source_total,
@@ -210,8 +212,7 @@ class TestASubSliceReceiptSurvivesAHeadNoticeMigration:
                 await c._consolidate(KEY, include_history=True)
             assert store.receipts
             before = log.get_metadata(KEY)
-            with history_mod.allow_on_loop_persist():
-                log.update_metadata(KEY, {"consolidation_retry_at": 0.0})
+            await asyncio.to_thread(log.update_metadata, KEY, {"consolidation_retry_at": 0.0})
             if change == "empty_receipt":
                 next(iter(store.receipts.values()))["source_count"] = 0
             else:

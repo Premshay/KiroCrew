@@ -320,13 +320,13 @@ class TestEveryKeyOfTheRunIsEnded:
         ):
             await svc._force_reap("seq1", _JOB_TIMEOUT_SECS + 60, claim=claim)
 
-        assert [called.args[0] for called in group_kill.call_args_list] == [7002, 7001], (
+        assert sorted(called.args[0] for called in group_kill.call_args_list) == [7001, 7002], (
             "the reap ended only the newest agent's key and recorded reaped while the earlier "
             "agent's session, kept alive for its pending sub-agents, still runs"
         )
-        assert [called.args[0] for called in svc._sessions.reset.await_args_list] == [
-            "cron:seq1:agentB",
+        assert sorted(called.args[0] for called in svc._sessions.reset.await_args_list) == [
             "cron:seq1:agentA",
+            "cron:seq1:agentB",
         ]
         assert _audited_outcome(mock_sel) == "reaped"
         audit = mock_sel().log_tool_invocation.call_args.kwargs

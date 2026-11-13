@@ -8,6 +8,8 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, fireEvent, act, cleanup } from '@testing-library/react'
 import { PackLoaderImage, paintStill } from '../pages/chat/PackLoaderImage'
 import ChatFooter from '../pages/chat/ChatFooter'
+import { RailHeaderGlyph } from '../shell/nav/railChrome'
+import { MobileNavGlyph } from '../shell/topbar/shellHeader'
 
 const SRC = '/api/theme/reef/assets/loader/cursor.svg'
 
@@ -46,6 +48,7 @@ function withNaturalSize(img: HTMLImageElement, w: number, h: number) {
 afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
   document.documentElement.removeAttribute('data-theme')
 })
 
@@ -76,6 +79,22 @@ describe('PackLoaderImage', () => {
     expect(drawImage.mock.calls[0][0]).toBe(img)
   })
 
+  it('repaints the still frame when its box changes size', () => {
+    motionPreference(true)
+    const drawImage = stubCanvas()
+    let resized = () => {}
+    vi.stubGlobal('ResizeObserver', class {
+      constructor(cb: () => void) { resized = cb }
+      observe() {}
+      disconnect() {}
+    })
+    const { container } = render(<PackLoaderImage src={SRC} />)
+    fireEvent.load(container.querySelector('img')!)
+    expect(drawImage).toHaveBeenCalledTimes(1)
+    resized()
+    expect(drawImage).toHaveBeenCalledTimes(2)
+  })
+
   it('follows a preference flipped while the page is open', () => {
     const pref = motionPreference(false)
     stubCanvas()
@@ -96,6 +115,19 @@ describe('PackLoaderImage', () => {
     paintStill(canvas, img)  // no layout box here, so the 14px slot edge is used
     expect([canvas.width, canvas.height]).toEqual([14, 14])
     expect(drawImage).toHaveBeenCalledWith(img, 0, 3.5, 14, 7)
+  })
+
+  it('sizes a canvas under a hidden ancestor from its CSS box, not the 14px slot edge', () => {
+    stubCanvas()
+    // The welcome hero is display:none on a short viewport, and can be shown later.
+    const hidden = document.body.appendChild(document.createElement('div'))
+    hidden.style.display = 'none'
+    const canvas = hidden.appendChild(document.createElement('canvas'))
+    canvas.style.width = '48px'
+    canvas.style.height = '48px'
+    paintStill(canvas, document.createElement('img'))
+    hidden.remove()
+    expect([canvas.width, canvas.height]).toEqual([48, 48])
   })
 
   it('fills the box for an image that reports no intrinsic size', () => {
@@ -165,6 +197,34 @@ describe('ChatFooter — pack loader art under reduced motion', () => {
     rerender(<FooterWithPack images={images} {...running} streamTick={2} />)
     expect(Array.from(container.querySelectorAll('canvas'))).toEqual(canvases)
     expect(drawImage).toHaveBeenCalledTimes(8)
+  })
+})
+
+// The rail and the narrow header draw the pack logo, and each reveals it only on
+// its `load` event and falls back to a stock glyph on `error`.
+describe('the pack logo in the rail and the narrow header under reduced motion', () => {
+  const LOGO = '/api/theme/reef/assets/branding/logo.svg'
+  const glyphs = [
+    ['RailHeaderGlyph', 'rail-header-fallback', () => <RailHeaderGlyph avatar={LOGO} boxClass="w-9 h-9" iconSize={24} />],
+    ['MobileNavGlyph', 'mobile-nav-fallback', () => <MobileNavGlyph avatar={LOGO} />],
+  ] as const
+
+  it.each(glyphs)('%s holds the logo still and still falls back on error', (_name, fallbackId, glyph) => {
+    motionPreference(true)
+    const drawImage = stubCanvas()
+    const { container } = render(glyph())
+    const fallback = () => container.querySelector(`[data-testid="${fallbackId}"]`)
+    const img = container.querySelector('img')!
+    // The only <img> is the decode-only copy, and it is never displayed.
+    expect(img.style.display).toBe('none')
+    expect(fallback()).not.toBeNull()
+    expect(container.querySelector('canvas')!.className).toContain('hidden')
+    fireEvent.load(img)
+    expect(drawImage).toHaveBeenCalledTimes(1)
+    expect(fallback()).toBeNull()
+    expect(container.querySelector('canvas')!.className).not.toContain('hidden')
+    fireEvent.error(img)
+    expect(fallback()).not.toBeNull()
   })
 })
 

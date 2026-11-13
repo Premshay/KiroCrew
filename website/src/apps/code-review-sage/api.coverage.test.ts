@@ -67,7 +67,7 @@ describe('sageApi request shapes', () => {
     ['createNamespace', () => sageApi.createNamespace('team'), `${API}/namespaces`, send('POST', { name: 'team' })],
     ['deleteNamespace', () => sageApi.deleteNamespace('team'), `${API}/namespaces`, send('DELETE', { name: 'team' })],
     ['learnings escapes the namespace', () => sageApi.learnings('my team'), `${API}/learnings?namespace=my%20team`, GET],
-    ['consolidateLearnings', () => sageApi.consolidateLearnings('team'), `${API}/learnings/consolidate`, send('POST', { namespace: 'team' })],
+    ['requestConsolidationPreview', () => sageApi.requestConsolidationPreview('team', ['c1']), `${API}/learnings/consolidate`, send('POST', { namespace: 'team', candidate_ids: ['c1'] })],
   ])('%s sends the expected verb, path and body', async (_name, call, url, init) => {
     await call()
 

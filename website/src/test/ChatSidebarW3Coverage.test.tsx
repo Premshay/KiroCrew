@@ -50,7 +50,14 @@ vi.mock('framer-motion', async () => {
       }
       return React.createElement(tag, { ...clean, ref }, props.children as React.ReactNode)
     })
-  const motion = new Proxy({}, { get: (_t, tag: string) => make(tag) })
+  // One component per tag: a fresh type on every read would remount the subtree.
+  const byTag = new Map<string, ReturnType<typeof make>>()
+  const motion = new Proxy({}, {
+    get: (_t, tag: string) => {
+      if (!byTag.has(tag)) byTag.set(tag, make(tag))
+      return byTag.get(tag)
+    },
+  })
   return {
     motion,
     AnimatePresence: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
@@ -160,7 +167,7 @@ const BETA: ChatFolder = { id: 'f2', name: 'Beta', order: 1 }
 const FILED: TestSlot = { key: 'k1', title: 'filed chat', running: false, messages: 2, folder_id: 'f1' }
 const LOOSE: TestSlot = { key: 'k2', title: 'loose chat', running: false, messages: 1 }
 
-function renderSidebar(opts: { slots?: TestSlot[]; folders?: ChatFolder[] } = {}) {
+function renderSidebar(opts: { slots?: TestSlot[]; folders?: ChatFolder[]; columns?: unknown[] } = {}) {
   const slots = opts.slots ?? [FILED, LOOSE]
   const folders = opts.folders ?? [ALPHA]
   mocks.chatFolders.mockResolvedValue(folders)
@@ -193,7 +200,7 @@ function renderSidebar(opts: { slots?: TestSlot[]; folders?: ChatFolder[] } = {}
     },
   })
   qc.setQueryData(['chat-folders'], folders)
-  qc.setQueryData(['tag-columns'], [])
+  qc.setQueryData(['tag-columns'], opts.columns ?? [])
   const view = render(
     <QueryClientProvider client={qc}>
       <Provider store={store}>
@@ -303,6 +310,19 @@ describe('ChatSidebar — list-view folder header', () => {
     await waitFor(() => expect(screen.getAllByRole('textbox').every(n => n.getAttribute('placeholder'))).toBe(true))
     expect(mocks.updateChatFolder).not.toHaveBeenCalled()
     expect(screen.getByTitle('Double-click to rename').textContent).toBe('Alpha')
+  })
+
+  it('names the folder rename field in the list view', () => {
+    renderSidebar()
+    fireEvent.doubleClick(screen.getByTitle('Double-click to rename'))
+    expect(screen.getByRole('textbox', { name: 'Folder name' })).toHaveValue('Alpha')
+  })
+
+  it('names the folder rename field in the board view', () => {
+    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false }
+    renderSidebar({ columns: [{ id: 'c1', name: 'All', tag_ids: [], mode: 'any', order: 0 }] })
+    fireEvent.doubleClick(screen.getAllByTitle('Double-click to rename')[0])
+    expect(screen.getByRole('textbox', { name: 'Folder name' })).toHaveValue('Alpha')
   })
 
   it('does not PATCH a name that trims to nothing', async () => {

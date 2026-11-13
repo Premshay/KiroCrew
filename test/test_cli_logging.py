@@ -1,13 +1,7 @@
-"""Tests for CLI logging setup — the detached-gateway ``gateway.log``
-double-write fix.
+"""Tests for CLI logging setup in a detached gateway.
 
-``_spawn_detached_gateway`` redirects the child gateway's stdout/stderr INTO
-``gateway.log``. Before the fix, ``main()``'s ``basicConfig`` console handler
-(root → stderr) then wrote a second, console-formatted copy (no [PID]) of
-every ``kiro_crew`` record into the same file the rotating file handler
-writes, doubling log volume and halving the 2MB rotation window. The boot
-rotation also renamed the inode fds 1/2 point at, sending raw stderr writes
-into ``gateway.log.prev``.
+The detached child's stdout/stderr already point INTO ``gateway.log``, so a console
+handler would write every record twice, and boot rotation must re-point fds 1/2.
 
 Covers:
 - ``_fd_targets_file``  — the dev/ino detection primitive
@@ -44,9 +38,11 @@ from kiro_crew.cli import (
     drain_log_queue_before_hard_exit,
 )
 from kiro_crew.cli_log_files import boot_log_dir, boot_log_paths, older_boot_logs
+from kiro_crew.cli_logging import _chat_console_filter
 from kiro_crew.cli_logging import _fd_is_regular_file as _real_fd_is_regular_file
 from kiro_crew.cli_logging import _rotate_boot_logs, _start_gateway_log_after_lock
-from kiro_crew.config import config_dir
+from kiro_crew.config import config_dir, loader_credentials, loader_pipeline
+from kiro_crew.dashboard import token_secret
 from kiro_crew.testing.wait import wait_until
 
 
@@ -62,15 +58,9 @@ def _stderr_is_not_a_file(_floor_monkeypatch):
 def _pristine_logging():
     """Snapshot, clear, and restore global logging state around each test.
 
-    ``_setup_cli_logging`` mutates the root and ``kiro_crew`` loggers
-    (handlers + levels), and these tests assert on absolute handler
-    topology. Other tests in the same process may have leaked handlers
-    onto either logger (they are process-global), so start each test from
-    empty handler lists, then restore the originals afterwards — closing
-    any handler the test added so the tmp gateway.log file descriptor is
-    released promptly (required on Windows, where an open fd blocks the
-    tmpdir cleanup). Also stops the module's QueueListener so its drain
-    thread and the file handler's fd never leak across tests.
+    These tests assert absolute handler topology, and other tests may leak handlers
+    onto these process-global loggers. Added handlers are closed so Windows can clean
+    the tmpdir, and the QueueListener is stopped so its thread and fd never leak.
     """
     root = logging.getLogger()
     kc = logging.getLogger("kiro_crew")
@@ -169,11 +159,8 @@ class TestRedirectFdsTo:
     def _read(path):
         """Read file bytes with newlines normalized to ``\\n``.
 
-        On Windows the CRT opens fds in text mode by default (both the test's
-        own ``os.open`` and the redirect target), translating ``\\n`` to
-        ``\\r\\n`` on write. These tests assert fd *redirection* semantics —
-        which file received which write — not platform newline conventions,
-        so comparisons are newline-agnostic.
+        The Windows CRT opens fds in text mode and writes ``\\r\\n``; these tests pin
+        which file got which write, not newline conventions.
         """
         return path.read_bytes().replace(b"\r\n", b"\n")
 
@@ -1011,12 +998,8 @@ class TestSetupCliLoggingDetached:
     def test_unwritable_gateway_log_fails_loudly(self, monkeypatch):
         """A DETACHED process must not soft-fail an unopenable ``gateway.log``.
 
-        Detached setup deliberately skips ``basicConfig`` (a console echo would
-        double-write into the log stderr already points at), so there is no
-        console handler. Swallowing the OSError here would boot a long-lived
-        gateway with no persistent log AND no destination for the warning
-        saying so. Only the console-backed foreground path soft-fails --
-        see ``TestSetupCliLoggingForeground.test_unwritable_gateway_log_soft_fails``.
+        Detached setup has no console handler, so swallowing the OSError would leave the
+        gateway with no log and nowhere to warn. The foreground path soft-fails instead.
         """
 
         def _deny(*_a, **_k):
@@ -1088,6 +1071,221 @@ class TestSetupCliLoggingServiceErrorFile:
         assert "kc-info-record" in self.console.getvalue()
 
 
+class _StuckConsole(io.StringIO):
+    """A console that stops reading: ``write`` blocks until ``release`` is set."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.writer_threads: set[int] = set()
+
+    def write(self, s: str) -> int:
+        self.writer_threads.add(threading.get_ident())
+        self.entered.set()
+        self.release.wait(10)
+        return super().write(s)
+
+
+class TestGatewayConsoleEchoOffLoop:
+    """A foreground gateway echoes to a terminal or pipe that can stop reading
+    (output paused with Ctrl-S, a stalled terminal app, an undrained pipe). The
+    echo runs on a listener thread, so the logging thread -- the event loop --
+    never waits on it, and the loop-stall watchdog never hard-exits over it."""
+
+    @pytest.fixture(autouse=True)
+    def _stuck_console(self, _floor_monkeypatch):
+        _floor_monkeypatch.setattr("kiro_crew.cli._fd_targets_file", lambda fd, path: False)
+        self.console = _StuckConsole()
+
+        def _basic_config(**_kwargs):
+            # The stdlib no-op rule, ignoring pytest's own capture handlers.
+            root = logging.getLogger()
+            ours = [
+                h
+                for h in root.handlers
+                if type(h) is logging.StreamHandler or isinstance(h, _CliLogQueueHandler)
+            ]
+            if not ours:
+                root.addHandler(logging.StreamHandler(self.console))
+
+        _floor_monkeypatch.setattr(logging, "basicConfig", _basic_config)
+        yield
+        self.console.release.set()
+
+    def test_stuck_console_does_not_block_the_logging_thread(self, _floor_monkeypatch):
+        _floor_monkeypatch.setattr("kiro_crew.cli._CONSOLE_DRAIN_TIMEOUT", 60.0, raising=False)
+        _setup_cli_logging("gateway", 1)
+        log = logging.getLogger("kiro_crew.test_console")
+        log.warning("first-record")
+        assert self.console.entered.wait(10)  # the listener is now stuck in write
+        log.warning("second-record")  # returns although the console is stuck
+        assert threading.get_ident() not in self.console.writer_threads
+        self.console.release.set()
+        _stop_log_queue_listener()
+        out = self.console.getvalue()
+        assert "first-record" in out
+        assert "second-record" in out
+
+    def test_no_console_handler_left_on_a_logger(self):
+        _setup_cli_logging("gateway", 1)
+        for lgr in (logging.getLogger(), logging.getLogger("kiro_crew")):
+            assert not any(type(h) is logging.StreamHandler for h in lgr.handlers)
+
+    def test_full_queue_drops_console_records_but_never_file_records(self, _floor_monkeypatch):
+        _floor_monkeypatch.setattr("kiro_crew.cli._CONSOLE_QUEUE_MAX", 3, raising=False)
+        _floor_monkeypatch.setattr("kiro_crew.cli._CONSOLE_DRAIN_TIMEOUT", 60.0, raising=False)
+        _setup_cli_logging("gateway", 1)
+        log = logging.getLogger("kiro_crew.test_console")
+        log.warning("rec-00")
+        assert self.console.entered.wait(10)
+        for i in range(1, 20):
+            log.warning("rec-%02d", i)  # past the cap: dropped, not blocking
+        assert threading.get_ident() not in self.console.writer_threads
+        self.console.release.set()
+        _stop_log_queue_listener()
+        assert 1 <= self.console.getvalue().count("rec-") <= 1 + 3
+        text = (config_dir() / "gateway.log").read_text(encoding="utf-8")
+        for i in range(20):
+            assert text.count(f"rec-{i:02d}") == 1
+
+    def test_stop_returns_while_the_console_is_stuck(self, _floor_monkeypatch):
+        _floor_monkeypatch.setattr("kiro_crew.cli._CONSOLE_DRAIN_TIMEOUT", 0.1, raising=False)
+        _setup_cli_logging("gateway", 1)
+        log = logging.getLogger("kiro_crew.test_console")
+        log.warning("stuck-record")
+        assert self.console.entered.wait(10)
+        log.warning("file-record")
+        _stop_log_queue_listener()  # exit must not wait on a console nobody reads
+        # Returned while the console is still stuck: nothing reached it yet.
+        assert self.console.getvalue() == ""
+        text = (config_dir() / "gateway.log").read_text(encoding="utf-8")
+        assert text.count("file-record") == 1
+
+    def test_file_tail_drains_before_the_console_within_one_budget(self, _floor_monkeypatch):
+        calls = []
+        real_stop = cli_mod._stop_console_queue_listener
+
+        def _spy(timeout=None):
+            # The file listener is already retired when the console's turn comes.
+            calls.append((cli_mod._LOG_QUEUE_LISTENER is None, timeout))
+            real_stop(timeout)
+
+        _setup_cli_logging("gateway", 1)
+        _floor_monkeypatch.setattr("kiro_crew.cli._stop_console_queue_listener", _spy)
+        log = logging.getLogger("kiro_crew.test_console")
+        log.warning("stuck-record")
+        assert self.console.entered.wait(10)
+        log.warning("file-record")
+        _stop_log_queue_listener(0.2)
+        ((file_first, budget),) = calls
+        assert file_first
+        assert budget is not None and 0.0 <= budget <= 0.2
+        text = (config_dir() / "gateway.log").read_text(encoding="utf-8")
+        assert text.count("file-record") == 1
+
+    def test_second_setup_keeps_the_console_echo(self, _floor_monkeypatch):
+        _floor_monkeypatch.setattr("kiro_crew.cli._CONSOLE_DRAIN_TIMEOUT", 60.0, raising=False)
+        self.console.release.set()
+        _setup_cli_logging("gateway", 1)
+        _setup_cli_logging("gateway", 1)
+        logging.getLogger("kiro_crew.test_console").warning("again-record")
+        _stop_log_queue_listener()
+        assert self.console.getvalue().count("again-record") == 1
+
+    def test_chat_keeps_its_synchronous_echo(self):
+        self.console.release.set()
+        _setup_cli_logging("chat", 1)
+        logging.getLogger("kiro_crew.test_console").info("chat-record")
+        assert "chat-record" in self.console.getvalue()  # no drain needed
+
+
+class TestChatConsoleShowsErrorsOnly:
+    """``kirocrew chat`` without ``-v`` keeps its own records below ERROR out of
+    the terminal; ``gateway.log`` still gets them."""
+
+    @pytest.fixture(autouse=True)
+    def _console(self, _floor_monkeypatch):
+        _floor_monkeypatch.setattr("kiro_crew.cli._fd_targets_file", lambda fd, path: False)
+        self.console = io.StringIO()
+
+        def _basic_config(**_kwargs):
+            logging.getLogger().addHandler(logging.StreamHandler(self.console))
+
+        _floor_monkeypatch.setattr(logging, "basicConfig", _basic_config)
+
+    def test_chat_warning_reaches_the_log_file_only(self):
+        _setup_cli_logging("chat", 0)
+        logging.getLogger("kiro_crew.test_chat").warning("kc-warn-record")
+        logging.getLogger("kiro_crew.test_chat").error("kc-error-record")
+        logging.getLogger("kiro_crew.cli_chat").warning("chat-warn-record")
+        logging.getLogger("kiro_crew.sandbox").warning("SECURITY: sandbox-warn-record")
+        logging.getLogger("third_party_lib").warning("lib-warn-record")
+        _stop_log_queue_listener()
+        console = self.console.getvalue()
+        assert "kc-warn-record" not in console
+        assert "kc-error-record" in console
+        assert "chat-warn-record" in console
+        assert "sandbox-warn-record" in console
+        assert "lib-warn-record" in console
+        text = (config_dir() / "gateway.log").read_text(encoding="utf-8")
+        assert text.count("kc-warn-record") == 1
+
+    def test_verbose_chat_echoes_its_records(self):
+        _setup_cli_logging("chat", 1)
+        logging.getLogger("kiro_crew.test_chat").info("kc-info-record")
+        assert "kc-info-record" in self.console.getvalue()
+
+    def test_chat_without_a_log_file_keeps_the_echo(self, _floor_monkeypatch):
+        def _deny(*_a, **_k):
+            raise PermissionError(1, "Operation not permitted")
+
+        _floor_monkeypatch.setattr("kiro_crew.cli._AppendOnlyLogFileHandler", _deny)
+        _setup_cli_logging("chat", 0)
+        logging.getLogger("kiro_crew.test_chat").warning("kc-warn-record")
+        assert "kc-warn-record" in self.console.getvalue()
+
+
+def _overlay_world_writable() -> None:
+    path = MagicMock()
+    path.is_file.return_value = True
+    path.stat.return_value.st_mode = 0o100666
+    reader = loader_pipeline._recording_config_reader([], overlay=True)
+    reader(path)
+
+
+def _env_file_cannot_be_locked_down() -> None:
+    path = MagicMock()
+    path.stat.return_value.st_mode = 0o100644
+    path.chmod.side_effect = OSError("read-only filesystem")
+    loader_credentials.enforce_env_permissions(path)
+
+
+def _signing_key_cannot_be_locked_down() -> None:
+    token_secret._enforce_owner_only(Path("token-signing.key"))
+
+
+@pytest.mark.parametrize(
+    "emit",
+    [_overlay_world_writable, _env_file_cannot_be_locked_down, _signing_key_cannot_be_locked_down],
+)
+def test_permission_warnings_stay_on_the_chat_terminal(emit, _floor_monkeypatch, caplog):
+    """A file other users can read or write is the user's to fix, so chat still shows it."""
+    # Through the facade: more than one loader owner binds this name.
+    _floor_monkeypatch.setattr("kiro_crew.config.loader.read_config_text", lambda _p: "{}")
+    _floor_monkeypatch.setattr(loader_credentials.platform_compat, "IS_POSIX", True)
+
+    def _refuse(_path):
+        raise OSError("not supported")
+
+    _floor_monkeypatch.setattr(token_secret.platform_compat, "restrict_to_owner", _refuse)
+    with caplog.at_level(logging.WARNING, logger="kiro_crew"):
+        emit()
+    owners = {loader_pipeline.logger.name, token_secret.logger.name}
+    [record] = [r for r in caplog.records if r.name in owners and r.levelno == logging.WARNING]
+    assert _chat_console_filter(record), record.getMessage()
+
+
 class TestSetupCliLoggingForeground:
     """The classic topology must be unchanged when stderr is a real console."""
 
@@ -1141,11 +1339,8 @@ class TestSetupCliLoggingForeground:
     def test_unwritable_gateway_log_soft_fails(self, monkeypatch):
         """Seatbelt may deny ``gateway.log``; a CONSOLE-backed setup must not raise.
 
-        Sandboxed MCP children (e.g. ``kirocrew mcp-core``) inherit a profile
-        that blocks the persistent log path. Foreground setup installed a
-        console handler, so the warning has somewhere to land and the MCP
-        handshake must still start. The detached counterpart is pinned by
-        ``TestSetupCliLoggingDetached.test_unwritable_gateway_log_fails_loudly``.
+        Sandboxed MCP children (e.g. ``kirocrew mcp-core``) cannot open the log path;
+        the console handler takes the warning and the MCP handshake must still start.
         """
 
         def _deny(*_a, **_k):
@@ -1253,13 +1448,8 @@ class TestQueueRoutedLogging:
 class TestRuntimeLevelReachesFileLog:
     """A runtime ``agent.log_level`` change reaches ``gateway.log`` without a restart.
 
-    ``apply_log_level`` -- the Logs-page toggle and the ``agent.log_level``
-    config applier -- moves the ``kiro_crew`` logger, and that logger is the
-    single level gate: neither the file handler nor the producer-side queue
-    handler pins a boot-time level of its own. A gateway booted at WARNING and
-    raised to INFO writes its INFO records to the file ``kirocrew logs`` reads,
-    not only to the live Logs stream (its own handler on the logger). These
-    tests fail if either handler carries a level.
+    ``apply_log_level`` moves the ``kiro_crew`` logger, the single level gate, so
+    neither the file handler nor the queue handler may carry a boot-time level.
     """
 
     @staticmethod
@@ -1565,15 +1755,11 @@ class TestDrainBeforeHardExit:
 
 
 class TestEveryGatewayHardExitDrainsTheQueue:
-    """Ratchet: the queue only helps if EVERY hard exit in the gateway process
-    drains it. ``src/kiro_crew/slack/gateway_runtime/exit_path.py`` and ``slack/events_slash.py`` are the
-    two modules that call ``os._exit`` from inside the long-lived gateway
-    process - the other ``os._exit`` sites in the tree (``sandbox.py``,
-    ``_process_group_supervisor.py``) run in forked/pre-exec children that
-    never install the CLI's queue listener.
+    """Ratchet: every ``os._exit`` in the gateway process drains the log queue.
 
-    The check is per-function and does NOT look inside nested functions, so a
-    drain in a sibling closure cannot vouch for its parent."""
+    Only ``slack/gateway_runtime/exit_path.py`` and ``slack/events_slash.py`` qualify;
+    other sites run in forked children with no queue listener. The check is
+    per-function, so a drain in a sibling closure cannot vouch for its parent."""
 
     _MODULES = (
         Path(__file__).resolve().parents[1] / "src/kiro_crew/slack/gateway.py",

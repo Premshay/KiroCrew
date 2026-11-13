@@ -3,12 +3,12 @@ import { useMemo, useRef, useState, useCallback, type Dispatch, type SetStateAct
 import type { ModelInfo } from '../../../providers/types'
 import { store, type AppDispatch } from '../../../store'
 import type { ChatSlot } from '../../../types'
-import { resolveByApprovalId, setAgentSwitchNotice } from '../../../store/chatSlice'
-import { endApprovalRow, liveApprovalRows } from '../../../store/notificationsSlice'
+import { setAgentSwitchNotice } from '../../../store/chatSlice'
 import { updateSlot } from '../../../store/dashboardSlice'
 import { inFlightSlotSwitchOutcome, stagedSlotSwitchTarget, performSlotSwitch } from '../../../lib/slotSwitch'
 import { performAgentSlotSwitch } from '../../../lib/agentSwitch'
 import { api } from '../../../api/client'
+import { decidePermissionRow } from '../../../lib/decidePermissionRow'
 import { useFilteredDropdown } from '../../../hooks/useFilteredDropdown'
 import { useModelPickerHiddenModelsQuery, useModelPickerConfigured, shouldSeparateModelEffort, filterInteractiveModels, effortToCarry, switchGroupedModel } from '../../../hooks/useInteractiveModels'
 import { jevRouteOffered, withJevRoute, JEV_ROUTE_MODEL } from '../../../lib/jevRoute'
@@ -114,8 +114,7 @@ export function useModelPickerModels({
 
 /**
  * The agent, model and project picked for the NEXT new session on a slotless page
- * (each a state value plus a ref the create path reads synchronously), and the model
- * picker's anchor on the composer chip.
+ * (each a state value plus a ref the create path reads synchronously).
  *
  * Called from ChatPage at the position its statements held, so React registers its effects in the same order.
  */
@@ -160,8 +159,6 @@ export function useNewSessionPicks() {
   // Sending the literal 'auto' would NOT be equivalent: it is truthy, so it
   // short-circuits `slot.model or agent_model` and would override a template or
   // global pin the user did configure.
-  // Composer-toolbar picker anchors: each hook keeps its portaled menu glued
-  // to the ChatInput chip that opened it while the menu is open (#10616).
   return {
     pendingAgent, pendingAgentRef, pendingAgentKindRef, setPendingAgent, pendingModel, pendingModelRef, setPendingModel, pendingProjectRef, setPendingProject,
   }
@@ -190,19 +187,12 @@ export function useSessionChoices({
   dispatch, queryClient, activeSlot, codexPairModels, setModelDropdown, modelPickerReturnsFocusRef, setPendingAgent, setPendingModel, setPendingProject,
 }: SessionChoicesOptions) {
   const [projectSwitches, setProjectSwitches] = useState<Readonly<Record<string, number>>>({})
-  const approve = useCallback(async (action: string) => { if (activeSlot) await api.approveChatSlot(activeSlot, action) }, [activeSlot])
-  // Approvals dismissed through the CollapsibleToolGroup mounts resolve via the
-  // ONE-SHOT `api.resolveApproval` endpoint, which has no trust verb. The shared
-  // `toApiDecision` (utils/approvalDecision.ts) is fail-closed and is the only
-  // place that mapping is spelled — a Trust affordance on this path would claim
-  // a standing grant the backend never records (#5400, #5434).
-  const dismissApproval = useCallback((aid: string, decision?: string) => {
-    dispatch(resolveByApprovalId({ id: aid, slot: activeSlot || undefined, decision }))
-    // The id recurs and the feed keeps a refused press's retired row, so only
-    // a live row under the id is this decision's.
-    const n = liveApprovalRows(store.getState().notifications, aid).at(-1)
-    if (n) dispatch(endApprovalRow(n.ts))
-  }, [activeSlot, dispatch])
+  // The collapsed tool groups decide their pending row bound to the request
+  // it names (see lib/decidePermissionRow). A row that names none, including a
+  // group with no pending row, is refused as no longer pending with nothing
+  // sent: a bare slot decide would answer whatever is pending there now.
+  const decideRow = useCallback((meta: Record<string, unknown> | undefined, action: string) =>
+    dispatch(decidePermissionRow(meta, activeSlot, action)), [activeSlot, dispatch])
   // Resolves `true` once the switch landed (or was held as the pending pick of a
   // chat not created yet), `false` when it was refused: the refusal is already
   // shown as the shared notice, so a caller only needs the answer to know
@@ -257,9 +247,10 @@ export function useSessionChoices({
     if (!activeSlot) {
       if (modelName === JEV_ROUTE_MODEL) { setPendingModel(''); return }
       setPendingModel(modelName)
-      return
+      return modelName
     }
     try {
+      let confirmedModel: string | undefined
       const slotState = store.getState().dashboard.slots.find(s => s.key === activeSlot)
       // A staged slider pick or a legacy pair level is carried; an effort
       // write already on the wire is waited for, not re-sent, and its
@@ -308,7 +299,8 @@ export function useSessionChoices({
             // from the next message; the store write below shows it at once,
             // so this line is what tells the user the running reply keeps its model.
             if (r?.deferred) dispatch(setAgentSwitchNotice(modelSwitchDeferredMessage(r.model ?? modelName)))
-            return r?.model ?? modelName
+            confirmedModel = r?.model ?? modelName
+            return confirmedModel
           },
           // The routing flag is written from the REQUEST, not from the response's
           // `model`: the gateway resolves the sentinel to `auto`, so the stored
@@ -321,6 +313,8 @@ export function useSessionChoices({
           })))
       }, () => inFlightSlotSwitchOutcome('reasoning_effort', activeSlot))
       queryClient.invalidateQueries({ queryKey: ['slot-selection-capabilities', activeSlot] })
+      return store.getState().dashboard.slots.find(s => s.key === activeSlot)?.model === confirmedModel
+        ? confirmedModel : undefined
     } catch (e) {
       // Same failure surface as the agent switch beside this: the shared
       // notice toast, preferring the server's own message. The chip keeps
@@ -380,6 +374,6 @@ export function useSessionChoices({
   // holds the turn-preparation lock, so a cold spawn can take seconds (#20351).
   const projectSwitching = !!activeSlot && (projectSwitches[activeSlot] ?? 0) > 0
   return {
-    approve, dismissApproval, switchAgent, switchModel, pickModel, setProject, projectSwitching,
+    decideRow, switchAgent, switchModel, pickModel, setProject, projectSwitching,
   }
 }

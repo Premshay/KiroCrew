@@ -94,7 +94,7 @@ def _load_stt(tmp_path: Path, section: dict) -> str:
 #: The exact text a standalone install logged before the seam existed.
 _STANDALONE_STT_WARNING = (
     "Unknown STT provider 'whispr'; using 'off' instead, so no recogniser runs until "
-    "the value is fixed. Selectable providers: local, apple, transcribe, off. Run "
+    "the value is fixed. Selectable providers: local, apple, transcribe, codex, off. Run "
     "'kirocrew config set stt.provider <provider>' to choose one, or "
     "'kirocrew config defaults --adopt stt.provider' to drop the stored value."
 )
@@ -115,11 +115,14 @@ class TestStandaloneIsUnchanged:
             "local",
             "apple",
             "transcribe",
+            "codex",
             "off",
         )
         assert sections_stt.valid_stt_providers() is sections_stt._VALID_STT_PROVIDERS
         assert voice_reply.valid_providers() == frozenset({"piper", "pocket", "polly", "system"})
         assert voice_reply.valid_providers() is voice_reply.VALID_PROVIDERS
+        assert voice_reply.VALID_PROVIDERS is speech_providers.VALID_PROVIDERS
+        assert not (speech_providers.VALID_PROVIDERS & speech_providers.REMOVED_PROVIDERS)
 
     def test_defaults_are_the_builtins(self, standalone) -> None:
         assert sections_stt.default_stt_provider() == "local"
@@ -160,6 +163,7 @@ class TestRegisteredProvider:
             "local",
             "apple",
             "transcribe",
+            "codex",
             "acme",
             "off",
         )
@@ -184,7 +188,7 @@ class TestRegisteredProvider:
     def test_unknown_name_lists_it(self, caplog) -> None:
         with caplog.at_level(logging.WARNING):
             assert sections_stt._validated_stt_provider("whispr") == "off"
-        assert "Selectable providers: local, apple, transcribe, acme, off." in caplog.text
+        assert "Selectable providers: local, apple, transcribe, codex, acme, off." in caplog.text
 
     def test_config_set_accepts_it(self) -> None:
         from kiro_crew.cli_config import _declared_enum_value
@@ -211,7 +215,7 @@ class TestEditionDefault:
     def test_a_stored_stt_value_wins(self, tmp_path, stored) -> None:
         assert _load_stt(tmp_path, {"provider": stored}) == stored
 
-    @pytest.mark.parametrize("stored", ["polly", "system"])
+    @pytest.mark.parametrize("stored", ["polly", "system", "piper", "pocket"])
     def test_a_stored_tts_value_wins(self, stored) -> None:
         assert voice_reply.resolve_configured_provider({"provider": stored}) == stored
 
@@ -237,6 +241,12 @@ class TestEditionDefault:
     @pytest.mark.parametrize("malformed", [False, 0, [], {}])
     def test_a_malformed_falsy_tts_value_keeps_the_builtin_default(self, malformed) -> None:
         assert voice_reply.resolve_configured_provider({"provider": malformed}) == "system"
+        assert (
+            voice_reply.resolve_configured_provider(
+                {"provider": malformed, "piper_model": "/m/en.onnx"}
+            )
+            == "system"
+        )
 
     @pytest.mark.parametrize("empty", [None, ""])
     def test_null_or_empty_tts_value_is_absent(self, empty) -> None:
@@ -252,6 +262,12 @@ class TestEditionDefault:
 
     def test_an_explicit_piper_value_keeps_the_local_provider(self) -> None:
         assert voice_reply.resolve_configured_provider({"provider": "piper"}) == "piper"
+
+    @pytest.mark.parametrize("provider", ["piper", "pocket"])
+    def test_local_builtin_defaults_need_no_registration(self, provider) -> None:
+        _install(_Registry(default_tts=provider))
+        speech_providers.validate_speech_registry(_Registry(default_tts=provider))
+        assert voice_reply.resolve_configured_provider({}) == provider
 
     def test_a_builtin_edition_default_needs_no_registration(self, tmp_path) -> None:
         _install(_Registry(default_stt="transcribe", default_tts="polly"))

@@ -457,6 +457,18 @@ def test_resolve_passes_windows_absolute_shapes_unaltered(monkeypatch):
         assert _resolve_project_relative("C:v.mp4") == ("C:v.mp4", None)  # drive-relative
 
 
+def test_resolve_admits_a_path_below_a_drive_root_project(tmp_path, monkeypatch):
+    """A project at a drive root (``H:\\``, or ``/``) keeps its trailing separator
+    through realpath, so ``root + os.sep`` would put every relative path outside."""
+    target = tmp_path / "clip.mp4"
+    target.write_bytes(b"x")
+    real = os.path.realpath(str(target))
+    drive_root = os.path.splitdrive(real)[0] + os.sep
+    monkeypatch.setenv("KIROCREW_PROJECT_DIR", drive_root)
+    rel = os.path.relpath(real, drive_root).replace(os.sep, "/")
+    assert _resolve_project_relative(rel) == (real, None)
+
+
 # --- SEL: the allow decision is recorded even if the client disconnects ---
 
 
@@ -483,7 +495,7 @@ async def test_mp3_with_jpeg_cover_art_streams(tmp_path, mock_sel):
     """ID3 cover art is a JPEG, whose standard Huffman table reads as a bot token."""
     import io
 
-    image = pytest.importorskip("PIL.Image")
+    import PIL.Image as image
     art = io.BytesIO()
     image.new("RGB", (64, 36), (120, 30, 200)).save(art, "JPEG")
     f = tmp_path / "song.mp3"

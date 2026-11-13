@@ -7,6 +7,7 @@ import { isTouchDevice } from '../utils/isTouchDevice'
 import { containedSelectionRange } from '../utils/selectionContainment'
 import { selectionTouchesHostOnly } from '../utils/visibleText'
 import { codePassagePosition, plainCodeFenceAtRangeStart, shadowSelectionRange } from '../utils/pierreShadow'
+import { anchorFromRange } from '../utils/selectionAnchor'
 import { useImeGuard } from '../hooks/useImeGuard'
 import { measureAutoGrowTextarea } from '../hooks/useAutoGrowTextarea'
 import ErrorNotice from './ErrorNotice'
@@ -421,6 +422,8 @@ interface SelectionToolbarProps {
    * until it opts in.
    */
   codeSelection?: boolean
+  /** Resolve a non-code shadow selection whose host can anchor the rendered text. */
+  shadowSelection?: (selection: Selection, container: Element) => Range | null
   /**
    * Copy on select: when a MOUSE drag opens the row, run its own Copy action
    * at once, so the selection is on the clipboard without a second click (the
@@ -474,7 +477,7 @@ function safeAreaBottomPx(): number {
 
 /** Generic floating toolbar that appears when user selects text within a container.
  *  Extensible — pass any actions (quote, copy, etc.) via the `actions` prop. */
-export default function SelectionToolbar({ containerRef, actions, externalSelection, composer, suspended: suspendedProp = false, externalOnly = false, dock: dockProp = false, codeSelection = false, copyOnSelect = false, appActions }: SelectionToolbarProps) {
+export default function SelectionToolbar({ containerRef, actions, externalSelection, composer, suspended: suspendedProp = false, externalOnly = false, dock: dockProp = false, codeSelection = false, shadowSelection, copyOnSelect = false, appActions }: SelectionToolbarProps) {
   // Behind a remote Crew the toolbar is hidden with its Crew (components/overlayRoot)
   // and suspends like a hidden tab, so a key aimed at the Crew in front cannot
   // reach it. The draft survives and returns with the Crew.
@@ -499,6 +502,8 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
   const externalOpenSeqRef = useRef(0)
   const codeSelectionRef = useRef(codeSelection)
   codeSelectionRef.current = codeSelection
+  const shadowSelectionRef = useRef(shadowSelection)
+  shadowSelectionRef.current = shadowSelection
   const copyOnSelectRef = useRef(copyOnSelect)
   copyOnSelectRef.current = copyOnSelect
   // Runs the row's Copy action; set below once `handleAction` exists.
@@ -640,6 +645,8 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
     if (visibleRef.current && composerRef.current && composerDraftRef.current) return
     const sel = window.getSelection()
     const container = containerRef.current
+    const inShadow = sel && container && sel.toString().trim()
+      ? shadowSelectionRef.current?.(sel, container) : null
     // Text selected inside a code block's shadow root is reported collapsed (both
     // ends move to the host's parent) while `toString()` still holds it; the
     // composed range is where it really is. Engines also expose noncollapsed
@@ -647,7 +654,7 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
     const inCode = codeSelectionRef.current && sel && container &&
       (sel.isCollapsed || (sel.rangeCount > 0 && sel.getRangeAt(0).startContainer.getRootNode() instanceof ShadowRoot)) &&
       sel.toString().trim() ? shadowSelectionRange(sel, container) : null
-    if (!sel || (sel.isCollapsed && !inCode) || !sel.toString().trim()) {
+    if (!sel || (sel.isCollapsed && !inCode && !inShadow) || !sel.toString().trim()) {
       // Only dismiss if toolbar was shown by DOM selection (not external/editor).
       // An OPEN composer is the exception: its selection is collapsed by design
       // (focus, or the host's <mark> wrapping), so an empty selection is not a
@@ -668,7 +675,7 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
     // toolbar one line below the selection on the touch/keyboard paths.
     // A code block's own range needs no such test: it is inside the container because
     // its host is (`shadowSelectionRange` looked only under the container).
-    const measureRange = inCode ?? containedSelectionRange(sel.getRangeAt(0), container)
+    const measureRange = inShadow ?? inCode ?? containedSelectionRange(sel.getRangeAt(0), container)
     if (!measureRange) {
       setVisible(false)
       return
@@ -745,9 +752,14 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
       // selection over unrelated light-DOM text.
       const inPlainCode = !inCode && codeSelectionRef.current && plainCodeFenceAtRangeStart(measureRange) != null
       const codePosition = inCode || inPlainCode ? codePassagePosition(container, measureRange) : null
-      codeRangeRef.current = inCode ?? (inPlainCode ? measureRange : null)
+      codeRangeRef.current = inShadow ?? inCode ?? (inPlainCode ? measureRange : null)
       if (inCode || inPlainCode) {
         savedSelectionRef.current = { start: codePosition == null ? -1 : -codePosition, length: 0 }
+      }
+      if (inShadow) {
+        // A shadow-text offset keys the draft, but must never restore a light-DOM selection.
+        const offset = anchorFromRange(inShadow.startContainer.getRootNode(), inShadow)?.startOffset ?? 0
+        savedSelectionRef.current = { start: -offset - 1, length: 0 }
       }
       // A re-open over an already-open composer (the user re-selected) is a
       // fresh open for the host too: it resolves the new anchor and re-paints.
@@ -1727,10 +1739,12 @@ export function ComposerBox({ inputRef, autoFocus, actions, copiedId, hintIdBase
   )
 }
 
-/** Pre-built actions for common use cases */
+/** Pre-built actions for common use cases. `copy` is what Copy writes, so a
+ *  host can add a rich-text flavour; plain text by default. */
 export function useSelectionActions(
   onQuote?: (text: string, rect: DOMRect) => void,
   onAsk?: (text: string, rect: DOMRect) => void,
+  copy: (text: string) => Promise<boolean> = copyToClipboard,
 ): SelectionAction[] {
   const actions: SelectionAction[] = []
 
@@ -1768,7 +1782,7 @@ export function useSelectionActions(
     label: i18nT('components.selectionToolbar.copy'),
     // Returns the clipboard result so the toolbar's checkmark is truthful
     // (and a refusal is reported rather than flashed as success).
-    onClick: (text) => copyToClipboard(text),
+    onClick: (text) => copy(text),
   })
 
   return actions

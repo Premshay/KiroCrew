@@ -489,7 +489,7 @@ async def test_authenticated_http_publication_admits_runner(
         return "https://example.invalid/pr/1"
 
     recipe.draft = draft
-    monkeypatch.setattr(routes, "GitHubPRRecipe", lambda **kw: recipe)
+    monkeypatch.setattr(routes, "build_pr_recipe", lambda provider, **kw: recipe)
     fp = "a" * 40
     queue = store.pr_queue_dir()
     for suffix, content in (
@@ -504,9 +504,8 @@ async def test_authenticated_http_publication_admits_runner(
     app.router.add_post(
         path, routes._handle_draft_pr if manual == "draft" else routes._handle_commit
     )
-    token = token_auth.generate_token("publication-tester")
+    token = token_auth.generate_token("publication-tester", register_nonce=False, session=True)
     token_auth.bind_token_ip(token, "127.0.0.1")
-    token_auth.mark_consumed(token)
     try:
         async with TestClient(TestServer(app, host="127.0.0.1")) as client:
             url = path.replace("{fp}", fp)

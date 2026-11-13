@@ -129,6 +129,29 @@ def flatten_config(doc: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
     return out
 
 
+def watch_document(cfg: Any) -> dict[str, Any]:
+    """``cfg.to_dict()`` as the watch compares it, never written anywhere.
+
+    ``agent.member_acp_backend`` also says whether it was stored or inherited from
+    ``agent.acp_backend`` (``config.loader_builders.mark_member_backend_inherited``).
+    Removing a stored value equal to the Settings harness leaves ``to_dict()``
+    unchanged, yet it can move a Crew bot onto KAS
+    (``crewmate_harness.worker_spec_forces_kas``), so it must reach that key's
+    subscribers like any other change.
+    """
+    from kiro_crew.config.loader_builders import MEMBER_BACKEND_INHERITED_ATTR
+
+    doc = cfg.to_dict()
+    agent = doc.get("agent")
+    inherited = getattr(getattr(cfg, "agent", None), MEMBER_BACKEND_INHERITED_ATTR, None)
+    if isinstance(agent, dict) and inherited is not None:
+        agent["member_acp_backend"] = [
+            agent.get("member_acp_backend"),
+            "inherited" if inherited else "stored",
+        ]
+    return doc
+
+
 def diff_config_docs(old: Mapping[str, Any] | None, new: Mapping[str, Any]) -> frozenset[str]:
     """Return the dotted leaf paths whose value differs between *old* and *new*.
 
@@ -631,7 +654,7 @@ class ConfigWatch:
         touches the filesystem.
         """
         self._cfg = cfg
-        self._doc = cfg.to_dict()
+        self._doc = watch_document(cfg)
         if fingerprint is not None:
             self._fingerprint = fingerprint
 
@@ -701,6 +724,12 @@ class ConfigWatch:
                 self._env_fingerprint = await asyncio.to_thread(self._current_env_fingerprint)
             except Exception:  # noqa: BLE001 - the first cycle re-reads it
                 self._env_fingerprint = None
+        # The torn / not-a-file record before the first cycle runs (one poll
+        # interval away): the dispatch switch reads it from the first request.
+        try:
+            await asyncio.to_thread(self._document_is_torn)
+        except Exception:  # noqa: BLE001 - the first cycle takes it again
+            logger.debug("config watch: initial file probe failed", exc_info=True)
         self._task = loop.create_task(self._run(), name="config-watch")
         self._task.add_done_callback(self._on_task_done)
 
@@ -887,7 +916,7 @@ class ConfigWatch:
                 logger.warning(
                     "config.json does not parse; keeping the previous settings until it does"
                 )
-                cfg, doc = kept, kept.to_dict()
+                cfg, doc = kept, watch_document(kept)
             if self._hold_depth > 0 or self._hold_gen != hold_gen:
                 # A transaction began while the file was being read, so this
                 # document may be its uncommitted intermediate state (a widened
@@ -1204,7 +1233,7 @@ class ConfigWatch:
     @classmethod
     def _load_with_doc(cls) -> tuple["KiroCrewConfig", dict[str, Any], bool]:
         cfg = cls._load()
-        return cfg, cfg.to_dict(), cls._document_is_torn()
+        return cfg, watch_document(cfg), cls._document_is_torn()
 
     @staticmethod
     def _document_is_torn() -> bool:
@@ -1213,19 +1242,88 @@ class ConfigWatch:
         The loader answers such a file with defaults and a degradation flag that
         stays for the life of the process, so the flag cannot say whether THIS
         read hit a torn file; the file can. Missing files are not torn.
+
+        The answer is also added, per file, to :func:`torn_config_files`, which
+        keeps it until restart. Nothing here touches the loader's process-wide
+        degradation record, so no gate that reads that record moves on a tear.
+
+        A ``config.local.json`` the loader reads as absent while its name still
+        stands (a symlink whose target is gone -- an unmounted share) is listed
+        there too: it can stand where an opt-out was. It is NOT reported as torn,
+        so the watcher still adopts the load and every other setting reloads as
+        before; only the dispatch switch reads the list. Both checks go through
+        the loader's own read, so where the sandbox seals the file and serves its
+        endorsed copy, a pending delete or edit is neither torn nor unknown.
         """
+        import os
+
+        from kiro_crew.config import loosening_provenance
         from kiro_crew.config.loader import config_local_path, config_path, read_config_text
 
-        for path in (config_path(), config_local_path()):
+        torn: set[str] = set()
+        unknown: set[str] = set()
+        local = config_local_path()
+
+        def _read(path: Any) -> bytes:
+            return read_config_text(path).encode("utf-8")
+
+        for leaf, path in (
+            ("config.json", config_path()),
+            ("config.local.json", local),
+        ):
             try:
-                if not path.exists():
+                # The bytes the loader parses: where the sandbox seals these files, an
+                # edit held as pending reads as the endorsed copy, so it is not torn.
+                content = loosening_provenance.reconciled_bytes(leaf, path, _read)
+                if content is None:
+                    # Absent to the loader. An overlay name that still stands there
+                    # (a symlink whose target is gone) can hide an opt-out; an
+                    # endorsed copy the loader serves instead never reaches here.
+                    if path == local and os.path.lexists(local):
+                        unknown.add(str(local))
                     continue
-                data = json.loads(read_config_text(path))
+                data = json.loads(content)
             except Exception:  # noqa: BLE001 - unreadable or unparseable: torn
-                return True
+                torn.add(str(path))
+                continue
             if not isinstance(data, dict):
-                return True
-        return False
+                torn.add(str(path))
+        _set_torn_files(torn | unknown)
+        return bool(torn)
+
+
+# ── the last probe's torn files ──────────────────────────────────────
+
+#: Every config file a watcher probe has found torn since the gateway started (see
+#: :meth:`ConfigWatch._document_is_torn`). Sticky until restart, on purpose: a
+#: later probe that reads the files whole does not mean the watcher adopted them
+#: (a held settings transaction can discard that result), so the snapshot it kept
+#: may still predate an opt-out written during the tear. Read only by the
+#: code-channel dispatch opt-in; the loader's degradation record is untouched.
+_TORN_FILES: frozenset[str] = frozenset()
+
+
+def _set_torn_files(paths: Iterable[str]) -> None:
+    global _TORN_FILES
+    _TORN_FILES = _TORN_FILES | frozenset(paths)
+
+
+def _clear_torn_files() -> None:
+    """Forget every tear (a fresh process; tests)."""
+    global _TORN_FILES
+    _TORN_FILES = frozenset()
+
+
+def torn_config_files() -> frozenset[str]:
+    """Every config file the live watcher has found torn since start, as path strings.
+
+    While a tear is unresolved the watcher keeps the snapshot from before it
+    (:func:`_keep_last_valid`), and a later whole read is not proof that snapshot
+    was replaced, so a file stays listed until the gateway restarts. Read by an
+    opt-in that must not treat a kept snapshot as the owner's current choice (the
+    Slack code-channel dispatch switch); no I/O.
+    """
+    return _TORN_FILES
 
 
 # ── process singleton ────────────────────────────────────────────────
@@ -1345,6 +1443,7 @@ def reset_for_tests() -> None:
         _WATCH = None
     if w is not None and w._task is not None:
         w._task.cancel()
+    _clear_torn_files()
 
 
 __all__ = [
@@ -1362,5 +1461,6 @@ __all__ = [
     "reset_for_tests",
     "snapshot",
     "subscribe",
+    "torn_config_files",
     "watch",
 ]

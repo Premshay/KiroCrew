@@ -1,5 +1,6 @@
 """The runnable harness choices a Bot profile offers and accepts."""
 
+import pytest
 from test_crewmate_harness import _cfg, _selectable  # noqa: F401
 
 
@@ -60,8 +61,8 @@ class TestCrewmateHarnesses:
         )
 
     def test_a_kas_boot_proved_unstartable_is_not_offered(self, monkeypatch):
-        """Enterprise boot recorded KAS cannot start: neither the picker nor a save offers it."""
-        from kiro_crew import enterprise_boot
+        """LTS boot recorded KAS cannot start: neither the picker nor a save offers it."""
+        from kiro_crew import lts_boot
         from kiro_crew.agent_sdk import backends
         from kiro_crew.crewmate_harness import (
             crewmate_harnesses,
@@ -72,14 +73,14 @@ class TestCrewmateHarnesses:
         monkeypatch.setattr(
             backends, "selectable_backends", lambda: frozenset({"", "kas", "claude"})
         )
-        monkeypatch.setattr("kiro_crew.edition.EDITION", "enterprise")
-        monkeypatch.setattr(enterprise_boot, "_kas_refusal", ("KAS failed", "fix it"))
+        monkeypatch.setattr("kiro_crew.edition.EDITION", "lts")
+        monkeypatch.setattr(lts_boot, "_kas_refusal", ("KAS failed", "fix it"))
         cfg = _cfg()
         assert crewmate_harnesses(cfg) == ["claude"]
         assert "must be one of" in (harness_pin_rejected("kas", cfg) or "")
         assert "kas" not in worker_harnesses(cfg) and "claude" in worker_harnesses(cfg)
         # Nothing recorded: KAS is offered again.
-        monkeypatch.setattr(enterprise_boot, "_kas_refusal", None)
+        monkeypatch.setattr(lts_boot, "_kas_refusal", None)
         assert "kas" in crewmate_harnesses(cfg)
 
     def test_a_kiro_pin_on_kas_has_kas_worker_limits(self):
@@ -106,3 +107,16 @@ class TestCrewmateHarnesses:
         assert harness_pin_rejected("", cfg) is None
         for refused in ("kiro", "opencode", "claude"):
             assert "must be one of" in (harness_pin_rejected(refused, cfg) or "")
+
+
+@pytest.mark.parametrize("harness", ["pi", "deepseek"])
+def test_an_explicit_chat_pin_keeps_its_own_model_namespace(monkeypatch, harness):
+    from kiro_crew.agent_sdk import backends
+    from kiro_crew.crewmate_harness import CrewBackendPin, crewmate_harnesses, kas_pin_harnesses
+
+    monkeypatch.setattr(
+        backends, "selectable_backends", lambda: frozenset({"", "kas", "claude", harness})
+    )
+    assert harness in crewmate_harnesses(_cfg())
+    assert CrewBackendPin("pixel", harness).checked().backend == harness
+    assert harness not in kas_pin_harnesses()

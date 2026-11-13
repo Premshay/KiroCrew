@@ -41,7 +41,10 @@ class TunnelProvider(Protocol):
 
     Public default = disabled/no-op (the ``tunnel/manager.py`` stub).  The
     companion supplies the internal tunnel supervisor (the Tunnels primitive
-    itself is owned by PartyRock and out of scope).
+    itself is owned by PartyRock and out of scope).  The public composition puts
+    the Kiro relay client (``relay_client.provider.RelayTunnelProvider``) here
+    instead only when ``tunnel.relay_enabled`` is on; a companion's own provider
+    is never replaced by it.
 
     WIRED: the ``tunnel/manager.py`` stub ``TunnelManager`` delegates its
     ``start`` / ``stop`` / ``public_url`` UNCONDITIONALLY to
@@ -223,15 +226,17 @@ class CloudInstancePolicy:
 
     Some organizations require each EC2 instance to run a host agent (monitoring,
     inventory, patch compliance) whose permissions come from a managed policy that
-    already exists in every account. The built-in launcher attaches only Session
-    Manager's policy, and its permissions boundary caps the role to that, so such
-    an instance is non-compliant from the moment it boots. This descriptor is how
+    the organization puts into its accounts. The built-in launcher attaches only
+    Session Manager's policy, and its permissions boundary caps the role to that,
+    so such an instance is non-compliant from the moment it boots. This descriptor is how
     an edition says what those organizations need, without the public build naming
     any one of them.
 
     ``managed_policy_arns`` are attached to the instance role beside Session
     Manager's. Each is a full IAM policy ARN; ``{account}`` stands for the launch
-    account's id, for a policy that exists at the same path in every account.
+    account's id, for a policy kept at the same path in each account. A launch
+    into an account that holds no policy at one of these ARNs is refused before
+    its stack is deployed (``host_policy.require_managed_policies``).
 
     ``boundary_statements`` are ``Allow`` statements appended to the instance
     permissions boundary. A boundary is a ceiling, so without them an attached
@@ -439,10 +444,11 @@ class FeedbackTrackerProvider(Protocol):
         Default) leaves today's behaviour byte-for-byte.
 
         *bundle* carries the facts a report wants: ``filename``,
-        ``total_redactions``, ``path_collapses`` and ``provenance`` (release,
-        channel). Never put ``bundle.zip_path`` in the URL: it sits under the
-        data home and leaks the OS login. *note* is the user's free text,
-        untrusted; percent-encode it or leave it out.
+        ``total_redactions``, ``path_collapses`` (host-name replacements
+        included) and ``provenance`` (release, channel). Never put
+        ``bundle.zip_path`` in the URL: it sits under the data home and leaks
+        the OS login. *note* is the user's free text, untrusted; percent-encode
+        it or leave it out.
 
         *prefill* says which surface the link is for. ``True`` is the dashboard,
         which renders the URL from a JSON field no redactor scans, so a long
@@ -456,6 +462,19 @@ class FeedbackTrackerProvider(Protocol):
         while keeping the bundle usable, without a standalone fallback. Any other
         error, a non-string or an empty string degrades to the public link.
         v1 addition (no ``CONTRACT_VERSION`` bump).
+        """
+        ...
+
+
+class AcceptanceCheckProvider(Protocol):
+    """The edition's checks behind ``kirocrew acceptance-check`` (``edition_check``)."""
+
+    def run_acceptance_check(self, check: str, ref: str) -> int:
+        """Print the JSON report for *check* about *ref* and return the exit code.
+
+        WIRED: the ``acceptance-check`` branch of ``kiro_crew.cli.main``. Exit codes
+        and report: platform-context.md, "Acceptance check command". v1 addition
+        (no ``CONTRACT_VERSION`` bump).
         """
         ...
 
@@ -634,7 +653,10 @@ class SttStreamSession(Protocol):
     it could not start; ``feed()`` takes 16 kHz mono Int16 PCM and answers False
     once the session stops accepting audio; ``events()`` yields
     ``{"type": "partial"|"final", "text": str}`` or ``{"type": "error",
-    "message": str}``; ``finish()`` ends the input so the trailing finals arrive;
+    "message": str, "code": str}``, where ``code`` is optional and core relays it
+    only when it is one of ``stt_stream.RELAYED_SESSION_ERROR_CODES`` (any other
+    code, or none, reaches the client as ``stt_session_failed``); ``finish()``
+    ends the input so the trailing finals arrive;
     ``close()`` releases everything and is idempotent.
     """
 
@@ -665,6 +687,25 @@ class SttProvider(Protocol):
     also set an optional ``identifies_languages = True``. Core then offers the
     mixed-language picker for it; the provider reads the candidates from
     ``stt_config.transcribe_language_identification`` itself.
+
+    :meth:`transcribe_file` gets the clip as it was recorded (webm from the
+    dashboard, ogg/Opus from Slack). A provider that reads only 16 kHz mono 16-bit
+    PCM WAV may set an optional ``needs_pcm_wav = True``. Core then converts any
+    other clip with its own audio decoder and passes the copy; with no decoder, a
+    container that decoder does not recognize by file suffix, or a clip over
+    ``transcribe._MAX_AUDIO_SECS`` (an hour), the transcription fails without
+    calling the provider.
+
+    A streaming provider whose backend decides how long one session runs may set
+    an optional ``owns_session_limit = True``. Core then applies no duration cap
+    to its sessions and advertises no ``max_duration_ms``: the backend's limit is
+    the only one, so it can change without a client release. When the backend
+    ends a session at its limit, the provider emits ``{"type": "error", "code":
+    "stt_max_duration_exceeded"}`` and the dashboard shows its length-limit
+    message. Such a provider must bound its own I/O (connect and read timeouts),
+    since no core deadline will end a session whose backend stops answering.
+    Without the attribute, core's ``_MAX_STREAM_DURATION_SECS`` applies as it
+    does to the built-in providers.
 
     Core may call any method from any event loop. A provider must not keep a
     loop-bound client (an aiohttp or httpx session) across calls: it creates one

@@ -5,9 +5,10 @@
 // in ChatInputTestUtils.tsx.
 import React from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { act, screen, fireEvent, waitFor } from '@testing-library/react'
+import { act, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 import ChatInput from '../components/ChatInput'
+import { sseDisconnected } from '../store/dashboardSlice'
 import { PREVIEW_STRIP_H, stubStripHeights } from './stripHeights'
 
 // The composer's own drag floor.
@@ -36,6 +37,14 @@ beforeEach(() => {
 })
 
 describe('ChatInput', () => {
+  it('does not invent token usage when the context window is unknown', () => {
+    renderWithProviders(
+      <ChatInput {...defaultProps} onModelClick={vi.fn()} modelName="auto" contextPct={50} />,
+    )
+    fireEvent.click(screen.getByLabelText('Context usage'))
+    const card = screen.getByTestId('context-usage-popover')
+    expect(within(card).getByText('Used').parentElement).toHaveTextContent('—')
+  })
   it('keeps Ultra Mode first in the mobile scroll strip with the attachment and permission controls', () => {
     mobileEnv.mobile = true
     renderWithProviders(
@@ -98,7 +107,9 @@ describe('ChatInput', () => {
     })
 
     it('shows offline placeholder when connected=false', () => {
-      renderWithProviders(<ChatInput {...defaultProps} connected={false} />)
+      const { store } = renderWithProviders(<ChatInput {...defaultProps} connected={false} />)
+      // An outage, not the page's first socket still opening (#34947).
+      act(() => { store.dispatch(sseDisconnected()) })
       expect(screen.getByPlaceholderText(/Gateway offline/)).toBeInTheDocument()
     })
 
@@ -414,6 +425,16 @@ describe('ChatInput', () => {
       Object.defineProperty(ta, 'selectionEnd', { value: 3, writable: true })
       fireEvent.keyDown(ta, { key: 'Enter', ctrlKey: true })
       expect(onChange).toHaveBeenCalledWith('hel\nlo')
+    })
+
+    it('leaves a read-only (disabled) composer untouched on Ctrl+Enter', () => {
+      const onChange = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="hello" disabled onChange={onChange} sendOnEnter="enter-ctrl-newline" />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      Object.defineProperty(ta, 'selectionStart', { value: 3, writable: true })
+      Object.defineProperty(ta, 'selectionEnd', { value: 3, writable: true })
+      fireEvent.keyDown(ta, { key: 'Enter', ctrlKey: true })
+      expect(onChange).not.toHaveBeenCalled()
     })
   })
 
@@ -1459,7 +1480,7 @@ describe('ChatInput', () => {
       let resolveFetch: ((value: Response) => void) | null = null
       const originalFetch = global.fetch
       const fetchSpy = vi.spyOn(global, 'fetch').mockImplementation((input, init) =>
-        String(input).includes('optimize')
+        String(input).includes('/api/optimizer/optimize')
           ? new Promise<Response>(res => { resolveFetch = res })
           : originalFetch(input, init)
       )
@@ -1498,7 +1519,7 @@ describe('ChatInput', () => {
       let rejectFetch: ((reason?: Error) => void) | null = null
       const originalFetch = global.fetch
       const fetchSpy = vi.spyOn(global, 'fetch').mockImplementation((input, init) =>
-        String(input).includes('optimize')
+        String(input).includes('/api/optimizer/optimize')
           ? new Promise<Response>((_res, rej) => { rejectFetch = rej })
           : originalFetch(input, init)
       )

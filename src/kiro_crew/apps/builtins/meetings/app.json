@@ -40,8 +40,12 @@
       "/api/ws/stt"
     ],
     "network": true,
-    "storage": true
+    "storage": true,
+    "agentTurns": true
   },
+  "agentReadOnlyDirs": [
+    "notes"
+  ],
   "backend": {
     "routes": "backend.routes:register_routes"
   },

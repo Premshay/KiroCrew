@@ -4,7 +4,6 @@ import { Clock, AppWindow } from 'lucide-react'
 import type { MessageQuoteRole, MessageQuote } from '../../../chat-core/composer/messageQuote'
 import type { ChatMessage, ChatSlot } from '../../../types'
 import type { CapabilityFix, FreshSessionState, RepairImagesState } from '../ErrorCard'
-import { toApiDecision } from '../../../utils/approvalDecision'
 import { isHiddenInvisibleAssistantRow } from '../../../utils/invisibleText'
 import { type MessageRenderer, mergeRenderers, type MessageRenderContext, resolveRenderer } from '../../../app-sdk/messageRenderers'
 import { createTranscriptRenderers } from '../transcriptRenderers'
@@ -38,6 +37,7 @@ import { fmtMessageTime, fmtMessageTimeFull } from '../messageTime'
 import type { useActiveSlotState } from './activeSlotState'
 import type { RefusedPressAction } from './turnActions'
 import { usePersistedBool } from '../../../hooks/usePersistedBool'
+import { continuesAuthorRun } from '../../../api/sharedCrewUi'
 import type { SteerRetractAction, SteerRetractRefusalNotice } from '../../../hooks/useSteerRetract'
 
 /** ChatPage's tool rows derive their auto-denied state inside ToolCallLine;
@@ -101,7 +101,7 @@ interface TranscriptRenderingOptions {
   handleOpenDiff: (filePath: string, modified: string, original: string) => void
   handleSubagentPanelOpen: (parsed: ParsedSubagentCompletion) => void
   sessionTitles: Map<string, string>
-  handleFork: (visibleIndex: number, messageId?: string, explicitDirection?: 'head') => Promise<void>
+  handleFork: (visibleIndex: number, messageId?: string, explicitDirection?: 'head') => Promise<boolean>
   forkDirectionChoice?: boolean
   highlightTs: string | null
   selectSessionTab: (key: string) => void
@@ -110,8 +110,8 @@ interface TranscriptRenderingOptions {
   connectionsUiOn: boolean
   planTaskId: string
   showRefusedPress: (action: RefusedPressAction, e: unknown) => void
-  approve: (action: string) => Promise<void>
-  dismissApproval: (aid: string, decision?: string) => void
+  /** Decides a collapsed tool group's pending row, bound to the request it names. */
+  decideRow: (meta: Record<string, unknown> | undefined, action: string) => Promise<void>
   revealAppInPanel: (toolCallId: string) => void
   lastTextIdx: number
   regenerating: boolean
@@ -154,6 +154,10 @@ interface TranscriptRenderingOptions {
   steerActionPending: Readonly<Record<string, SteerRetractAction>>
   steerActionRefusals: Readonly<Record<string, SteerRetractRefusalNotice>>
   steerActionRequestFailures: Readonly<Record<string, true>>
+  /** The agent and project the composer scopes its `$` skill menu by, so the
+   *  Edit & Resend field opens the same menu (see UserMessage `editSkillPicker`). */
+  editSkillAgent?: string
+  editSkillProject?: string
 }
 
 /**
@@ -165,16 +169,19 @@ interface TranscriptRenderingOptions {
  */
 /** The repeat-session-start card's restart (#13791). Module scope so the
  *  transcript renderers' memo never sees a new identity. */
+// A declined "work is running" confirmation rejects with `WorkConfirmDeclined`,
+// which the card treats as a quiet cancel (no failure shown).
 const restartGatewayFromError = (): Promise<unknown> => api.restartGateway()
 
 export function useTranscriptRendering({
   embedded, mode, popout, filteredSlots, connected, activeSlot, voiceRecoverySlot, appToolCallIds, mcpAppPanel, messages, messagesRef, slotRunning, toolDisclosure, setToolDisclosureFor, slotState,
   activityOpen, slotHasMore, slotOldestIndex, cursorIsForActiveSlot, loadingOlder, chatConfig, activeSlotRemoteBound, automationId, setAutomationOpen, handleArtifactOpen, handleFileOpen,
   handleFolderOpen, handleOpenDiff, handleSubagentPanelOpen, sessionTitles, handleFork, forkDirectionChoice, highlightTs, selectSessionTab, linkPreviewsOn, socialShareOn, connectionsUiOn, planTaskId, showRefusedPress, handleOpenCrewTab,
-  approve, dismissApproval, revealAppInPanel, lastTextIdx, regenerating, handleRegenerate, replacingMids, continuable, continuing, freshSession, handleContinue, handleFreshSession, repairImages, handleRepairImages, interrupted,
+  decideRow, revealAppInPanel, lastTextIdx, regenerating, handleRegenerate, replacingMids, continuable, continuing, freshSession, handleContinue, handleFreshSession, repairImages, handleRepairImages, interrupted,
   openDefaultModelSetting, openKiroSignIn, openMemberCapabilities, openModelPickerFromError, openTurnLimitSetting, quoteWholeMessage, handleAsk, handleQuote, handleEditResend, editLast, farmPassRef,
   handleEditConsumed, renderUserContentCb, transcriptHot, toggleAct, handleSpeak, handleApplyPlan, renderedDisplayItems, stableMsgKey, handleLoadEarlier, isPinned, handleJumpToQuote,
   handleTogglePinForMessage, handleSteerAction, steerActionPending, steerActionRefusals, steerActionRequestFailures,
+  editSkillAgent, editSkillProject,
 }: TranscriptRenderingOptions) {
   // Precomputed O(n) map from message index → visible (user/assistant) index,
   // used by the fork button. Avoids a per-row O(i) filter that would make the
@@ -224,6 +231,12 @@ export function useTranscriptRendering({
   // through the memo.
   const visibleIndexMapRef = useRef(visibleIndexMap); visibleIndexMapRef.current = visibleIndexMap
   const forkHasLaterMessages = useCallback((forkIndex: number) => forkIndex < visibleIndexMapRef.current.size - 1, [])
+  // "Fork with another model": a fork with the earlier messages, then the new chat's own model
+  // picker, so the model and effort are picked in the one combined control. Not opened when the
+  // person moved to another chat while the fork ran: the picker acts on the open chat.
+  const handleForkWithModel = useCallback(async (visibleIndex: number, messageId?: string) => {
+    if (await handleFork(visibleIndex, messageId, 'head')) openModelPickerFromError()
+  }, [handleFork, openModelPickerFromError])
   const lastTextIdxRef = useRef(lastTextIdx); lastTextIdxRef.current = lastTextIdx
   // The first reply in this session with a removed credential: the one-time
   // redaction coach renders after it and nowhere else.
@@ -252,6 +265,12 @@ export function useTranscriptRendering({
   }, [messages, replacingMids])
   const newReplyStarted = firstNewReplyIdx >= 0
   const slotStateRef2 = useRef(slotState); slotStateRef2.current = slotState
+  // One object per chat, agent and project, so memo(UserMessage) keeps
+  // short-circuiting on unrelated renders.
+  const editSkillPicker = useMemo(
+    () => (activeSlot ? { slotId: activeSlot, agentName: editSkillAgent, project: editSkillProject } : undefined),
+    [activeSlot, editSkillAgent, editSkillProject],
+  )
 
   // Row action handlers that never change identity. Their sources are rebuilt on
   // every chunk flush (handleEditResend and handleRegenerate close over
@@ -347,6 +366,7 @@ export function useTranscriptRendering({
               canEdit={!slotRunning && !regenerating && !!activeSlot && !activeSlotRemoteBound}
               slotRunning={slotRunning}
               showQueuedSend={queuedSendRow(ctx.messages) === i}
+              continuesRun={continuesAuthorRun(ctx.messages, i)}
               messageIndex={i}
               messageTs={m.ts || ''}
               onEditResend={stableEditResend}
@@ -355,6 +375,7 @@ export function useTranscriptRendering({
               onEditConsumed={farmPassRef.current ? undefined : handleEditConsumed}
               slotKey={activeSlot || undefined}
               slotTitle={activeSlotTitle}
+              editSkillPicker={editSkillPicker}
               sessions={connected ? sessionTitles : undefined}
               onSessionOpen={selectSessionTab}
               mode={mode}
@@ -402,7 +423,7 @@ export function useTranscriptRendering({
               {startsNewReply && <span className="text-muted text-[11px] leading-4 font-medium px-1 mb-1 border-t border-border pt-2" data-testid="regenerate-new-reply">{i18nT('pages.chatPage.regenerate_new_reply')}</span>}
               <AssistantMessage body={warmBriefBodyOf(m, activeSlot || undefined)} revealActions={!!activeSlot && voiceRecoverySlot === activeSlot} suppressSteerAck={turnHadPolicyBlock(messagesRef.current, i)} prevUserText={prevUserTextFor(messagesRef.current, i)} shareEnabled={socialShareOn} linkPreviews={linkPreviewsOn} content={m.content} isStreaming={isStreaming} isRegenerating={regenerating && i === lastTextIdxRef.current} onFileOpen={handleFileOpen} onFolderOpen={handleFolderOpen} onArtifactOpen={handleArtifactOpen} onSessionOpen={selectSessionTab} sessions={connected ? sessionTitles : undefined} activeSession={activeSlot || undefined} onQuote={handleQuote} onAsk={handleAsk} copyOnSelect={copyOnSelect} slotRunning={slotRunning} planTaskId={planTaskId} timestamp={chatConfig.showTimestamps ? msgTime : undefined} timestampTitle={msgTimeFull} messageTs={m.ts} slotKey={activeSlot || undefined} slotTitle={activeSlotTitle} mode={mode} fileChanges={(m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined} fileChangesOmittedFiles={(m.meta as Record<string, unknown> | undefined)?.file_changes_omitted_files} blockedLinks={(m.meta as Record<string, unknown> | undefined)?.blocked_links} redactions={(m.meta as Record<string, unknown> | undefined)?.redactions} showRedactionCoach={!!m.ts && m.ts === redactionCoachTs} turnStats={chatConfig.showTurnStats ? (m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined : undefined} decisionsStrip={decisionStripFieldOf(m)} onOpenDiff={handleOpenDiff} fileChipStyle={chatConfig.fileChipStyle} artifactPaths={artifactPaths} pinned={m.ts && (m.meta as Record<string, unknown> | undefined)?.mid ? isPinned((m.meta as Record<string, unknown>).mid as string) : false} onTogglePin={m.ts && (m.meta as Record<string, unknown> | undefined)?.mid ? rowHandlersFor(m, 'assistant').togglePin : undefined} onQuoteMessage={activeSlot && !activeSlotRemoteBound && !isStreaming ? rowHandlersFor(m, 'assistant').quote : undefined} showFooter={replyShowsFooter(m, messagesRef.current, i, slotRunning)} onSpeak={handleSpeak} onRegenerate={i === lastTextIdxRef.current && !slotRunning && !regenerating && activeSlot && !activeSlotRemoteBound ? stableRegenerate : undefined} variants={m.variants} variantIdx={m.variant_idx} onSwitchVariant={i === lastTextIdxRef.current && m.variants && m.variants.length > 1 && activeSlot ? (idx: number) => { api.switchVariant(activeSlot, idx).catch((e: unknown) => {
                 showRefusedPress('switch_variant', e)
-              }) } : undefined} onFork={embedded && !popout ? undefined : handleFork} forkDirectionChoice={forkDirectionChoice} forkHasLaterMessages={forkHasLaterMessages} forkIndex={forkIndex} forkMessageId={canResolveOnServer ? messageId : undefined} onLoadEarlier={cursorIsForActiveSlot ? handleLoadEarlier : undefined} loadingOlder={loadingOlder} earlierRemaining={slotOldestIndex} onApplyPlan={handleApplyPlan} />
+              }) } : undefined} onFork={embedded && !popout ? undefined : handleFork} onForkWithModel={embedded && !popout ? undefined : handleForkWithModel} forkDirectionChoice={forkDirectionChoice} forkHasLaterMessages={forkHasLaterMessages} forkIndex={forkIndex} forkMessageId={canResolveOnServer ? messageId : undefined} onLoadEarlier={cursorIsForActiveSlot ? handleLoadEarlier : undefined} loadingOlder={loadingOlder} earlierRemaining={slotOldestIndex} onApplyPlan={handleApplyPlan} />
             </div>
           )}
         </div>
@@ -495,7 +516,7 @@ export function useTranscriptRendering({
       bubble,
     ])
     return { renderers, fallback: bubble }
-  }, [slotRunning, handleFileOpen, handleArtifactOpen, selectSessionTab, sessionTitles, connected, handleFork, forkDirectionChoice, forkHasLaterMessages, handleQuote, handleAsk, stableJumpToQuote, chatConfig, copyOnSelect, activeSlot, regenerating, replacingMids, firstNewReplyIdx, newReplyStarted, activeSlotRemoteBound, stableRegenerate, stableEditResend, rowHandlersFor, editLast, handleEditConsumed, slotHasMore, loadingOlder, cursorIsForActiveSlot, slotOldestIndex, handleLoadEarlier, renderUserContentCb, highlightTs, activeSlotTitle, mode, embedded, popout, handleOpenDiff, planTaskId, artifactPaths, automationId, toolDisclosure, setToolDisclosureFor, linkPreviewsOn, socialShareOn, voiceRecoverySlot, handleSubagentPanelOpen, isPinned, showRefusedPress, transcriptHot, revealAppInPanel, continuable, interrupted, continuing, handleContinue, openModelPickerFromError, openDefaultModelSetting, openKiroSignIn, openMemberCapabilities, openTurnLimitSetting, handleFreshSession, freshSession, handleRepairImages, repairImages, handleFolderOpen, handleSpeak, handleApplyPlan, mcpAppPanel, redactionCoachTs, setAutomationOpen, farmPassRef, messagesRef, handleSteerAction, steerActionPending, steerActionRefusals, steerActionRequestFailures, handleOpenCrewTab])
+  }, [slotRunning, handleFileOpen, handleArtifactOpen, selectSessionTab, sessionTitles, connected, handleFork, handleForkWithModel, forkDirectionChoice, forkHasLaterMessages, handleQuote, handleAsk, stableJumpToQuote, chatConfig, copyOnSelect, activeSlot, regenerating, replacingMids, firstNewReplyIdx, newReplyStarted, activeSlotRemoteBound, stableRegenerate, stableEditResend, rowHandlersFor, editLast, handleEditConsumed, slotHasMore, loadingOlder, cursorIsForActiveSlot, slotOldestIndex, handleLoadEarlier, renderUserContentCb, highlightTs, activeSlotTitle, mode, embedded, popout, handleOpenDiff, planTaskId, artifactPaths, automationId, toolDisclosure, setToolDisclosureFor, linkPreviewsOn, socialShareOn, voiceRecoverySlot, handleSubagentPanelOpen, isPinned, showRefusedPress, transcriptHot, revealAppInPanel, continuable, interrupted, continuing, handleContinue, openModelPickerFromError, openDefaultModelSetting, openKiroSignIn, openMemberCapabilities, openTurnLimitSetting, handleFreshSession, freshSession, handleRepairImages, repairImages, handleFolderOpen, handleSpeak, handleApplyPlan, mcpAppPanel, redactionCoachTs, setAutomationOpen, farmPassRef, messagesRef, handleSteerAction, steerActionPending, steerActionRefusals, steerActionRequestFailures, handleOpenCrewTab, editSkillPicker])
 
   const renderMessage = useCallback((i: number, m: ChatMessage) => {
     // Key identity rules (clientTs preference + streaming->assistant role
@@ -553,16 +574,15 @@ export function useTranscriptRendering({
           permissionMeta={unresolvedPerms.at(-1)?.meta as Record<string, unknown> | undefined}
           pendingPermCount={unresolvedPerms.length}
           onApprove={(() => {
-            const aid = unresolvedPerms.at(-1)?.meta?.approval_id as string | undefined
-            if (!aid) return approve
-            return async (action: string) => { await api.resolveApproval(aid, toApiDecision(action)); dismissApproval(aid) }
+            const meta = unresolvedPerms.at(-1)?.meta as Record<string, unknown> | undefined
+            return (action: string) => decideRow(meta, action)
           })()}
           onViewActivity={toggleAct}
           activityOpen={activityOpen}
         >{it.msgs.map((m, j) => <div key={msgIdentityKey(m, stableMsgKey)}>{renderMessage(it.startIdx + j, m)}</div>)}</CollapsibleToolGroup>)
       })() : renderMessage(it.idx, it.msg)}
     </div>
-  }, [stableMsgKey, renderMessage, approve, dismissApproval, toggleAct, activityOpen])
+  }, [stableMsgKey, renderMessage, decideRow, toggleAct, activityOpen])
 
   // ---- Measure-farm wiring ----
   // The farm's renderItem must reproduce the transcript row wrappers EXACTLY
@@ -588,7 +608,7 @@ export function useTranscriptRendering({
               isRunning={false}
               permissionMeta={undefined}
               pendingPermCount={0}
-              onApprove={approve}
+              onApprove={action => decideRow(undefined, action)}
               onViewActivity={toggleAct}
               activityOpen={false}
             >{item.msgs.map((m, j) => <div key={msgIdentityKey(m, stableMsgKey)}>{renderMessage(item.startIdx + j, m)}</div>)}</CollapsibleToolGroup>
@@ -596,7 +616,7 @@ export function useTranscriptRendering({
         })() : renderMessage(item.idx, item.msg)}
       </div>
     )
-  }, [renderedDisplayItems, renderTurnItem, chatConfig.collapseAllSteps, appToolCallIds, approve, toggleAct, stableMsgKey, renderMessage, activeSlot])
+  }, [renderedDisplayItems, renderTurnItem, chatConfig.collapseAllSteps, appToolCallIds, decideRow, toggleAct, stableMsgKey, renderMessage, activeSlot])
   const renderFarmItem = useCallback((i: number): React.ReactNode => {
     farmPassRef.current = true
     try { return buildFarmItem(i) } finally { farmPassRef.current = false }

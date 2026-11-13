@@ -15,6 +15,28 @@ from kiro_crew.doctor_checks import render
 if TYPE_CHECKING:
     from kiro_crew.config import KiroCrewConfig
 
+# Display names for the packages behind the shared channel -> SDK table in
+# ``dashboard/handlers/messaging.py`` (``_CHANNEL_SDK_EXTRA``), which this file
+# reads rather than copies. Names only: which module to probe and which extra
+# installs it stay in that one table.
+_SDK_PACKAGE_NAMES: dict[str, str] = {"teams": "PyJWT", "feishu": "lark-oapi"}
+
+
+def _print_sdk_fix(command: str) -> None:
+    """Say how to add a channel's missing SDK, given its install *command*.
+
+    Same rule as the faiss row in ``features.py``: *command* names THIS
+    interpreter and is empty wherever it cannot run. A bare ``pip`` lands in
+    whatever Python owns that name, which on the desktop app is never the
+    bundled one the gateway imports from, so the next doctor run would print the
+    same advice.
+    """
+    if command:
+        print(f"               Fix: {command}")
+    else:
+        print("               This install's Python cannot add packages with pip;")
+        print("               see Settings > Messaging Channels")
+
 
 def _discord_live_state(port: int | None) -> dict[str, object] | None:
     """Read the gateway's live Discord state, or ``None`` when unreachable.
@@ -103,8 +125,18 @@ def _discord_install_line(application_id: str, *, dm_only: bool) -> None:
     print(f"{render._INDENT}({shape}: re-run it to update scopes or permissions)")
 
 
+#: Printed in place of a credential verdict when the credentials file could not be
+#: read: the value may be in that file, so its absence from *creds* proves nothing.
+_CREDS_UNKNOWN = "⏭  unknown — credentials not readable from this shell"
+
+
 def _doctor_discord(
-    cfg: KiroCrewConfig, creds: dict[str, str], port: int | None, issues: list[str]
+    cfg: KiroCrewConfig,
+    creds: dict[str, str],
+    port: int | None,
+    issues: list[str],
+    *,
+    creds_unreadable: bool = False,
 ) -> None:
     """Report the Discord channel: config, grants, and the live connection.
 
@@ -120,7 +152,8 @@ def _doctor_discord(
     dc = cfg.discord
     if not dc.enabled:
         print("  status:      ⏭  not enabled (optional)")
-        print("  setup:       enable it in the dashboard → Settings → Discord, or set")
+        print("  setup:       enable it in the dashboard under")
+        print(f"{render._INDENT}Settings → Messaging Channels → Discord, or set")
         print(f"{render._INDENT}discord.enabled in config.json and DISCORD_BOT_TOKEN in")
         print(f"{render._INDENT}{cli_doctor.env_path()}, then `kirocrew restart`")
         return
@@ -132,9 +165,12 @@ def _doctor_discord(
     token = creds.get(cli_doctor.CRED_DISCORD_BOT_TOKEN, "") or dc.bot_token
     if token:
         print("  token:       ✅ present")
+    elif creds_unreadable:
+        print(f"  token:       {_CREDS_UNKNOWN}")
     else:
         print("  token:       ❌ missing, so the channel never starts")
-        print(f"{render._INDENT}Fix: paste the bot token in Settings → Discord, or add")
+        print(f"{render._INDENT}Fix: paste the bot token in")
+        print(f"{render._INDENT}Settings → Messaging Channels → Discord, or add")
         print(
             f"{render._INDENT}DISCORD_BOT_TOKEN=<token> to {cli_doctor.env_path()}, then `kirocrew restart`"
         )
@@ -147,7 +183,8 @@ def _doctor_discord(
         print(f"  users:       ✅ {len(users)} allow-listed")
     else:
         print("  users:       ❌ allow-list empty, so EVERY message is denied")
-        print(f"{render._INDENT}Fix: add your numeric user ID under Settings → Discord")
+        print(f"{render._INDENT}Fix: add your numeric user ID under")
+        print(f"{render._INDENT}Settings → Messaging Channels → Discord")
         print(f"{render._INDENT}(Discord → Settings → Advanced → Developer Mode, then")
         print(f"{render._INDENT}right-click your name → Copy User ID), then `kirocrew restart`")
         issues.append("discord: empty user allow-list denies every message")
@@ -209,11 +246,7 @@ def _doctor_whatsapp(cfg: KiroCrewConfig, issues: list[str]) -> None:
     """
     # Function-local, so the channel package loads only when this section runs,
     # never merely because the doctor's families were imported.
-    from kiro_crew.whatsapp.client import (
-        MISSING_EXTRA_HINT,
-        default_db_path,
-        neonize_available,
-    )
+    from kiro_crew.whatsapp.client import default_db_path, neonize_available
 
     print("\nWhatsApp Integration")
     wa = cfg.whatsapp
@@ -226,8 +259,11 @@ def _doctor_whatsapp(cfg: KiroCrewConfig, issues: list[str]) -> None:
     if neonize_available():
         print("  extra:       ✅ neonize importable")
     else:
-        print("  extra:       ❌ not installed, so the enabled channel cannot start")
-        print(f"               Fix: {MISSING_EXTRA_HINT}")
+        print("  extra:       ❌ neonize not installed, so the enabled channel cannot start")
+        command = ""
+        if cli_doctor.pip_install_channel_available():
+            command = cli_doctor.pip_install_command("whatsapp")
+        _print_sdk_fix(command)
         issues.append("whatsapp extra missing")
 
     # The SAME expression ``whatsapp/gateway.py`` builds the client from, so doctor
@@ -258,7 +294,12 @@ def _doctor_whatsapp(cfg: KiroCrewConfig, issues: list[str]) -> None:
 
 
 def _doctor_slack(
-    cfg: KiroCrewConfig, creds: dict[str, str], has_slack: bool, issues: list[str]
+    cfg: KiroCrewConfig,
+    creds: dict[str, str],
+    has_slack: bool,
+    issues: list[str],
+    *,
+    creds_unreadable: bool = False,
 ) -> None:
     """Render the ``Slack Integration`` section.
 
@@ -291,13 +332,21 @@ def _doctor_slack(
                 print("  workspace:   ❌ not in configured workspace allowlist")
                 print("               The gateway will refuse to connect.")
                 issues.append("slack workspace: not in allowlist")
+    elif creds_unreadable:
+        print(f"  status:      {_CREDS_UNKNOWN}")
     else:
         print("  status:      ⏭  not configured (optional)")
         print("  setup:       run 'kirocrew setup --slack', or connect any channel")
         print("               (Slack, Discord, Telegram, …) from the dashboard")
 
 
-def _doctor_other_channels(cfg: KiroCrewConfig, creds: dict[str, str], issues: list[str]) -> None:
+def _doctor_other_channels(
+    cfg: KiroCrewConfig,
+    creds: dict[str, str],
+    issues: list[str],
+    *,
+    creds_unreadable: bool = False,
+) -> None:
     """Render the ``Other Channels`` section: every channel without its own section.
 
     One loop over the roster rather than a section per channel: the doctor knows
@@ -305,10 +354,13 @@ def _doctor_other_channels(cfg: KiroCrewConfig, creds: dict[str, str], issues: l
     `telegram.enabled: true` and no token gets a clean bill of health from the
     tool whose whole job is telling them what is wrong. Readiness is derived from
     descriptor data, so the next channel is covered by adding its descriptor.
+    Readiness is config-only, so a channel whose gateway also needs an optional
+    SDK is probed here before it is reported as fine.
     """
     print("\nOther Channels")
     try:
         from kiro_crew.channels import channel_readiness
+        from kiro_crew.dashboard.handlers.messaging import _channel_sdk_status
 
         # Slack, Discord and WhatsApp each have a dedicated section above reporting
         # the same credential AND the live connection, so listing them again here
@@ -328,7 +380,18 @@ def _doctor_other_channels(cfg: KiroCrewConfig, creds: dict[str, str], issues: l
         if not row.enabled:
             continue
         name = row.channel_type
-        if row.ready:
+        # The same probe Settings' optional-SDK card uses: a find_spec lookup
+        # (never an import), and a command only where pip can install.
+        installed, _supported, command = (
+            _channel_sdk_status(name) if row.ready else (True, False, "")
+        )
+        if not installed:
+            package = _SDK_PACKAGE_NAMES.get(name, f"the {name} SDK")
+            print(f"  {name + ':':12} ❌ enabled, but {package} is not installed,")
+            print("               so the channel cannot start")
+            _print_sdk_fix(command)
+            issues.append(f"{name}: {package} not installed")
+        elif row.ready:
             print(f"  {name + ':':12} ✅ enabled, credentials present")
         else:
             # Credentials and required config are reported separately because they
@@ -336,10 +399,16 @@ def _doctor_other_channels(cfg: KiroCrewConfig, creds: dict[str, str], issues: l
             # an account id in config.json. One combined line would send the
             # operator to the wrong file.
             parts = []
-            if row.missing_credentials:
+            # A credential missing from an unreadable file is unknown, not missing;
+            # missing config is still read from config.json and still counts.
+            if row.missing_credentials and creds_unreadable:
+                print(f"  {name + ':':12} credentials {_CREDS_UNKNOWN}")
+            elif row.missing_credentials:
                 parts.append(", ".join(row.missing_credentials))
             if row.missing_config:
                 parts.append(", ".join(f"{name}.{attr}" for attr in row.missing_config))
+            if not parts:
+                continue
             missing = " and ".join(parts)
             print(f"  {name + ':':12} ❌ enabled but missing {missing}")
             print(

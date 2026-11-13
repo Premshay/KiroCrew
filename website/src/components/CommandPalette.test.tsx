@@ -88,7 +88,7 @@ const H = vi.hoisted(() => {
   // direct hooks. Mock them with stable, empty-search providers
   // so the modal renders without React-Query / Router (matching the P0 mocks).
   const knowledgeProvider = { id: 'knowledge', label: 'Knowledge', icon: null, search: vi.fn(() => []) }
-  const skillsProvider = { id: 'skills', label: 'Skills', icon: null, search: vi.fn(() => []) }
+  const skillsProvider = { id: 'skills', label: 'Skills', icon: null, search: vi.fn(() => []), scope: '' }
   const promptsProvider = { id: 'prompts', label: 'Prompts', icon: null, search: vi.fn(() => []) }
   const artifactsProvider = { id: 'artifacts', label: 'Artifacts', icon: null, search: vi.fn(() => []) }
   const recentsProvider = { id: 'recents', label: 'Recent', icon: null, search: vi.fn(async () => [recentResult]) }
@@ -221,8 +221,8 @@ const failingChunk = vi.hoisted(() => {
   }
   return { state, Overlay }
 })
-vi.mock('../apps/overlayRegistry', () => ({
-  getBuiltinOverlay: () => failingChunk.Overlay,
+vi.mock('./commandBar/CommandBarOverlay', () => ({
+  default: failingChunk.Overlay,
 }))
 
 import CommandPalette from './CommandPalette'
@@ -640,7 +640,7 @@ describe('CommandPalette — keyboard & activation', () => {
     // "fold" uniquely prefixes nothing here. If a Folders provider is ever put
     // back into this host, the hint label appears and Tab adopts the scope — and
     // this assertion is the thing that says so, because the feature would then
-    // have two implementations (this one and `apps/command-bar/foldersProvider`)
+    // have two implementations (this one and `components/commandBar/foldersProvider`)
     // free to disagree about ranking and about what a reveal does.
     fireEvent.change(screen.getByRole('textbox', { name: 'Search everywhere' }), { target: { value: 'fold' } })
     await waitFor(() => expect(H.allProvider.search).toHaveBeenCalled())
@@ -713,6 +713,22 @@ describe('CommandPalette — keyboard & activation', () => {
 
     expect(await screen.findByPlaceholderText('Search skills…')).toBeInTheDocument()
     expect(screen.getByRole('textbox', { name: 'Search everywhere' })).toHaveValue('sla')
+  })
+
+  it('re-runs the Skills search when the provider scope moves to another chat', async () => {
+    try {
+      const { rerender } = render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+      await screen.findByText('Recent Session')
+      fireEvent.change(screen.getByRole('textbox', { name: 'Search everywhere' }), { target: { value: '$' } })
+      await screen.findByPlaceholderText('Search skills…')
+      await waitFor(() => expect(H.skillsProvider.search).toHaveBeenCalled())
+      const before = H.skillsProvider.search.mock.calls.length
+      H.skillsProvider.scope = 'scope-test-chat-b'
+      rerender(<CommandPalette open onClose={vi.fn()} />)
+      await waitFor(() => expect(H.skillsProvider.search.mock.calls.length).toBeGreaterThan(before))
+    } finally {
+      H.skillsProvider.scope = ''
+    }
   })
 
   it('Backspace on an empty scoped query pops the scope chip', async () => {
@@ -1267,6 +1283,15 @@ describe('CommandPalette — focus restore on close', () => {
     expect(document.activeElement).not.toBe(composer)
   })
 
+  it('keeps an outside press from clearing the focus the close gives back', async () => {
+    // In a browser the press's default action runs after the close (#33323).
+    const onClose = vi.fn()
+    render(<CommandPalette open onClose={onClose} />, { wrapper })
+    await screen.findByText('Recent Session')
+    expect(fireEvent.mouseDown(screen.getByRole('dialog'))).toBe(false)
+    expect(onClose).toHaveBeenCalledTimes(1)
+  })
+
   it('does not restore after a row is chosen (its action owns focus)', async () => {
     const prev = outside('button', { 'data-test-outside': '' })
     prev.focus()
@@ -1297,7 +1322,8 @@ describe('CommandPalette — fallback for a failed overlay chunk', () => {
       const onClose = vi.fn()
       render(
         <QuickSearchSurface
-          owners={{ 'quick-search': { app: 'command-bar', overlayId: 'command-bar' } }}
+          owners={{}}
+          commandBar
           open
           onClose={onClose}
         />,
@@ -1308,7 +1334,9 @@ describe('CommandPalette — fallback for a failed overlay chunk', () => {
       fireEvent.change(catcher, { target: { value: 'alice' } })
       await act(async () => { release(); await failingChunk.state.promise })
 
-      const input = await screen.findByRole('textbox', { name: 'Search everywhere' })
+      // Waits across QuickSearchSurface's `lazy(() => import('./commandBar/CommandBarOverlay'))`
+      // settling into the thrown chunk and its fallback to this palette.
+      const input = await screen.findByRole('textbox', { name: 'Search everywhere' }, { timeout: 5000 })
       expect(input).toHaveValue('alice')
       expect(await screen.findByText('All Result')).toBeInTheDocument()
       expect(H.allProvider.search).toHaveBeenCalledWith('alice')

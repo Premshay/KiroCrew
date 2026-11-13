@@ -299,6 +299,9 @@ const FORWARDING_PROVEN = [
   // TipClickable forwards its ref to the Clickable it renders, so the
   // side-panel toggle is the one element registered as chat.side-panel-open.
   'TipClickable',
+  // Proven in src/test/sidePanelLeadingTab.test.tsx: a `segments` entry's
+  // marker lands, registered, on that leading tab's chip and on no other.
+  'SidePanel',
 ]
 
 describe('a marker must register the element it sits on', () => {
@@ -1448,6 +1451,12 @@ describe('the committed index', () => {
     expect(byId.get('setting:developer.explore')!.placements[0].requires).toEqual([])
   })
 
+  it('keeps Start New Chats in Ultra Mode behind the Ultra Mode preview, and not its own switch', () => {
+    const want = [{ kind: 'preview_flag', flag: 'mc-preview-crew-mode', location: 'setting:developer.ultra-mode' }]
+    expect(byId.get('setting:chat.start-new-chats-in-ultra-mode')!.placements[0].requires).toEqual(want)
+    expect(byId.get('setting:developer.ultra-mode')!.placements[0].requires).toEqual([])
+  })
+
   it('shows Mates with no prerequisite', () => {
     expect(byId.get('page.members')!.placements[0].requires).toEqual([])
   })
@@ -1523,14 +1532,14 @@ describe('the committed index', () => {
     expect(zh[at('schedule.add-job').label_key]).toBe('添加任务')
     // Artifacts: import hangs under the desktop caret menu.
     expect(at('artifacts.import').placements[0]).toMatchObject({ route: '/artifacts', parent_ids: ['page.artifacts', 'artifacts.add-menu'], entry_kind: 'menu' })
-    // MCP: Connections opens on Services, so the MCP Servers sub-tab is in the path.
+    // MCP: the add buttons are on Customize → MCP Servers, Servers view.
     for (const id of ['mcp.add-custom', 'mcp.add-server']) {
       expect(at(id).placements[0]).toMatchObject({
-        route: '/capabilities?tab=mcp',
-        parent_ids: ['page.capabilities', 'tab.capabilities.mcp', 'connections.mcp-servers-tab'],
+        route: '/capabilities?tab=mcp-servers',
+        parent_ids: ['page.capabilities', 'tab.capabilities.mcp-servers', 'mcp.servers-view'],
       })
     }
-    expect(zh[at('connections.mcp-servers-tab').label_key]).toBe('MCP 服务器')
+    expect(zh[at('mcp.servers-view').label_key]).toBe('服务器')
     expect((at('mcp.add-custom') as { guide_ref?: unknown }).guide_ref).toEqual({ action_id: 'mcp.open_add' })
     expect((at('mcp.add-server') as { guide_ref?: unknown }).guide_ref).toBeUndefined()
     // Search Everywhere: shell chrome, on every page.

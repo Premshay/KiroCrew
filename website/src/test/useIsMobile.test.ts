@@ -11,12 +11,16 @@ const mql = {
   removeEventListener: vi.fn(() => { listener = null }),
 }
 
+// The breakpoint list answers only the width query: every other query (the
+// touch-first and reduced-motion reads) is a fine-pointer desktop's answer.
+const widthOnly = (q: string) => (q.includes('max-width') ? mql : { matches: false })
+
 beforeAll(async () => {
   // Set up mock before importing the hook (module caches mql at load time)
   vi.resetModules()
   Object.defineProperty(window, 'matchMedia', {
     writable: true,
-    value: vi.fn().mockReturnValue(mql),
+    value: vi.fn(widthOnly),
   })
   const mod = await import('../hooks/useIsMobile')
   useIsMobile = mod.useIsMobile
@@ -105,17 +109,12 @@ describe('useIsMobile', () => {
     let updates: Array<() => void>
     beforeEach(() => {
       updates = []
-      // This file's matchMedia answers every query with the breakpoint list, so
-      // the reduced-motion query would read the breakpoint. Answer it apart.
-      vi.mocked(window.matchMedia).mockImplementation(((q: string) =>
-        (q.includes('prefers-reduced-motion') ? { matches: false } : mql)) as unknown as typeof window.matchMedia)
       ;(document as unknown as { startViewTransition: unknown }).startViewTransition = vi.fn((update: () => void) => {
         updates.push(update)
         return { finished: new Promise(() => {}) }
       })
     })
     afterEach(() => {
-      vi.mocked(window.matchMedia).mockImplementation((() => mql) as unknown as typeof window.matchMedia)
       delete (document as unknown as { startViewTransition?: unknown }).startViewTransition
       delete document.documentElement.dataset.layoutMorph
       delete document.documentElement.dataset.layoutMorphEdge
@@ -151,6 +150,60 @@ describe('useIsMobile', () => {
       act(() => { currentMatches = true; window.dispatchEvent(new Event('pageshow')) })
       expect(document.startViewTransition).not.toHaveBeenCalled()
       expect(result.current).toBe(true)
+    })
+  })
+
+  // A display:none iframe (an inactive remote pane) reports a 0x0 viewport and
+  // matches the narrow query. Chromium measured: 0 wide and narrow while hidden,
+  // then `resize` plus the query's `change` once shown.
+  describe('a frame with no viewport', () => {
+    const real = { w: window.innerWidth, h: window.innerHeight }
+    const setViewport = (w: number, h: number) => {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: w })
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: h })
+    }
+    let transitions: number
+    beforeEach(() => {
+      transitions = 0
+      ;(document as unknown as { startViewTransition: unknown }).startViewTransition = vi.fn((update: () => void) => {
+        transitions++
+        update()
+        return { finished: Promise.resolve() }
+      })
+    })
+    afterEach(() => {
+      setViewport(real.w, real.h)
+      delete (document as unknown as { startViewTransition?: unknown }).startViewTransition
+    })
+
+    it('keeps the desktop form while hidden, and shows without a morph', () => {
+      currentMatches = false
+      setViewport(1400, 900)
+      const { result } = renderHook(() => useIsMobile())
+      act(() => { setViewport(0, 0); currentMatches = true; listener?.(); window.dispatchEvent(new Event('resize')) })
+      expect(result.current).toBe(false)
+      act(() => { setViewport(1400, 900); currentMatches = false; window.dispatchEvent(new Event('resize')); listener?.() })
+      expect(result.current).toBe(false)
+      expect(transitions).toBe(0)
+    })
+
+    it('starts on desktop when first loaded hidden, and swaps instantly when shown narrow', () => {
+      setViewport(0, 0)
+      currentMatches = true
+      const { result } = renderHook(() => useIsMobile())
+      expect(result.current).toBe(false)
+      act(() => { setViewport(600, 900); window.dispatchEvent(new Event('resize')); listener?.() })
+      expect(result.current).toBe(true)
+      expect(transitions).toBe(0)
+    })
+
+    it('still morphs a real resize across the breakpoint once shown', () => {
+      setViewport(1400, 900)
+      currentMatches = false
+      const { result } = renderHook(() => useIsMobile())
+      act(() => { setViewport(600, 900); currentMatches = true; window.dispatchEvent(new Event('resize')) })
+      expect(result.current).toBe(true)
+      expect(transitions).toBe(1)
     })
   })
 

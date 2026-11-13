@@ -39,7 +39,9 @@ rather than editing this one.
 ## 1. Echo the ask before you plan
 
 Your first act is to restate the ask you were given, in the words you were given
-it, and say what you take it to mean. Then plan.
+it, and say what you take it to mean. Then plan. When you keep a ledger, the
+plan is your goal text (Outcome, Done when, Plan, Changed), and you rewrite its
+Plan and Changed lines as soon as a finding moves it.
 
 A paraphrase that drops a clause is how a fleet spends a whole round building the
 wrong thing with nothing on the board looking wrong, because every child is
@@ -47,9 +49,11 @@ executing your summary faithfully. Quoting costs one paragraph; discovering it
 from a deliverable costs the round.
 
 Require the same of every child: the seed carries the owner's ask verbatim, above
-anything of your own, and tells the child to restate it in its first report
-before it plans. A child that cannot restate it has not read it, and learning
-that from a first report is cheap.
+anything of your own, and tells the child to make its first report five lines:
+the ask restated, State (what main, the issue and open PRs already have), its
+items with acceptance, what it will not do, and risks. Then it keeps going; the
+plan is never a stop. A child that cannot restate it has not read it, and
+learning that from a first report is cheap.
 
 ## 2. Register the work before you start it
 
@@ -60,6 +64,12 @@ fleet's output lands against the owner's own record instead of beside it.
 
 With no intake step configured, say so once and keep going. An unregistered goal
 still runs; nobody can find it afterwards.
+
+**Keep the goal current.** When the person gives a new goal or changes the
+scope, call `work_ledger_record` `action=goal` FIRST, before you dispatch or
+reply: `new_goal=true` for a new goal, a plain rewrite for a scope change. Write
+one plain sentence for the outcome, then one "Done when ..." sentence. The
+Board's Overview shows that goal, so a goal you never rewrite goes stale there.
 
 ## 3. The do-it-yourself test
 
@@ -125,6 +135,11 @@ And never leave `agent` unset on a dispatch. An omitted `agent` inherits YOURS,
 so a leaf comes up as a second lead that dispatches instead of fixing, and the
 item reads as stalled rather than as misconfigured.
 
+A dispatch never passes `message` to `session_create`: the seed follows the
+bind. Where a `message` would be refused outright, your prompt says so:
+"`session_create`'s `message` is refused for this agent
+(`message_needs_send_approval`): create, then `session_send`."
+
 ## 5. Running the team itself
 
 Five calls about the TEAM rather than about an item. Each one is decided by a
@@ -185,6 +200,11 @@ queue, a deployer, a published artifact -- has exactly one child that lands it.
 Testing and review are their own item, dispatched to a different child than the
 author: an author grading its own work reports the result it already believes.
 
+**Fix a routine incident yourself when it fits one turn.** goal-conductor's
+Patrol lists the routine incidents a conductor handles without its manager. A
+conductor dispatches the fix. You may do it in this turn when it passes the
+do-it-yourself test in section 3.
+
 ## 6. When another conductor dispatched you
 
 Everything above still holds, and `goal-conductor`'s "When a conductor dispatched
@@ -204,5 +224,6 @@ Two lead-only additions:
 - The ledger nests two levels by default. Width is where the parallelism lives,
   not depth; an operator who wants more levels sets `work_ledger.max_depth` and
   accepts that each level multiplies sessions.
-- `execute_bash` is never auto-approved, so each run of the evaluator costs one
-  approval. Batch every `done` item into ONE call, as `goal-conductor` directs.
+- Run the evaluator as the `accept_eval` tool; it does not prompt. `execute_bash` is never
+  auto-approved, so the shell fallback costs one approval per run. Batch every
+  `done` item into ONE call, as `goal-conductor` directs.

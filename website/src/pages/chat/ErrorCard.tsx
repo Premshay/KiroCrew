@@ -19,6 +19,8 @@ import { SessionTurnLimitButton } from '../../components/SessionTurnLimitMenu'
 import { AgentSpecChoiceCard, agentSpecAmbiguity } from './AgentSpecChoiceCard'
 import { injectOpensTurn } from './RecoveryCard'
 import { resumeProseFor } from './gatewayNotice'
+import { WorkConfirmDeclined } from '../../utils/workInFlight'
+import { useRestartRefusal } from '../../hooks/useRestartRefusal'
 
 /** Where a capability refusal's fix lives: the member's Approvals section in
  *  the crewmate editor, or the editor itself (its Built from field picks the
@@ -165,6 +167,9 @@ export const isKiroCliMissing = (m: Pick<ChatMessage, 'kind' | 'meta'>): boolean
 const CLOUD_SESSION_NOTICE_KEYS: Record<string, string> = {
   cloud_session_replayed: 'sessionEnvironments.kiroCloud.replayed',
   cloud_session_replaced: 'sessionEnvironments.kiroCloud.replaced',
+  // The same kind of start notice, for a chat whose folder was an earlier run's
+  // scratch folder (`session_allocation_parts/get_or_create.py`).
+  hidden_scratch_cwd_skipped: 'pages.chat.errorCard.hidden_scratch_folder',
 }
 
 /** The catalog key of a Kiro Cloud sandbox notice row, or `''`. */
@@ -455,11 +460,19 @@ function RestartGatewayCard({ displayText, onRestartGateway }: {
   // broken launcher or interpreter), so pressing again fails the same way. Both drop
   // the button. `retry`: anything else, where a second press can work.
   const [failure, setFailure] = useState<{ title: string; detail: string; next: 'owner' | 'terminal' | 'retry' } | null>(null)
+  const restartRefusal = useRestartRefusal(detail => {
+    setRestarting(false)
+    setFailure({ title: i18nT('pages.chat.errorCard.restart_gateway_failed'), detail, next: 'retry' })
+  })
   const restart = useMutation({
     mutationFn: onRestartGateway,
-    onMutate: () => setFailure(null),
+    onMutate: () => { setFailure(null); restartRefusal.begin() },
     onSuccess: () => setRestarting(true),
     onError: (e: unknown) => {
+      restartRefusal.end()
+      // Declining the "work is running" confirmation (raised by the client's
+      // restart wrapper) is a quiet cancel: no failure card.
+      if (e instanceof WorkConfirmDeclined) return
       // The owner gate's 403 only. A lapsed dashboard cookie also answers 403
       // (`authRequired`), but the client refreshes that in the background, so
       // the next press can pass and the button must stay.

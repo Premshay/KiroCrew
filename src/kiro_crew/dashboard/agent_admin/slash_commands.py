@@ -9,130 +9,83 @@ from aiohttp import web
 if TYPE_CHECKING:
     from kiro_crew.dashboard.handlers.agents import (
         _BLOCKED_SLASH_COMMANDS,
-        _DASHBOARD_COMMANDS,
         _MAX_COMMAND_DESCRIPTION_CHARS,
         _SLASH_COMMANDS,
+        ACP_BACKEND_PROMPT_HANDLER_COMMANDS,
         ACP_BACKENDS_LOCAL_HARNESS_COMMANDS,
         SLASH_COMMAND_DESCRIPTIONS,
-        DashboardState,
         KiroCrewConfig,
-        _history_key_for,
         capabilities_for,
-        capabilities_of,
         is_claude_code,
         local_harness_menu,
+        menu_backend,
+        menu_with_session_commands,
     )
 
 
 def _menu_description(raw: str) -> str:
-    """Reduce a backend-supplied description to what one menu row can show."""
     lines = raw.strip().splitlines()
     return lines[0][:_MAX_COMMAND_DESCRIPTION_CHARS] if lines else ""
 
 
-def _advertised_commands(
-    state: DashboardState | None, slot: str | None, blocked_commands: frozenset[str]
-) -> list[dict[str, str]]:
-    """Slash commands the live Claude ACP session advertised, "/"-prefixed.
-
-    claude-agent-acp forwards the Claude Code CLI's own registry over
-    ``available_commands_update`` — built-ins, skills and MCP prompts — and
-    the CLI expands any of them from prompt text, so what it advertises is
-    exactly what this session can run.
-
-    The Claude backend only. kiro-cli advertises its own registry, but the
-    dashboard's static ``_SLASH_COMMANDS`` deliberately differs from it: the
-    commands ``_BLOCKED_SLASH_COMMANDS`` refuses are absent by design, and
-    adopting the backend list wholesale would offer them again.
-
-    Which backend a session runs is a per-agent routing decision, not a global
-    one — ``agent.provider`` stays ``acp`` while individual agents are bound to
-    the Claude seam -- so eligibility is read off the live provider.
-    """
-    if state is None:
-        return []
-    providers = []
-    if slot:
-        try:
-            provider = state.sessions.get_provider(_history_key_for(slot))
-        except (KeyError, AttributeError):
-            provider = None
-        if provider is not None:
-            providers = [provider]
-    if not slot:
-        providers = state.sessions.active_providers()
-
-    for provider in providers:
-        if not is_claude_code(capabilities_of(provider).provider_seam):
-            continue
-        commands = getattr(provider, "slash_commands", [])
-        if not commands:
-            continue
-        return [
-            {"name": f"/{c['name']}", "description": _menu_description(c["description"])}
-            for c in commands
-            if f"/{c['name']}" not in blocked_commands
-        ]
-    return []
+async def _menu_rows(request: web.Request, rows: list, blocked: frozenset) -> list:
+    result = await menu_with_session_commands(request, rows, blocked)
+    return [{**row, "description": _menu_description(row["description"])} for row in result]
 
 
 async def api_slash_commands(request: web.Request) -> web.Response:
-    """GET /api/slash-commands — list available slash commands (provider-aware).
-
-    An optional ``?slot=`` names the chat slot whose backend to ask, matching
-    :func:`api_effort_levels`: concurrent slots can sit on different backends,
-    and the commands one advertises are not the commands another accepts.
-    """
+    """GET /api/slash-commands — list available slash commands (provider-aware)."""
     cfg = KiroCrewConfig.load()
-    # This global endpoint has no session/member key; the configured default
-    # backend is its capability authority, independent of the provider label.
+    # The ``?slot=`` chat's backend decides the base list, the one the slash gate
+    # resolves for that chat, so a chat pinned off the configured default lists
+    # what runs there. With no slot it is the configured default. ``?slot=`` then
+    # adds what that chat's live session advertised.
+    backend = await menu_backend(request, cfg.agent.acp_backend)
     blocked_commands = _BLOCKED_SLASH_COMMANDS
-    if capabilities_for(cfg.agent.acp_backend).supports_native_todos:
+    if capabilities_for(backend).supports_native_todos:
         blocked_commands = blocked_commands - {"/todos"}
-    # `.get`, not `[...]`: nothing here needs dashboard state to answer, and a
-    # menu that 500s where it could serve the static list is the worse failure.
-    state: DashboardState | None = request.app.get("state")
-
-    result = _advertised_commands(state, request.query.get("slot"), blocked_commands)
-    if not result and (
-        capabilities_for(cfg.agent.acp_backend).runs_own_slash_commands
-        or is_claude_code(cfg.agent.provider)
-    ):
-        # Cold start: no session has handshaked yet, so nothing has been
-        # advertised. These are the SDK-supported commands every Claude Code
-        # session carries.
+    # A harness that runs its own commands gets its own list, not kiro-cli's.
+    if capabilities_for(backend).runs_own_slash_commands or is_claude_code(cfg.agent.provider):
+        cc_commands = [
+            "compact",
+            "clear",
+            "context",
+            "help",
+            "init",
+            "review",
+            "security-review",
+            "todos",
+            "usage",
+        ]
         result = [
             {"name": f"/{c}", "description": SLASH_COMMAND_DESCRIPTIONS.get(f"/{c}", "")}
-            for c in (
-                "compact",
-                "clear",
-                "context",
-                "help",
-                "init",
-                "review",
-                "security-review",
-                "todos",
-                "usage",
-            )
+            for c in cc_commands
             if f"/{c}" not in blocked_commands
         ]
-
-    if result:
-        advertised = {c["name"] for c in result}
-        result.extend(
-            {"name": name, "description": SLASH_COMMAND_DESCRIPTIONS.get(name, "")}
-            for name in (*_DASHBOARD_COMMANDS, "/agent")
-            if name not in advertised
-        )
-        return web.json_response(result)
+        # The commands the dashboard answers before any harness sees the turn.
+        for command in ("/agent", "/goal", "/prompts", "/side", "/workflow"):
+            if not any(item["name"] == command for item in result):
+                result.append(
+                    {"name": command, "description": SLASH_COMMAND_DESCRIPTIONS.get(command, "")}
+                )
+        return web.json_response(await _menu_rows(request, result, blocked_commands))
 
     # Blocked commands stay in _SLASH_COMMANDS (typing one still gets the
     # explicit "not available in the dashboard" rejection in chat_runner), but
     # the suggestion payload must not advertise them: a menu entry that only
     # ever produces a warning is an inert affordance.
     offered = _SLASH_COMMANDS - blocked_commands
-    if cfg.agent.acp_backend in ACP_BACKENDS_LOCAL_HARNESS_COMMANDS:
-        offered = offered & local_harness_menu(cfg.agent.acp_backend)
-    return web.json_response(
-        [{"name": c, "description": SLASH_COMMAND_DESCRIPTIONS.get(c, "")} for c in sorted(offered)]
-    )
+    # The same holds for a harness with no command channel: the slash gate answers
+    # its commands with a notice, so list only what the dashboard serves there
+    # (local_harness_menu, which /help prints too).
+    if backend in ACP_BACKENDS_LOCAL_HARNESS_COMMANDS:
+        offered = offered & local_harness_menu(backend)
+    # A harness whose prompt handler runs only some harness commands gets the
+    # notice for the rest too, so list what the dashboard serves and that row.
+    runs_from_prompt = ACP_BACKEND_PROMPT_HANDLER_COMMANDS.get(backend)
+    if runs_from_prompt is not None:
+        offered = offered & (local_harness_menu(backend) | runs_from_prompt)
+    rows = [
+        {"name": c, "description": SLASH_COMMAND_DESCRIPTIONS.get(c, "")} for c in sorted(offered)
+    ]
+    return web.json_response(await _menu_rows(request, rows, blocked_commands))

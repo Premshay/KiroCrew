@@ -277,6 +277,8 @@ _TURN_ONLY_BODY_KEYS = frozenset(
         "send_now",
         # A display label for this send's row; the slot keeps nothing.
         "banner",
+        # Read only on a person's send, for a conversation the send begins.
+        "embed_app",
     }
 )
 _SETTINGS_BODY_KEYS: dict[str, object] = {
@@ -415,6 +417,22 @@ async def test_app_on_user_slot_cannot_steer_past_running_subagents(state) -> No
     assert sent.data["queued"] is True
     sent.run_chat.assert_not_called()
     assert slot.queue_depth == 1
+
+
+@pytest.mark.asyncio
+async def test_app_send_is_held_while_subagents_run(state) -> None:
+    """The session's own human is never held, but an app's send still waits."""
+    _user_slot(state, agent="researcher")
+    state.subagents = MagicMock()
+    state.subagents.running_agents_for.return_value = [{"id": "child"}]
+
+    sent = await _app_send(state, {"slot": "s1"})
+
+    assert sent.status == 200, sent.data
+    assert sent.data["queued"] is True
+    sent.run_chat.assert_not_called()
+    # The gate must query the slot's parent key, not a bare/mismatched one.
+    state.subagents.running_agents_for.assert_any_call("dashboard:s1")
 
 
 @pytest.mark.asyncio
@@ -652,7 +670,7 @@ async def test_app_send_refused_when_the_slot_closes_during_the_permission_read(
     reading = threading.Event()
     release = threading.Event()
 
-    def gated_grant(_app: str) -> bool:
+    def gated_grant(_app: str, **_kw: object) -> bool:
         reading.set()
         assert release.wait(5)
         return True
@@ -770,6 +788,48 @@ async def test_app_sse_stream_stops_at_the_end_of_its_turn(state) -> None:
         if call.args[0].get("_type") == "chat_message"
     ]
     assert dashboard == ["reply to the app", "reply to the user"]
+
+
+@pytest.mark.asyncio
+async def test_app_sse_stream_never_carries_a_restored_note(state) -> None:
+    # A restart restored a held note into the user's idle slot. The app's send
+    # flushes it for the turn, but the app may not read it: only the user's
+    # dashboard gets the note's row.
+    slot = _user_slot(state, agent="researcher")
+    slot._deferred_notes.append(
+        {
+            "id": "n1",
+            "content": "the user's private note",
+            "cls": "reconcile-note",
+            "context": None,
+            "session": None,
+        }
+    )
+    state._broadcast = MagicMock()
+
+    async def reply(_state, s, _message, **_kwargs):
+        s.append("assistant", "reply to the app")
+        s.append("done", "", "done")
+
+    with (
+        patch(_GRANT_CHECK, return_value=True),
+        patch("kiro_crew.dashboard.chat_handlers._run_chat", new=reply),
+        patch("kiro_crew.dashboard.chat_handlers._maybe_auto_title", new=AsyncMock()),
+    ):
+        async with _app_client(state) as client:
+            resp = await client.post("/api/chat", json={"slot": "s1", "message": "hi"})
+            stream = await resp.text()
+
+    assert resp.status == 200
+    assert "reply to the app" in stream
+    assert "private note" not in stream
+    assert slot._deferred_notes == []
+    dashboard = [
+        call.args[0]["content"]
+        for call in state._broadcast.call_args_list
+        if call.args[0].get("_type") == "chat_message"
+    ]
+    assert "the user's private note" in dashboard
 
 
 @pytest.mark.asyncio
@@ -954,6 +1014,23 @@ async def test_only_the_ending_turns_own_recovery_continues_its_turn(
     await _drain_once(state, slot, predecessor_actor=predecessor, predecessor_turn_id=ending_id)
 
     assert ((TURN_END_WIRE_CLS, "") in [(m["cls"], m["content"]) for m in slot.drain()]) is marked
+
+
+@pytest.mark.parametrize(("own", "recovery_id"), [(True, "turn-a"), (False, "turn-b")])
+@pytest.mark.asyncio
+async def test_an_own_retry_keeps_its_turns_lineage(state, own: bool, recovery_id: str) -> None:
+    """The ending turn's own retry is that turn again under a new generation; any
+    other dispatch starts a turn of its own."""
+    slot = _user_slot(state)
+    slot.queue_append("first", directive_user_origin=True)
+    await _drain_once(state, slot)
+    first = slot._turn_generation
+    assert slot._turn_lineage_generation() == first
+    meta = {TURN_ACTOR_META_KEY: "app", chat_runner._RECOVERY_TURN_META_KEY: recovery_id}
+    slot.queue_insert(0, "retry", kind=SYNTHETIC_RECOVERY_KIND, meta=meta)
+    await _drain_once(state, slot, predecessor_actor="app", predecessor_turn_id="turn-a")
+    assert slot._turn_generation == first + 1
+    assert slot._turn_lineage_generation() == (first if own else first + 1)
 
 
 def _held_note(slot, text: str) -> None:

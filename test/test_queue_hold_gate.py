@@ -22,8 +22,8 @@ from kiro_crew.dashboard.chat_utils import (
 )
 from kiro_crew.dashboard.chat_utils_completion import SYNTHESIS_CLEAR, chat_done_payload
 from kiro_crew.dashboard.chat_utils_injected_rows import (
+    COMPOSER_SEND_META,
     CRON_NOTIFICATION_KIND,
-    STEER_INTENT_META,
 )
 from kiro_crew.start_priority import StartPriority
 from kiro_crew.testing.wait import async_wait_until, await_until
@@ -242,6 +242,60 @@ class TestSynthesisConsultsTheHold:
         state, slot = self._setup(tmp_path)
         started = await self._finish_with_a_send_in_the_done_read(state, slot)
         assert started and started[0] is not None, "the arrival never got the floor"
+        _cancel_turn(slot)
+
+    async def test_an_ultra_mode_pause_withholds_the_synthesis_dispatch(
+        self, tmp_path, monkeypatch
+    ):
+        """Pause all holds the session: its armed synthesis waits for Resume all."""
+        from kiro_crew import crew_pause
+
+        monkeypatch.setattr(crew_pause, "holds_slot", lambda sl: True)
+        state, slot = self._setup(tmp_path)
+        slot._pending_synthesis = True
+        with patch.object(chat_runner, "_run_pending_synthesis", new=AsyncMock()):
+            await chat_runner._finish_queue_cycle(state, slot)
+            await asyncio.sleep(0)
+        assert slot._synthesis_inflight is False
+        assert slot._pending_synthesis is True
+        _cancel_turn(slot)
+
+    async def test_a_pause_after_the_verdict_still_holds_the_synthesis_turn(
+        self, tmp_path, monkeypatch
+    ):
+        """The recheck timer reaches `_run_pending_synthesis` directly: it holds there too."""
+        from kiro_crew import crew_pause
+
+        monkeypatch.setattr(crew_pause, "holds_slot", lambda sl: True)
+        state, slot = self._setup(tmp_path)
+        slot._pending_synthesis = True
+        runs = _record_runs(monkeypatch)
+        await chat_runner._run_pending_synthesis(state, slot)
+        assert runs == []
+        assert slot._pending_synthesis is True
+        _cancel_turn(slot)
+
+    async def test_a_pause_during_the_synthesis_queue_drain_holds_the_synthesis(
+        self, tmp_path, monkeypatch
+    ):
+        """The drain awaits before it refuses: a pause published then holds synthesis too."""
+        from kiro_crew import crew_pause
+
+        paused = {"on": False}
+        monkeypatch.setattr(crew_pause, "holds_slot", lambda sl: paused["on"])
+
+        async def drain_then_paused(_st, _sl, **_kwargs):
+            paused["on"] = True
+            return False
+
+        state, slot = self._setup(tmp_path)
+        slot._pending_synthesis = True
+        slot.queue_append("waiting behind the pause")
+        runs = _record_runs(monkeypatch)
+        monkeypatch.setattr(chat_runner, "_start_next_queued_turn", drain_then_paused)
+        await chat_runner._run_pending_synthesis(state, slot)
+        assert runs == []
+        assert slot._pending_synthesis is True
         _cancel_turn(slot)
 
     async def test_synthesis_still_dispatches_when_nothing_is_held(self, tmp_path):
@@ -915,15 +969,15 @@ class TestDrainChokePoint:
         """The sub-agent hold's selector releases steers on purpose; the teardown hold must not."""
         state, slot = fresh
         slot._pending_discard_conversation_key = "s1"
-        slot.queue_append("steer that fell back to the queue", "", {STEER_INTENT_META: True})
+        slot.queue_append("steer that fell back to the queue", "", {COMPOSER_SEND_META: True})
         assert await self._drain(state, slot, monkeypatch) == []
         assert [e.get("content") for e in slot._queue] == ["steer that fell back to the queue"]
 
     async def test_a_queued_steer_still_drains_past_the_subagent_hold(self, fresh, monkeypatch):
-        """Positive control: with no discard armed, the steer exemption still releases the entry."""
+        """Positive control: with no discard armed, the composer-send exemption still releases the entry."""
         state, slot = fresh
         state.subagents = _children("a1")
-        slot.queue_append("steer that fell back to the queue", "", {STEER_INTENT_META: True})
+        slot.queue_append("steer that fell back to the queue", "", {COMPOSER_SEND_META: True})
         assert await self._drain(state, slot, monkeypatch) == ["steer that fell back to the queue"]
 
     async def test_a_deferred_discard_holds_the_queued_user_entry(self, fresh, monkeypatch):

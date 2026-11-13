@@ -78,7 +78,7 @@ _APP_OWNED_TOP_KEYS: frozenset = _builtin_config_top_keys()
 #     (``cfg.raw.get("voice_reply")``), and also by
 #     telegram/transport_dispatch.py (``raw.get("voice_reply")``). No
 #     SCHEMA_REGISTRY entry.
-#   * connections -- the Connections block. The Settings "OAuth Apps" form
+#   * connections -- the Connections block. The Settings → Connections OAuth app form
 #     writes ``connections.oauth_clients.<slug>.client_id``
 #     (dashboard/handlers/connections.py::_write_oauth_client), read back by
 #     connections/oauth_clients.py::_config_client_id; the
@@ -290,6 +290,12 @@ def _actual_type_name(value: object) -> str:
 #:   Preserved, the loader records ``DEGRADED_WORKSPACES`` and the fence
 #:   refuses every root until the table is readable again.
 #:
+#: * ``mcp_gateway`` (the section): ``apps_enabled`` and
+#:   ``forward_declared_env`` default to on, so an overlay whose ``mcp_gateway``
+#:   is not an object and replaces the base file's section would, repaired to
+#:   absent, drop a stored ``false``. Preserved, ``_coerced_section`` records
+#:   ``mcp_gateway`` as degraded and both gates read it as off.
+#:
 #: Exact-match only: this is a per-path judgment, not a subtree rule. The
 #: registry is only half of a fix — a preserved value changes nothing unless
 #: the loader RECORDS the degradation and a gate reads
@@ -306,6 +312,7 @@ _FAIL_CLOSED_PATHS = frozenset(
         "workspaces",
         "hooks",
         "hooks.confirm_tools",
+        "mcp_gateway",
     }
 )
 

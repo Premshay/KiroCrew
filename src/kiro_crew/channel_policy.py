@@ -126,6 +126,7 @@ CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATIONS: dict[str, tuple[tuple[str, str], ...]
 CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     "send_message",
     "send_notification",
+    "dismiss_notification",
     "session_stop",
     # Ending another session's wait moves that turn forward on a schedule the
     # channel's thread text would then be choosing; same containment reason.
@@ -139,6 +140,7 @@ CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     # on and spends; same containment reason as stop.
     "session_set_model",
     "session_set_color",
+    "session_set_note",
     # Reload relaunches another session's agent process; same containment
     # reason as stop.
     "session_reload",
@@ -153,6 +155,8 @@ CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     # A digest of the same transcript `session_read_message` returns, so it is
     # blocked for the same exfiltration reason.
     "session_summary",
+    "read_slack_history",
+    "session_queue",
     # The fan-out verb, blocked for the reason `session_send` is and then some: one
     # call reaches every session the caller created, so a channel agent acting on
     # words from a thread other people are in would relay them into the user's
@@ -211,7 +215,9 @@ CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     "work_report",
     "work_ledger_read",
     "work_ledger_record",
+    "work_ask_record",
     "work_ledger_rebuild",
+    "accept_eval",
 ) + CHANNEL_AGENT_BLOCKED_DISPATCH_TOOLS
 
 # Boundary-aware matcher: the tool name must stand alone in the rendered

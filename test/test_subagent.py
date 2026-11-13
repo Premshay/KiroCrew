@@ -1340,6 +1340,7 @@ class TestOnDoneTimeout:
             await asyncio.sleep(999)
 
         sessions = _mock_sessions()
+        sessions.turn_holder = MagicMock(return_value=None)  # no turn holds the parent
         manager = SubagentManager(
             sessions=sessions,
             ctx_builder=_mock_ctx_builder(),

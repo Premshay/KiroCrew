@@ -283,10 +283,13 @@ def _no_leaked_telemetry_exporter():
     leaked = _live_exporter_threads() - before
     if not leaked:
         return
-    provider = sys.modules.get("kiro_crew.metrics.provider")
-    if provider is not None:
-        with contextlib.suppress(Exception):
-            provider.reset_for_testing()
+    # The span processor's thread ("OtelBatchSpanRecordProcessor") matches the
+    # same marker; its provider is reset the same way.
+    for name in ("kiro_crew.metrics.provider", "kiro_crew.tracing.provider"):
+        provider = sys.modules.get(name)
+        if provider is not None:
+            with contextlib.suppress(Exception):
+                provider.reset_for_testing()
     for thread in leaked:
         _stop_leaked_exporter(thread)
     raise AssertionError(
@@ -468,6 +471,7 @@ def _restore_log_queue_listener():
     """
     cli = sys.modules.get("kiro_crew.cli")
     before = getattr(cli, "_LOG_QUEUE_LISTENER", None)
+    console_before = getattr(cli, "_CONSOLE_QUEUE_LISTENER", None)
     routed_before = list(getattr(cli, "_LOG_QUEUE_LISTENERS", ()))
     inherited_handlers = {
         logger: tuple(logger.handlers)
@@ -478,6 +482,7 @@ def _restore_log_queue_listener():
     if cli is None:
         return
     after = getattr(cli, "_LOG_QUEUE_LISTENER", None)
+    console_after = getattr(cli, "_CONSOLE_QUEUE_LISTENER", None)
     if after is not before and after is not None:
         # Drains and joins the listener thread, then closes the file handler. Suppressed
         # because a floor must not fail a test for state it is only cleaning up, and the
@@ -486,6 +491,18 @@ def _restore_log_queue_listener():
             cli._stop_log_queue_listener()
     if after is not before:
         cli._LOG_QUEUE_LISTENER = before
+    if console_after is not console_before and console_after is not None:
+        with contextlib.suppress(Exception):
+            cli._stop_console_queue_listener()
+        root = logging.getLogger()
+        for handler in root.handlers[:]:
+            if getattr(handler, "queue", None) is console_after.queue:
+                root.removeHandler(handler)
+        for handler in console_after.handlers:
+            if handler in inherited_handlers[root] and handler not in root.handlers:
+                root.addHandler(handler)
+    if console_after is not console_before:
+        cli._CONSOLE_QUEUE_LISTENER = console_before
     routed_after = getattr(cli, "_LOG_QUEUE_LISTENERS", None)
     if routed_after is None:
         return
@@ -552,6 +569,26 @@ def _restore_hooks_integration_globals():
         # started life with both slots empty.
         before = (None, None)
     hi._lifecycle_dispatcher, hi._route_registry = before
+
+
+# ── the relay client's published dashboard ingress goes back after every test ──
+
+
+@pytest.fixture(autouse=True)
+def _restore_relay_gateway_ingress():
+    """Put ``relay_client.provider._gateway_ingress`` back.
+
+    ``_start_aea_tunnel`` publishes the dashboard app's relay ingress there, and a
+    gateway sets it once at boot, so every test that builds the real dashboard app
+    would otherwise hand the next test its app's ingress. Reached through
+    ``sys.modules`` for the same reason as the hooks floor above.
+    """
+    provider = sys.modules.get("kiro_crew.relay_client.provider")
+    before = getattr(provider, "_gateway_ingress", None) if provider is not None else None
+    yield
+    provider = sys.modules.get("kiro_crew.relay_client.provider")
+    if provider is not None:
+        provider._gateway_ingress = before
 
 
 # ── logger levels go back after every test ──────────────────────────

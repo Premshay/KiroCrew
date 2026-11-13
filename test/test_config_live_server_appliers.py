@@ -10,7 +10,7 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from _hot_reload_helpers import write_config as _write
@@ -79,15 +79,10 @@ class TestServerAppliers:
         assert state.push_refresh.call_count == 2, "an unrelated key pushes nothing"
 
     def test_the_chat_default_model_has_an_applier(self) -> None:
-        """Regression: the list carried ``agent.role_models.background`` but not
-        ``agent.model``.
+        """``agent.model`` has an applier, like ``agent.role_models.background``.
 
-        Both keys are baked into a kiro agent spec at agent-build time, so both
-        need the same rebuild to take effect. With no applier for the chat
-        default, a change reached ``config.json`` and the provider factory
-        (``refresh_defaults``) but never ``~/.kiro/agents/kirocrew.json`` -- which
-        is the file kiro-cli reads at ``--agent`` startup -- so every newly created
-        session kept inheriting the PREVIOUS model until the gateway restarted.
+        Both are baked into ``~/.kiro/agents/kirocrew.json``, which kiro-cli reads at
+        ``--agent`` startup, so both need the spec rebuild to reach new sessions.
         """
         subs = self._register(SimpleNamespace(workflow_service=None, channel_manager=None))
         assert "agent.model" in subs
@@ -127,12 +122,9 @@ class TestServerAppliers:
     async def test_a_successful_rebuild_reconciles_the_warm_pool(self) -> None:
         """The rebuild must re-drain the warm pool to close the ordering race.
 
-        SessionManager subscribes to ``agent.model`` before this applier, so it
-        runs ``refresh_defaults`` first and re-fills the warm pool from the spec
-        as it stood BEFORE the rebuild. A provider minted in that window pins the
-        old model. After the spec is rebuilt this applier re-runs the same
-        idempotent refresh so any raced provider is discarded and re-spawned from
-        the correct spec. Passing ``change.new`` keeps it off disk on the loop.
+        SessionManager runs ``refresh_defaults`` before this applier, against the old
+        spec, so the applier refreshes again after the rebuild. Passing ``change.new``
+        keeps the refresh off disk on the loop.
         """
         sessions = SimpleNamespace(refresh_defaults=AsyncMock())
         state = SimpleNamespace(
@@ -197,12 +189,9 @@ class TestServerAppliers:
     async def test_a_refused_rebuild_is_not_reported_as_applied(self) -> None:
         """A shared-home refusal returns ``wrote=False`` WITHOUT writing the spec.
 
-        ``rebuild_agent_config_reporting`` returns the spec path even when the
-        shared-agent-home guard declines to rewrite it, so the installed
-        ``kirocrew.json`` keeps its old model pin. That is a no-op, not a
-        success: the applier must take the SAME failure path as a raised error --
-        notify once, push no refresh, and re-raise so ConfigWatch defers it for
-        retry -- instead of clearing the failure state and broadcasting success.
+        ``rebuild_agent_config_reporting`` returns the path even when the guard declines.
+        The applier treats that like an error: notify once, no refresh, and re-raise so
+        ConfigWatch retries.
         """
         state = SimpleNamespace(
             workflow_service=None,
@@ -232,6 +221,57 @@ class TestServerAppliers:
             "agent",
             "Default model could not be applied",
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("outcome", ["raised", "unreadable"])
+    async def test_a_background_model_rebuild_that_did_not_land_defers_for_retry(
+        self, outcome: str
+    ) -> None:
+        """ConfigWatch retries only an applier that raises. A swallowed failure, or
+        an unwritten rebuild logged as rebuilt, left the lite and heartbeat specs
+        on the previous background model until a restart."""
+        state = SimpleNamespace(workflow_service=None, channel_manager=None)
+        apply = self._register(state)["agent.role_models.background"].callback()
+
+        def _rebuild() -> tuple[Path, bool]:
+            if outcome == "raised":
+                raise OSError("spec directory is read-only")
+            return (Path("/home/x/.kiro/agents/kirocrew.json"), False)
+
+        with (
+            # Mocked so the code on main, which calls this one, touches no real spec.
+            patch("kiro_crew.agent.rebuild_agent_config", MagicMock()),
+            patch("kiro_crew.agent.rebuild_agent_config_reporting", _rebuild),
+            pytest.raises((OSError, RuntimeError)),
+        ):
+            await apply(
+                ConfigChange(
+                    old=KiroCrewConfig(),
+                    new=KiroCrewConfig(),
+                    changed=frozenset({"agent.role_models.background"}),
+                )
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_shared_home_refusal_is_audited_by_the_rebuild_and_retried(self) -> None:
+        """A refusal goes through the rebuild, whose guard writes the denied audit
+        row, and is deferred for retry like any unwritten rebuild: the same
+        contract the agent.model applier runs under."""
+        state = SimpleNamespace(workflow_service=None, channel_manager=None)
+        apply = self._register(state)["agent.role_models.background"].callback()
+        spec = Path("/home/x/.kiro/agents/kirocrew.json")
+        change = ConfigChange(
+            old=KiroCrewConfig(),
+            new=KiroCrewConfig(),
+            changed=frozenset({"agent.role_models.background"}),
+        )
+        rebuild = MagicMock(return_value=(spec, False))
+        with (
+            patch("kiro_crew.agent.rebuild_agent_config_reporting", rebuild),
+            pytest.raises(RuntimeError, match="shared agent home"),
+        ):
+            await apply(change)
+        rebuild.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_successful_retry_notifies_that_the_saved_model_is_active(self) -> None:
@@ -270,6 +310,11 @@ class TestServerAppliers:
         assert state.notify.call_args_list[-1].args[2] == (
             "The saved default model is now active. New sessions will use it."
         )
+        # The dashboard copy each note names (notifMeta.tsx SYSTEM_NOTE_TITLE_KEY).
+        assert [call.kwargs["i18n"] for call in state.notify.call_args_list] == [
+            {"id": "default_model_failed"},
+            {"id": "default_model_applied"},
+        ]
 
     @pytest.mark.asyncio
     async def test_the_channel_manager_binds_its_caps_in_its_constructor(
@@ -359,6 +404,113 @@ class TestServerAppliers:
             )
         )
         state.push_refresh.assert_called_once_with("config")
+
+    def test_a_command_bar_switch_change_tells_every_dashboard_to_refresh(self) -> None:
+        """`kirocrew config set dashboard.command_bar_enabled` reaches open dashboards.
+
+        The shell picks what the shortcut opens from a config query that never goes
+        stale on its own, so only a refresh frame makes it re-read the switch. An
+        unrelated dashboard write pushes nothing.
+        """
+        state = SimpleNamespace(
+            workflow_service=None, channel_manager=None, push_refresh=MagicMock()
+        )
+        sub = self._register(state)["dashboard.command_bar_enabled"]
+        assert sub.prefixes == ("dashboard.command_bar_enabled",)
+        apply = sub.callback()
+        cfg = KiroCrewConfig()
+        apply(ConfigChange(old=cfg, new=cfg, changed=frozenset({"dashboard.folder_sort"})))
+        state.push_refresh.assert_not_called()
+        apply(ConfigChange(old=cfg, new=cfg, changed=frozenset({"dashboard.command_bar_enabled"})))
+        state.push_refresh.assert_called_once_with("config")
+
+    @pytest.mark.asyncio
+    async def test_a_failed_stale_wake_job_sync_reaches_the_watcher(self) -> None:
+        """The stale-wake applier lets a cron store failure raise, so ConfigWatch
+        records it as stale and retries, instead of reading a swallowed error as
+        applied."""
+
+        class _BrokenCrons:
+            async def list_jobs_async(self, include_disabled: bool = False) -> list[Any]:
+                raise OSError("cron store is read-only")
+
+        state = SimpleNamespace(workflow_service=None, channel_manager=None, crons=_BrokenCrons())
+        apply = self._register(state)["dashboard.stale_wake"].callback()
+        cfg = KiroCrewConfig()
+        with (
+            patch("kiro_crew.dashboard.stale_wake.enabled", lambda: True),
+            pytest.raises(OSError, match="cron store is read-only"),
+        ):
+            await apply(
+                ConfigChange(
+                    old=cfg,
+                    new=cfg,
+                    changed=frozenset({"dashboard.feature_previews.dashboard_stale_wake"}),
+                )
+            )
+
+    def test_an_app_mute_change_tells_every_dashboard_to_refresh(self) -> None:
+        """An app muted from one dashboard is muted in the other open ones too.
+
+        Each reads ``apps.<name>.mute_sessions`` off its cached config to silence
+        that app's sessions, and only a refresh frame makes it re-read that cache.
+        """
+        state = SimpleNamespace(
+            workflow_service=None, channel_manager=None, push_refresh=MagicMock()
+        )
+        sub = self._register(state)["apps"]
+        assert sub.prefixes == ("apps",)
+        apply = sub.callback()
+        cfg = KiroCrewConfig()
+        apply(ConfigChange(old=cfg, new=cfg, changed=frozenset({"agent.log_level"})))
+        state.push_refresh.assert_not_called()
+        apply(ConfigChange(old=cfg, new=cfg, changed=frozenset({"apps.notes.mute_sessions"})))
+        state.push_refresh.assert_called_once_with("config")
+
+    @pytest.mark.asyncio
+    async def test_switching_the_terminal_off_ends_every_registered_shell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``dashboard.terminal.enabled`` going false ends each registered shell at once,
+        rather than leaving it to the orphan sweep, and closes its tab with the
+        shell-exited code; a redial is refused at once despite the 30 s gate cache.
+        Switching it back on ends nothing."""
+        from kiro_crew.dashboard.handlers import terminal
+
+        ws = AsyncMock()
+        ws.closed = False
+        first = terminal._TerminalSession(
+            session_id="s1", master_fd=-1, ws=ws  # wokeignore:rule=master
+        )
+        second = terminal._TerminalSession(session_id="s2", master_fd=-1)  # wokeignore:rule=master
+        registry: dict[str, Any] = {"s1": first, "s2": second, "s3": None}
+        state = SimpleNamespace(
+            workflow_service=None,
+            channel_manager=None,
+            _terminal_sessions=registry,
+            _background_tasks=set(),
+        )
+        apply = self._register(state)["dashboard.terminal.enabled"].callback()
+        kill = AsyncMock()
+        monkeypatch.setattr(terminal, "_kill_session", kill)
+        monkeypatch.setattr(terminal, "_enabled_cache", [True, float("inf")])
+        monkeypatch.setattr(terminal, "_get_config", lambda request: {"enabled": False})
+        on, off = KiroCrewConfig(), KiroCrewConfig()
+        off.dashboard.terminal = {"enabled": False}
+
+        async def dispatch(old: KiroCrewConfig, new: KiroCrewConfig) -> None:
+            changed = frozenset({"dashboard.terminal.enabled"})
+            await apply(ConfigChange(old=old, new=new, changed=changed))
+            await asyncio.gather(*state._background_tasks)
+
+        await dispatch(off, on)
+        kill.assert_not_awaited()
+        await dispatch(on, off)
+
+        assert kill.await_args_list == [call(first), call(second)]
+        assert registry == {"s3": None}, "a reservation has no shell to end"
+        ws.close.assert_awaited_once_with(code=4001)
+        assert terminal._is_enabled(object()) is False
 
     @pytest.mark.asyncio
     async def test_the_provider_switch_runs_off_the_watcher_cycle_exactly_once(self) -> None:
@@ -466,6 +618,11 @@ class TestServerAppliers:
             "browser.settings",
             "agent.crew_mode_agent",
             "dashboard.feature_previews",
+            "dashboard.stale_wake",
+            "apps",
+            "dashboard.command_bar_enabled",
+            "dashboard.terminal.enabled",
+            "crewmate.harness_fallback",
         }
         # None of them is a catch-all: an unrelated write must dispatch nothing.
         for sub in subs.values():

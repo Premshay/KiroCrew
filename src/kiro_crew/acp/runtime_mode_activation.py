@@ -47,6 +47,14 @@ logger = logging.getLogger("kiro_crew.acp.runtime")
 _PROJECTED_MODE_RETRY_DELAYS_SECS: tuple[float, ...] = (0.5, 0.5, 0.5, 0.5, 1.0)
 
 
+def _leased_agents(projection: Any) -> tuple[str, ...]:
+    """The agents whose views *projection* leases, by authored name."""
+    leased = getattr(projection, "leased_aliases", None)
+    if projection is None or leased is None:
+        return ()
+    return tuple(name for name, alias in projection.aliases.items() if alias in leased)
+
+
 async def _prepare_projection_to_completion(
     prepare: Callable[..., Any], *args: Any, **kwargs: Any
 ) -> tuple[Any, bool]:
@@ -267,7 +275,10 @@ async def _spawn_agent_not_loaded_reason(self: AcpRuntime, spawn_agent: str) -> 
     so the spawn path itself gains no gate and no failure mode
     (harness-parity H13): the host answers from
     ``ACP_BACKENDS_MARKDOWN_AGENT_SPECS``, never "is kiro", and a host added
-    later that reads markdown is handed the generic text unchanged.
+    later that reads markdown is handed the generic text unchanged. A missing
+    spec named by ``agent.default_agent`` that setup does not write gets the
+    setting as its remedy instead
+    (``side_readonly_spec.missing_default_agent_explanation``).
     """
     if not self._harness.reads_markdown_agent_specs:
         markdown_spec = await asyncio.to_thread(
@@ -287,6 +298,18 @@ async def _spawn_agent_not_loaded_reason(self: AcpRuntime, spawn_agent: str) -> 
                 f"Switch agent.acp_backend to {capable} or add a JSON spec for this "
                 f"agent."
             )
+    # Setup rewrites only Kiro Crew's own specs, so for a configured
+    # agent.default_agent it does not write, the remedy is the setting.
+    from kiro_crew.dashboard.side_readonly_spec import missing_default_agent_explanation
+
+    default = await asyncio.to_thread(missing_default_agent_explanation, spawn_agent)
+    if default is not None:
+        cause, remedy = default
+        return (
+            f"{cause} Refusing to run the backend's own default agent in its place, "
+            "which would silently drop every Kiro Crew tool the agent's prompt "
+            f"relies on. {remedy}"
+        )
     return (
         f"Its ~/.kiro/agents/{spawn_agent}.json is missing, or the backend "
         f"refused to load it. Refusing to run the backend's own default "
@@ -586,6 +609,12 @@ async def _activate_mode_bracketed(
                         self._work_dir,
                         enabled=True,
                         on_lock_unavailable=lock_errors.append,
+                        # This agent, plus every agent the replaced projection
+                        # leased, by NAME: a start whose set_mode is still in
+                        # flight keeps its agent's current view on disk, even
+                        # one an edit just replaced and the retry now sends.
+                        # An edited agent's old view is not carried.
+                        lease_agents=(mode_agent, *_leased_agents(previous)),
                     )
                     if prepared is not None:
                         # set_mode always names the FRESH alias, never an older
@@ -594,9 +623,9 @@ async def _activate_mode_bracketed(
                         # since revoked grants from. Inbound frames keep
                         # translating every alias this process published before
                         # (``recognise``), so an agent the host still lists under
-                        # an older alias stays selectable. Holding
-                        # ``_spawn_skill_projection`` keeps those aliases -- and so
-                        # the host's view of them -- out of the prune.
+                        # an older alias stays selectable. On disk, each start
+                        # holds only the view it activates (``lease_agents``
+                        # below); translation needs no file.
                         spawn = getattr(self, "_spawn_skill_projection", None)
                         if spawn is not None:
                             prepared.recognise(spawn)

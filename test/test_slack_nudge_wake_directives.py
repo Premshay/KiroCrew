@@ -68,6 +68,7 @@ class _OneToolProvider:
             title=self.tool,
             tool_name=self.tool,
             mcp_server_name=self.server,
+            mcp_identity_trusted=True,
         )
         yield AcpEvent(
             kind=EVENT_TOOL_RESULT,

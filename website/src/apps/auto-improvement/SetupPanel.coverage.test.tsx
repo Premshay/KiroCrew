@@ -1,5 +1,6 @@
-import { describe, it, expect, vi, afterEach } from 'vitest'
-import { screen, fireEvent, waitFor } from '@testing-library/react'
+import { describe, it, expect, vi, afterEach, onTestFinished } from 'vitest'
+import { act, screen, fireEvent, waitFor } from '@testing-library/react'
+import i18next from 'i18next'
 
 import { renderWithProviders } from '../../test/helpers'
 import { i18nT } from '../../i18n/t'
@@ -18,7 +19,7 @@ function installApi(extra: (call: Call) => unknown = () => undefined) {
       body: init?.body ? JSON.parse(String(init.body)) : undefined,
     }
     calls.push(call)
-    const custom = extra(call)
+    const custom = await extra(call)
     if (custom instanceof Response) return custom
     const fallback =
       call.path === '/branches' ? { branches: ['main', 'dev'] }
@@ -61,22 +62,54 @@ describe('SetupPanel repository and branch steps', () => {
     renderWithProviders(<SetupPanel config={{}} />)
     expect(screen.getByRole('button', { name: CLONE })).toBeDisabled()
     fireEvent.change(screen.getByRole('textbox', { name: REPO }), { target: { value: '  https://github.com/o/r  ' } })
-    await waitFor(() => expect(screen.getByRole('button', { name: CLONE })).toBeEnabled())
+    await waitFor(() => expect(screen.getByRole('button', { name: CLONE })).not.toHaveAttribute('aria-disabled'))
     fireEvent.click(screen.getByRole('button', { name: CLONE }))
     expect(await screen.findByText('not a GitHub URL')).toBeInTheDocument()
     expect(calls).toContainEqual({ method: 'POST', path: '/setup-clone', body: { url: 'https://github.com/o/r' } })
+  })
+
+  it('keeps keyboard focus on Clone while the clone runs, and ignores a second press (#33102)', async () => {
+    let settle!: (value: Response) => void
+    const calls = installApi((c) => (c.path === '/setup-clone'
+      ? new Promise<Response>((resolve) => { settle = resolve })
+      : undefined))
+    renderWithProviders(<SetupPanel config={{}} />)
+    fireEvent.change(screen.getByRole('textbox', { name: REPO }), { target: { value: 'https://github.com/o/r' } })
+    const button = screen.getByRole('button', { name: CLONE })
+    await waitFor(() => expect(button).not.toHaveAttribute('aria-disabled'))
+    button.focus()
+    // A double click in one tick, before the pending state renders.
+    fireEvent.click(button)
+    fireEvent.click(button)
+    await waitFor(() => expect(button).toHaveAttribute('aria-disabled', 'true'))
+
+    // A real browser drops focus from a disabled button; jsdom does not, so the
+    // tab-order half is pinned on the attribute itself.
+    expect(button).not.toBeDisabled()
+    expect(button).toHaveFocus()
+    fireEvent.click(button)
+    fireEvent.keyDown(screen.getByRole('textbox', { name: REPO }), { key: 'Enter' })
+    // Let any second mutation reach fetch before counting.
+    await act(async () => {})
+    expect(calls.filter((c) => c.path === '/setup-clone')).toHaveLength(1)
+
+    settle(new Response(JSON.stringify({ ok: false, error: 'not a GitHub URL' })))
+    expect(await screen.findByText('not a GitHub URL')).toBeInTheDocument()
+    expect(button).not.toHaveAttribute('aria-disabled')
   })
 
   it('raises a mutation error when a failed clone returns no error text', async () => {
     installApi((c) => (c.path === '/setup-clone' ? new Response('{}', { status: 500 }) : undefined))
     const { queryClient } = renderWithProviders(<SetupPanel config={{}} />)
     fireEvent.change(screen.getByRole('textbox', { name: REPO }), { target: { value: 'https://github.com/o/r' } })
-    await waitFor(() => expect(screen.getByRole('button', { name: CLONE })).toBeEnabled())
+    await waitFor(() => expect(screen.getByRole('button', { name: CLONE })).not.toHaveAttribute('aria-disabled'))
     fireEvent.click(screen.getByRole('button', { name: CLONE }))
     await waitFor(() => {
       const failed = queryClient.getMutationCache().getAll().find((m) => m.state.status === 'error')
       expect(failed?.state.error).toEqual(new Error(i18nT('testEnvironment.failed', { status: 500 })))
     })
+    // The failed request is announced, not dropped (#33102 review).
+    expect(await screen.findByRole('alert')).toHaveTextContent('HTTP 500')
   })
 
   it('shows the repo and push-disabled badge, then saves the autocommit toggle', async () => {
@@ -86,6 +119,19 @@ describe('SetupPanel repository and branch steps', () => {
     expect(screen.getByText(i18nT('autoImprovement.pushDisabled'))).toBeInTheDocument()
     fireEvent.click(await screen.findByRole('checkbox', { name: AUTOCOMMIT }))
     await waitFor(() => expect(calls).toContainEqual({ method: 'PUT', path: '/config', body: { directCommit: true } }))
+  })
+
+  it('puts the repo name where the language places it in the current-repo line', async () => {
+    installApi()
+    const key = 'autoImprovement.currentRepoLine'
+    const shipped = i18next.getResource('ja', 'translation', key) as string
+    onTestFinished(() => { i18next.addResource('ja', 'translation', key, shipped) })
+    i18next.addResource('ja', 'translation', key, '<repo/> SENTINEL')
+    await i18next.changeLanguage('ja')
+    renderWithProviders(<SetupPanel config={CONFIGURED} />)
+    const repo = await screen.findByText('owner/repo')
+    expect(repo).toHaveClass('text-accent')
+    expect(repo.closest('p')?.textContent).toMatch(/^owner\/repo SENTINEL/)
   })
 
   it('hides the branch step when the clone reports no branches', async () => {

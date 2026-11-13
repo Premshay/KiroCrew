@@ -4,9 +4,9 @@
 // to say WHICH repository the loop should work on. The flow is deliberately
 // three explicit steps rather than one opaque field, because each step has a
 // real failure mode worth surfacing on its own:
-//   1. paste a GitHub URL -> the backend validates + clones it PUSH-DISABLED
-//      (POST /setup-clone). A bad URL or a clone that cannot be made push-safe
-//      fails HERE, before anything else is configured.
+//   1. paste a GitHub or GitLab URL -> the backend validates + clones it
+//      PUSH-DISABLED (POST /setup-clone). A bad URL or a clone that cannot be
+//      made push-safe fails HERE, before anything else is configured.
 //   2. pick a base branch -> the picker only offers branches that actually
 //      exist in the clone (GET /branches), so a run can never target a typo.
 //   3. start the run -> POST /run; live status polls GET /run.
@@ -14,8 +14,9 @@
 // All colors come from the app's design tokens (accent / warn / muted / border)
 // via Tailwind utilities — never a hardcoded hex — so the panel matches whatever
 // theme the dashboard is on.
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Trans } from 'react-i18next'
 import { FolderGit2, GitBranch, Loader2, Play, Square } from 'lucide-react'
 
 import ErrorNotice from '../../components/ErrorNotice'
@@ -139,7 +140,18 @@ function RepositorySetup({ config, repo }: { config?: Record<string, unknown>; r
         qc.invalidateQueries({ queryKey: ['auto-improvement-branches'] })
       }
     },
+    onSettled: () => { cloning.current = false },
   })
+  // Claimed synchronously before `mutate`: `clone.isPending` only flips on the
+  // next render, so a double click or a repeated Enter in the same tick would
+  // otherwise start a second clone.
+  const cloning = useRef(false)
+  const startClone = () => {
+    const u = url.trim()
+    if (!u || cloning.current || setupBusy || environmentBusy) return
+    cloning.current = true
+    clone.mutate(u)
+  }
 
   // One mutation for any allowlisted config key. The backend rejects anything
   // not on its allowlist (clone/target_url can only move through setup-clone), so
@@ -193,16 +205,21 @@ function RepositorySetup({ config, repo }: { config?: Record<string, unknown>; r
           <Input
             value={url}
             onChange={(e) => setUrl(e.target.value)}
-            placeholder={i18nT('apps.autoImprovement.setupPanel.https_github_com_owner_repo')}
+            placeholder={i18nT('apps.autoImprovement.setupPanel.repo_url_placeholder')}
             className="flex-1"
             aria-label={i18nT('autoImprovement.repoLabel')}
-            {...ime.bindEnter({ onEnter: () => { if (url.trim() && !setupBusy && !environmentBusy) clone.mutate(url.trim()) } })}
+            {...ime.bindEnter({ onEnter: startClone })}
           />
+          {/* A clone in flight marks the button aria-disabled, not disabled: a
+              disabled button leaves the tab order and drops the focus of the
+              keyboard user who just pressed it. An empty URL still disables it. */}
           <Btn
             primary
             aria-label={i18nT('autoImprovement.cloneBtn')}
-            disabled={!url.trim() || setupBusy || environmentBusy}
-            onClick={() => clone.mutate(url.trim())}
+            disabled={!url.trim()}
+            aria-disabled={setupBusy || environmentBusy || undefined}
+            className="aria-disabled:bg-bg-hover aria-disabled:text-muted aria-disabled:border-transparent aria-disabled:opacity-60 aria-disabled:cursor-default aria-disabled:hover:bg-bg-hover aria-disabled:hover:shadow-none aria-disabled:active:scale-100"
+            onClick={startClone}
           >
             {clone.isPending ? (
               <Loader2 className="lucide-inline animate-spin" size={14} />
@@ -212,10 +229,10 @@ function RepositorySetup({ config, repo }: { config?: Record<string, unknown>; r
           </Btn>
         </div>
         {/* No hand-off: the repository URL and environment draft are unsaved. */}
-        <ErrorNotice message={clone.error?.message || saveConfig.error?.message || startRun.error?.message || stopRun.error?.message || runError?.message} messageClassName="max-h-40 overflow-auto whitespace-pre-wrap break-words select-text" />
+        <ErrorNotice message={clone.data?.error || clone.error?.message || saveConfig.error?.message || startRun.error?.message || stopRun.error?.message || runError?.message} messageClassName="max-h-40 overflow-auto whitespace-pre-wrap break-words select-text" />
         {configured ? (
           <p className="text-[12px] text-muted">
-            {i18nT('autoImprovement.currentRepo')} <span className="text-accent">{display}</span>
+            <Trans i18nKey="autoImprovement.currentRepoLine" components={{ repo: <span className="text-accent">{display}</span> }} />
             {config?.clone ? (
               <Badge variant="ok" className="ml-2">
                 {i18nT('autoImprovement.pushDisabled')}

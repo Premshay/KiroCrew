@@ -54,7 +54,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Final, Mapping
 
-from kiro_crew.crew_log.entry_types import CUSTOM_FOLD_NAME, DASHBOARD_FOLD_NAME
+from kiro_crew.crew_log.entry_types import CUSTOM_FOLD_NAME, DASHBOARD_FOLD_NAME, OBJECTS_FOLD_NAME
 from kiro_crew.crew_log.projection import (
     _FOLDS,
     _SLOT_FOLD_ROW_BYTES,
@@ -269,6 +269,7 @@ _OPAQUE: Final[dict[str, str]] = {
     "panel.data": "a key the publishing crew chose",
     "panel.owners": "an owning crew key",
     "otel_usage.turns": "an actor value",
+    "otel_usage.resumed_turns": "an actor value",
     # Built from the fold's own registry constant rather than spelled out, because a
     # key naming a fold under a name the registry does not carry is not an error here:
     # ``_node`` looks this table up with a plain ``in``, misses, and falls through to
@@ -279,6 +280,8 @@ _OPAQUE: Final[dict[str, str]] = {
     # The same, for the records a script cron appends: each key is the record type
     # the script named, and a page binds ``custom.latest.<type>.data.<key>``.
     f"{CUSTOM_FOLD_NAME}.latest": "a custom record type a script cron named",
+    # Each key is a subject's URL, and each value is keyed by the producer that read it.
+    f"{OBJECTS_FOLD_NAME}.latest": "a subject URL, then a producer name",
 }
 
 

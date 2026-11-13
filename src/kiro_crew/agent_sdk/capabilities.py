@@ -63,6 +63,7 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKENDS_INLINE_COMPACTION,
     ACP_BACKENDS_KIRO_SLASH_COMMANDS,
     ACP_BACKENDS_NATIVE_TODOS,
+    ACP_BACKENDS_NATIVE_WORKFLOWS,
     ACP_BACKENDS_REMOTE_MCP_OAUTH,
     model_registry_namespace,
 )
@@ -162,10 +163,10 @@ class SessionCapabilities:
     #: cannot refuse a tool call (``postToolUse``, ``userPromptSubmit``,
     #: ``agentSpawn``, ``stop``).
     #:
-    #: True wherever :attr:`crew_fires_spec_hooks` is, and on claude, whose harness
-    #: is handed no spec but approves some calls without asking, so only these
-    #: events are fired there and ``preToolUse`` runs nowhere. False where the
-    #: harness runs the field itself.
+    #: True wherever :attr:`crew_fires_spec_hooks` is, and on claude and codex,
+    #: whose harnesses are handed no spec but approve some calls without asking, so
+    #: only these events are fired there and ``preToolUse`` runs nowhere. False
+    #: where the harness runs the field itself.
     crew_fires_spec_observer_hooks: bool
 
     #: Whether this harness interprets ``/todos`` as its native task-list command.
@@ -192,8 +193,10 @@ class SessionCapabilities:
     #: member mounts from the same spec parse). False for claude, whose routing is
     #: declared but not enforced by this core -- an inherited ``~/.claude``
     #: pre-approval can skip ``session/request_permission`` entirely, so the refusal
-    #: never runs. False for codex, whose sessions are served by ``AcpRuntime``,
-    #: which carries no zero-tool refusal at all. A consumer that
+    #: never runs. False for codex: its ``AcpSessionHandle`` refuses every permission
+    #: request of a zero-tool session (``_deny_zero_tools``), but codex reads files,
+    #: searches the web, runs sandboxed commands and calls self-approved tools of the MCP servers in the
+    #: operator's ``config.toml`` without asking. A consumer that
     #: spawns a zero-tool agent (the knowledge/research pool) asks this before
     #: trusting a resolved backend, rather than enumerating identities itself.
     honors_zero_tool_ban: bool
@@ -219,6 +222,13 @@ class SessionCapabilities:
     #: page reads it to mark those providers kiro-cli only rather than offer a
     #: Connect that cannot finish.
     honors_remote_mcp_oauth: bool
+
+    #: Whether the harness brings its own workflow engine
+    #: (:data:`ACP_BACKENDS_NATIVE_WORKFLOWS`), so that workflow definitions, runs
+    #: and controls go to it over ``_kiro/workflow/*`` instead of to Crew's
+    #: ``ctx``-script engine. False routes to Crew's engine, which serves every
+    #: harness, so an unknown backend loses nothing.
+    native_workflows: bool
 
 
 def capabilities_for(backend: str) -> SessionCapabilities:
@@ -248,6 +258,7 @@ def capabilities_for(backend: str) -> SessionCapabilities:
         honors_zero_tool_ban=backend in ACP_BACKENDS_HONOR_ZERO_TOOL_BAN,
         acp_client_spawnable=backend in ACP_BACKENDS_ACP_CLIENT_SPAWNABLE,
         honors_remote_mcp_oauth=backend in ACP_BACKENDS_REMOTE_MCP_OAUTH,
+        native_workflows=backend in ACP_BACKENDS_NATIVE_WORKFLOWS,
     )
 
 
@@ -279,6 +290,7 @@ UNKNOWN_BACKEND_CAPABILITIES = SessionCapabilities(
     honors_zero_tool_ban=False,
     acp_client_spawnable=False,
     honors_remote_mcp_oauth=False,
+    native_workflows=False,
 )
 
 

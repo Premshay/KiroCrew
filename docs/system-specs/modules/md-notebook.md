@@ -539,6 +539,17 @@ hook. New state or behaviour goes in the hook, or in a sibling
 `useMdNotebookPage<Part>.ts` the hook calls, and new markup in the page;
 `website/src/apps/md-notebook/MdNotebookPage.owners.test.tsx` pins that shape.
 
+**Images.** A markdown `![alt](src)` image and an Obsidian `![[file]]` embed render side by
+side through `NoteImage.tsx`; every local one is served by the dashboard's guarded
+`/api/file-raw`. An embed is recognised per occurrence, and only for an image extension that
+endpoint serves, so a note or PDF embed keeps the wikilink look. Its target is tried from the
+vault root, then beside the note. A target in Obsidian's relative link format (`./a.png`,
+`../assets/a.png`) is read from the note's folder alone, and asks for nothing once it climbs
+above the vault root; any other target that is absolute or carries a `.` or `..` segment asks
+for nothing. A numeric suffix (`|720`, `|720x400`) is a display width the column still
+caps, any other suffix the alt text. Obsidian's `attachmentFolderPath` and its vault-wide
+lookup by file name are not read.
+
 Knowledge-sync calls go to the HOST API (`/api/knowledge/*`) rather than the app namespace,
 because registration needs the user's dashboard session. `/api/knowledge` is therefore
 declared in the manifest's `permissions.api`.
@@ -615,6 +626,8 @@ including the conflict path. The suite is split by topic: `test/test_md_notebook
 `test/test_md_notebook_settings_sync.py` (change polling, sync stamps, settings and the
 auto-sync loop), with shared fixtures in `test/md_notebook_helpers.py`.
 `test/test_md_notebook_git_ops.py` pins Git subprocess lifecycle,
+`test/test_core_md_notebook_decoupling.py` pins that no core module imports the app and
+lists, with a reason each, the core strings that still name it,
 `test/test_sandbox_md_notebook_carveout.py` pins the state-file carve-out and orphan sweep,
 and `src/kiro_crew/apps/builtins/md_notebook/tests/test_md_notebook_windows.py` covers the
 native Windows branches. All are collected because `setup.cfg` includes both `test` and

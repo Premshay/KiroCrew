@@ -107,6 +107,7 @@ def test_focused_iteration_and_unrestricted_final_regression(tmp_path, monkeypat
 
 def make_driver(tmp_path, monkeypatch, passed=True):
     d = object.__new__(drv.Driver)
+    d.candidate_admission = None
     d.clone = tmp_path
     d.branch = "feature"
     d.log = logging.getLogger(__name__)

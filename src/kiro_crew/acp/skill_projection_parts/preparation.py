@@ -2,7 +2,8 @@
 
 It publishes, under this home's publication lock and lease, the views a spawn launches
 with, and falls back to the authored agent once the projected-alias count reaches
-``SKILL_VIEW_PROJECTION_CEILING``, warning once per process.
+the ceiling (``skill_view_ceiling``: ``SKILL_VIEW_PROJECTION_CEILING`` or two views
+per authored agent, whichever is larger), warning once per process.
 
 :mod:`kiro_crew.acp.skill_projection` stays the import path and the patch surface; see
 :mod:`kiro_crew.acp.skill_projection_parts`.
@@ -80,9 +81,15 @@ from kiro_crew.agent_discovery import (
     list_agents,
     skill_search_refusal,
 )
-from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX, SKILL_VIEW_PROJECTION_CEILING
+from kiro_crew.agent_spec_format import (
+    NATIVE_SKILL_ALIAS_PREFIX,
+    SKILL_VIEW_PROJECTION_CEILING,
+    count_authored_agent_files,
+    skill_view_ceiling,
+)
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import data_home, kiro_agents_dir, kiro_home, project_agents_dir
+from kiro_crew.file_uri import file_uri_path_text
 from kiro_crew.user_json import copy_json_document
 from kiro_crew.workspace_cli_settings import workspace_cli_settings_lock
 
@@ -100,8 +107,9 @@ logger = logging.getLogger("kiro_crew.acp.skill_projection")
 # (a per-launch env value that mints a view per spawn, or one unreadable lease
 # that keeps the reclaim from draining anything), NOT the mechanism that keeps a
 # healthy host bounded -- the boot drain and per-spawn reclaim do that, far below
-# this number. Deliberately well above a healthy host's authored-agents x
-# workspaces so normal use never trips it.
+# this number. ``skill_view_ceiling`` sizes it from the authored agents in the
+# directory (two views each, never below the constant), so a host whose steady
+# state is one view per agent does not trip it before anything has leaked.
 #
 # Defined in the ``agent_spec_format`` leaf (beside the alias prefix) and
 # imported at the top of this module, so the doctor can share the number without
@@ -142,13 +150,13 @@ def _projection_enabled() -> bool:
         return False
 
 
-def _count_projected_aliases(directory: Path) -> int:
-    """Count ``kirocrew-skill-view-*.json`` files in *directory*, up to the ceiling.
+def _count_projected_aliases(directory: Path, ceiling: int) -> int:
+    """Count ``kirocrew-skill-view-*.json`` files in *directory*, up to *ceiling*.
 
     One bounded ``os.scandir``. Counts regular files by name only -- no read, no
     lease probe, no sidecar -- because the ceiling asks only "how many views are
     on disk", which is what kiro-cli pays for at startup. The scan STOPS as soon
-    as the count reaches :data:`SKILL_VIEW_PROJECTION_CEILING`: the only caller
+    as the count reaches *ceiling*: the only caller
     tests ``>= ceiling``, so an exact count past it buys nothing and every extra
     entry is wasted work on the spawn path. No result cache sits in front of it:
     on a healthy host it lists a near-empty directory in microseconds, and the
@@ -161,7 +169,7 @@ def _count_projected_aliases(directory: Path) -> int:
     try:
         with os.scandir(directory) as entries:
             for entry in entries:
-                if count >= SKILL_VIEW_PROJECTION_CEILING:
+                if count >= ceiling:
                     break
                 if (
                     entry.name.startswith(NATIVE_SKILL_ALIAS_PREFIX)
@@ -179,7 +187,38 @@ def _count_projected_aliases(directory: Path) -> int:
     return count
 
 
-def _warn_ceiling_fallback_once(directory: Path, count: int) -> None:
+def _skill_view_census(directory: Path) -> tuple[int, int]:
+    """``(views on disk, view ceiling)`` for *directory*, the view ceiling's one test.
+
+    The ceiling is reached when the first is at least the second. The spawn's
+    admission decision and :func:`next_spawn_projects_skill_view` both read it
+    here, so the two cannot answer by different rules.
+    """
+    ceiling = skill_view_ceiling(
+        count_authored_agent_files(directory), SKILL_VIEW_PROJECTION_CEILING
+    )
+    return _count_projected_aliases(directory, ceiling), ceiling
+
+
+def next_spawn_projects_skill_view() -> bool:
+    """Whether a spawn that does not pass ``enabled`` projects the skill view now.
+
+    The admission decision :func:`prepare_native_skill_projection` takes on that
+    path, read and not acted on: projection switched on (:func:`_projection_enabled`)
+    and the agents directory under the view ceiling. Nothing is warned, pruned,
+    locked or written, so a read-only diagnostic may ask it. A spawn can still fall
+    back for a reason only that spawn meets (the alias lock busy, the global
+    ``cli.json`` unreadable, one agent's view refused); this answers only the
+    decision every spawn of the process shares. Blocking: a config read and two
+    bounded directory scans.
+    """
+    if not _projection_enabled():
+        return False
+    view_count, ceiling = _skill_view_census(kiro_agents_dir())
+    return view_count < ceiling
+
+
+def _warn_ceiling_fallback_once(directory: Path, count: int, ceiling: int) -> None:
     """Warn, at most once per process, that the view ceiling is now in effect."""
     global _CEILING_FALLBACK_WARNED
     with _CEILING_FALLBACK_WARNED_LOCK:
@@ -197,7 +236,7 @@ def _warn_ceiling_fallback_once(directory: Path, count: int) -> None:
         "gateway using this agents directory, then move the files out). A gateway restart "
         "runs the boot drain for this home's own files.",
         count,
-        SKILL_VIEW_PROJECTION_CEILING,
+        ceiling,
         directory,
     )
 
@@ -210,6 +249,7 @@ def project_agent_view(
     crew_home_id: str,
     inherits_skills: bool,
     per_session_element: bool,
+    registry_ceiling: bool | None = None,
 ) -> tuple[dict[str, Any] | None, bool, str | None]:
     """*spec*'s native skill view: ``(view, is_search_agent, refusal)``.
 
@@ -217,11 +257,22 @@ def project_agent_view(
     ``kirocrew-core``'s ``skill_search`` instead; every other field is the spec's own.
     *source* is the spec's file, which a relative ``file://`` prompt is anchored to.
     *inherits_skills* says the agent's workspace lends it inherited skill trees.
+    Under the registry ceiling (:func:`session_mcp.registry_withholds_control_plane`:
+    the control plane is marked for the admin's catalog and the security policy
+    does not set ``mcp_registry_local_control_plane``) the agent is left as
+    authored: its ``skill://`` resources kept, no ``kirocrew-core`` element and no
+    ``skill_search`` injected, never a search agent -- see
+    :func:`prepare_native_skill_projection`. *registry_ceiling* ``None`` reads
+    that predicate here, so every caller (the app launch copy too) asks the
+    mount's question; :func:`prepare_native_skill_projection` passes the value it
+    read once for all its agents.
     ``view`` is ``None``, with the sentence that says why, when the view is refused.
     Shared by :func:`prepare_native_skill_projection` and the app launch copy
     (``apps.agent_launch``), so the two views cannot drift apart.
     """
     search = False
+    if registry_ceiling is None:
+        registry_ceiling = session_mcp.registry_withholds_control_plane()
     # An iterative copy, not ``copy.deepcopy``: the reader admits a spec
     # nested hundreds of levels deep, and a recursive copy of it would
     # raise ``RecursionError`` out of the projection.
@@ -235,9 +286,17 @@ def project_agent_view(
     view["description"] = _managed_view_description(agent_name, crew_home_id)
     resources = view.get("resources", [])
     resources = resources if isinstance(resources, list) else []
-    view["resources"] = [
-        r for r in resources if not (isinstance(r, str) and r.startswith("skill://"))
-    ]
+    # Under the registry ceiling the view is left as authored (see the note in
+    # prepare_native_skill_projection): the ``skill://`` resources are KEPT,
+    # because the element that would replace them with ``skill_search`` cannot
+    # mount, and stripping them would cost the agent its native skills for
+    # nothing. The key is set either way so the inheritance-append always finds
+    # a list.
+    view["resources"] = (
+        list(resources)
+        if registry_ceiling
+        else [r for r in resources if not (isinstance(r, str) and r.startswith("skill://"))]
+    )
     mapped = any(isinstance(r, str) and r.startswith("skill://") for r in resources)
     # An unmapped custom agent reaches the block below only through its
     # inherited skill trees. Where the block would refuse a mapped agent, this
@@ -249,7 +308,7 @@ def project_agent_view(
         and inherits_skills
         and can_inherit_skills(spec)
     )
-    if agent_name in WHOLE_CATALOG_TEMPLATES or mapped or inherited_only:
+    if not registry_ceiling and (agent_name in WHOLE_CATALOG_TEMPLATES or mapped or inherited_only):
         refusal = skill_search_refusal(view)
         if refusal is not None:
             return None, False, refusal
@@ -316,12 +375,39 @@ def project_agent_view(
                     view["tools"] = [*tools, _SEARCH_TOOL]
             if not inherited_only:
                 search = True
+    _relaunch_reserved_servers(view)
     prompt = view.get("prompt")
     if isinstance(prompt, str) and prompt.startswith("file://"):
-        path = Path(prompt[7:]).expanduser()
+        path = Path(file_uri_path_text(prompt)).expanduser()
         if not path.is_absolute():
             view["prompt"] = "file://" + (source.parent / path).absolute().as_posix()
     return view, search, None
+
+
+def _relaunch_reserved_servers(view: dict[str, Any]) -> None:
+    """Point each reserved ``kirocrew-*`` entry of *view* at Crew's installed launch.
+
+    kiro-cli starts a view's entry as written wherever no per-session element
+    replaces it: on the direct client, and on the shared runtime when a key the
+    element cannot carry (a ``timeout``) withholds the element. The managed path
+    names the installed version, so a spec copied from ``kirocrew.json`` would
+    start a payload a later upgrade removed. The view is Crew's own file, so its
+    ``command`` and ``args`` are re-derived here
+    (:func:`~kiro_crew.agent.with_managed_launch`) and every other key stays the spec's.
+    """
+    servers = view.get("mcpServers")
+    if not isinstance(servers, dict):
+        return
+    from kiro_crew.agent import managed_mcp_spec_entry, with_managed_launch
+    from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
+
+    for name in KIROCREW_BIN_MCP_SERVERS:
+        entry = servers.get(name)
+        if isinstance(entry, dict) and "command" in entry:
+            # include_opt_in: the spec already grants the server, so the question
+            # is what its launch is, not whether a rebuild would emit it.
+            managed = managed_mcp_spec_entry(name, include_opt_in=True)
+            servers[name] = with_managed_launch(entry, managed)
 
 
 def _contested_names(directory: Path) -> frozenset[str]:
@@ -383,6 +469,7 @@ def prepare_native_skill_projection(
     enabled: bool | None = None,
     per_session_element: bool = True,
     on_lock_unavailable: Callable[[OSError], None] | None = None,
+    lease_agents: tuple[str, ...] | None = None,
 ) -> NativeSkillProjection | None:
     """Prepare native views after spec freshness admission, before spawning.
 
@@ -408,6 +495,13 @@ def prepare_native_skill_projection(
     :class:`InProcessProjectionWaitTimeout` is this process's own queue, a
     :class:`CrossProcessProjectionLockTimeout` another process holding the file
     lock, any other ``OSError`` a problem with the lock file itself.
+
+    ``lease_agents`` names the agents this projection's caller will hand kiro-cli
+    (by authored name or by view name). Only their views are leased, and only they
+    stay in this process's active set. Every agent still gets a published view and
+    a translation, so an edited agent's old view is pinned only by a session that
+    runs that agent, and the prune can reclaim it otherwise. ``None`` leases every
+    view.
     """
     directory = kiro_agents_dir()
     crew_home_id = data_home().absolute().as_posix()
@@ -432,8 +526,8 @@ def prepare_native_skill_projection(
         # fallback. So the ceiling never touches an explicit caller; it only
         # declines to START projecting when nothing asked for it specifically.
         if enabled:
-            view_count = _count_projected_aliases(directory)
-            if view_count >= SKILL_VIEW_PROJECTION_CEILING:
+            view_count, ceiling = _skill_view_census(directory)
+            if view_count >= ceiling:
                 # The safety net: the agents directory already holds at least the
                 # ceiling of views, so minting more would deepen a backlog
                 # kiro-cli reads in full on every start. Fall back to the authored
@@ -449,7 +543,7 @@ def prepare_native_skill_projection(
                 # host never reaches here; see the ceiling constant. The fallback
                 # still prunes below (``ceiling_tripped``) so the count can fall
                 # back under the ceiling without a restart.
-                _warn_ceiling_fallback_once(directory, view_count)
+                _warn_ceiling_fallback_once(directory, view_count, ceiling)
                 enabled = False
                 ceiling_tripped = True
     if not enabled:
@@ -534,6 +628,7 @@ def prepare_native_skill_projection(
     # Call-time: a module-level name here would be served by the facade as well.
     from kiro_crew import agent as agent_mod
     from kiro_crew.acp.default_crew_servers import with_default_crew_servers
+    from kiro_crew.acp.kas_auto_approve import grant_in_skill_view
 
     # A crew-bound spec's view carries only the grants the governance ceiling
     # permits: kiro-cli runs the view, not the authored file, which is never written.
@@ -544,6 +639,61 @@ def prepare_native_skill_projection(
     # never handed a name whose file it would choose itself.
     contested = _contested_names(directory)
 
+    # Registry mode is a whole-install CEILING, not a settings-file restriction:
+    # kiro-cli resolves every managed ``mcpServers`` entry against the admin's
+    # catalog by map key and its registry filter is SYMMETRIC -- under registry
+    # mode it keeps only the entries carrying ``"type": "registry"`` and DROPS
+    # every unmarked one (see ``session_mcp.kiro_control_plane_servers``). So
+    # while an admin registry may govern the sign-in, the managed
+    # ``kirocrew-core`` element Crew mounts for a search agent cannot bind for
+    # ANY agent on EITHER client: the shared runtime cannot mint the per-session
+    # identity element, and the direct client's injected ``kirocrew-core`` entry
+    # is unmarked, so kiro-cli drops it. When it is known that no registry can
+    # govern the sign-in, the control plane is unmarked, the mount gives it its
+    # element and ``skill_search`` binds. The admin's security policy can also
+    # opt Crew's own servers past the registry
+    # (``mcp_registry_local_control_plane``, read through
+    # ``platform.governance.registry_local_control_plane_permitted``); the shared
+    # runtime's mount then gives the control plane its element under the ceiling
+    # too, so ``skill_search`` binds there. The ceiling below is the mount's own
+    # gate, ``session_mcp.registry_withholds_control_plane`` (the spec writer's
+    # marker for the control plane, minus that opt-in), read once here for every
+    # agent this preparation projects. It is not the direct client's whole
+    # answer: with the opt-in on, that client's injected ``kirocrew-core`` entry
+    # is still unmarked, so kiro-cli's filter can drop it there.
+    #
+    # Therefore under the ceiling every agent is left EXACTLY as authored, on
+    # BOTH clients -- its ``skill://`` resources kept, no managed element, no
+    # ``skill_search`` injected, not a search agent -- rather than stripped on the
+    # promise of a ``skill_search`` that cannot bind, which would cost the agent
+    # its native skills AND leave ``skill_search`` answering ``identity_unattested``
+    # (shared runtime) or dropped outright (direct client). The decision is gated
+    # on that predicate alone, not on ``per_session_element``: gating on the
+    # element would still strip + inject on the direct client, promising a
+    # ``skill_search`` whose unmarked server kiro-cli then drops. The mount's
+    # empty verdict under the ceiling then has no search agent to collide with
+    # and no session is refused for it.
+    #
+    # The INHERITANCE overlay follows the same ceiling: it turns off kiro-cli's
+    # native default-resource inheritance, and under the ceiling no client can
+    # replace that with Crew's own discovery (the unmarked managed entry is
+    # dropped on both clients). So the overlay is off for BOTH clients under the
+    # ceiling -- also gated on the predicate alone -- or the two clients write
+    # opposite overlay states on one workspace and whichever spawned last
+    # decides what every agent inherits.
+    registry_ceiling = session_mcp.registry_withholds_control_plane()
+    if registry_ceiling:
+        # Make the degradation observable: the old path aborted loudly with
+        # "Cannot bind skill_search", so a silent fallback would be a regression
+        # in its own right. One line names that skill_search is withheld and
+        # that discovery falls back to kiro-cli's native resource inheritance.
+        logger.warning(
+            "skill projection: registry mode active, an admin registry may govern "
+            "this sign-in and the security policy does not set "
+            "mcp_registry_local_control_plane -- skill_search is withheld (no managed "
+            "element can bind under the admin catalog); agents are left as authored and skill "
+            "discovery falls back to kiro-cli's native resource inheritance."
+        )
     for agent in list_agents(project_dir=str(work_dir)):
         if not agent.filename:
             continue
@@ -581,12 +731,17 @@ def prepare_native_skill_projection(
             crew_home_id=crew_home_id,
             inherits_skills=bool(inherited_globs),
             per_session_element=per_session_element,
+            registry_ceiling=registry_ceiling,
         )
         if view is None:
             errors[agent.name] = refusal or ""
             continue
         if governed_names is None or agent.name in governed_names:
             agent_mod.govern_shared_template_view(agent.name, view)
+        # kiro-cli has no `autoApprove` field, so a verb governance keeps runs without
+        # a prompt only as an `allowedTools` entry. Every agent's view gets that grant,
+        # the one the KAS projection derives, after the pass above.
+        grant_in_skill_view(agent.name, view)
         if search:
             search_agents.add(agent.name)
         specs[agent.name] = view
@@ -643,7 +798,7 @@ def prepare_native_skill_projection(
                         "value": local.get(_INHERIT_SETTING),
                     }
 
-                if inherited:
+                if inherited and not registry_ceiling:
                     for view in specs.values():
                         for resource in (
                             f"file://{kiro_home().as_posix()}/steering/**/*.md",
@@ -697,7 +852,16 @@ def prepare_native_skill_projection(
                     }
 
                 metadata_dir = _ensure_projection_metadata_directory() if aliases else None
-                lease_stack = _acquire_projection_lease(directory, set(aliases.values()))
+                if lease_agents is None:
+                    leased = set(aliases.values())
+                else:
+                    wanted = set(lease_agents)
+                    leased = {
+                        alias
+                        for name, alias in aliases.items()
+                        if name in wanted or alias in wanted
+                    }
+                lease_stack = _acquire_projection_lease(directory, leased)
                 try:
                     for agent_name, alias in aliases.items():
                         alias_raw = json.dumps(specs[agent_name], ensure_ascii=False)
@@ -727,10 +891,27 @@ def prepare_native_skill_projection(
                             # The ledger only serves names stored before a
                             # restart; losing one write never blocks a spawn.
                             logger.debug("skill projection: view ledger not written", exc_info=True)
-                    local[_MANAGED_SETTING] = inherited
-                    local[_INHERIT_SOURCE] = preference_source
-                    local[_INHERIT_SETTING] = True
-                    atomic_write(locked_settings, json.dumps(local, indent=2))
+                    if registry_ceiling:
+                        # Under the registry ceiling the projection supplies NO
+                        # discovery for either client (the managed entry is
+                        # unmarked, so kiro-cli's registry filter drops it even on
+                        # the direct client), so the overlay that turns off
+                        # kiro-cli's native inheritance must not be applied: that
+                        # would leave an inherited-only agent (and ``kirocrew``
+                        # with no ``skill://`` resources) with neither Crew's
+                        # bounded skill directory NOR kiro-cli's native default
+                        # skill trees -- no skills at all. Gated on the shared
+                        # predicate, not on ``per_session_element``, so both
+                        # clients agree and alternating spawns on one workspace do
+                        # not rewrite the setting against each other.
+                        # Restore native inheritance (undoing any overlay a
+                        # non-governed spawn left) so kiro-cli loads the defaults.
+                        _restore_inheritance(locked_settings, local)
+                    else:
+                        local[_MANAGED_SETTING] = inherited
+                        local[_INHERIT_SOURCE] = preference_source
+                        local[_INHERIT_SETTING] = True
+                        atomic_write(locked_settings, json.dumps(local, indent=2))
                     prepared = NativeSkillProjection(
                         aliases,
                         specs,
@@ -738,6 +919,7 @@ def prepare_native_skill_projection(
                         search_agents,
                         refusals=refusals,
                     )
+                    prepared.leased_aliases = frozenset(leased)
                     _remember_view_sources(aliases)
                     # Releases the lease and prunes this home's unleased views
                     # as soon as the projection ends -- explicitly through

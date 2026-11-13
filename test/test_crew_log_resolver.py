@@ -403,29 +403,71 @@ def test_a_background_call_with_no_owner_or_no_kind_resolves_no_owner():
     assert sessions.calls == [], "an unnamed call must not even resolve a session"
 
 
-def test_a_background_owner_is_resolved_before_the_call_not_after_it():
-    """The resolver answers "now", so resolving in the teardown is the wrong now.
+def _unit_files(session_id: str) -> dict[str, int]:
+    """Every file directly in a unit's directory (log segments, cuts), by size."""
+    from kiro_crew.crew_log.store_paths import crew_log_dir
 
-    A slot reset, switch or compaction during the model call cold-starts a NEW ACP
-    session id. Resolving at teardown would hand this call's spend to the successor
-    -- a session that never incurred it -- silently, in an append-only file. So the
-    owner is pinned before the call and the teardown writes to that pin.
+    directory = crew_log_dir("session", session_id)
+    return {p.name: p.stat().st_size for p in directory.iterdir() if p.is_file()}
+
+
+def test_a_reset_during_a_background_call_writes_to_the_newest_unit_for_the_pinned_one():
+    """The owner is pinned before the call; the entry lands in the slot's newest unit.
+
+    A slot reset, switch or compaction during the model call starts a NEW unit. A
+    crew log is append-only and an older unit never grows (a write there retires the
+    savepoints beside the newest unit), so the teardown writes into the successor and
+    counts it in that unit's usage.
     """
+    from kiro_crew.llm_helpers import _background_crew_log_owner, _record_background_crew_log
+
+    _open_session()
+    successor = "successor-sid"
+    sessions = _Sessions({"dashboard:chat-7": _Provider(SESSION)})
+    owner = _background_crew_log_owner(sessions, "dashboard:chat-7", "title")
+    assert owner == SESSION
+    # The slot is reset mid-call: the registry now serves a new unit.
+    emit.on_session_opened(
+        successor, agent="kirocrew", slot="chat-7", model="m", cwd="/w", owner="default"
+    )
+    sessions._providers["dashboard:chat-7"] = _Provider(successor)
+    assert_drained()
+    before = _unit_files(SESSION)
+    _record_background_crew_log(
+        owner,
+        "title",
+        _Usage(credits=1.0),
+        model="m",
+        provider="acp",
+        elapsed_ms=1,
+        sessions=sessions,
+        crew_log_session_key="dashboard:chat-7",
+    )
+    assert_drained()
+    assert _unit_files(SESSION) == before, "the superseded unit did not grow"
+    (entry,) = [e for e in _body(successor) if e["type"] == "background/completed"]
+    assert entry["data"]["kind"] == "title"
+
+
+def test_a_background_call_with_no_reset_writes_to_the_pinned_unit():
     from kiro_crew.llm_helpers import _background_crew_log_owner, _record_background_crew_log
 
     _open_session()
     sessions = _Sessions({"dashboard:chat-7": _Provider(SESSION)})
     owner = _background_crew_log_owner(sessions, "dashboard:chat-7", "title")
-    assert owner == SESSION
-    # The slot is reset mid-call: the registry now serves a different unit.
-    sessions._providers["dashboard:chat-7"] = _Provider("successor-sid")
     _record_background_crew_log(
-        owner, "title", _Usage(credits=1.0), model="m", provider="acp", elapsed_ms=1
+        owner,
+        "title",
+        _Usage(credits=1.0),
+        model="m",
+        provider="acp",
+        elapsed_ms=1,
+        sessions=sessions,
+        crew_log_session_key="dashboard:chat-7",
     )
     assert_drained()
-    assert _entries(SESSION), "the spend stayed with the session that incurred it"
-    assert _of("background/completed")[0]["kind"] == "title"
-    assert _entries("successor-sid") == [], "and did not follow the successor"
+    (data,) = _of("background/completed")
+    assert data["kind"] == "title"
 
 
 def test_both_background_helpers_pin_the_owner_before_their_first_await():
@@ -1060,6 +1102,7 @@ def test_a_turn_still_pending_at_the_terminal_is_billed_in_the_closer():
 
     coordinator = SimpleNamespace(
         _record_terminal_metric=lambda _info: None,
+        _fire_session_ended=lambda _info: None,
         _manager=SimpleNamespace(
             arm_report_in_flight=lambda _info: None,
             consume_report_hold=lambda _batch, _id: None,
@@ -1187,3 +1230,91 @@ def test_the_origin_map_is_bounded_by_uptime_not_by_the_number_of_live_turns():
     assert len(emit._child_origin) == emit._MAX_CHILD_ORIGINS
     assert emit.open_child_origin("a0") == ("", 0), "the oldest is evicted first"
     assert emit.open_child_origin(f"a{emit._MAX_CHILD_ORIGINS + 49}") == (SESSION, 1)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "closer"), [("completed", "subagent/completed"), ("failed", "subagent/failed")]
+)
+def test_the_terminal_closer_names_the_session_the_child_ran_in(outcome, closer):
+    """A reader finds the child's own transcript from the closer, after result.txt is gone.
+
+    The run's ``_session_id`` is the session its last attempt ran in; the closer is the
+    first entry written after that session exists (``subagent/spawned`` is written at
+    admission, before the child has one).
+    """
+    from kiro_crew.subagent_manager.terminal import TerminalCoordinator
+
+    _open_session()
+    emit.remember_child_origin("ab12", SESSION, 3)
+    assert emit.open_child_origin("ab12") == (SESSION, 3)
+    info = SimpleNamespace(
+        id="ab12", elapsed=0.5, outcome=outcome, error=None, credits=0.0, _session_id="child-sid-1"
+    )
+    TerminalCoordinator._record_crew_log_terminal(SimpleNamespace(), info)
+    assert_drained()
+    assert [d.get("child_sid") for d in _of(closer)] == ["child-sid-1"]
+
+
+def test_a_child_that_never_got_a_session_closes_without_a_child_sid():
+    from kiro_crew.subagent_manager.terminal import TerminalCoordinator
+
+    _open_session()
+    emit.remember_child_origin("ab12", SESSION, 3)
+    assert emit.open_child_origin("ab12") == (SESSION, 3)
+    info = SimpleNamespace(id="ab12", elapsed=0.5, outcome="failed", error="boom", credits=0.0)
+    TerminalCoordinator._record_crew_log_terminal(SimpleNamespace(), info)
+    assert_drained()
+    (data,) = _of("subagent/failed")
+    assert "child_sid" not in data
+
+
+def test_a_recovery_that_never_got_a_session_keeps_the_earlier_attempt_s_child_sid():
+    """A cancel-recovery attempt that fails before acquiring clears ``_session_id``; the
+    closer must still name the session the child last ran in."""
+    from kiro_crew.subagent_manager.terminal import TerminalCoordinator
+
+    _open_session()
+    emit.remember_child_origin("ab12", SESSION, 3)
+    assert emit.open_child_origin("ab12") == (SESSION, 3)
+    info = SimpleNamespace(
+        id="ab12",
+        elapsed=0.5,
+        outcome="failed",
+        error="boom",
+        credits=0.0,
+        _session_id="",
+        _last_session_id="first-attempt-sid",
+    )
+    TerminalCoordinator._record_crew_log_terminal(SimpleNamespace(), info)
+    assert_drained()
+    (data,) = _of("subagent/failed")
+    assert data["child_sid"] == "first-attempt-sid"
+
+
+@pytest.mark.parametrize(
+    ("current", "earlier", "kept"),
+    [("attempt-1", "", "attempt-1"), ("", "attempt-1", "attempt-1"), ("", "", "")],
+)
+def test_each_attempt_remembers_the_last_session_before_clearing(current, earlier, kept):
+    """``_run_inner_impl`` clears the cleanup identity first; the last session id survives."""
+    import asyncio
+
+    import kiro_crew.subagent as facade
+    from kiro_crew.subagent_manager.run import RunEventCoordinator
+
+    info = SimpleNamespace(_session_id=current, _last_session_id=earlier)
+
+    class _Stop(Exception):
+        pass
+
+    def _stop(*_a, **_k):
+        raise _Stop
+
+    # Stop right after the identity reset: the first statement that reads the time.
+    # The bound ``*_impl`` runs on the facade's globals, so its ``time`` is patched there.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(facade, "time", SimpleNamespace(time=_stop, monotonic=_stop))
+        with pytest.raises(_Stop):
+            asyncio.run(RunEventCoordinator._run_inner_impl(SimpleNamespace(), info, "k", None))
+    assert info._session_id == ""
+    assert info._last_session_id == kept

@@ -10,6 +10,7 @@ import WebAppArtifactCard from '../components/WebAppArtifactCard'
 import { AlertCircle, AlertTriangle } from 'lucide-react'
 import { Btn } from '../components/ui'
 import SelectionToolbar from '../components/SelectionToolbar'
+import { svgSelectionRange } from '../utils/svgSelection'
 import { CommentsSidebar } from '../components/CommentsSidebar'
 import { SubmitBar } from '../components/ArtifactSubmitBar'
 import { ArtifactChatPanel } from '../components/ArtifactChatPanel'
@@ -307,7 +308,7 @@ export function ArtifactDetailPageBody({
     iframeScrollTarget, previewRef, bodyRef, iframeBodyRef, detailQuery, eventsQuery, effectiveVersion,
     isCurrent, dirty, usesIframe, contentWidthStyle,
   } = documentRead
-  const { reprobing, reprobeError, reprobeNotice, flushLiveEdits } = editorRead
+  const { reprobing, reprobeError, reprobeNotice, flushLiveEdits, editorRef } = editorRead
   const {
     commentable, invalidateComments, commentActionError, setCommentActionError, addDocComment, replyComment,
     resolveComment, markReviewComment, reopenComment, removeComment, editComment,
@@ -453,6 +454,7 @@ export function ArtifactDetailPageBody({
           <span className="min-w-0 flex-1">{i18nT(publishNoticeKey({
             rolling_out: 'pages.artifactDetailPage.publication_still_rolling_out',
             distribution_disabled: 'pages.artifactDetailPage.publication_distribution_disabled',
+            origin_mismatch: 'pages.artifactDetailPage.publication_origin_mismatch',
             notice_generic: 'pages.artifactDetailPage.publication_notice_generic',
           }, artifact.publication.notice_code))}</span>
           {/* A notice is recorded once, at publish time, and the ordinary happy path
@@ -549,6 +551,7 @@ export function ArtifactDetailPageBody({
                   editing={editing && (artifact.kind === 'svg' || !previewDuringEdit)}
                   onChange={setEditedContent}
                   previewRef={previewRef}
+                  editorRef={editorRef}
                   comments={overlayComments}
                   activeCommentId={activeCommentId}
                   scrollNonce={bodyScrollNonce}
@@ -568,7 +571,7 @@ export function ArtifactDetailPageBody({
                   submit the previous artifact's draft through this one's callbacks. */}
               {/* `externalSelection` carries a code-block line range (Pierre's
                   shadow DOM holds no light-DOM selection to read). */}
-              {commentable && <SelectionToolbar key={`${slug}:${composerResetNonce}`} containerRef={previewRef} actions={selectionActions} composer={selectionComposer} externalSelection={iframeSelection} suspended={narrowPanelOpen} codeSelection={artifact.kind === 'text'} />}
+              {commentable && <SelectionToolbar key={`${slug}:${composerResetNonce}`} containerRef={previewRef} actions={selectionActions} composer={selectionComposer} externalSelection={iframeSelection} suspended={narrowPanelOpen} codeSelection={artifact.kind === 'text'} shadowSelection={artifact.kind === 'svg' ? svgSelectionRange : undefined} />}
             </div>
           )}
         </div>
@@ -619,8 +622,10 @@ export function ArtifactDetailPageBody({
             {/* IN THIS COLUMN, its only mount: the remedy names the composer below it, and a
                 page-top banner puts that instruction a column away from the control it means. */}
             {contextNotice}
+            {/* Not until the create returns: the gateway lists the new session before it
+                answers, and a chat mounted from that frame never reads the prompt staged after. */}
             <ArtifactChatPanel
-              slotKey={boundSlot?.key ?? null}
+              slotKey={chatCreating ? null : boundSlot?.key ?? null}
               creating={chatCreating}
               onNewChat={() => { void newCompanionChat() }}
               onOpenFull={openChatFull}

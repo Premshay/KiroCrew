@@ -26,6 +26,12 @@ interface NativeSelectProps extends React.ComponentPropsWithoutRef<'select'> {
   appearance?: SelectAppearance
   /** Inline style for the positioning wrapper — where a caller's sizing belongs. */
   wrapperStyle?: React.CSSProperties
+  /** The control is writing its own change: it keeps its tab stop (not native
+   *  `disabled`, which drops a keyboard user to the page) but wears the disabled
+   *  look and refuses the pointer. The caller carries the `aria-disabled` /
+   *  `aria-busy` attrs and the change guard; this only owns the look, so the
+   *  dimming stays in the primitive rather than a restyle at the call site. */
+  busy?: boolean
 }
 
 /**
@@ -42,7 +48,7 @@ const NativeSelect = React.forwardRef<HTMLSelectElement, NativeSelectProps>(
   // React infers the devtools name from the function, and the assignment form would
   // add a bare string literal that the i18n gate counts (eslint-rules/i18n-strict.js
   // re-surfaces literals the upstream rule exempts).
-  function NativeSelect({ className, appearance = 'default', wrapperStyle, children, ...props }, ref) {
+  function NativeSelect({ className, appearance = 'default', wrapperStyle, busy, children, ...props }, ref) {
     return (
       // The wrapper is the layout box: it owns the chevron's positioning context,
       // so a caller's sizing (a flex basis, a min-width) has to land HERE to have
@@ -63,6 +69,7 @@ const NativeSelect = React.forwardRef<HTMLSelectElement, NativeSelectProps>(
             'hover:border-border-strong transition-all cursor-pointer outline-hidden appearance-none',
             'focus-visible:border-accent disabled:opacity-40 disabled:pointer-events-none',
             selectAppearanceClasses[appearance],
+            busy && 'opacity-40 pointer-events-none',
             className
           )}
           // The gutter the chevron below sits in. It is a constant of THIS

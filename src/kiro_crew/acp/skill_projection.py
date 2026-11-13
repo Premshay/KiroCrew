@@ -27,6 +27,8 @@ from kiro_crew.agent_discovery import (  # noqa: F401
 from kiro_crew.agent_spec_format import (  # noqa: F401
     NATIVE_SKILL_ALIAS_PREFIX,
     SKILL_VIEW_PROJECTION_CEILING,
+    count_authored_agent_files,
+    skill_view_ceiling,
     volatile_env_keys,
 )
 from kiro_crew.atomic_write import atomic_write, on_event_loop  # noqa: F401
@@ -36,6 +38,7 @@ from kiro_crew.config.paths import (  # noqa: F401
     kiro_home,
     project_agents_dir,
 )
+from kiro_crew.file_uri import file_uri_path_text  # noqa: F401
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes  # noqa: F401
 from kiro_crew.security import _PATH_RESOLVE_TIMEOUT_SECS  # noqa: F401
 from kiro_crew.user_json import copy_json_document  # noqa: F401
@@ -63,6 +66,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _END_PRUNE_RUNNING,
         _EXIT_REAPER_WAIT_SECS,
         _EXITING,
+        _LEGACY_METADATA_DIR_NAME,
         _LEGACY_RECLAIM_MIN_AGE_SECS,
         _PROJECTION_PRUNE_WORK_LIMIT,
         _PRUNE_MAX_RECLAIMS_PER_RUN,
@@ -77,11 +81,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _end_projection_off_loop,
         _end_prune_more_requested,
         _ensure_projection_reaper,
-        _migrate_legacy_side_files,
-        _move_sidecar,
+        _is_legacy_metadata_file,
         _note_env_values,
         _projection_prune_candidates,
-        _prune_excluding_older_publishers,
         _prune_stale_managed_aliases,
         _prune_start_offset,
         _read_alias_spec_bounded,
@@ -89,6 +91,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _reaper_alive,
         _reclaim_prune_candidate,
         _release_queued_leases_at_exit,
+        _remove_legacy_metadata_dir,
         _run_requested_end_prunes,
         _sweep_orphan_alias_locks,
         _sweep_orphan_sidecars,
@@ -98,6 +101,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         census_projected_aliases,
         census_projection_residue,
         drain_stale_aliases,
+        prune_stale_aliases_at_stop,
     )
     from kiro_crew.acp.skill_projection_parts.inheritance_overlay import (  # noqa: F401
         _ABSENT_SETTINGS,
@@ -129,7 +133,10 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _has_spec_pin,
         _pinned_source,
         _projection_enabled,
+        _relaunch_reserved_servers,
+        _skill_view_census,
         _warn_ceiling_fallback_once,
+        next_spawn_projects_skill_view,
         prepare_native_skill_projection,
         project_agent_view,
     )
@@ -141,7 +148,6 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _LEGACY_ALIAS_NAME_RE,
         _PER_SPAWN_PRUNE_MIN_INTERVAL_SECS,
         _PINNED_SIDE_DIR,
-        _PROJECTION_LEASE_DIR_NAME,
         _PROJECTION_LEASE_HOLDER_SUFFIX,
         _PROJECTION_LEASE_MAX_ALIASES,
         _PROJECTION_LEASE_MAX_BYTES,
@@ -149,9 +155,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _PROJECTION_LEASE_SCAN_LIMIT,
         _PROJECTION_LEASE_SCAN_MAX_SECONDS,
         _PROJECTION_LEASE_STEM_RE,
-        _PROJECTION_LOCK_NAME,
         _PROJECTION_LOCK_TIMEOUT_SECS,
-        _PROJECTION_METADATA_DIR_NAME,
         _PROJECTION_PUBLICATION_RESERVE_SECS,
         _PROJECTION_SIDE_DIR_NAME,
         _PROJECTION_SIDE_LEASE_DIR_NAME,
@@ -167,14 +171,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _acquire_projection_lease,
         _ensure_projection_metadata_directory,
         _ensure_real_directory,
-        _hold_legacy_publication_lock,
         _in_process_projection_lock,
         _is_projection_lease_stem,
         _LeaseIdentities,
-        _legacy_lease_dir,
-        _legacy_lock_path,
-        _legacy_metadata_dir,
-        _metadata_dirs,
         _path_exists,
         _per_spawn_prune_due,
         _probe_orphan_projection_holder,
@@ -187,7 +186,6 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _prune_budget_within,
         _read_lease_record,
         _scan_lease_dir,
-        _scan_legacy_lease_dir,
         _scan_projection_leases,
         _unlink_alias_if_unchanged,
         _unlink_projection_lease_if_unchanged,
@@ -248,7 +246,6 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _VIEW_SOURCES_MAX,
         RetiredSkillView,
         _admissible_source_agent,
-        _import_legacy_ledger,
         _read_json_regular_file,
         _read_view_ledger,
         _record_view_ledger,
@@ -258,6 +255,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _sidecar_answers_for,
         _ViewLedgerWrites,
         is_skill_view_name,
+        owned_view_source,
         remembered_view_source,
         resolve_source_agent,
         source_agent_name,

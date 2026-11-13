@@ -11,10 +11,12 @@ and the gateway installs the pinned engine if it is missing
 The rule, in order:
 
 1. ``agent.kas_bundle`` on: the bundle route, as configured.
-2. ``agent.acp_backend`` stored as the Kiro CLI pick (``"kiro"``): the relay. That
-   pick runs on KAS only because kiro-cli itself offers v3 (the decision entry
-   "A Kiro CLI harness choice runs on Kiro Crew's KAS path"), so it never moves
-   onto an engine kiro-cli does not serve.
+2. The harness choice stored as the Kiro CLI pick (``"kiro"``): the relay. The
+   choice is the session's own Bot pin (``agents.<name>.acp_backend``) when it
+   has one, else ``agent.acp_backend``. That pick runs on KAS only because
+   kiro-cli itself offers v3 (the decision entry "A Kiro CLI harness choice runs
+   on Kiro Crew's KAS path"), so it never moves onto an engine kiro-cli does not
+   serve.
 3. No kiro-cli resolves: the bundle route.
 4. kiro-cli resolves, and is not the operator's own ``KIROCREW_KIRO_BIN`` (that
    binary is never second-guessed), but cannot run a session: kiro-cli's own sign-in is proven
@@ -41,6 +43,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from kiro_crew import lts_sign_in as sign_in
+from kiro_crew.acp_backends import STORED_BACKEND_KIRO
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -49,6 +54,7 @@ __all__ = [
     "REASON_KIRO_CLI_SIGNED_OUT",
     "REASON_NO_KIRO_CLI",
     "KasRoute",
+    "crew_sign_in_starts_spawn",
     "kiro_cli_signed_out",
     "last_spawn_route",
     "note_spawn_route",
@@ -193,8 +199,14 @@ def _stored_as_kiro_pick() -> bool:
         return False
 
 
-def automatic_switch_allowed() -> bool:
-    """Rule 2: a stored Kiro CLI pick never leaves kiro-cli. Blocking (reads config)."""
+def automatic_switch_allowed(pin: str = "") -> bool:
+    """Rule 2: a stored Kiro CLI pick never leaves kiro-cli. Blocking (reads config).
+
+    *pin* is the session's own Bot pin as stored; ``""`` means it has none, and
+    the installation's ``agent.acp_backend`` decides.
+    """
+    if pin:
+        return pin != STORED_BACKEND_KIRO
     return not _stored_as_kiro_pick()
 
 
@@ -290,6 +302,36 @@ def crew_entry_skips_launcher(kiro_bin: str, environ: Mapping[str, str]) -> bool
     if sys.platform == "win32" or os.path.basename(kiro_bin) == BUNDLED_KIRO_CLI_ENTRY:
         return True
     return chat_sibling(kiro_bin) is not None
+
+
+def crew_sign_in_starts_spawn(
+    *,
+    environ: Mapping[str, str] | None = None,
+    home: Path | None = None,
+) -> bool:
+    """Whether the next KAS spawn starts on Kiro Crew's own usable sign-in alone.
+
+    The bundle route runs no kiro-cli, and the relay entered through
+    ``kiro-cli-chat`` skips the launcher's own sign-in check; any other relay
+    spawn passes that check, so it needs kiro-cli's sign-in too. The vault
+    entry must resolve (``lts_sign_in.resolve``): a lapsed one answers False,
+    where ``auth.bridge.vault_holds_identity`` still names the spawn
+    Crew-owned. Blocking (vault, kiro-cli store and config reads); never raises.
+    """
+    environ = os.environ if environ is None else environ
+    home = Path.home() if home is None else home
+    try:
+        if sign_in.resolve(policy=sign_in.OSS).source is not sign_in.Source.VAULT:
+            return False
+        # Local, as in resolve_kas_route: this module loads while acp.client imports.
+        from kiro_crew.acp.client import _resolve_kiro_bin
+
+        kiro_bin = _resolve_kiro_bin(environ=environ, home=home)
+        if kiro_bin and crew_entry_skips_launcher(kiro_bin, environ):
+            return True
+        return resolve_kas_route(environ=environ, home=home).bundle
+    except Exception:  # noqa: BLE001 - no usable Crew sign-in keeps kiro-cli's in play
+        return False
 
 
 #: The route the last KAS spawn in this process took, ``None`` before the first.

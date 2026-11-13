@@ -20,12 +20,40 @@ from kiro_crew.knowledge.extractor import EntityExtractor
 from kiro_crew.knowledge.readers import FileReader
 from kiro_crew.knowledge.retrieval import ANY_EMBEDDING_SPACE, HybridRetriever, _bytes_to_floats
 
-# ---------------------------------------------------------------------------
 # 8. HybridRetriever -- additional coverage
-# ---------------------------------------------------------------------------
 
 
 class TestHybridRetrieverExtended:
+    @pytest.mark.parametrize("json1", [True, False])
+    def test_graph_source_and_status_are_applied_before_limit(self, store, monkeypatch, json1):
+        from kiro_crew.knowledge import retrieval
+
+        monkeypatch.setattr(retrieval, "_has_json1", lambda _db: json1)
+        selected = store.add_source("selected", "manual", "selected")
+        other = store.add_source("other", "manual", "other")
+        entity = store.add_entity("Quokka", "concept")
+        kept = store.add_item("Kept", "details", "doc", source_id=selected)
+        archived = store.add_item("Archived", "details", "doc", source_id=selected)
+        foreign = store.add_item("Foreign", "details", "doc", source_id=other)
+        located = store.add_item("Located", "details", "doc", source_id=other)
+        store.add_source_location(located, selected)
+        for item in (kept, archived, foreign, located):
+            store.add_mention(item, entity)
+        store.update_item(archived, status="archived")
+        retriever = HybridRetriever(store)
+        assert {item for item, _ in retriever._graph_search("Quokka", source_id=selected)} == {
+            kept,
+            located,
+        }
+        assert retriever._graph_search("Quokka", status="archived", source_id=selected) == [
+            (archived, 1)
+        ]
+        assert {item for item, _ in retriever._graph_search("Quokka", status=None, source_id=selected)} == {
+            kept,
+            archived,
+            located,
+        }
+
     def test_graph_search(self, store):
         e1 = store.add_entity("JWT", "concept")
         item_id = store.add_item("Auth", "JWT token design", "doc")
@@ -38,6 +66,13 @@ class TestHybridRetrieverExtended:
     def test_graph_search_no_match(self, store):
         retriever = HybridRetriever(store)
         assert retriever._graph_search("nonexistent") == []
+
+    def test_search_with_a_lone_surrogate_still_finds_the_rest_of_the_query(self, store):
+        # A JSON "\ud83d" escape, or a query cut mid-emoji, carries a lone
+        # surrogate that SQLite cannot bind; the search must still run.
+        item_id = store.add_item("Auth", "JWT token design", "doc")
+        results = HybridRetriever(store).search("JWT " + chr(0xD83D))
+        assert [r["id"] for r in results] == [item_id]
 
     def test_graph_search_with_neighbors(self, store):
         e1 = store.add_entity("Auth", "service")
@@ -105,9 +140,7 @@ class TestHybridRetrieverExtended:
         assert _bytes_to_floats(b"not json") == []
 
 
-# ---------------------------------------------------------------------------
 # 9. EntityExtractor -- additional coverage
-# ---------------------------------------------------------------------------
 
 
 class TestEntityExtractorExtended:
@@ -234,9 +267,7 @@ class TestEntityExtractorExtended:
         assert result["category"] == "runbook"
 
 
-# ---------------------------------------------------------------------------
 # 10. Chunker -- additional coverage
-# ---------------------------------------------------------------------------
 
 
 class TestChunkerExtended:
@@ -315,9 +346,7 @@ class TestChunkerExtended:
         assert len(overlap_prefix.split()) >= 2
 
 
-# ---------------------------------------------------------------------------
 # 11. FileReader -- additional coverage
-# ---------------------------------------------------------------------------
 
 
 class TestFileReaderExtended:
@@ -412,9 +441,7 @@ class TestPysqlite3Fallback:
         self._reload_without_pysqlite3("kiro_crew.snapshot")
 
 
-# ---------------------------------------------------------------------------
 # 12. chunk_markdown() -- heading-aware markdown chunking
-# ---------------------------------------------------------------------------
 
 
 class TestChunkMarkdown:
@@ -490,16 +517,14 @@ class TestChunkMarkdown:
         assert len(chunks) == 1
         chunk = chunks[0]
         assert chunk["line_start"] == 1
-        # The body's last real content line is line 6; before the fix this was
-        # reported as 8 (6 + 2 injected newlines), citing two lines past EOF.
+        # The last content line is 6; counting the 2 injected newlines would cite
+        # lines past EOF.
         assert chunk["line_end"] == 6
         assert chunk["line_end"] <= total_lines
 
     def test_merged_section_ending_in_whitespace_only_line(self):
-        # The last section's body trails a whitespace-only line, which strip()
-        # drops from the emitted content. A blank tail is not a content line, so
-        # line_end must stay on the last line carrying real text (4) instead of
-        # counting the blank tail line (5) that the content does not hold.
+        # strip() drops the whitespace-only tail, so line_end stays on the last
+        # line with real text (4), not the blank line 5.
         text = (
             "## Alpha\n"  # line 1
             "body a\n"  # line 2
@@ -516,9 +541,7 @@ class TestChunkMarkdown:
         assert chunk["line_end"] == 4
 
 
-# ---------------------------------------------------------------------------
 # 13. FileReader -- .docx content_type metadata
-# ---------------------------------------------------------------------------
 
 
 class TestDocxContentType:
@@ -595,9 +618,7 @@ class TestCosineSimilarityDimensionMismatch:
         assert HybridRetriever._cosine_similarity([], []) == 0.0
 
 
-# ---------------------------------------------------------------------------
 # EntityExtractor -- untrusted-chunk nonce-suffixed delimiters (CWE-94)
-# ---------------------------------------------------------------------------
 
 
 class TestEntityExtractorNonceDelimiters:

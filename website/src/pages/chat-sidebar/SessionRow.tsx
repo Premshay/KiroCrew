@@ -4,7 +4,7 @@
  *  (./rows) and its one `actions` object; the row's memo compares both. */
 import { useRef, useEffect, useState, memo, useMemo, useContext, type ReactNode } from 'react'
 import { motion } from 'framer-motion'
-import { X, Pin, VolumeX, EyeOff, VenetianMask, MoreVertical, CornerDownRight, GitFork, Loader, Loader2, Bot, ExternalLink, Workflow, TriangleAlert, Goal, MessageCircleQuestionMark, ShieldCheck, Hourglass, GripVertical, Moon, Zap } from 'lucide-react'
+import { X, Pin, VolumeX, EyeOff, VenetianMask, MoreVertical, CornerDownRight, Split, Loader, Loader2, Bot, ExternalLink, Workflow, TriangleAlert, Goal, MessageCircleQuestionMark, ShieldCheck, Hourglass, GripVertical, Moon, Zap } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { shallowEqual } from 'react-redux'
 import { useAppDispatch, useAppSelector, type RootState } from '../../store'
@@ -12,8 +12,9 @@ import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent } from '../../co
 import { ContextMenuStableTrigger, ContextMenuContent } from '../../components/ui/context-menu'
 import { offlineProps } from '../../utils/offline'
 import { sessionRefBlockReason } from '../../utils/sessionRefs'
+import { OfflineReasonRow } from '../../components/OfflineMenuReason'
 import { crewOf } from '../../hooks/useInstanceSessions'
-import { switchSlot, selectSidebarWorkflowActive, selectAutomationForSlot } from '../../store/chatSlice'
+import { switchSlot, selectSidebarWorkflowActive, selectAutomationForSlot, selectSlotStreamState } from '../../store/chatSlice'
 import { api } from '../../api/client'
 import { recencyTintShadow } from '../../utils/recencyTint'
 import { resolveSessionColor } from '../../utils/sessionColors'
@@ -29,7 +30,7 @@ import { RemoteCrewChip } from '../../components/RemoteCrewChip'
 import { DndDraggable, DndDroppable } from '../../components/dnd'
 import { normalizeRunSessionKey } from '../../apps/workflows/runModel'
 import { sanitizeLlmOutput } from '../../utils/sanitize'
-import type { ChatTag, CrewWorkFacts, SessionLink } from '../../types'
+import type { ChatTag, CrewWorkFacts } from '../../types'
 import { hasLiveSessionWork } from '../chat/sessionLane'
 import { crewNeedsYou, crewWorkCounts, longestStalledWork, stalledWorkKeys, useCrewWorkClock } from '../../lib/crewWork'
 import { isMemoryWait, queuedWaitText } from '../chat/subagentQueuedReason'
@@ -50,6 +51,8 @@ import { useSlotTitleGenerating } from '../../hooks/slotTitleGeneration'
 import { DisclosureChevron, isOpenInTabModifierClick } from './chrome'
 import { SessionSourceChips } from './SessionSourceChips'
 import { useSessionCardLines, cardLineClass } from './cardLines'
+import { RowTrailingMeta, SearchHitTail } from './searchHits'
+import { connectedChannelLinks } from './connectedChannelLinks'
 import { CrewEyebrow } from '../../components/crew/CrewModeMarks'
 import { crewRootOf } from '../../lib/crewMode'
 import { summarizeCrewWorkers, crewRowCounts } from '../../lib/crewWorkers'
@@ -76,6 +79,7 @@ function selectRowLive(st: RootState, localSlotKey: string) {
   const wf = selectSidebarWorkflowActive(st)[normalizeRunSessionKey(localSlotKey)]
   return {
     statusDetail: st.chat.slotStatusDetail?.[localSlotKey],
+    compacting: selectSlotStreamState(st, localSlotKey) === 'compacting',
     automation: selectAutomationForSlot(st, localSlotKey),
     queuedForSlot: st.chat.subagentQueued?.[localSlotKey] || 0,
     queuedReason: st.chat.subagentQueuedReason?.[localSlotKey],
@@ -143,41 +147,17 @@ const LIVE_ROW_STATE_KEYS: ReadonlySet<string> = new Set(['running', 'subagents'
  *  member's waiting approval never takes the line from one of them. */
 const OWED_ROW_STATE_KEYS: ReadonlySet<string> = new Set(['pending_approval', 'subagent_awaiting', 'needs_input', 'loop_waiting'])
 
-/** A slot's running-status line. Every phase resolves through toolStatusLabel:
- *  the fixed phases (`thinking`/`streaming`) carry no copy in the store and map
- *  to catalog keys at render time, a server-supplied status (also
- *  `kind: 'thinking'`, with its own `label`) is passed through, and a `tool`
- *  phase honors the user's `simplifiedToolNames` preference (purpose vs raw tool
- *  title), so the row agrees with the inline tool pill in the transcript rather
- *  than always showing the purpose. The generic copy covers whatever resolves to
- *  nothing (an `idle` phase caught before the slot list refreshes). */
-function slotStatusText(detail: ToolStatusDetail | undefined, simplifiedToolNames: boolean, uiLang: string): string {
-  return toolStatusLabel(detail, simplifiedToolNames, uiLang) || i18nT('pages.chatSidebar.thinking')
+/** A slot's running-status line. A compaction says the chat footer's word, whatever
+ *  phase the status detail still holds. Every other phase resolves through
+ *  toolStatusLabel: `thinking`/`streaming` map to catalog keys at render time, a
+ *  server-supplied status (`kind: 'thinking'` with its own `label`) passes through,
+ *  and a `tool` phase honors `simplifiedToolNames`, as the transcript's tool pill
+ *  does. The generic copy covers whatever resolves to nothing (an early `idle`). */
+function slotStatusText(detail: ToolStatusDetail | undefined, compacting: boolean, simplifiedToolNames: boolean, uiLang: string): string {
+  return compacting ? i18nT('pages.chat.chatFooter.compacting') : toolStatusLabel(detail, simplifiedToolNames, uiLang) || i18nT('pages.chatSidebar.thinking')
 }
 
-/** The channels a session row wears a brand mark for: one per channel that is
- * currently connected, in first-seen order.
- *
- * Connected means at least one delivery on that channel is not paused — the
- * same rule the session menu's Connect/Disconnect row uses to pick its verb, so
- * the mark on the row and the verb in the menu can never disagree. `direction`
- * plays no part: a channel the session was born in and a channel it was later
- * connected to are the same fact to the reader of the list, and the one thing a
- * disconnect changes on either is `paused`.
- *
- * One per channel, not one per link. A session born in Discord and mirrored to
- * Discord carries two links for it, and a reader should see one Discord mark,
- * not two.
- *
- * Exported for its own test; the row is the only production caller. */
-export function connectedChannelLinks(links: readonly SessionLink[] | undefined): SessionLink[] {
-  const byChannel = new Map<string, SessionLink>()
-  for (const link of links ?? []) {
-    if (link.paused || byChannel.has(link.channel)) continue
-    byChannel.set(link.channel, link)
-  }
-  return [...byChannel.values()]
-}
+export { connectedChannelLinks }
 
 /** How many levels of conductor nesting still step the row to the right.
  *
@@ -198,6 +178,13 @@ interface SessionRowActions {
   onRenameCommit: (key: string, value: string) => void
   slotRenameEnterRef: React.MutableRefObject<boolean>
   onRenameCancel: () => void
+  /** The slot whose rename was refused offline, so only that row shows the
+   *  neutral notice. Null when no refusal stands. */
+  renameOfflineSlot: string | null
+  /** The placement scope the refusal happened in, compared alongside the slot.
+   *  A multi-tag chat renders one row per board column, so the slot alone
+   *  matches every copy. Null when no refusal stands. */
+  renameOfflineScope: string | null
   /** The row menu's "Regenerate title": re-derives the title from the
    *  conversation without making the session active. */
   onAutoTitle: (key: string) => void
@@ -259,8 +246,8 @@ interface SessionRowProps {
 /** An Ultra Mode root's status line: "N needs you", "N stalled" (plus who
  *  stalled longest), "N running", or "Done" -- only what applies. With no crew
  *  and nothing owed it shows *fallback*, the row's usual line. */
-function CrewRootSummaryLine({ root, fallback, own = null, work, rootOwes = 0 }: {
-  root: string; fallback: ReactNode; own?: CrewRowOwnState | null
+function CrewRootSummaryLine({ root, fallback, own = null, work, rootOwes = 0, dot = null }: {
+  root: string; fallback: ReactNode; own?: CrewRowOwnState | null; /** The row's unread dot, kept in front of the status. */ dot?: ReactNode
   /** The root's ledger in brief (`crew_work`): what waits on a person, what stalled. */
   work?: CrewWorkFacts | null
   /** The root itself holds an approval or a question for the person. */
@@ -269,7 +256,7 @@ function CrewRootSummaryLine({ root, fallback, own = null, work, rootOwes = 0 }:
   // The server's groups (the worker list API), so the row, the panel and the
   // breadcrumb agree. Only what needs attention is drawn (CrewRowAttention); the
   // full counts live in the tooltip. A failed poll says so in the status line.
-  const { lastWorkers, failed } = useCrewWorkerSummary(root)
+  const { lastWorkers, failed, paused } = useCrewWorkerSummary(root)
   const { groups, done, total } = summarizeCrewWorkers(lastWorkers ?? [])
   const rowCounts = crewRowCounts(groups)
   const running = rowCounts.find(c => c.bucket === 'working')?.count ?? 0
@@ -278,10 +265,12 @@ function CrewRootSummaryLine({ root, fallback, own = null, work, rootOwes = 0 }:
   const stall = useAppSelector(st => {
     const now = Date.now()
     const counts = crewWorkCounts(work, st.dashboard.slots, now)
+    // A running conductor turn is picking its stalls up: none are shown meanwhile.
+    const handling = !!st.dashboard.slots.find(x => x.key === root)?.running
     // The crew members whose live row waits on a tool approval, as one string so
     // the selector compares by value.
     const live = st.dashboard.slots.filter(x => x.pending_approval && crewRootOf(x) === root).map(x => x.key).join(' ')
-    return { person: counts?.person ?? 0, stalled: counts?.stalled ?? 0, keys: stalledWorkKeys(work, st.dashboard.slots, now), live }
+    return { person: counts?.person ?? 0, stalled: handling ? 0 : counts?.stalled ?? 0, keys: handling ? '' : stalledWorkKeys(work, st.dashboard.slots, now), live }
   }, shallowEqual)
   // A stalled line's duration reads the clock: step it once a minute while shown.
   const [, setMinute] = useState(0)
@@ -303,18 +292,18 @@ function CrewRootSummaryLine({ root, fallback, own = null, work, rootOwes = 0 }:
   // Finished only when the main chat itself is settled too.
   const allDone = total > 0 && done === total && !own
   // An interrupted turn or a stalled goal loop of the main chat is said first.
-  const ownFirst = own && (own.kind === 'paused' || own.kind === 'stalled') ? own : null
-  // Nothing needs attention and the crew is not finished: the row's usual line.
-  if (!failed && !ownFirst && !allDone && needsYou === 0 && stall.stalled === 0 && running === 0) return <>{fallback}</>
+  const ownFirst = !paused && own && (own.kind === 'paused' || own.kind === 'stalled') ? own : null
+  // Nothing needs attention and the crew is not finished (or paused): the row's usual line.
+  if (!failed && !paused && !ownFirst && !allDone && needsYou === 0 && stall.stalled === 0 && running === 0) return <>{fallback}</>
   return (
-    <div className={ROW_STATUS_LINE_CLS} data-testid="crew-root-summary">
+    <div className={ROW_STATUS_LINE_CLS} data-testid="crew-root-summary">{dot}
       {/* The row's own state outranks a failed crew read: it is said first. */}
       {failed && own && <CrewStateWord kind={own.kind} title={own.title} />}
       {!failed && ownFirst && <CrewStateWord kind={ownFirst.kind} title={ownFirst.title} />}
       {failed ? (
         <ErrorNotice variant="inline" askAgent className="min-w-0" messageClassName="truncate" message={i18nT('commandCenter.workers_error')} />
       ) : (
-        <CrewRowAttention needsYou={needsYou} stalled={stall.stalled} running={running} done={allDone}
+        <CrewRowAttention needsYou={needsYou} stalled={stall.stalled} running={running} done={allDone} paused={paused}
           stalledName={stall.stalled > 0 ? stalledName : undefined} stalledForMs={stall.stalled > 0 ? stalledForMs : undefined} title={title} />
       )}
     </div>
@@ -380,7 +369,7 @@ export const SessionRow = memo(function SessionRow({ view, actions }: SessionRow
   const {
     onNativeDragStart, onNativeDragEnd, onPinnedKeyboardReorder, onManualKeyboardReorder,
     renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel, onAutoTitle,
-    slotRenameEnterRef,
+    slotRenameEnterRef, renameOfflineSlot, renameOfflineScope,
     onDuplicate, onCloseSession, onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab, onOpenSource, onOpenPeerSession,
     openElsewhere, toggleConductor, onDropSessionRef, canStageSessionRef,
   } = actions
@@ -452,7 +441,7 @@ export const SessionRow = memo(function SessionRow({ view, actions }: SessionRow
   // keeps each field's own identity rule: an entry object repaints only when
   // THIS slot's entry is replaced, and the workflow primitives only when this
   // slot's runs change.
-  const { statusDetail, automation, queuedForSlot, queuedReason, wfCount, wfName: wfRawName, wfPhase: wfRawPhase } =
+  const { statusDetail, compacting, automation, queuedForSlot, queuedReason, wfCount, wfName: wfRawName, wfPhase: wfRawPhase } =
     useAppSelector(st => selectRowLive(st, localSlotKey), shallowEqual)
   // A Crew Mode root's crew members waiting on a tool approval. The server keeps
   // each one's `pending_approval` on its own row, which the person's list leaves
@@ -755,6 +744,8 @@ export const SessionRow = memo(function SessionRow({ view, actions }: SessionRow
     // next check. Both read as their own state, never as "Waiting on you".
     const crewStalled = crewIdle && (crewWork?.stalled ?? 0) > 0
     const crewMoving = crewIdle && (crewWork?.moving ?? 0) > 0
+    const crewLooping = crewMoving && crewWork?.looping === crewWork?.moving
+    const crewRunningText = crewLooping ? i18nT('components.crewMode.ultra_row_count_running', { count: crewWork?.looping ?? 0 }) : ''
     // Ordinary sessions need the same reboot/error visibility as goal loops,
     // without claiming that an older interrupted parent turn has stopped live
     // child work. A goal loop keeps its richer cycle-specific treatment below;
@@ -772,7 +763,7 @@ export const SessionRow = memo(function SessionRow({ view, actions }: SessionRow
       : subagentCount > 0
         ? subagentLabel
         : s.running
-          ? slotStatusText(statusDetail, simplifiedToolNames, uiLang)
+          ? slotStatusText(statusDetail, compacting, simplifiedToolNames, uiLang)
           : snapshotOnlyLiveWork
             ? snapshotLiveWorkLabel
             : (s.last_message || '')
@@ -918,16 +909,23 @@ export const SessionRow = memo(function SessionRow({ view, actions }: SessionRow
       },
       {
         // Nothing runs and an open ledger item has gone quiet with its next step
-        // not taken (`lib/crewWork.ts`, the ledger's own stale rule). Static warn:
-        // no work is moving, and the conductor's patrol is what picks it up.
+        // not taken (`lib/crewWork.ts`, the ledger's own stale rule). Muted: it is
+        // the conductor's to pick up, not the person's; only "needs you" is warm.
         key: 'crew_stalled',
         when: crewStalled,
         build: () => (
-          <div className={ROW_STATUS_LINE_CLS} title={i18nT('pages.chatSidebar.crew_work_stalled_title', { count: crewWork?.stalled ?? 0 })} data-testid="crew-work-stalled">
-            <TriangleAlert size={ROW_ICON_PX} className="shrink-0" style={{ color: 'var(--warn)' }} aria-hidden />
-            <span className="truncate font-medium" style={{ color: 'var(--warn)' }}>{i18nT('pages.chatSidebar.crew_work_stalled', { count: crewWork?.stalled ?? 0 })}</span>
+          <div className={`${ROW_STATUS_LINE_CLS} text-muted`} title={i18nT('pages.chatSidebar.crew_work_stalled_title', { count: crewWork?.stalled ?? 0 })} data-testid="crew-work-stalled">
+            <TriangleAlert size={ROW_ICON_PX} className="shrink-0" aria-hidden />
+            <span className="truncate">{i18nT('pages.chatSidebar.crew_work_stalled', { count: crewWork?.stalled ?? 0 })}</span>
           </div>
         ),
+      },
+      {
+        // Idle, but every open item's worker waits in its own loop (`crew_work` `looping`,
+        // e.g. on CI): the crew runs. A still radar, not a spinner: no turn is in flight.
+        key: 'crew_running',
+        when: crewLooping,
+        build: () => <div className={ROW_STATUS_LINE_CLS} title={crewRunningText} data-testid="crew-work-running"><MonitorRadar actionRunning={false} className="text-accent" /><span className="truncate">{crewRunningText}</span></div>,
       },
       {
         // Nothing runs, and the ledger's open work still moves: a worker parked
@@ -1051,7 +1049,7 @@ export const SessionRow = memo(function SessionRow({ view, actions }: SessionRow
         key: 'running',
         when: isRunning && (!monitorOwnsRunning || s.running),
         build: () => {
-          const text = slotStatusText(statusDetail, simplifiedToolNames, uiLang)
+          const text = slotStatusText(statusDetail, compacting, simplifiedToolNames, uiLang)
           // `title` because this is the one status text that is unbounded — a tool
           // phase can name a long command — and the line truncates. The gutter
           // glyph used to carry that tooltip, so it has to move with it, or a
@@ -1146,6 +1144,7 @@ export const SessionRow = memo(function SessionRow({ view, actions }: SessionRow
           : i18nT('pages.chatSidebar.loop_waiting_monitor')}`
         case 'interrupted': return i18nT('pages.chat.recoveryCard.turn_interrupted')
         case 'crew_stalled': return i18nT('pages.chatSidebar.crew_work_stalled_title', { count: crewWork?.stalled ?? 0 })
+        case 'crew_running': return crewRunningText
         case 'crew_waiting': return i18nT('pages.chatSidebar.crew_work_waiting_title', { count: crewWork?.moving ?? 0 })
         case 'goal_loop': return goalLoopStalled ? i18nT('pages.chatSidebar.goal_loop_interrupted_title')
           : [goalLoopLabel, goalLoopDetail].filter(Boolean).join(' · ')
@@ -1155,7 +1154,7 @@ export const SessionRow = memo(function SessionRow({ view, actions }: SessionRow
         case 'subagents_waiting': return subagentWaitingTitle || subagentWaitingLabel
         case 'subagents': return subagentLabel
         case 'snapshot_live_work': return snapshotLiveWorkLabel
-        case 'running': return slotStatusText(statusDetail, simplifiedToolNames, uiLang)
+        case 'running': return slotStatusText(statusDetail, compacting, simplifiedToolNames, uiLang)
         default: return ''
       }
     }
@@ -1307,16 +1306,17 @@ export const SessionRow = memo(function SessionRow({ view, actions }: SessionRow
     ) : (
       // The open session's row shows its actions only while a guide step
       // points at one (sessions.row-menu resolves to the open row's copy).
+      // No `title` here: IconButton then shows each aria-label as an instant tip.
       <IconButtonGroup className={`absolute top-1/2 -translate-y-1/2 right-1.5 opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 group-focus-visible:opacity-100 group-has-[:focus-visible]:opacity-100 has-[[data-state=open]]:opacity-100 ${isActive && guideOnRowControl ? '!opacity-100' : ''}`}>
         <DropdownMenu guideScope="menu:sessions.row-menu">
           <DropdownMenuTrigger asChild>
-            <IconButton title={i18nT('pages.chatSidebar.more')} aria-label={i18nT('pages.chatSidebar.more_options')} {...uiLocation('sessions.row-menu')} onMouseDown={e => e.stopPropagation()} onClick={e => e.stopPropagation()}><MoreVertical size={12} /></IconButton>
+            <IconButton aria-label={i18nT('pages.chatSidebar.more_options')} {...uiLocation('sessions.row-menu')} onMouseDown={e => e.stopPropagation()} onClick={e => e.stopPropagation()}><MoreVertical size={12} /></IconButton>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="min-w-[160px]" onClick={e => e.stopPropagation()} onCloseAutoFocus={onMenuCloseAutoFocus}>
             <SessionActionsMenu variant="dropdown" {...rowMenuProps} />
           </DropdownMenuContent>
         </DropdownMenu>
-        <IconButton variant="accent" title={i18nT('pages.chatSidebar.duplicate')} aria-label={i18nT('pages.chatSidebar.duplicate')} {...uiLocation('sessions.row-duplicate')} onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); onDuplicate(rowKey) }}><GitFork size={12} /></IconButton>
+        <IconButton variant="accent" aria-label={i18nT('pages.chatSidebar.duplicate')} {...uiLocation('sessions.row-duplicate')} onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); onDuplicate(rowKey) }}><Split size={12} /></IconButton>
         {/* No hover close control on an ADOPTED remote-crew row (#19958, ruling 4):
             a bare icon with no visible label read as a destructive "cut the chat
             off" and the reader would not click it (UX). Removal for an adopted row
@@ -1324,7 +1324,7 @@ export const SessionRow = memo(function SessionRow({ view, actions }: SessionRow
             where the plain label and the hint are always visible. Ordinary local
             rows keep their red ✕ close. */}
         {!releaseLocally && (
-          <IconButton variant="danger" title={closeReachLabel ?? i18nT('pages.chatSidebar.close')} aria-label={closeReachLabel !== undefined ? i18nT('pages.chatSidebar.close_this_session_only') : i18nT('pages.chatSidebar.close_session')} {...uiLocation('sessions.row-close')} onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); onCloseSession(rowKey) }}><X size={12} /></IconButton>
+          <IconButton variant="danger" aria-label={closeReachLabel !== undefined ? i18nT('pages.chatSidebar.close_this_session_only') : i18nT('pages.chatSidebar.close_session')} {...uiLocation('sessions.row-close')} onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); onCloseSession(rowKey) }}><X size={12} /></IconButton>
         )}
       </IconButtonGroup>
     )) : null
@@ -1830,9 +1830,9 @@ export const SessionRow = memo(function SessionRow({ view, actions }: SessionRow
                *  and in practice the two names coincide often enough that showing
                *  both read as a stutter. Folder membership is carried by the tree
                *  itself in folder view; in flat view the row's own context menu
-               *  still names it. */}
+               *  still names it, and a search names it beside the time. */}
               {slotActivityTs(s) || isPinned || s.muted || s.process === 'released' || conductorMeta ? (
-                <span className="ml-auto inline-flex items-center gap-1 shrink-0">
+                <RowTrailingMeta slot={s}>
                   {/* FIRST in the group, so it sits immediately left of the timestamp
                    *  and the timestamp keeps the position it has in every other lane.
                    *  Inside the card's own meta group rather than beside the card:
@@ -1847,7 +1847,7 @@ export const SessionRow = memo(function SessionRow({ view, actions }: SessionRow
                   {s.muted && <span className="shrink-0" data-testid="session-row-muted" role="img" aria-label={i18nT('pages.chatSidebar.muted')} title={i18nT('pages.chatSidebar.muted')}><VolumeX size={10} className="text-muted" /></span>}
                   {s.process === 'released' && <span className="shrink-0" data-testid="session-row-released" role="img" aria-label={i18nT('pages.chatSidebar.process_released')} title={i18nT('pages.chatSidebar.process_released')}><Moon size={10} className="text-muted" /></span>}
                   {isPinned && <span className="shrink-0" role="img" aria-label={i18nT('pages.chatSidebar.pinned')} title={i18nT('pages.chatSidebar.pinned')}><Pin size={10} className="text-accent" /></span>}
-                </span>
+                </RowTrailingMeta>
               ) : null}
             </div>
             {/* One line by default: `truncate`, so every row is the same height.
@@ -1859,6 +1859,12 @@ export const SessionRow = memo(function SessionRow({ view, actions }: SessionRow
             <div
               data-session-title
               className={`${ROW_TITLE_CLS} font-semibold text-text ${renamingHere ? '' : cardLineClass(cardLines.title)}`}
+              {...(renamingHere ? {} : offlineProps(connected, i18nT('utils.offline.rename_sessions')))}
+              // AFTER the spread, deliberately: `offlineProps` would otherwise
+              // replace this with its own tooltip, and this one is the only
+              // place a truncated session name is shown in full. The row's own
+              // offline tooltip and the notice below already say why rename is
+              // refused, so only the aria-disabled affordance is taken here.
               title={tooltipTitle}
             >
               {/* No separate fork glyph: forked titles already carry the
@@ -1890,22 +1896,34 @@ export const SessionRow = memo(function SessionRow({ view, actions }: SessionRow
                 </>
               )}
             </div>
+            {/* An offline refusal is not a failure: nothing was sent, so this is
+                the shared neutral reason row, not the row's danger surface. It
+                sits under the title it refused, beside a draft the commit kept.
+                Keyed by slot AND scope, the pair `renamingHere` compares: a
+                multi-tag chat renders one row per board column, so slot alone
+                matches every copy and each would show its own notice under one
+                shared testid. */}
+            {renameOfflineSlot === s.key && renameOfflineScope === scope && (
+              <OfflineReasonRow
+                testId={`session-rename-offline-${s.key}`}
+                className="mt-1 leading-snug whitespace-normal [overflow-wrap:anywhere] group-hover:pr-20"
+                message={i18nT('utils.offline.gateway_offline_reconnect', { action: i18nT('utils.offline.rename_sessions') })}
+              />
+            )}
             {/* Secondary line: one ordered resolver decides both the words and the
                 marker leading them (#3830), so the two can no longer disagree.
                 The tail is `last_message`, which is also where the `unread` dot
                 lands — the one marker with no state branch of its own. A row that
                 is unread with nothing said yet still renders the line, because the
                 dot IS the content then. A crew card's workers summary takes the
-                tail's place: still ONE line, below the row's own state. */}
+                tail's place (ONE line); a search's snippet stands in for the tail. */}
             {crewRoot
-              // An Ultra Mode row shows only what needs attention; the full counts
-              // are in the tooltip.
-              ? <CrewRootSummaryLine root={s.key} fallback={rowState ?? lastMessageLine} own={crewOwnState} work={s.crew_work}
-                  // What the main chat itself holds for the person: an approval, a
-                  // question, a spawn approval, or an armed loop asking (a ledger item
-                  // on the person is counted from `crew_work` already).
+              // An Ultra Mode row shows only what needs attention (counts in the tooltip), else the usual tail.
+              ? <CrewRootSummaryLine root={s.key} fallback={<SearchHitTail slot={s} preview={lastMessageLine} dot={unreadDot} tail={rowState ?? lastMessageLine} />} own={crewOwnState} work={s.crew_work} dot={unreadDot}
+                  // What the main chat itself holds for the person: an approval, a question, a
+                  // spawn approval, or an armed loop asking (a ledger item on the person is counted from `crew_work`).
                   rootOwes={s.pending_approval || s.needs_input || subagentAwaiting > 0 || (loopWaiting && !(crewWork?.person ?? 0)) ? 1 : 0} />
-              : (rowState ?? lastMessageLine)}
+              : <SearchHitTail slot={s} preview={lastMessageLine} dot={unreadDot} tail={rowState ?? lastMessageLine} />}
             {s.source_links && s.source_links.length > 0 && (
               <SessionSourceChips
                 slotKey={s.key}

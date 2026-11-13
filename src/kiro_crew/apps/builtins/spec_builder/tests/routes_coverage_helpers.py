@@ -146,6 +146,7 @@ class _Slot:
         self._queue: list[Any] = []
         self._pending_steers: list[str] = []
         self._pending_synthesis = False
+        self._deferred_notes: list[dict] = []
         self.queued: list[str] = []
 
     def queue_append(self, message: str, *, meta=None, directive_user_origin: bool) -> None:
@@ -155,8 +156,10 @@ class _Slot:
         assert isinstance(meta, dict)
         self._queue.append(message)
 
-    def append(self, role: str, content: str) -> None:
-        self.messages.append({"role": role, "content": content, "ts": ""})
+    def append(self, role: str, content: str, *, meta: dict | None = None) -> None:
+        self.messages.append(
+            {"role": role, "content": content, "ts": "", **({"meta": meta} if meta else {})}
+        )
 
 
 class _State:

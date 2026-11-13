@@ -296,6 +296,7 @@ async def test_setup_switch_restores_repository_environment(tmp_path, monkeypatc
         lambda url, path: (
             {
                 "clone": str(tmp_path),
+                "target_url": url,
                 "display": url.rsplit("/", 1)[-1],
                 "push_disabled": True,
             },

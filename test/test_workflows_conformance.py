@@ -28,6 +28,28 @@ import pytest
 
 import kiro_crew.workflows as wf
 
+
+def test_fork_checkpoint_fingerprint_and_backend_identity() -> None:
+    from kiro_crew.workflows.runner import _call_fingerprint
+
+    opts = {
+        "label": "display",
+        "phase": "phase",
+        "schema": None,
+        "model": None,
+        "agent": None,
+        "effort": None,
+        "cwd": None,
+        "session": None,
+        "nudge": None,
+        "max_tool_calls": 200,
+    }
+    fingerprint = _call_fingerprint("audit", opts, (0,))
+    assert fingerprint == "d518f843930da8cec10591ff464055e829e6a31d46baa66bf53d0c6e4b5b964a"
+    assert _call_fingerprint("audit", {**opts, "backend": "kas"}, (0,)) != fingerprint
+    assert _call_fingerprint("audit", {**opts, "max_tool_calls": 201}, (0,)) != fingerprint
+
+
 # --------------------------------------------------------------------------- #
 # Expected public surface (the freeze). Keep these literals in lockstep with
 # workflows/__init__.py + the module spec. Editing one without the others is a
@@ -95,6 +117,7 @@ EXPECTED_CTX_METHODS: dict[str, tuple[bool, list[tuple[str, str, bool]]]] = {
             ("session", "KEYWORD_ONLY", True),
             ("nudge", "KEYWORD_ONLY", True),
             ("max_tool_calls", "KEYWORD_ONLY", True),
+            ("backend", "KEYWORD_ONLY", True),
         ],
     ),
     "parallel": (

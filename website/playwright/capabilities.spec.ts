@@ -2,8 +2,8 @@ import { test, expect } from '@playwright/test'
 
 /**
  * /capabilities — Customize page (formerly Agent Capabilities).
- * SidePanelLayout with 6 tabs: Agents, Connections,
- * Skills, Steering, Hooks, Prompts. Default tab is "crews" (KiroCrewAgentsPage).
+ * SidePanelLayout with 5 tabs: Agents, Skills, Steering, Hooks, Prompts
+ * (Connections is a Settings tab, MCP Servers its own rail page). Default tab is "crews" (KiroCrewAgentsPage).
  *
  * Covers: page load + heading, tab navigation with content change assertion,
  * the crew roster read + a create/delete round-trip mutation through the
@@ -28,13 +28,14 @@ test.describe('Capabilities Page — /capabilities', () => {
     await expect(page.locator('#main-content').getByText('Always-on AI agents', { exact: false })).toBeVisible({ timeout: 5000 })
   })
 
-  test('shows all 6 tab buttons in the side nav', async ({ page }) => {
+  test('shows all 5 tab buttons in the side nav, and no Connections tab', async ({ page }) => {
     // Tab buttons inside the nav panel — look inside #main-content nav
     const nav = page.locator('#main-content nav')
-    const tabs = ['Bots', 'Connections', 'Skills', 'Steering', 'Hooks', 'Prompts']
+    const tabs = ['Bots', 'Skills', 'Steering', 'Hooks', 'Prompts']
     for (const label of tabs) {
       await expect(nav.getByRole('button', { name: label, exact: true })).toBeVisible({ timeout: 5000 })
     }
+    await expect(nav.getByRole('button', { name: 'Connections', exact: true })).toHaveCount(0)
   })
 
   test('crews tab renders the crew roster as cards', async ({ page }) => {
@@ -61,7 +62,7 @@ test.describe('Capabilities Page — /capabilities', () => {
 
     // The trailing dashed tile is the roster's second entry point into the
     // create dialog, so it is part of the contract rather than decoration.
-    await expect(page.getByLabel('New Bot', { exact: true })).toBeVisible()
+    await expect(page.getByLabel('New bot', { exact: true })).toBeVisible()
   })
 
   test('switching to Skills tab renders skills content', async ({ page }) => {
@@ -81,15 +82,15 @@ test.describe('Capabilities Page — /capabilities', () => {
   })
 
   test('create and delete crew round-trip via the editor panel', async ({ page, request }) => {
-    // Creation now opens the simple New Bot dialog (the same one the
-    // Bots page uses); deletion is still card → editor → Delete Bot.
+    // Creation now opens the simple New bot dialog (the same one the
+    // Bots page uses); deletion is still card → editor → Delete bot.
     // Config mode: a create stays on this roster, it does not navigate away.
     const agentName = `pw-cap-${Date.now()}`
-    const card = page.getByRole('button', { name: `Edit Bot ${agentName}`, exact: true })
+    const card = page.getByRole('button', { name: `Edit bot ${agentName}`, exact: true })
 
     try {
       await page.getByTestId('new-crew').click()
-      const createSheet = page.getByRole('dialog', { name: 'New Bot' })
+      const createSheet = page.getByRole('dialog', { name: 'New bot' })
       await expect(createSheet).toBeVisible({ timeout: 5000 })
 
       // Name by placeholder (its label is a <span>, not a <label for>). "Built
@@ -109,13 +110,13 @@ test.describe('Capabilities Page — /capabilities', () => {
       // Delete through the same panel — the danger zone only renders for a crew
       // that is not the default, which a freshly created one never is.
       await card.click()
-      const editSheet = page.getByRole('dialog', { name: `Edit Bot ${agentName}` })
+      const editSheet = page.getByRole('dialog', { name: `Edit bot ${agentName}` })
       await expect(editSheet).toBeVisible({ timeout: 5000 })
       // The editor is a rail plus one pane, so removal lives on its own pane and
       // the button is not mounted until that pane is showing. This is the click a
       // user makes; without it the button below is simply absent.
       await editSheet.getByTestId('next-rail-danger').click()
-      await editSheet.getByRole('button', { name: 'Delete Bot', exact: true }).click()
+      await editSheet.getByRole('button', { name: 'Delete bot', exact: true }).click()
       // Delete is a two-step confirm: the first press only arms it, so without
       // this second press the sheet never closes and the delete never happens.
       await editSheet.getByTestId('next-confirm-delete-crew').click()

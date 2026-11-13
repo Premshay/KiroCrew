@@ -3,6 +3,7 @@ import { CheckCircle, Handshake, Ban, Package, Wrench } from 'lucide-react'
 import ToolInputPreview from './ToolInputPreview'
 import TrustDropdown from './TrustDropdown'
 import ErrorNotice from './ErrorNotice'
+import StatusNotice from './StatusNotice'
 import { ApiError } from '../api/client'
 import { isTerminalApprovalRefusal } from '../api/apiError'
 import { baseCommandLabel } from '../utils/trustPatterns'
@@ -35,7 +36,8 @@ type ApprovalCardProps = {
   trustBaseLabelKey?: string
   /** Post-decision confirmation per trust tier, so the card restates the
       scope the reader just granted instead of one sentence for all three.
-      A tier without a key keeps the generic confirmation. */
+      A tier without a key keeps the generic confirmation. A `trust_command`
+      key shows the command through a `<mono/>` slot, never `{{cmd}}`. */
   trustedLabelKeys?: Partial<Record<'trust' | 'trust_command' | 'trust_base', string>>
   /** Extra interpolation values for the keys above (e.g. the agent role),
       beside the `cmd` / `base` the card supplies itself. */
@@ -101,7 +103,7 @@ function ApprovalCardBody({ title, toolInput, showButtons, showTrust = true, has
         : buttons.length > 2 ? buttons[1] : buttons[0]
     target.focus()
   }, [failure])
-  const borderColor = decided === 'approved' || decided === 'trust' || decided === 'trust_command' || decided === 'trust_base' ? 'border-l-ok' : decided === 'rejected' || failure?.terminal ? 'border-l-danger' : 'border-l-warn'
+  const borderColor = decided === 'approved' || decided === 'trust' || decided === 'trust_command' || decided === 'trust_base' ? 'border-l-ok' : decided === 'rejected' ? 'border-l-danger' : failure?.terminal ? 'border-l-border' : 'border-l-warn'
 
   const isShell = title.startsWith('Running: ')
   const normalized = title.replace(/^(Running: |Reading )/, '')
@@ -111,8 +113,13 @@ function ApprovalCardBody({ title, toolInput, showButtons, showTrust = true, has
   // knows which binary its grant would cover.
   const baseCmd = hasCommand ? (baseCommand || normalized.split(/\s+/)[0] || normalized) : ''
   const trustValues = { cmd: hasCommand ? normalized : '', base: baseCommandLabel(baseCmd), ...labelValues }
-  const trustedLabel = (tier: 'trust' | 'trust_command' | 'trust_base') =>
-    i18nT(trustedLabelKeys?.[tier] ?? 'components.approvalCard.trusted_auto_approving_future_calls', trustValues)
+  // Only the exact-command tier goes through Trans, with the command as the
+  // <mono/> chip's child, so it is never parsed as markup. The other tiers stay
+  // on i18nT, which shows every value as plain text.
+  const trustedLabel = (tier: 'trust' | 'trust_command' | 'trust_base') => tier === 'trust_command'
+    ? <Trans i18nKey={trustedLabelKeys?.trust_command ?? 'components.approvalCard.trusted_auto_approving_future_calls'} values={trustValues}
+      components={{ mono: <span className="bg-bg-elevated px-1.5 py-0.5 rounded font-mono break-all border border-border">{trustValues.cmd}</span> }} />
+    : i18nT(trustedLabelKeys?.[tier] ?? 'components.approvalCard.trusted_auto_approving_future_calls', trustValues)
   // The showButtons branch is a pending request: it reads "<title> wants to
   // run", so a shell title is de-prefixed there -- a "Running:" verb would say
   // the command already runs (#28883). The wrench branch has no sentence, so
@@ -142,14 +149,14 @@ function ApprovalCardBody({ title, toolInput, showButtons, showTrust = true, has
           <button className={btnClass + ' hover:!text-danger hover:!border-danger'} onClick={() => handle('rejected')}><Ban className="lucide-inline" /> {i18nT('components.approvalCard.reject')}</button>
         </div>
       )}
-      {failure !== null && (
+      {/* A gone approval is status: nothing the user did failed. */}
+      <StatusNotice tone="info" className="mt-1.5" testId="approval-card-gone" message={failure?.terminal ? i18nT('components.approvalCard.approval_no_longer_pending') : null} />
+      {failure !== null && !failure.terminal && (
         // The card holds no draft: the pending buttons are not user input and the
         // failed decision is retryable, so the hand-off loses nothing.
-        <ErrorNotice variant="inline" className="mt-1.5" askAgent testId="approval-card-failure" message={failure.terminal
-          ? i18nT('components.approvalCard.approval_no_longer_pending')
-          : failure.message
-            ? i18nT('components.approvalCard.decision_not_recorded_error', { error: failure.message })
-            : i18nT('components.approvalCard.decision_failed')} />
+        <ErrorNotice variant="inline" className="mt-1.5" askAgent testId="approval-card-failure" message={failure.message
+          ? i18nT('components.approvalCard.decision_not_recorded_error', { error: failure.message })
+          : i18nT('components.approvalCard.decision_failed')} />
       )}
       {decided && (
         <div className="mt-1.5 text-[13px] text-muted">

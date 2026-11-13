@@ -61,19 +61,10 @@ def _pr_is_draft(pr: int, repo: object = None) -> bool:
     if repo:
         argv += ["--repo", str(repo)]
     argv += ["--json", "isDraft", "-q", ".isDraft"]
-    try:
-        proc = subprocess.run(  # noqa: S603 - argv is product-built; no shell
-            argv,
-            capture_output=True,
-            shell=False,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=TIMEOUT_SECS,
-        )
-    except (subprocess.TimeoutExpired, OSError):
+    problem, proc = _exec(argv)
+    if problem is not None or proc is None or proc.returncode != 0:
         return False
-    return proc.returncode == 0 and (proc.stdout or "").strip().lower() == "true"
+    return proc.stdout.strip().lower() == "true"
 
 
 _GH_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}")

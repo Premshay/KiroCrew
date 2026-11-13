@@ -366,10 +366,11 @@ describe('ui.show: point at an indexed location, never click it', () => {
   it('moving a job to a folder has the person tick that one job, never Select all', () => {
     const r = resolveGuideAction({ ...show('schedule.move-to-folder'), params: { location_id: 'schedule.move-to-folder', pick: 'Morning summary' } })
     if (!r.ok) throw new Error(r.reason)
-    const [tick, move] = r.action.steps
+    const [tick, open, move] = r.action.steps
     expect(tick.complete).toMatchObject({ kind: 'select', selection: 'one_job_checked' })
     expect(tick.target).toMatchObject({ kind: 'location', id: 'schedule.job-list', pickName: 'Morning summary' })
     expect(tick.textKey).toBe('components.guideLayer.select_tickjob')
+    expect(open.target).toMatchObject({ kind: 'location', id: 'schedule.batch-actions' })
     expect(move.target).toMatchObject({ kind: 'location', id: 'schedule.move-to-folder' })
     expect(r.action.steps.some(st => st.target.kind === 'location' && st.target.id === 'schedule.select-all')).toBe(false)
   })
@@ -488,7 +489,7 @@ describe('ui.show: point at an indexed location, never click it', () => {
     expect(stepBoundHolds(uninstall)).toBe(false)
   })
 
-  it('walks to Delete Bot through the editor and its Danger zone row, which it points at', () => {
+  it('walks to Delete bot through the editor and its Danger zone row, which it points at', () => {
     const r = resolveGuideAction(show('agents.delete'))
     if (!r.ok) throw new Error(r.reason)
     expect(r.action.steps.map(st => st.complete.kind)).toEqual(['select', 'reach', 'ack'])
@@ -538,11 +539,11 @@ describe('ui.show: point at an indexed location, never click it', () => {
     expect(factVerdict(discover)).toBeNull()
     window.history.pushState({}, '', '/apps/')
     expect(factVerdict(discover)).toBe('done')
-    const mcp = page('MCP Servers', '/capabilities?tab=mcp')
+    const skills = page('Skills', '/capabilities?tab=skills')
     window.history.pushState({}, '', '/capabilities?tab=crews')
-    expect(factVerdict(mcp)).toBeNull()
-    window.history.pushState({}, '', '/capabilities?tab=mcp')
-    expect(factVerdict(mcp)).toBe('done')
+    expect(factVerdict(skills)).toBeNull()
+    window.history.pushState({}, '', '/capabilities?tab=skills')
+    expect(factVerdict(skills)).toBe('done')
     window.history.pushState({}, '', '/chat')
   })
 
@@ -576,8 +577,8 @@ describe('ui.show: point at an indexed location, never click it', () => {
     expect(r.action.enter.to({ pathname: '/schedule', search: '' })).toBe('/chat')
     const mcp = resolveGuideAction(show('mcp.add-server'))
     if (!mcp.ok) throw new Error('expected ok')
-    expect(mcp.action.enter.to({ pathname: '/capabilities', search: '?tab=skills' })).toBe('/capabilities?tab=mcp')
-    expect(mcp.action.enter.to({ pathname: '/capabilities', search: '?tab=mcp' })).toBe('/capabilities?tab=mcp')
+    expect(mcp.action.enter.to({ pathname: '/capabilities', search: '?tab=skills' })).toBe('/capabilities?tab=mcp-servers')
+    expect(mcp.action.enter.to({ pathname: '/capabilities', search: '?tab=mcp-servers' })).toBe('/capabilities?tab=mcp-servers')
     expect(alreadyAt('/chat', { pathname: '/chatter', search: '' })).toBe(false)
   })
 
@@ -720,7 +721,7 @@ describe('ui.show: point at an indexed location, never click it', () => {
     }
   })
 
-  it('the Delete Bot guide carries the Danger zone notice as its caution text', () => {
+  it('the Delete bot guide carries the Danger zone notice as its caution text', () => {
     const r = resolveGuideAction(show('agents.delete'))
     if (!r.ok) throw new Error(r.reason)
     const last = r.action.steps[r.action.steps.length - 1]

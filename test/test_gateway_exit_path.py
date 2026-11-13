@@ -31,6 +31,7 @@ from kiro_crew import eventlog_hooks
 from kiro_crew import session as session_mod
 from kiro_crew import skill_usage
 from kiro_crew.slack import gateway as gw
+from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS, async_wait_until
 
 
 @pytest.fixture
@@ -511,6 +512,121 @@ async def test_the_exit_path_releases_shared_crew_slices_a_timed_out_shutdown_sk
     no_exit._exit.assert_called_once_with(0)
 
 
+@pytest.mark.asyncio
+async def test_the_exit_path_stops_app_backends_a_timed_out_shutdown_never_reached(
+    monkeypatch, seams
+) -> None:
+    """The dashboard cleanup hook that stops the spawned app backends runs only once
+    the web server's in-flight requests drain, so an open log stream lets the
+    graceful deadline cut the shutdown before it. The exit path stops what is still
+    tracked before its hard exit, and leaves an adopted backend running."""
+    import kiro_crew.apps.backend as backend
+    from kiro_crew.apps import hooks_integration
+
+    no_exit = _graceful_exit_seams(monkeypatch)
+    order: list[str] = []
+    no_exit._exit.side_effect = lambda code: order.append("exit")
+    spawned = backend.AppProcess(app_name="spawned-app", proc=MagicMock(name="proc"))
+    adopted = backend.AppProcess(app_name="adopted-app", proc=None, port=4242, adopted_pids=[123])
+    monkeypatch.setattr(backend, "_processes", {"spawned-app": spawned, "adopted-app": adopted})
+
+    def _stop(name: str) -> bool:
+        order.append(f"stop {name}")
+        return True
+
+    monkeypatch.setattr(hooks_integration, "stop_app_backend", _stop)
+    orch = _bare_orchestrator()
+    orch._shutdown = AsyncMock(side_effect=asyncio.TimeoutError())
+
+    await orch._shutdown_and_exit()
+
+    assert order == ["stop spawned-app", "exit"]
+
+
+@pytest.mark.asyncio
+async def test_the_exit_sweep_starts_every_stop_at_once_even_past_the_shared_pool(
+    monkeypatch,
+) -> None:
+    """A stop drops its records before it signals, then waits before escalating, so a
+    stop left queued behind other stops when the hard exit lands leaves a backend
+    nothing records. The exit sweep gives every backend its own worker: with one more
+    backend than the shared subprocess pool has workers, every stop is running at
+    the same moment."""
+    import kiro_crew.apps.backend as backend
+    from kiro_crew.apps import hooks_integration
+    from kiro_crew.executors import subprocess_executor
+
+    count = subprocess_executor()._max_workers + 1
+    names = [f"app-{i}" for i in range(count)]
+    monkeypatch.setattr(
+        backend,
+        "_processes",
+        {name: backend.AppProcess(app_name=name, proc=MagicMock(name=name)) for name in names},
+    )
+    all_running = threading.Barrier(count)
+    met: list[str] = []
+
+    def _stop(name: str) -> bool:
+        # Returns only once every stop is running at once. A stop that had to queue
+        # never arrives, so the sweep's own budget ends the wait and the barrier is
+        # broken below to free the workers.
+        try:
+            all_running.wait(timeout=FALLBACK_TIMEOUT_SECS)
+        except threading.BrokenBarrierError:
+            return False
+        met.append(name)
+        return True
+
+    monkeypatch.setattr(hooks_integration, "stop_app_backend", _stop)
+
+    try:
+        await hooks_integration.stop_spawned_backends_at_exit()
+    finally:
+        all_running.abort()
+
+    assert sorted(met) == sorted(names)
+
+
+@pytest.mark.asyncio
+async def test_the_exit_sweep_waits_for_a_stop_the_cleanup_hook_left_running(
+    monkeypatch, caplog
+) -> None:
+    """The cleanup hook's sweep can reach its deadline with a stop still in its wait
+    before SIGKILL, and that stop already dropped the backend's records, so the
+    tracking table is empty at exit. The exit sweep still waits for it: the stop
+    finishes, and is logged, before the hard exit."""
+    import logging
+
+    from kiro_crew.apps import hooks_integration
+
+    started = threading.Event()
+    release = threading.Event()
+    tracked = [["slow-app"], []]
+
+    def _names() -> list[str]:
+        names = tracked.pop(0)
+        if not names:
+            release.set()  # the exit sweep has looked; only then may the stop end
+        return names
+
+    def _stop(name: str) -> bool:
+        started.set()
+        return release.wait(timeout=FALLBACK_TIMEOUT_SECS)
+
+    monkeypatch.setattr(hooks_integration, "spawned_backend_names", _names)
+    monkeypatch.setattr(hooks_integration, "stop_app_backend", _stop)
+    # A zero budget: the cleanup sweep returns at its deadline with the stop unfinished.
+    monkeypatch.setattr(hooks_integration, "_BACKEND_STOP_BUDGET_SECS", 0)
+    await hooks_integration._stop_spawned_backends()
+    await async_wait_until(started.is_set, describe=lambda: "the cleanup stop never started")
+    monkeypatch.setattr(hooks_integration, "_BACKEND_STOP_BUDGET_SECS", FALLBACK_TIMEOUT_SECS)
+
+    with caplog.at_level(logging.INFO, logger=hooks_integration.logger.name):
+        await hooks_integration.stop_spawned_backends_at_exit()
+
+    assert "Stopped app backend on gateway shutdown: slow-app" in caplog.messages
+
+
 async def _reached(barrier: asyncio.Event, task: asyncio.Task[Any]) -> None:
     """Wait for ``barrier``, bounded, and fail at once if ``task`` ends first.
 
@@ -619,3 +735,95 @@ async def test_an_unclaimed_force_exit_leaves_the_graceful_exit_as_it_was(
     gw.flush_audit_queue_before_hard_exit.assert_awaited_once_with()
     cli_mod.drain_log_queue_before_hard_exit.assert_awaited_once_with()
     no_exit._exit.assert_called_once_with(0)
+
+
+@pytest.mark.asyncio
+async def test_the_exit_path_marks_the_clean_exit_last_before_its_hard_exit(
+    monkeypatch, seams
+) -> None:
+    # A teardown that wedges and is then killed never reaches the mark, so its
+    # header-only crash dump is kept as the trace of that death.
+    from kiro_crew.dashboard import crash_dump_store
+
+    order: list[str] = []
+    no_exit = _graceful_exit_seams(monkeypatch)
+    no_exit._exit.side_effect = lambda _code: order.append("exit")
+    cli_mod.drain_log_queue_before_hard_exit.side_effect = lambda: order.append("log drain")
+    monkeypatch.setattr(crash_dump_store, "record_clean_exit", lambda *_: order.append("marked"))
+    orch = _bare_orchestrator()
+    orch._shutdown = AsyncMock(side_effect=lambda: order.append("shutdown"))
+
+    await orch._shutdown_and_exit()
+
+    assert order[0] == "shutdown"
+    assert order[-3:] == ["log drain", "marked", "exit"]
+
+
+@pytest.mark.asyncio
+async def test_a_force_exit_claimed_during_the_clean_exit_mark_still_owns_the_exit(
+    monkeypatch, seams
+) -> None:
+    # The mark is awaited off the loop, so a second signal can land while it is
+    # written; the graceful exit must then park instead of exiting over the force
+    # thread's drains.
+    from kiro_crew.dashboard import crash_dump_store
+
+    no_exit = _graceful_exit_seams(monkeypatch)
+    orch = _bare_orchestrator()
+    orch._force_exit_claimed = threading.Event()
+    monkeypatch.setattr(
+        crash_dump_store, "record_clean_exit", lambda *_: orch._force_exit_claimed.set()
+    )
+    parked = asyncio.Event()
+    real_park = orch._park_if_force_exit_claimed
+
+    async def _park() -> None:
+        # The mark is the only thing that claims, so a claimed park comes after it.
+        if orch._force_exit_claimed.is_set():
+            parked.set()
+        await real_park()
+
+    orch._park_if_force_exit_claimed = _park
+
+    task = asyncio.create_task(orch._shutdown_and_exit())
+    try:
+        # Unparked, the mocked os._exit returns, the task ends, and _reached fails.
+        await _reached(parked, task)
+        await asyncio.sleep(0)
+        assert not task.done()
+        no_exit._exit.assert_not_called()
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("test_mode", [False, True])
+async def test_the_teardown_awaits_one_skill_view_prune_after_the_sessions_close(
+    monkeypatch, test_mode
+) -> None:
+    # Each closed runtime prunes its views on a daemon thread the hard exit can cut,
+    # and a home stopped then deleted has no next boot drain. So the
+    # teardown awaits one more prune once every session has ended and the cut turns
+    # have saved; test mode skips it, like the boot drain.
+    from slack_gateway_helpers import _make_orchestrator, _mock_sessions
+
+    from kiro_crew.agent_sdk.drivers import acp as acp_driver
+
+    order: list[str] = []
+
+    async def _unwound(_state: Any) -> None:
+        order.append("unwound")
+
+    monkeypatch.setattr(gw, "wait_for_unwinding_turns", _unwound)
+    monkeypatch.setattr(
+        acp_driver, "prune_skill_view_aliases_at_stop", lambda: order.append("prune") or 0
+    )
+    orch = _make_orchestrator(test_mode=test_mode)
+    orch.sessions = _mock_sessions()
+    orch.sessions.close_all = AsyncMock(side_effect=lambda: order.append("close_all"))
+
+    await orch._stop_services_and_sessions()
+
+    assert order == ["close_all", "unwound"] + ([] if test_mode else ["prune"])

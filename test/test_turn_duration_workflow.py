@@ -135,7 +135,7 @@ async def test_row_records_local_wall_clock_when_provider_reports_none(
     # Deterministic turn clock: t0=1000.0, persist-time=1000.250 → 250 ms.
     monkeypatch.setattr(agent_exec, "time", _FakeTime(1000.0, 1000.25))
     monkeypatch.setattr(
-        agent_exec, "provider_last_turn_usage", lambda p: TurnUsage(duration_ms=0)
+        agent_exec, "provider_last_turn_usage", lambda p, *, since=None: TurnUsage(duration_ms=0)
     )
 
     sessions = FakeSessions()
@@ -157,7 +157,7 @@ async def test_provider_reported_duration_wins_over_local_clock(
     monkeypatch.setattr(
         agent_exec,
         "provider_last_turn_usage",
-        lambda p: TurnUsage(duration_ms=999999),
+        lambda p, *, since=None: TurnUsage(duration_ms=999999),
     )
 
     sessions = FakeSessions()

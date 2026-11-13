@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from aiohttp import web
 
+from kiro_crew.dashboard.slot_row_memo import ROW_MEMO, RowMemoContext
 from kiro_crew.dashboard.state_parts.slot_directory import _is_genuine_slack_link
 from kiro_crew.messaging.link import (
     SLACK_NAMESPACE,
@@ -144,6 +145,18 @@ def _published_queued_by_slot(subs: "SubagentManager | None") -> dict[str, int]:
             slot = subagent_event_slot(parent)
             by_slot[slot] = by_slot.get(slot, 0) + depth
     return by_slot
+
+
+def _published_queued_reason_by_slot(subs: "SubagentManager | None") -> dict[str, dict]:
+    """Each slot's ``subagents_queued_reason``: the wait label of the newest
+    labelled frame routed to it, so a client that missed that frame (a reload)
+    still shows why the rows wait. Routed like :func:`_published_queued_by_slot`."""
+    if not subs:
+        return {}
+    # circular import: chat_utils imports this module at load time.
+    from kiro_crew.dashboard.chat_utils import subagent_event_slot
+
+    return {subagent_event_slot(p): label for p, label in subs.published_queued_labels().items()}
 
 
 def _attach_slot_parents(
@@ -661,6 +674,14 @@ def _slot_link_projection(
     channel menu and the releasable-mirror controls all read them that way. The
     origin thread is only where the session's own conversation already is, so
     the dashboard can link to it without treating it as a mirror.
+
+    Inside a ``serialize_slots`` pass the result is memoized per slot (see
+    ``slot_row_memo``). Everything it reads is in the key: the session map's
+    mutation counter (every link, pause flag and nonce lives there), the
+    registered transports (``live``), the redaction stamp (``target``), and the
+    slot's session key and legacy Slack fields. The counter is read when the
+    pass starts, before any row is built, so a mutation landing mid-pass
+    costs one recompute on the next pass and is never hidden.
     """
     # circular import: chat imports state at module scope.
     # Module import (not from-import) avoids the _handle_fromlist __path__
@@ -668,6 +689,36 @@ def _slot_link_projection(
     import kiro_crew.dashboard.chat_utils as _cu
 
     session_key = _cu.effective_session_key(slot)
+    ctx = ROW_MEMO.get()
+    key: tuple[object, ...] | None = None
+    if ctx is not None and ctx.links is not None:
+        key = (
+            ctx.links,
+            ctx.redaction,
+            session_key,
+            getattr(slot, "_slack_thread_ts", None),
+            getattr(slot, "_slack_channel", None),
+        )
+        memo = slot._slot_links_memo
+        if memo is not None and memo[0] == key:
+            ctx.counts["links_hit"] += 1
+            return memo[1]
+        ctx.counts["links_miss"] += 1
+    result = _build_slot_links(self, slot, session_key)
+    if key is not None:
+        # Stored and returned as is: the row embeds the list and nothing
+        # downstream writes into it.
+        slot._slot_links_memo = (key, result)
+    return result
+
+
+def _build_slot_links(
+    self: DashboardState, slot: _ChatSlot, session_key: str
+) -> tuple[list[dict[str, Any]], bool, str, str, tuple[str, str]]:
+    """The uncached body of :func:`_slot_link_projection`."""
+    # circular import: chat imports state at module scope.
+    import kiro_crew.dashboard.chat_utils as _cu
+
     # Resolved once per slot rather than per row: all three are storage reads,
     # and a session holds at most one Slack thread, one born-in conversation
     # and one mirror binding.
@@ -905,6 +956,46 @@ def serialize_slot(
     return payload
 
 
+def _row_memo_context(state: "DashboardState") -> RowMemoContext | None:
+    """The global halves of the per-slot row memo keys, or ``None`` to memo nothing.
+
+    ``None`` inside a scope that changes the display battery's answer. The link
+    part is ``None`` (links unmemoized) unless the session manager reports a
+    real ``(map id, counter)`` generation: a test double answers with a mock.
+    """
+    # circular import: chat_utils_display imports dashboard.state at module scope.
+    from kiro_crew.dashboard.chat_utils_display import display_redaction_stamp
+
+    redaction = display_redaction_stamp()
+    if redaction is None:
+        return None
+    sessions = getattr(state, "sessions", None)
+    reader = getattr(sessions, "session_map_generation", None)
+    generation = reader() if callable(reader) else None
+    links: tuple[object, ...] | None = None
+    if type(generation) is tuple:
+        transports = getattr(state, "channel_transports", None) or {}
+        links = (
+            id(sessions),
+            generation,
+            tuple(
+                (
+                    channel_type,
+                    id(transport),
+                    bool(
+                        getattr(
+                            getattr(transport, "capabilities", None),
+                            "supports_proactive_send",
+                            False,
+                        )
+                    ),
+                )
+                for channel_type, transport in list(transports.items())
+            ),
+        )
+    return RowMemoContext(redaction=redaction, links=links)
+
+
 def serialize_slots(
     self: DashboardState, *, include_check_status: bool = False, dashboard_user: bool = False
 ) -> list:
@@ -936,20 +1027,34 @@ def serialize_slots(
 
     under_construction = getattr(self, "_slots_under_construction", None) or ()
     queued_by_slot = _published_queued_by_slot(subs)
+    queued_reason_by_slot = _published_queued_reason_by_slot(subs)
     saved_creators: dict[str, str] = {}
-    for s in self._slots.values():
-        if s.key in under_construction:
-            continue
-        saved_creators[s.key] = getattr(s, "_saved_created_by", "") or ""
-        self._drop_orphaned_mcp_report(s)
-        d = self.serialize_slot(
-            s,
-            include_check_status=include_check_status,
-            dashboard_user=dashboard_user,
-        )
-        d["subagents_running"] = bool(subs and subs.running_agents_for(effective_session_key(s)))
-        d["subagents_queued"] = queued_by_slot.get(s.key, 0)
-        out.append(d)
+    # Per-slot row memos for this pass; their global key parts are read here,
+    # once, BEFORE any row is built (see ``slot_row_memo``).
+    memo_ctx = _row_memo_context(self)
+    memo_token = ROW_MEMO.set(memo_ctx)
+    try:
+        for s in self._slots.values():
+            if s.key in under_construction:
+                continue
+            saved_creators[s.key] = getattr(s, "_saved_created_by", "") or ""
+            self._drop_orphaned_mcp_report(s)
+            d = self.serialize_slot(
+                s,
+                include_check_status=include_check_status,
+                dashboard_user=dashboard_user,
+            )
+            d["subagents_running"] = bool(
+                subs and subs.running_agents_for(effective_session_key(s))
+            )
+            d["subagents_queued"] = queued_by_slot.get(s.key, 0)
+            if d["subagents_queued"] and s.key in queued_reason_by_slot:
+                d["subagents_queued_reason"] = queued_reason_by_slot[s.key]
+            out.append(d)
+    finally:
+        ROW_MEMO.reset(memo_token)
+    if memo_ctx is not None and logger.isEnabledFor(logging.DEBUG):
+        logger.debug("slot row memo pass: %s", dict(sorted(memo_ctx.counts.items())))
     # The slot-key/session-key correspondence the lineage join needs, read the same
     # way ``/api/sessions/memory`` reads it for the Sessions table. Handed over
     # UNCALLED: resolving it is pure dict work over the live registry, but it belongs
@@ -984,27 +1089,42 @@ def serialize_slots(
 
 
 def _attach_crew_work(self: DashboardState, rows: list[dict]) -> None:
-    """Put each Crew Mode root's open-work summary on its row (``crew_work``).
+    """Put each conductor's open-work summary on its row (``crew_work``).
 
-    Each live root's board is followed (its ``work`` fold kept current, and primed
-    once when nothing is held yet), so a restart does not leave its row on the old
-    reading until its ledger next moves; a root that left the frame is released.
-    The summary reads the held items against this frame's live slots. No I/O.
+    A conductor is a Crew Mode root, or a sub-conductor: a crew member that
+    dispatched another one, whose board holds that session's item. Each live
+    conductor's board is followed (its ``work`` fold kept current, and primed once
+    when nothing is held yet), so a restart does not leave its row on the old
+    reading until its ledger next moves, and a sub-conductor's report reaches its
+    root's worker list as a push. Roots are followed first, so the follow bound
+    never trades a root for a sub-conductor; a conductor that left the frame is
+    released. The summary reads the held items against this frame's live slots.
+    No I/O.
     """
     from kiro_crew import crew_mode
     from kiro_crew.dashboard import crew_work
     from kiro_crew.dashboard.chat_utils import effective_session_key
     from kiro_crew.session_ledger_layout import ledger_key
 
-    roots: list[str] = []
-    for row in rows:
+    dispatchers = {
+        row.get(crew_mode.DISPATCHER_FIELD) for row in rows if row.get(crew_mode.WORKER_FIELD)
+    }
+    conductors = [
+        row
+        for row in rows
+        if row.get(crew_mode.ROOT_FIELD)
+        or (row.get(crew_mode.WORKER_FIELD) and row.get("key") in dispatchers)
+    ]
+    conductors.sort(key=lambda row: not row.get(crew_mode.ROOT_FIELD))
+    followed: list[str] = []
+    for row in conductors:
         key = row.get("key")
-        if not isinstance(key, str) or not row.get(crew_mode.ROOT_FIELD):
+        if not isinstance(key, str):
             continue
         slot = self._slots.get(key)
         if slot is None:
             continue
-        roots.append(key)
+        followed.append(key)
         # The ledger spelling of the session key first: the identity the board's
         # entries are recorded under, and the one primed (``chat-7`` for a dashboard
         # slot, the channel key for a channel one). The raw key is followed too.
@@ -1013,7 +1133,7 @@ def _attach_crew_work(self: DashboardState, rows: list[dict]) -> None:
         summary = crew_work.summary_for_state(key, self)
         if summary is not None:
             row[crew_work.CREW_WORK_FIELD] = summary
-    crew_work.retain(roots)
+    crew_work.retain(followed)
 
 
 def serialize_slot_views(
@@ -1078,6 +1198,13 @@ def _reproject_slots(
         slot = self._slots.get(payload.get("key", ""))
         if slot is None or "source_links" not in payload:
             out.append(payload)
+            continue
+        if payload.get("source_links_total") == 0 and payload["source_links"] == []:
+            # Nothing was extracted in this same synchronous pass, so every
+            # audience's projection of it is the empty list too.
+            view = dict(payload)
+            view["source_links"] = []
+            out.append(view)
             continue
         view = dict(payload)
         view["source_links"] = slot.source_links_view(

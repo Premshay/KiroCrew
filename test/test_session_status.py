@@ -158,6 +158,18 @@ class TestLiveness:
         row = _rows(_status(state, caller))["chat-2"]
         assert row["status"] == "queued" and row["queue_depth"] == 1
 
+    def test_an_idle_session_holding_only_restored_cards_is_idle(self, tmp_path):
+        """A card restored after a restart never runs on its own, so the row asks
+        for a decision instead of telling the patrol to wait for it."""
+        from kiro_crew.dashboard.slot_queue_repository import RESTORED_QUEUE_KEY
+
+        state = _make_state(tmp_path)
+        caller = _slot(state, "chat-1")
+        child = _child(state, "chat-2", caller)
+        child._queue[:] = [{"id": "r1", "content": "restored", RESTORED_QUEUE_KEY: True}]
+        row = _rows(_status(state, caller))["chat-2"]
+        assert row["status"] == "idle" and row["queue_depth"] == 1
+
     def test_a_row_carries_the_title_the_person_sees(self, tmp_path):
         state = _make_state(tmp_path)
         caller = _slot(state, "chat-1")
@@ -433,6 +445,60 @@ class TestThePersistedBirthRoster:
             }
         }
 
+    def _archived_birth(self, state, caller, monkeypatch) -> str:
+        """A session *caller* opened and that closed before its first turn.
+
+        Its transcript line names *caller*; no creation record exists, because the
+        caller has no ACP session to write one, which is what a forged line looks like.
+        """
+        from kiro_crew.dashboard.chat_persistence import _save_slot_to_history
+
+        monkeypatch.setattr(sc, "_workspace_name_for_dir", lambda cfg, ws_dir: caller.workspace)
+        result = asyncio.run(
+            sc.create_session(state, caller_session_key=_key(caller), title="private work")
+        )
+        slot = state.get_slot(result["target"])
+        assert _save_slot_to_history(state, slot, closed=True, force=True)
+        state._slots.pop(slot.key)
+        return slot.key
+
+    def test_a_fenced_caller_is_not_shown_a_line_no_creation_record_confirms(
+        self, tmp_path, monkeypatch
+    ):
+        """A sandboxed shell can write the line, so for a fenced caller it is only a
+        claim. With no creation record the row could be forged or real, so it is
+        left out and the scan reads as a floor. The person's own tab is not fenced
+        and still sees it."""
+        state = _make_state(tmp_path)
+        caller = _slot(state, "chat-1")
+        archived = self._archived_birth(state, caller, monkeypatch)
+
+        unfenced = _status(state, caller, caller_fenced=False)
+        assert set(_rows(unfenced)) == {archived}
+        assert unfenced["history"] == "readable"
+
+        fenced = _status(state, caller, caller_fenced=True)
+        assert _rows(fenced) == {}
+        assert fenced["history"] == "incomplete"
+
+    @pytest.mark.parametrize("recorded_creator", ["caller", "chat-8"])
+    def test_a_fenced_callers_line_follows_the_creation_record(
+        self, tmp_path, monkeypatch, recorded_creator
+    ):
+        state = _make_state(tmp_path)
+        caller = _slot(state, "chat-1")
+        archived = self._archived_birth(state, caller, monkeypatch)
+        creator = caller.key if recorded_creator == "caller" else recorded_creator
+        stp.record_spawned(f"sid-{creator}", creator, archived, at=1)
+
+        out = _status(state, caller, caller_fenced=True)
+
+        assert out["history"] == "readable", "the record answered either way"
+        if recorded_creator == "caller":
+            assert _rows(out)[archived]["source"] == "history"
+        else:
+            assert _rows(out) == {}
+
 
 class TestTheDurableReadsQuality:
     def test_an_unreadable_tree_is_said_out_loud_and_the_answer_is_live_only(
@@ -511,7 +577,7 @@ class TestTheEventLoopBoundary:
         event_loop_thread = threading.get_ident()
         scan_threads: list[int] = []
 
-        def _history_scan(_state, _caller_key, _caller_workspace):
+        def _history_scan(_state, _caller_key, _caller_workspace, _fenced):
             scan_threads.append(threading.get_ident())
             return {}, "readable", 0
 
@@ -966,11 +1032,11 @@ class TestTheCallerSurfaceIsRecheckedAfterTheScan:
         child.title = "acquisition terms Q4"
         real_scan = sc._created_history_roster
 
-        def _scan_then_mirror(state_, caller_key_, workspace_):
+        def _scan_then_mirror(state_, caller_key_, workspace_, fenced_):
             # The mirror lands while the scan is on its worker thread, which is
             # exactly the window the synchronous gate cannot see -- in the store the
             # re-check reads.
-            out = real_scan(state_, caller_key_, workspace_)
+            out = real_scan(state_, caller_key_, workspace_, fenced_)
             state.sessions.set_mirror_link(_key(caller), "C0FFEE", "1758.0004")
             return out
 
@@ -1006,8 +1072,8 @@ class TestTheCallerSurfaceIsRecheckedAfterTheScan:
         _child(state, "chat-2", caller)
         real_scan = sc._created_history_roster
 
-        def _scan_then_move(state_, caller_key_, workspace_):
-            out = real_scan(state_, caller_key_, workspace_)
+        def _scan_then_move(state_, caller_key_, workspace_, fenced_):
+            out = real_scan(state_, caller_key_, workspace_, fenced_)
             caller.workspace = "somewhere-else"
             return out
 

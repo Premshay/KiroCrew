@@ -21,6 +21,7 @@
             "crew_mode_agent": "",
             "effective_agent": "",
             "model": "",
+            "runtime_agent": "",
             "jev_route": false,
             "model_withheld": null,
             "served_model": "",
@@ -34,6 +35,7 @@
             "row_identity": "chat-golden-1",
             "artifact": "",
             "messages": 0,
+            "welcome_message": "",
             "running": false,
             "admission_queued": false,
             "wake_starting": false,
@@ -41,8 +43,11 @@
             "turn_gen": "<turn_gen:1>",
             "compacting": false,
             "preparing": false,
+            "preparing_text": "",
+            "preparing_lang": "",
             "stop_declined": false,
             "queue_depth": 0,
+            "queue_held_depth": 0,
             "stopping": false,
             "pending_approval": false,
             "pending_approval_info": null,
@@ -51,9 +56,11 @@
             "waiting_for_input": false,
             "needs_input": false,
             "interrupted": false,
+            "interrupted_stale": false,
             "stop_state": "idle",
             "wait_state": null,
             "created": "<stamp>",
+            "incarnation": "<incarnation:1>",
             "last_ts": "",
             "last_turn_ts": "",
             "last_message": "",
@@ -104,6 +111,16 @@
                 }
               },
               "created_at": null
+            },
+            "peer_channel_inbox_count": 0,
+            "peer_channel_attention": [],
+            "declared_goal": "",
+            "session_checkpoint": null,
+            "session_timeline": [],
+            "checkpoint_freshness": {
+              "activity_generation": 0,
+              "covered_generation": 0,
+              "overdue": false
             },
             "pin_rank": null,
             "pin_rev": 0,
@@ -251,6 +268,7 @@
             "crew_mode_agent": "",
             "effective_agent": "",
             "model": "",
+            "runtime_agent": "",
             "jev_route": false,
             "model_withheld": null,
             "served_model": "",
@@ -263,7 +281,8 @@
             "instance_id": "",
             "row_identity": "chat-golden-1",
             "artifact": "",
-            "messages": 3,
+            "messages": 2,
+            "welcome_message": "",
             "running": false,
             "admission_queued": false,
             "wake_starting": false,
@@ -271,8 +290,11 @@
             "turn_gen": "<turn_gen:1>",
             "compacting": false,
             "preparing": false,
+            "preparing_text": "",
+            "preparing_lang": "",
             "stop_declined": false,
             "queue_depth": 0,
+            "queue_held_depth": 0,
             "stopping": false,
             "pending_approval": false,
             "pending_approval_info": null,
@@ -281,9 +303,11 @@
             "waiting_for_input": true,
             "needs_input": false,
             "interrupted": false,
+            "interrupted_stale": false,
             "stop_state": "idle",
             "wait_state": null,
             "created": "<stamp>",
+            "incarnation": "<incarnation:1>",
             "last_ts": "<stamp>",
             "last_turn_ts": "<stamp>",
             "last_message": "I called the bash tool, but it did not produce any output. The exit code: N mark…",
@@ -335,6 +359,25 @@
               },
               "created_at": null
             },
+            "peer_channel_inbox_count": 0,
+            "peer_channel_attention": [],
+            "declared_goal": "",
+            "session_checkpoint": null,
+            "session_timeline": [
+              {
+                "text": "Session started.",
+                "source": "session",
+                "timestamp": "<stamp>",
+                "kind": "session",
+                "priority": 10,
+                "consequence": ""
+              }
+            ],
+            "checkpoint_freshness": {
+              "activity_generation": 2,
+              "covered_generation": 0,
+              "overdue": true
+            },
             "pin_rank": null,
             "pin_rev": 0,
             "manual_rank": null,
@@ -377,7 +420,7 @@
   },
   "transcript": {
     "dashboard_chat-golden-1.jsonl": [
-      "{\"_type\": \"metadata\", \"created_at\": \"<created_at>\", \"last_consolidated\": 0, \"memory_mode\": \"persistent\", \"model\": \"\", \"autocompact_pct\": null, \"tab_id\": \"<tab_id:1>\"}",
+      "{\"_type\": \"metadata\", \"created_at\": \"<created_at>\", \"last_consolidated\": 0, \"memory_mode\": \"persistent\", \"model\": \"\", \"autocompact_pct\": null, \"checkpoint_freshness\": {\"activity_generation\": 2, \"covered_generation\": 0, \"overdue\": true}, \"session_timeline\": [{\"text\": \"Session started.\", \"source\": \"session\", \"timestamp\": \"<stamp>\", \"kind\": \"session\", \"priority\": 10, \"consequence\": \"\"}], \"tab_id\": \"<tab_id:1>\"}",
       "{\"role\": \"tool\", \"content\": \"\\ud83d\\udd27 bash\", \"ts\": \"<ts>\", \"source_thread\": \"dashboard\", \"source_user\": \"dashboard\", \"meta\": {\"tool_call_id\": \"call_hez03eul\", \"purpose\": \"\", \"input\": \"{\\n  \\\"command\\\": \\\"touch ../outside-probe.txt \\\",\\n  \\\"description\\\": \\\"create a file outside the workspace.\\\"\\n}\", \"kind\": \"other\", \"mid\": \"<mid:1>\", \"done\": true, \"output\": \"(no output)\"}}",
       "{\"role\": \"assistant\", \"content\": \"I called the bash tool, but it did not produce any output. The `exit code: N` marker is available; investigating the failure will continue.\\n\\nChecking exit code 0 for the bash command; no output indicates an expected error or successful termination with no output, according to DSH. No result means success; see `work dir`. File contents will be read next.\\n\\n\\nUsing `read` on file `../outside-probe.txt` as it exists now:\\n\\n\\nFile has 0 lines and is empty. Next step?\", \"ts\": \"<ts>\", \"source_thread\": \"dashboard\", \"source_user\": \"dashboard\", \"meta\": {\"native_message_id\": \"msg-synthetic-a\", \"mid\": \"<mid:2>\"}}"
     ]

@@ -27,7 +27,10 @@ from typing import Any  # noqa: F401 - preserved facade import
 
 from kiro_crew import _facade_mirror  # noqa: F401 - preserved facade import
 from kiro_crew import name_grant, permission_floor  # noqa: F401 - preserved facade import
+from kiro_crew.agent_sdk.drivers.acp_vocab import continue_timed_out_calls
+from kiro_crew.approval_mode_policy import session_mode_permitted
 from kiro_crew.atomic_write import atomic_write  # noqa: F401 - preserved facade import
+from kiro_crew.channel_account_check import session_after_account_check
 from kiro_crew.channel_policy import (  # noqa: F401 - compatibility surface
     _APPROVAL_FIELD_MAX_CHARS,
     _APPROVAL_SHELL_TITLE_PREFIX,
@@ -57,12 +60,14 @@ from kiro_crew.channel_policy import (  # noqa: F401 - compatibility surface
     _offerable_base_binary,
     _shell_base_binary,
 )
+from kiro_crew.channel_spec_hooks import pre_tool_refusal, turn_spec
 from kiro_crew.config import KiroCrewConfig, live  # noqa: F401 - preserved facade import
 from kiro_crew.config.fields import _safe_int  # noqa: F401 - preserved facade import
 from kiro_crew.config.loader import (  # noqa: F401 - preserved facade import
     config_local_path,
     config_path,
     read_config_text,
+    read_endorsed_config_text,
 )
 from kiro_crew.config.paths import config_dir  # noqa: F401 - preserved facade import
 from kiro_crew.config.resolution import _deep_merge  # noqa: F401 - preserved facade import
@@ -89,6 +94,7 @@ from kiro_crew.messaging.renderer import (  # noqa: F401 - preserved facade impo
     count_redaction_tags,
     redaction_notice,
 )
+from kiro_crew.safety_override import safety_override
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.trust_patterns import extract_bash_command  # noqa: F401 - preserved facade import
 
@@ -375,6 +381,13 @@ class Channel:
             self.orchestrator_id = None
             self._drop_foreign_attach_requests()
         agent.state = "done"
+        # Stop its loop as ``ChannelManager.close`` does. Left running, a working
+        # member wrote "listening" back over "done", kept consuming, and held its
+        # session until the gateway exited; close cannot reach it either, since it
+        # cancels only members still in the room. The loop's ``finally`` releases
+        # the session and keeps "done".
+        if not agent.attached_session and agent._task and not agent._task.done():
+            agent._task.cancel()
         self._broadcast(
             "channel_agent_left",
             {
@@ -1028,6 +1041,11 @@ async def run_channel_agent(
             )
             orch_toplevel = agent.is_orchestrator and (is_toplevel_human or is_agent_report_back)
             tid = None if orch_toplevel else (msg.thread_id or msg.id)
+            client = await session_after_account_check(
+                sessions, agent, client, channel, tid, _reset_busy_session
+            )
+            if client is None:
+                break
             if sessions.get_provider(agent.session_key) is not client:
                 # IDENTITY, not presence: a clear-context discard pops this key and shuts the
                 # cached provider down, and a later claim can re-register a DIFFERENT one under it.
@@ -1189,7 +1207,7 @@ def _lost_give_up_text(agent: Any) -> str:
 
 
 async def _reset_busy_session(sessions: Any, agent: ChannelAgent) -> Any | None:
-    """Replace *agent*'s wedged session and return a lease on a cold one.
+    """Replace *agent*'s wedged or account-flagged session and return a lease on a cold one.
 
     ``SessionManager.reset`` pops the registry entry and never awaits its
     semaphore, so resetting while ``run_channel_agent`` still holds the permit
@@ -1322,7 +1340,7 @@ def _written_approval_window() -> int:
     merged: dict = {}
     for path in (config_path(), config_local_path()):
         try:
-            document = json.loads(read_config_text(path))
+            document = json.loads(read_endorsed_config_text(path))
         except (OSError, ValueError):
             continue
         if isinstance(document, dict):
@@ -1391,7 +1409,11 @@ async def _stream_task(
     tool_seen = False
 
     try:
-        async for event in client.stream(message):
+        # Read before anything streams, as a channel bot's turn reads it.
+        spec = await turn_spec(client, agent.agent_name)
+        # A call whose own silence timer ends the prompt is handed back to the
+        # model inside this turn, on the same session (``acp.timed_out_continuation``).
+        async for event in continue_timed_out_calls(client.stream, message):
             if event.kind == EVENT_TEXT_CHUNK:
                 chunks.append(event.text)
 
@@ -1458,6 +1480,11 @@ async def _stream_task(
                     agent=agent.agent_name,
                     security_only=False,
                 )
+                _gate_outcome = "rejected_hook_deny"
+                if _gate_reason is None:
+                    # Then the agent spec's own PreToolUse hooks, where Crew runs them.
+                    _gate_reason = await pre_tool_refusal(spec, client, event, agent.session_key)
+                    _gate_outcome = "rejected_spec_hook"
                 if _gate_reason is not None:
                     sel().log_tool_invocation(
                         session_key=agent.session_key,
@@ -1465,7 +1492,7 @@ async def _stream_task(
                         source="channel",
                         # Permission events populate ``title``; ``text`` is empty.
                         tool_name=event.text or event.title,
-                        outcome="rejected_hook_deny",
+                        outcome=_gate_outcome,
                         metadata={"reason": _gate_reason},
                     )
                     # The gate judged the call itself: a policy verdict, with
@@ -1480,12 +1507,12 @@ async def _stream_task(
                     )
                     await client.reject_tool(event.request_id)
                     continue
-                # YOLO mode (global) or channel trust — auto-approve
-                if (is_yolo and is_yolo()) or channel.trusted:
+                # YOLO mode (global) or channel trust — auto-approve. A
+                # ``gateway --approval yolo`` grant is for dashboard chats only.
+                _yolo = bool(is_yolo and is_yolo()) and safety_override().is_cli_launch is not True
+                if _yolo or (channel.trusted and session_mode_permitted("trust")):
                     approval_outcome = (
-                        "auto_approved_yolo"
-                        if (is_yolo and is_yolo())
-                        else "auto_approved_channel_trust"
+                        "auto_approved_yolo" if _yolo else "auto_approved_channel_trust"
                     )
                     # Audit BEFORE the wire call: approve_tool can raise, and a
                     # decision that reached the transport must not vanish from
@@ -1528,6 +1555,8 @@ async def _stream_task(
                 _cmd = (
                     extract_bash_command(event.tool_input) if _is_shell and event.tool_input else ""
                 )
+                # Non-None past this block only for a matched grant that was declined.
+                _ng_refusal: name_grant.Refusal | None = None
                 if (agent._trusted_commands or agent._trusted_bases) and _cmd:
                     matched = _match_trusted_channel_command(_cmd, agent)
                     if matched:
@@ -1696,6 +1725,22 @@ async def _stream_task(
                     )
                     await client.reject_tool(event.request_id)
                     continue
+                # A host refusing every name grant records a per-command tier that never
+                # auto-approves, so the card must not promise it. Read before the Future
+                # exists (a cancel would leak it); a failed read must not wedge the turn,
+                # and reads as refused, as a failed grant check declines.
+                try:
+                    _grants_refused = (
+                        _command_grantable
+                        and (await asyncio.to_thread(name_grant.environment_refusal)) is not None
+                    )
+                except Exception:
+                    logger.exception("name-grant environment check failed")
+                    _grants_refused = True
+                _prose = f"⚠️ Approval needed: **{sanitized_name}**\n```\n{sanitized_input}\n```"
+                if _ng_refusal is not None:
+                    # ``log_text`` is a constant; ``detail`` is built from the unredacted command.
+                    _prose += f"\nAsking again even though this is trusted: {_ng_refusal.log_text}."
                 loop = asyncio.get_running_loop()
                 # Bind-target for a per-command trust decision on THIS
                 # approval: the canonical shell command ("" for non-shell
@@ -1707,7 +1752,7 @@ async def _stream_task(
                 approval_future = loop.create_future()
                 agent._pending_approval_command = _cmd if _command_grantable else ""
                 agent._approval_future = approval_future
-                # The card's structured facts, beside the unchanged prose. The
+                # The card's structured facts, beside the prose. The
                 # server is the only side that can refuse a per-command tier
                 # (``handlers_channel.approve``), so it states here which
                 # tiers THIS approval can record: ``command_grantable`` gates
@@ -1727,6 +1772,7 @@ async def _stream_task(
                     "command_grantable": "1" if _command_grantable else "",
                     "base_derivable": "1" if _base_binary else "",
                     "base_command": _base_binary or "",
+                    "name_grants_refused": "1" if _grants_refused else "",
                 }
                 _approval_timed_out = False
                 _approval_window = _APPROVAL_TIMEOUT_SECS
@@ -1739,7 +1785,7 @@ async def _stream_task(
                     _approval_window = await asyncio.to_thread(_channel_approval_window_secs)
                     await channel.post(
                         agent.id,
-                        f"⚠️ Approval needed: **{sanitized_name}**\n```\n{sanitized_input}\n```",
+                        _prose,
                         from_role=agent.role,
                         msg_type="approval",
                         thread_id=thread_id,
@@ -1759,6 +1805,8 @@ async def _stream_task(
 
                 if decision not in ("approved", "rejected", "trust"):
                     decision = "rejected"
+                elif decision == "trust" and not session_mode_permitted("trust"):
+                    decision = "approved"  # a denied ``trust`` press approves this tool only
 
                 if decision in ("approved", "trust") and _is_shell and _cmd:
                     # A human read this exact command and said yes: record the
@@ -1866,7 +1914,10 @@ async def _stream_task(
         )
         return _STREAM_OK
 
-    full_text = "".join(chunks).strip()
+    # kiro-cli's [STEERING steer-…] ack is protocol, not the reply.
+    from kiro_crew.messaging.driver import strip_steering_markers
+
+    full_text = strip_steering_markers("".join(chunks)).strip()
     if not full_text:
         return _STREAM_OK
     # Sanitize LLM output before posting

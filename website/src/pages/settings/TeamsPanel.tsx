@@ -211,6 +211,10 @@ export function TeamsPanel() {
   const [appPassword, setAppPassword] = useState('')
   const [pwClear, setPwClear] = useState(false)
   const [formKey, setFormKey] = useState(0)
+  // The save's onSuccess reads the secret field as it is when it lands, not
+  // as it was when the request started.
+  const secretRef = useRef({ appPassword, pwClear })
+  useEffect(() => { secretRef.current = { appPassword, pwClear } }, [appPassword, pwClear])
   const [saved, setSaved] = useState(false)
   const [restartHint, setRestartHint] = useState(false)
   const [error, setError] = useState('')
@@ -249,11 +253,32 @@ export function TeamsPanel() {
       // leaves a quiet form that reads as saved.
       setError(msg)
     },
-    onSuccess: res => {
+    onSuccess: (res, vars) => {
       setSaved(true)
       setRestartHint(!!res.restart_required)
-      syncArmed.current = true
-      setFormKey(k => k + 1)
+      // Not re-arming the draft sync: the server took the values we sent, and
+      // a reseed would overwrite any field edited while the save was in
+      // flight. Only the password just sent is cleared, and only while the
+      // field still holds what was sent.
+      const s = secretRef.current
+      const nextPassword = vars.app_password && s.appPassword.trim() === vars.app_password ? '' : s.appPassword
+      setAppPassword(nextPassword)
+      if (vars.app_password_clear) setPwClear(false)
+      // Collapse the secret field back to its stored preview only when no
+      // newer edit is pending in it; a remount would hide it.
+      if (!nextPassword && !(s.pwClear && !vars.app_password_clear)) setFormKey(k => k + 1)
+      setDraft(d => {
+        if (!d) return d
+        // The stored App ID is masked once set; blank the sent value as the
+        // reseed did, unless it was edited during the save.
+        const appId = vars.app_id && d.app_id.trim() === vars.app_id ? '' : d.app_id
+        // A blank folder name was saved as the channel's own name: show that,
+        // unless the field was cleared after a named folder was sent.
+        const folder = d.session_folder_on && !d.session_folder.trim() && vars.session_folder === CHANNEL_NAME
+          ? vars.session_folder
+          : d.session_folder
+        return appId === d.app_id && folder === d.session_folder ? d : { ...d, app_id: appId, session_folder: folder }
+      })
       setTimeout(() => setSaved(false), 6000)
       qc.invalidateQueries({ queryKey: ['teams-config'] })
     },
@@ -363,7 +388,10 @@ export function TeamsPanel() {
       <SettingsSection title={i18nT('pages.settings.teamsPanel.get_your_credentials')}>
         <SettingsCard>
           <p className="text-[13px] text-text m-0">
-            {i18nT('pages.settings.teamsPanel.register_an_azure_bot_add_the')} <strong>{i18nT('pages.settings.teamsPanel.microsoft_teams')}</strong> {i18nT('pages.settings.teamsPanel.channel_and_set_its_messaging_endpoint_to_your_p')} <code>{WEBHOOK_PATH}</code>{i18nT('pages.settings.teamsPanel.copy_the_app_client_id_create_a_client_secret_an')}
+            <Trans
+              i18nKey="pages.settings.teamsPanel.register_azure_bot_intro"
+              components={{ channel: <strong>{i18nT('pages.settings.teamsPanel.microsoft_teams')}</strong>, path: <code>{WEBHOOK_PATH}</code> }}
+            />
           </p>
           <div className="flex items-center gap-2 mt-2 flex-wrap">
             <a
@@ -379,13 +407,16 @@ export function TeamsPanel() {
             </a>
           </div>
           <p className="text-[12px] text-muted mt-2 mb-0">
-            {i18nT('pages.settings.teamsPanel.messaging_endpoint')} <code>{i18nT('pages.settings.teamsPanel.https_your_host')}{WEBHOOK_PATH}</code>
+            <Trans i18nKey="pages.settings.teamsPanel.messaging_endpoint_url" components={{ url: <code>{i18nT('pages.settings.teamsPanel.https_your_host')}{WEBHOOK_PATH}</code> }} />
           </p>
           <div className="flex items-start gap-2 rounded-md border border-warn/40 bg-warn/10 px-3 py-2 mt-3">
             <AlertTriangle size={13} className="lucide-inline text-warn flex-none mt-0.5" />
             <span className="text-[12px] text-text">
-              <strong>{i18nT('pages.settings.teamsPanel.requires_a_public_https_url')}</strong> {i18nT('pages.settings.teamsPanel.teams_delivers_messages_by_calling_this_endpoint')} <code>{i18nT('pages.settings.teamsPanel.localhost')}</code> {i18nT('pages.settings.teamsPanel.or_ssh_tunneled_address_won_t_work_expose_the_ga')}
-              <code>{i18nT('pages.settings.teamsPanel.your_host')}</code> {i18nT('pages.settings.teamsPanel.above_unlike_slack_the_bot_framework_has_no_outb')}
+              <strong>{i18nT('pages.settings.teamsPanel.requires_a_public_https_url')}</strong>{' '}
+              <Trans
+                i18nKey="pages.settings.teamsPanel.public_host_required_detail"
+                components={{ localhost: <code>{i18nT('pages.settings.teamsPanel.localhost')}</code>, host: <code>{i18nT('pages.settings.teamsPanel.your_host')}</code> }}
+              />
             </span>
           </div>
         </SettingsCard>
@@ -420,7 +451,7 @@ export function TeamsPanel() {
               {i18nT('pages.settings.teamsPanel.fill_in_the_credentials_below_add_yourself_to_th')} <strong>{i18nT('pages.settings.teamsPanel.enable')}</strong>{i18nT('pages.settings.teamsPanel.and_save')}
             </li>
             <li>
-              {i18nT('pages.settings.teamsPanel.side_load_a_teams_app_whose')} <code>{i18nT('pages.settings.teamsPanel.botid')}</code> {i18nT('pages.settings.teamsPanel.is_your_app_id_then_dm_the_bot_full_manifest_ste')}
+              <Trans i18nKey="pages.settings.teamsPanel.side_load_app_with_bot_id" components={{ field: <code>{i18nT('pages.settings.teamsPanel.botid')}</code> }} />
             </li>
           </ol>
         </SettingsCard>
@@ -445,6 +476,9 @@ export function TeamsPanel() {
             isSet={data.app_password_set}
             preview={SECRET_MASK}
             readOnly={ro}
+            // A value still pending (typed during a save) stays in the editor,
+            // even once the refetch reports a stored credential.
+            editing={appPassword ? true : undefined}
             value={appPassword}
             onChange={setAppPassword}
             cleared={pwClear}

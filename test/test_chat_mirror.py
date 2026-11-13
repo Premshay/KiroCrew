@@ -36,7 +36,7 @@ from kiro_crew.messaging.link import ChannelLink, binding_token
 #: gate must reject them. Pinned as a set so an unlock is a NAMED failure in
 #: ``test_the_proactive_split_matches_the_shipped_caps``. The rejection branch is
 #: driven by a SYNTHETIC capability, because this set can be empty.
-NON_PROACTIVE_CHANNELS: set[str] = {"feishu"}
+NON_PROACTIVE_CHANNELS: set[str] = set()
 
 
 def _channels_declaring_proactive(supported: bool) -> list[str]:
@@ -273,8 +273,9 @@ class TestMirrorLink:
 
         Weixin ships ``supports_proactive_send=True``, so it must LINK. Without
         this half the suite only ever proved the gate says no, and a gate that
-        refuses everything would pass it — including the day WeCom's declaration
-        flips and the endpoint is supposed to start accepting it.
+        refuses everything would pass it — including the day a channel's
+        declaration flips to proactive and the endpoint is supposed to start
+        accepting it.
         """
         state = _prep(tmp_path, monkeypatch)
         state.register_channel_transport(_real_caps_transport(channel))

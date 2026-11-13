@@ -29,6 +29,17 @@ class TestKnowledgeSearchDBMissing:
 
 
 class TestKnowledgeSearchValidation:
+    def test_status_choices_are_advertised_and_invalid_values_are_refused(self):
+        from kiro_crew.mcp_core import _call_tool_inner
+        from kiro_crew.mcp_tools.catalog.knowledge import schemas
+
+        descriptor = next(t for t in schemas() if t["name"] == "local_knowledge_search")
+        status = descriptor["inputSchema"]["properties"]["status"]
+        assert set(status["enum"]) == {"active", "archived", "all"}
+        assert status["default"] == "active"
+        with pytest.raises(ValidationError):
+            _call_tool_inner("local_knowledge_search", {"query": "test", "status": "unknown"})
+
     @pytest.mark.parametrize("query", ["", "   "], ids=["empty", "whitespace"])
     def test_blank_query_raises_validation_error(self, query):
         from kiro_crew.mcp_core import _call_tool_inner
@@ -124,7 +135,7 @@ class TestKnowledgeSearchResults:
 
         result = _call_tool_inner("local_knowledge_search", {"query": "test"})
         mock_retriever_cls.return_value.search.assert_called_once_with(
-            "test", limit=3, source_id=None, namespace=None
+            "test", limit=3, source_id=None, namespace=None, status="active"
         )
         assert "No relevant knowledge found" in result
 
@@ -302,7 +313,9 @@ class TestKnowledgeSearchSourceFilter:
         from kiro_crew.mcp_core import _call_tool_inner
 
         result = _call_tool_inner("local_knowledge_search", {"query": "auth", **extra})
-        mock_retriever_cls.return_value.search.assert_called_once_with("auth", limit=3, **expected)
+        mock_retriever_cls.return_value.search.assert_called_once_with(
+            "auth", limit=3, status="active", **expected
+        )
         assert "No relevant knowledge found" in result
 
     @patch("kiro_crew.mcp_core.config_dir")

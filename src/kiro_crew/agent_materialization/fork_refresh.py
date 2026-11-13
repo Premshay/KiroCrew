@@ -24,7 +24,8 @@ from kiro_crew.agent_files import DASHBOARD_AUTHOR_AGENT_FILENAME, OWNED_KIRO_AG
 from kiro_crew.agent_materialization import auto_approve
 from kiro_crew.agent_spec_format import is_markdown_spec
 
-#: The dashboard-author origin stem, digest-gated in :func:`_origin_is_owned`.
+#: The dashboard-author origin stem, digest-gated in :func:`fork_origin_is_owned`
+#: and :func:`_owned_spec_has_its_own_writer`.
 _DASHBOARD_AUTHOR_STEM = Path(DASHBOARD_AUTHOR_AGENT_FILENAME).stem
 
 #: The SEL operation :func:`_report_mcp_json_merge_pinned_off` records.
@@ -84,12 +85,12 @@ def refresh_after_rebuild(
     # "defer" is the boot path: per-fork work scales with fork count and must
     # not delay readiness. Owning the deferral HERE keeps the skip+schedule
     # pair in one place, so no caller can skip the refresh and forget the
-    # background half (or drop gated_off, as the first split version did).
+    # background half (or drop gated_off).
     if refresh_forks == "defer":
         # The whole refresh — plumbing AND the governance projection — stays
         # off the boot path (no-new-work-on-gateway-boot-path: the per-fork
         # pass scales with fork count). Sessions do not get to race it either:
-        # the settled event is cleared here and ensure_agent_materialized
+        # the settled event is cleared here and require_fork_governance
         # holds a fork-backed spawn until the pass re-sets it, so a fork
         # carrying grants the ceiling has since tightened away is re-filtered
         # before any session consumes it.
@@ -592,9 +593,10 @@ def require_shared_template_within_ceiling(
     """Refuse a *backend* start on a crew-bound spec Kiro Crew does not own that the
     ceiling would narrow.
 
-    kiro-cli honours a spec file's ``allowedTools`` and server ``autoApprove`` before
-    Kiro Crew's gate, and Kiro Crew never writes a spec it does not own (owner
-    decision, docs/decisions). So a session on such a file is started only when the
+    kiro-cli honours a spec file's ``allowedTools`` before Kiro Crew's gate (a server's
+    ``autoApprove`` reaches it the same way, as the ``allowedTools`` entries the skill
+    view adds for the verbs governance keeps), and Kiro Crew never writes a spec it
+    does not own (owner decision, docs/decisions). So a session on such a file is started only when the
     two governance passes would remove nothing from any file that claims *agent*:
     otherwise it would auto-approve what the ceiling denies. Only a host in
     ``ACP_BACKENDS_SPEC_FILE_GRANTS`` reads the file's grants, so only its starts

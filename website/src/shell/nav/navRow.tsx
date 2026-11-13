@@ -253,7 +253,7 @@ export const NavItem = forwardRef(function NavItem({ path, label, icon, active, 
       // (Crewmates, Customize) and an app's own icon (Task Runner) are spans
       // with an inline 16px `width`/`height` that a plain class cannot beat,
       // which would leave them smaller than the 20px Lucide tiles beside them.
-      className={`nav-item group/nav relative flex items-center min-w-0 cursor-pointer text-sm font-medium whitespace-nowrap gap-2.5 transition-colors duration-200 ${touch ? 'w-16 h-14 px-0.5 flex-col justify-center gap-0.5 rounded-xl shrink-0 [&_.app-icon-nav]:w-5 [&_.app-icon-nav]:h-5 [&_.app-icon-nav>*]:!w-5 [&_.app-icon-nav>*]:!h-5 [&_.app-icon-nav]:opacity-100' : `rounded-md ${collapsed ? 'py-1.5' : 'py-2'} pl-2.5 pr-2.5`} ${collapsed ? '' : 'overflow-hidden'} ${active ? 'nav-active text-text-strong bg-accent-subtle hover:brightness-110' : 'text-muted hover:text-text hover:bg-bg-hover/60'}`}
+      className={`nav-item group/nav relative flex items-center min-w-0 cursor-pointer text-sm font-medium whitespace-nowrap gap-2.5 transition-colors duration-200 ${touch ? 'w-16 h-14 px-0.5 flex-col justify-center gap-0.5 rounded-xl shrink-0 [&_.app-icon-nav]:w-5 [&_.app-icon-nav]:h-5 [&_.app-icon-nav>*]:!w-5 [&_.app-icon-nav>*]:!h-5 [&_.app-icon-nav]:opacity-100' : `rounded-md py-2 pl-2.5 pr-2.5`} ${collapsed ? '' : 'overflow-hidden'} ${active ? 'nav-active text-text-strong bg-accent-subtle hover:brightness-110' : 'text-muted hover:text-text hover:bg-bg-hover/60'}`}
       onClick={activate}
       onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate() } }}
       {...tipPointerProps}
@@ -325,12 +325,11 @@ export const NavItem = forwardRef(function NavItem({ path, label, icon, active, 
           {shortcut.chord}
         </span>
       )}
-      {/* LAST in the flex line, so the expanded unread/activity indicators sit to
-          the RIGHT of the chord above rather than over it. Order matters only for
-          the in-flow expanded indicators: every caller-supplied badge (the dev
-          dot, the update dot) and the collapsed dot are absolutely positioned
-          against the row, so they render where they always did regardless of
-          where in the children they appear. */}
+      {/* LAST in the flex line, so the expanded indicators sit to the RIGHT of the
+          chord above and the label truncates before them. An expanded badge must
+          be IN FLOW (`shrink-0`): an absolute one takes no room, so the
+          `flex-1 truncate` label runs under it. Only collapsed and phone-tile
+          badges are absolute, in the icon's corner, where no label is drawn. */}
       {badge}
       {collapsed && tip && <OverlayPortal>
         <div

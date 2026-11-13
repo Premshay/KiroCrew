@@ -251,6 +251,9 @@ class FakeListingLog(FakeConvLog):
     def list_sessions(self) -> list[dict]:
         return list(self._rows)
 
+    def list_sessions_indexed(self) -> list[dict]:
+        return self.list_sessions()
+
 
 class TestSessionsCommand:
     @staticmethod
@@ -351,7 +354,7 @@ class TestSessionsCommand:
     @pytest.mark.asyncio
     async def test_a_listing_failure_is_reported_rather_than_raised(self) -> None:
         class Boom(FakeConvLog):
-            def list_sessions(self):
+            def list_sessions_indexed(self):
                 raise OSError("disk")
 
         d = _dispatcher(FakeSessions(FakeProvider([])), FakeCtx(), FakeClient())
@@ -492,6 +495,38 @@ class TestModelCommand:
         await d.handle_message(_inbound("/model 2"))
         assert provider.client.set_calls == []
         assert "a reply is still running" in d.client.sent[-1][1]
+
+    @pytest.mark.asyncio
+    async def test_a_session_the_account_check_retires_defers_to_the_next_message(self) -> None:
+        provider = ModelProvider()
+        sessions = FakeSessions(provider, acquire=False)
+        refuse = sessions.try_acquire
+
+        async def _retire_then_refuse(key) -> bool:
+            # The acquire's Kiro account check retired the session: it held another
+            # account, so nothing is live by the time the lease would be taken.
+            sessions._has_session = False
+            return await refuse(key)
+
+        sessions.try_acquire = _retire_then_refuse
+        d = _dispatcher(sessions, FakeCtx(), FakeClient())
+        await d.handle_message(_inbound("/model 2"))
+        assert provider.client.set_calls == []
+        assert "it applies to your next message" in d.client.sent[-1][1]
+        assert "still running" not in d.client.sent[-1][1]
+
+    @pytest.mark.asyncio
+    async def test_a_session_the_account_check_flags_defers_to_the_next_message(self) -> None:
+        # Flagged, not retired (an idle parent the check spared for its running
+        # sub-agents): refused, yet still registered, and no reply is running.
+        provider = ModelProvider()
+        sessions = FakeSessions(provider, acquire=False)
+        sessions.retiring = True
+        d = _dispatcher(sessions, FakeCtx(), FakeClient())
+        await d.handle_message(_inbound("/model 2"))
+        assert provider.client.set_calls == []
+        assert "it applies to your next message" in d.client.sent[-1][1]
+        assert "still running" not in d.client.sent[-1][1]
 
     @pytest.mark.asyncio
     async def test_a_backend_without_set_model_defers(self) -> None:

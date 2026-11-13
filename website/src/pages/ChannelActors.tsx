@@ -21,7 +21,7 @@ import { menuItemsOf, useMenuKeyboard } from '../hooks/useMenuKeyboard'
 import type { RootState } from '../store'
 import { useAppSelector } from '../store'
 
-import { fmtDateFields } from '../i18n/format'
+import { fmtDateFields, fmtList } from '../i18n/format'
 import { i18nT } from '../i18n/t'
 import { isChatPageSurface } from '../utils/channelOrigin'
 // ── Types ──
@@ -62,6 +62,7 @@ export interface ApprovalMeta {
   command_grantable?: string
   base_derivable?: string
   base_command?: string
+  name_grants_refused?: string
 }
 
 export interface AttachRequest {
@@ -326,6 +327,12 @@ const CHANNEL_TRUSTED_LABEL_KEYS = {
   trust_base: 'components.approvalCard.trusted_channel_base',
 } as const
 
+const CHANNEL_REFUSED_LABEL_KEYS = {
+  ...CHANNEL_TRUSTED_LABEL_KEYS,
+  trust_command: 'components.approvalCard.trusted_channel_still_asks',
+  trust_base: 'components.approvalCard.trusted_channel_still_asks',
+} as const
+
 /** Exported for the capture entries only, alongside `approvalToolTitle`: an
  *  approval's posted TEXT is rendered here, above the card, so a frame that
  *  mounts the card alone cannot show what a channel reader actually reads. */
@@ -369,9 +376,8 @@ export function MessageBubble({
           {msg.mention && (
             <span className="text-[13px] text-muted">
               →{' '}
-              {(Array.isArray(msg.mention) ? msg.mention : [msg.mention])
-                .map((id) => '@' + (agents.find((a) => a.id === id)?.role || id))
-                .join(', ')}
+              {fmtList((Array.isArray(msg.mention) ? msg.mention : [msg.mention])
+                .map((id) => '@' + (agents.find((a) => a.id === id)?.role || id)))}
             </span>
           )}
           <span className="text-[13px] text-muted ml-auto">{time}</span>
@@ -407,7 +413,7 @@ export function MessageBubble({
               trustAllLabelKey="components.trustDropdown.trust_all_tools_channel"
               trustCommandLabelKey="components.trustDropdown.trust_this_command_channel"
               trustBaseLabelKey="components.trustDropdown.trust_all_base_channel"
-              trustedLabelKeys={CHANNEL_TRUSTED_LABEL_KEYS}
+              trustedLabelKeys={msg.meta?.name_grants_refused === '1' ? CHANNEL_REFUSED_LABEL_KEYS : CHANNEL_TRUSTED_LABEL_KEYS}
               labelValues={{ role: msg.fromRole }}
               onApprove={onApprove}
             />

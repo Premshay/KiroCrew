@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from chat_test_helpers import _make_ready_kiro_prerequisite
+from named_cases_helpers import named_cases
 
 import kiro_crew.config.paths as paths_mod
 import kiro_crew.hooks as hooks_mod
@@ -22,8 +23,11 @@ from kiro_crew.acp._dispatch import build_permission_event
 from kiro_crew.acp.kas_permissions import KAS_TOOL_IDS_BY_KIRO_TOOL, kas_tool_match_names
 from kiro_crew.agent_sdk import spec_hooks
 from kiro_crew.agent_sdk.backends import (
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_MIMOCODE,
     ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS,
 )
 from kiro_crew.agent_sdk.capabilities import capabilities_for
@@ -57,11 +61,23 @@ def _fresh_cache():
 
 def test_every_backend_crew_fires_spec_hooks_for_has_a_translation_table():
     # A backend that Crew fires spec hooks for needs its own vocabulary: KAS's is
-    # this module's table, every other member's is in harness_tool_names.
+    # this module's table, every other member's is in harness_tool_names. claude,
+    # codex and mimocode are the tables outside that set: Crew fires no preToolUse
+    # spec hooks there, and their tables name a call for hook matching only.
     from kiro_crew.acp.harness_tool_names import HARNESS_TOOL_TABLES
 
     assert ACP_BACKEND_KAS in ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS
-    assert ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS - {ACP_BACKEND_KAS} == frozenset(HARNESS_TOOL_TABLES)
+    # claude and mimocode are the two tables outside that set. Crew fires no spec
+    # hooks on either: claude's table names a call for Hooks-page matchers only;
+    # mimocode's names its calls for the gate's own hooks on the calls that do ask,
+    # while the spec's hooks are withheld because some of its tools never ask
+    # (``providers/mirrors/mimocode.py``).
+    assert ACP_BACKEND_CLAUDE not in ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS
+    assert ACP_BACKEND_CODEX not in ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS
+    assert ACP_BACKEND_MIMOCODE not in ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS
+    assert frozenset(HARNESS_TOOL_TABLES) == (
+        ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS - {ACP_BACKEND_KAS}
+    ) | {ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_MIMOCODE}
 
 
 def test_a_kas_shell_call_answers_to_its_kiro_cli_name():
@@ -158,7 +174,22 @@ def _pre_tool_hooks(matcher: str) -> list[ScriptHook]:
     )
 
 
-@pytest.mark.parametrize("matcher", ["execute_bash", "shell", "run_command", "fs_*", "*"])
+@pytest.mark.parametrize(
+    "matcher",
+    [
+        *named_cases(
+            "test_a_matcher_naming_a_tool_kas_runs_is_kept",
+            "matcher",
+            ["execute_bash", "shell", "run_command", "fs_*", "*"],
+        ),
+        # The matcher kinds kiro-cli reads.
+        *named_cases(
+            "test_kiro_cli_matcher_kinds_are_kept_for_spec_hooks",
+            "matcher",
+            ["@builtin", "@builtin/fs_*", "@github", "@github/get_*", "@mcp", "fs_rea?"],
+        ),
+    ],
+)
 def test_a_matcher_naming_a_tool_kas_runs_is_kept(matcher):
     assert [h.matcher for h in _pre_tool_hooks(matcher)] == [matcher]
 
@@ -168,6 +199,21 @@ def test_a_matcher_the_table_does_not_know_is_kept_and_warned(caplog):
         hooks = _pre_tool_hooks("use_aws")
     assert [h.matcher for h in hooks] == ["use_aws"]
     assert any("use_aws" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("matcher", ["Agent", "NotebookEdit", "exec_command", "write_stdin"])
+def test_a_matcher_naming_only_a_claude_or_codex_id_is_not_warned(matcher):
+    assert spec_hooks._matcher_names_a_kas_tool(matcher)
+
+
+@pytest.mark.parametrize("matcher", ["actor", "notebook_edit", "view_image"])
+def test_a_matcher_naming_only_a_mimocode_id_is_still_warned(matcher, caplog):
+    # mimocode has a table but no fired spec hooks, so its ids must not quiet the
+    # warning a KAS, goose or opencode spec would otherwise get.
+    with caplog.at_level("WARNING", logger="kiro_crew.agent_sdk.spec_hooks"):
+        hooks = _pre_tool_hooks(matcher)
+    assert [h.matcher for h in hooks] == [matcher]
+    assert any(matcher in r.getMessage() for r in caplog.records)
 
 
 def test_a_kept_matcher_meets_the_kas_id_it_names(tmp_path, monkeypatch):
@@ -196,7 +242,6 @@ def test_an_mcp_server_tool_matcher_is_kept_without_a_warning(matcher, caplog):
     [
         "@*/create_issue",  # a server glob would widen the guard across servers
         "@gith?b/create_issue",
-        "@github",  # no tool part
         "@/create_issue",
         "@github/",
         "@github/create/issue",
@@ -518,6 +563,48 @@ async def test_kas_an_mcp_server_tool_spec_hook_blocks_the_mcp_call(
     assert len(ran) == 1 and ran[0].startswith("spec:")
     client.reject_tool.assert_called_once()
     client.approve_tool.assert_not_called()
+
+
+def _claude_bash_request(harness_tool_id: str) -> LLMEvent:
+    # The event build_permission_event makes of the captured claude Bash pair
+    # (acp_frames/claude/builtins-bash-edit-webfetch-live.jsonl).
+    return LLMEvent(
+        kind=EVENT_PERMISSION_REQUEST,
+        title="touch made.txt",
+        tool_kind="execute",
+        request_id="req-1",
+        harness_tool_id=harness_tool_id,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("matcher", ["execute_bash", "shell", "Bash"])
+async def test_claude_a_hooks_page_kiro_cli_matcher_refuses_a_claude_bash_call(
+    tmp_path, agents_dir, monkeypatch, matcher
+):
+    ran = _blocking_runner(monkeypatch)
+    # Crew fires no spec hooks on claude, so the agent's own execute_bash hook
+    # never runs here; only the Hooks-page one does.
+    _write_spec(agents_dir, "execute_bash")
+    state, client = _turn_state(tmp_path, ACP_BACKEND_CLAUDE)
+    _page_hook(state, matcher)
+    await _one_turn(state, client, [_claude_bash_request("claude#Bash")])
+    assert ran == ["page"]
+    client.reject_tool.assert_called_once()
+    client.approve_tool.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_claude_a_hooks_page_matcher_for_another_tool_lets_a_claude_bash_call_through(
+    tmp_path, agents_dir, monkeypatch
+):
+    ran = _blocking_runner(monkeypatch)
+    _write_spec(agents_dir, "execute_bash")
+    state, client = _turn_state(tmp_path, ACP_BACKEND_CLAUDE)
+    _page_hook(state, "fs_write")
+    await _one_turn(state, client, [_claude_bash_request("claude#Bash")])
+    assert ran == []
+    client.approve_tool.assert_called_once()
 
 
 def _fetch_frames() -> list:

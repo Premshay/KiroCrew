@@ -17,9 +17,7 @@ from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 def _make_app(state: DashboardState) -> web.Application:
     app = web.Application()
     app["state"] = state
-    app.router.add_post(
-        "/api/chat/slots/{slot}/interrupt", api_chat_slot_interrupt
-    )
+    app.router.add_post("/api/chat/slots/{slot}/interrupt", api_chat_slot_interrupt)
     return app
 
 
@@ -457,6 +455,29 @@ class TestChatSlotInterrupt:
             # The future should be resolved with "rejected"
             assert fut.done()
             assert fut.result() == "rejected"
+
+    @pytest.mark.asyncio
+    async def test_older_interrupt_idle_outcome_keeps_newer_stop_posture(self, _patch_sel):
+        """A late "idle" from an older /interrupt leaves a newer stop's claim alone.
+
+        The turn ends while the interrupt awaits ``stop_turn`` and a newer
+        press claims a fresh generation; the older "idle" must not settle it.
+        """
+        slot = _ChatSlot("test")
+        slot.task = asyncio.get_running_loop().create_future()
+        slot.queue_append("msg")
+        state = _mock_state(slot)
+
+        async def newer_press_claims_during_await(*_args, **_kwargs):
+            slot._stop_state = "idle"  # the turn ends and resets the posture
+            slot._stop_state = "soft_pending"  # a newer press claims a new generation
+            return "idle"
+
+        state.sessions.stop_turn = AsyncMock(side_effect=newer_press_claims_during_await)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post("/api/chat/slots/test/interrupt", json={})
+            assert resp.status == 200
+        assert slot._stop_state == "soft_pending"
 
 
 class TestRefusalRecoverySkippedOnCancel:

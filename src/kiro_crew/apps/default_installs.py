@@ -127,12 +127,16 @@ def _applied_names() -> frozenset[str]:
     """
     import json
 
-    from kiro_crew.config.loader import KiroCrewConfig, config_path, read_config_text
+    from kiro_crew.config.loader import KiroCrewConfig, config_path, read_endorsed_config_text
 
     names: set[str] = set()
     path = config_path()
-    if path.is_file():
-        raw = json.loads(read_config_text(path))
+    try:
+        # Read as the load reads it, so a deleted file serves its endorsed copy.
+        raw = json.loads(read_endorsed_config_text(path))
+    except FileNotFoundError:
+        raw = None  # neither the file nor an endorsed copy
+    if raw is not None:
         agent_raw = raw.get("agent") if isinstance(raw, dict) else None
         if isinstance(agent_raw, dict):
             names.update(_list(agent_raw, _APPLIED_KEY))
@@ -260,7 +264,7 @@ async def _install_transaction(
     from kiro_crew.apps.manager import enable_app
     from kiro_crew.apps.registry import install_from_registry
     from kiro_crew.apps.routes import (
-        _app_may_run_after_install,
+        _app_may_enable_after_install,
         _register_app_off_loop,
         _start_backend_after_install,
         _suspend_app_for_session_approval_reconsent,
@@ -273,7 +277,7 @@ async def _install_transaction(
         return result
     if not enabled:
         return {**result, "enabled": False}
-    if not await _app_may_run_after_install(result["name"], fresh_install=True):
+    if not await _app_may_enable_after_install(result["name"]):
         await _suspend_app_for_session_approval_reconsent(result["name"])
         return {**result, "enabled": False}
     activated = await asyncio.to_thread(enable_app, result["name"])

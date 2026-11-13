@@ -156,16 +156,46 @@ class WaveDigestCoordinator(ManagerComponent):
         children of this wave's members, so a sibling wave under the same
         parent cannot make this True. It is read-only and never withholds the
         digest — it only informs the wording.
+
+        Reads manager state only. A nested child queued outside the dispatch
+        window exists only as a task-store row, which
+        :meth:`wave_has_live_nested_spawns_async_impl` also counts.
         """
-        if not batch_id:
+        member_keys = self._wave_member_keys(batch_id)
+        return bool(member_keys) and self._nested_live_in_memory(batch_id, member_keys)
+
+    async def wave_has_live_nested_spawns_async_impl(self, batch_id: str) -> bool:
+        """:meth:`wave_has_live_nested_spawns_impl` plus the task store: a
+        member's child accepted while the dispatch window was full has a
+        queued row and nothing in memory. The in-memory halves are read on the
+        loop, each member's store count off it. A store nobody could read
+        answers True (``UNKNOWN_PENDING``), so the digest does not claim a
+        completion it could not check."""
+        member_keys = self._wave_member_keys(batch_id)
+        if not member_keys:
             return False
-        member_keys = {
+        if self._nested_live_in_memory(batch_id, member_keys):
+            return True
+        admission = self._manager._admission
+        for key in sorted(member_keys):
+            if await admission.taskq_overflow_async(key) > 0:
+                return True
+        return False
+
+    def _wave_member_keys(self, batch_id: str) -> set[str]:
+        """The session keys of *batch_id*'s members: the parent key their own
+        spawns carry (``conversation_key`` else ``subagent:<id>``)."""
+        if not batch_id:
+            return set()
+        return {
             (a.conversation_key or f"subagent:{a.id}")
             for a in self._manager._agents.values()
             if a.batch_id == batch_id
         }
-        if not member_keys:
-            return False
+
+    def _nested_live_in_memory(self, batch_id: str, member_keys: set[str]) -> bool:
+        """Whether a running or in-memory queued spawn outside *batch_id* has
+        one of *member_keys* as its parent."""
         if any(
             not a.done and a.batch_id != batch_id and a.parent_session_key in member_keys
             for a in self._manager._agents.values()
@@ -213,6 +243,15 @@ class WaveDigestCoordinator(ManagerComponent):
         member; callers invoke it once per lost submission.
         """
         if not batch_id:
+            return
+        # A Dashboard card's turn starts no sub-agent (the spawn gate refuses every one of
+        # its spawns before any batch accounting), so no sibling of this member was counted
+        # and there is no wave to strand. Announcing a synthetic member would start a
+        # continuation turn on the parent that nobody marked as a card's.
+        from kiro_crew.dashboard import card_send
+
+        if parent_session_key and card_send.card_turn_running(parent_session_key):
+            logger.debug("lost submission %s ignored: its parent runs a card turn", batch_id)
             return
         _bs = self._manager._batch_submitted.setdefault(batch_id, [0, max(0, int(batch_total))])
         _bs[0] += 1

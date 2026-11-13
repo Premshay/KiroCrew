@@ -64,6 +64,7 @@ if TYPE_CHECKING:
         _route_unpinned_start,
         _RunCreditAccounting,
         _selection_kind,
+        _spawning_agents,
         _validate_agent,
         _vet_spawn_governance,
         acp_error_is_transient,
@@ -103,9 +104,17 @@ async def _run_inner_impl(
     usage: _RunCreditAccounting,
 ) -> None:
     """Inner execution — called within timeout wrapper."""
+    # A recovery attempt that never gets a session must not erase the one an
+    # earlier attempt ran in: the crew-log closer names it (``child_sid``).
+    setattr(
+        info,
+        "_last_session_id",
+        getattr(info, "_session_id", "") or getattr(info, "_last_session_id", ""),
+    )
     setattr(info, "_session_id", "")
     setattr(info, "_session_provider", "")
     setattr(info, "_session_cwd", "")
+    setattr(info, "_session_codex_home", "")
     # Mark the real start of execution BEFORE any await so the startup
     # watchdog measures from here, not from registration (which may include
     # an arbitrary spawn-approval wait). Must be the first statement.
@@ -225,7 +234,7 @@ async def _run_inner_impl(
         info._state_drain_active = False
     from kiro_crew.subagent_manager import turn_session as _session
 
-    parent_policy = _session.resolve_parent_policy(self, info)
+    parent_policy, ask_key = await _session.resolve_parent_policy(self, info)
     # Admission captured both memory identity and this invocation's persona
     # before any asynchronous work. A continuation's explicit override is
     # effective only for this turn; its next continuation keeps its lineage.
@@ -244,9 +253,19 @@ async def _run_inner_impl(
     kind = _selection_kind(info)
     if info.crew or execution.member_id or (not info.agent and agent):
         policy_agent = info.crew or (execution.selection_name if kind == "member" else agent)
-        denial = await asyncio.to_thread(
-            _vet_spawn_governance, info.parent_session_key, policy_agent, app=info.app
-        )
+        denial = None
+        for parent_agent in _spawning_agents(
+            self._manager._agents.values(), info.parent_session_key or ""
+        ) or ("",):
+            denial = await asyncio.to_thread(
+                _vet_spawn_governance,
+                info.parent_session_key,
+                policy_agent,
+                app=info.app,
+                **({"parent_agent": parent_agent} if parent_agent else {}),
+            )
+            if denial:
+                break
         if denial:
             raise RuntimeError(f"spawn refused by governance: {denial}")
         sel().log_api_access(
@@ -270,20 +289,21 @@ async def _run_inner_impl(
         from kiro_crew.mate_worker import crewmate_worker_backend, worker_kit_backend_refusal
 
         _cfg = await asyncio.to_thread(_Config.load)
+        _crew = crew_for_member_id(_cfg, str(execution.member_id or ""))
         try:
             worker_backend = (
                 resolve_selected_backend(info.backend)
                 if info.backend is not None
-                else crewmate_worker_backend(
-                    _cfg, crew_for_member_id(_cfg, str(execution.member_id or ""))
-                )
+                else crewmate_worker_backend(_cfg, _crew)
             )
         except CrewmateHarnessUnavailable as exc:
             # The crewmate's pinned harness cannot start, so neither can its
             # worker; it never runs on another harness in its place. The
             # message leads with its code, as the kit refusal below does.
             raise RuntimeError(str(exc)) from None
-        backend_reason = worker_kit_backend_refusal(worker_backend)
+        backend_reason = worker_kit_backend_refusal(
+            worker_backend, _cfg, _crew, requested=info.backend is not None
+        )
         if backend_reason is not None:
             raise RuntimeError(f"capability_harness_unsupported: {backend_reason}")
     elif agent and (kind == "member" or (info.conversation_key and not info.agent)):
@@ -364,6 +384,9 @@ async def _run_inner_impl(
         extra_kwargs["allowed_tools"] = info.allowed_tools
     if info.cwd:
         extra_kwargs["cwd"] = info.cwd
+    # A run that withholds memory keeps the harness's own memory out too.
+    if not info.include_memory:
+        extra_kwargs["include_memory"] = False
     # A dedicated process joins its parent's session tree: the parent's
     # ``$KIROCREW_SCRATCH`` is mounted beside the child's own scratch and is
     # what the child's ``$KIROCREW_SCRATCH`` names, so a brief the parent
@@ -382,7 +405,7 @@ async def _run_inner_impl(
     # ── Session sharing: reuse parent's shared AcpRuntime ──
     # When enabled and eligible, subagents get a session on the parent's
     # companion AcpRuntime (~200ms startup, ~0 memory) instead of spawning
-    # a fresh kiro-cli process (~3-5s, ~400MB).
+    # a fresh kiro-cli process (~3-5s, ~0.55 GB).
     #
     # Retain-by-default: EVERY run keeps its session files (teardown skips
     # deletion on both arms), so any completed run is continuable while
@@ -534,8 +557,10 @@ async def _run_inner_impl(
     child_escalations_by_origin: dict[str, int] = {}
     await _session.persist_spawn_records(self, info, session_key, agent, client)
 
-    _rp = agent_dir_for_display(info.id) / "result.txt"
-    info.result_path = str(_rp)
+    # Off the loop: the display path resolves the run directory, a realpath that
+    # opens every path part on Windows.
+    _run_dir = await asyncio.to_thread(agent_dir_for_display, info.id)
+    info.result_path = str(_run_dir / "result.txt")
     # This attempt's first text chunk starts the live partial and
     # result.txt afresh, so they hold this attempt's text alone, never
     # glued to an earlier attempt's: until then that partial stays
@@ -561,6 +586,19 @@ async def _run_inner_impl(
     # On such a backend PreToolUse hooks gate each permission request below;
     # the KAS projection turns every call they cover into one.
     _spec = await turn_spec_hooks(client, agent)
+    if _spec.lost:
+        # Once per run, for the operator. Not in the result, which callers may
+        # parse. The log counts the keys and does not name them, so no spec text
+        # reaches it; a dashboard chat on the same agent names them.
+        from kiro_crew.agent_sdk.spec_hooks import session_agent
+
+        logger.warning(
+            "Subagent %s: agent %s sets %d spec key(s) this backend does not apply "
+            "as written in this run",
+            info.id,
+            session_agent(client, agent),
+            len(_spec.lost),
+        )
     _hook_prefix = await _session.fire_prompt_hooks(
         self,
         info,
@@ -568,6 +606,7 @@ async def _run_inner_impl(
         task=raw_task,
         fresh_session=is_new and not _resumed,
         spec=_spec,
+        client=client,
     )
     from kiro_crew.prompt_segments import prepend_injected
 
@@ -586,9 +625,13 @@ async def _run_inner_impl(
             session_key=session_key,
             agent=info.agent or "",
             app=info.app or "",
+            # The ladder's SpecHooks floor fired the PreToolUse hooks first.
+            pre_tool_hooks_fire=True,
             **hook_gate_kwargs(event),
         )
         return verdict
+
+    _parent_revoked = _session.parent_trust_revoked(self._manager._sessions, info._approval_lineage)
 
     def _policy_for(spec: Any) -> tool_permission.Policy:
         # ``sel`` is read per row, as the facade's audit seam expects.
@@ -596,9 +639,11 @@ async def _run_inner_impl(
             info,
             spec=spec,
             parent_policy=parent_policy,
+            ask_key=ask_key,
             consult=_consult_gate,
             sel=lambda: sel(),
             log=logger,
+            parent_revoked=_parent_revoked,
         )
 
     _wire = tool_permission.AcpWire(client)
@@ -1393,6 +1438,8 @@ async def _run_inner_impl(
                     _tool_name = _pending_tools.pop(event.tool_call_id, "")
                     _named = _pending_tool_ids.pop(event.tool_call_id, None)
                     _out = _redact((event.tool_output or "")[:2000])
+                    # The child's own ACP session id, for its spec hooks only.
+                    _sid = getattr(client, "session_id", "") if _spec.hooks else ""
                     await self._manager.hook_store.fire(
                         HOOK_EVENT_POST_TOOL_USE,
                         tool_name=_tool_name,
@@ -1417,6 +1464,7 @@ async def _run_inner_impl(
                             if _named is not None and _spec.hooks
                             else None
                         ),
+                        acp_session_id=_sid if isinstance(_sid, str) and _sid else None,
                     )
                 except Exception:
                     logger.debug(
@@ -1432,6 +1480,12 @@ async def _run_inner_impl(
     # current prompt stats are still the authoritative billing record.
     usage.settle()
 
+    # kiro-cli's [STEERING steer-…] ack is protocol, not the run's answer: drop
+    # it before the completion result and the result.txt rewrite both read it.
+    # Imported here: this body runs on kiro_crew.subagent's globals.
+    from kiro_crew.messaging.driver import strip_steering_markers
+
+    result_text = strip_steering_markers(result_text)
     # Strip [OPTIONS: ...] tags and redact sensitive content
     cleaned, _ = extract_options(result_text) if result_text else (result_text, [])
     # Read before the fallback annotation, which is not a reply.

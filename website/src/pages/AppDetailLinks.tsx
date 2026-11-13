@@ -63,3 +63,15 @@ export default function AppDetailLinks({ links }: { links: unknown }) {
     </div>
   )
 }
+
+/** Issue tracker for an already validated repository URL. */
+export function repositoryIssuesUrl(source: string | null): string {
+  if (!source) return ''
+  try {
+    return new URL(source).hostname === 'github.com'
+      ? `${source.replace(/\/+$/, '').replace(/\.git$/, '')}/issues`
+      : ''
+  } catch {
+    return ''
+  }
+}

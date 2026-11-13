@@ -2,36 +2,39 @@
 
 ## Overview
 
-Command Bar is a builtin App Store app (`kiro_crew/apps/builtins/command_bar/`) that replaces
-the dashboard's quick-search surface with a launcher: the reader types a command rather than a
-query. It is the first app to ship with **no backend at all** — no subprocess, no port, no
-proxy, no routes. Its whole surface is a code-split React chunk in the dashboard bundle, so it
-carries the same origin, i18n catalogs, design system and build as the shell.
+Command Bar is the dashboard's own quick-search launcher (`website/src/components/commandBar/`):
+it replaces the legacy command palette on the quick-search gesture, so the reader types a
+command rather than a query. It has **no backend at all**: no subprocess, no port, no proxy, no
+routes. Its whole surface is a code-split React chunk in the dashboard bundle, loaded by
+`QuickSearchSurface` the first time the gesture opens it.
 
-The app id is `command-bar`; the display name is "Command Bar". `defaultEnabled` is TRUE, so a
-fresh install has the launcher on the quick-search gesture and there is no config key for the
-feature -- the app's enabled state is the switch. Builtins otherwise ship default-off, so this
-exemption is declared where every other one is, on `manager._DEFAULT_ON_BUILTINS`; the manifest
-flag alone would fail the opt-in policy tests. Disabling the app hands the gesture back to the
-legacy command palette, which is left in place precisely so that is a real choice rather than a
-downgrade; nothing about that path changes while the app is off.
+The switch is `dashboard.command_bar_enabled` (Settings, Display, View; default on). The shell
+reads it from the shared `['kirocrewConfig']` query (`shell/appShell.tsx`) and passes it to
+`QuickSearchSurface`; only a literal `false` is off, and until the config has loaded the gesture
+opens the palette. Off hands the gesture back to the legacy command palette, which is left in
+place precisely so that is a real choice rather than a downgrade; nothing about that path changes
+while the bar is off. The labels on the controls that open the gesture follow the same switch
+(`quickSearchLauncher` in the shell), so a trigger never promises a search the launcher omits.
 
-The flag reaches FRESH installs only. An install that registered `command-bar` while it was still
-default-off keeps `enabled: false` forever, and because this app has no page it appears in neither
-the launcher's own app list nor Discover — so those users have no way to learn it exists.
-`manager.backfill_default_on_builtins()`, which reads `manager._DEFAULT_ON_BACKFILL` and records
-delivery on the app's own record (`InstalledApp.defaultOnBackfilled`, written in the same atomic
-write that flips `enabled`), is what delivers the launcher to them; see app-kit-platform section 12.
+It used to be the built-in app `command-bar`, whose enabled state was the switch. That record is
+now a migrated built-in (`apps/builtins._MIGRATED_BUILTINS`), and the boot cleanup that removes
+it first writes its opt-out to the setting (`apps/builtin_fold.py`, through
+`_FOLDED_BUILTIN_SWITCHES`): a record with the app off writes `command_bar_enabled: false`, a
+record with it on writes nothing because the setting defaults on, and a record still owed its
+default-on promotion (the old `_DEFAULT_ON_BACKFILL` delivery) reads as on unless the `apps`
+governance allowlist denied the app. A key already in `config.json` is kept, and a write that
+fails keeps the record so the next start tries again. The retired-built-in uninstall path
+carries the opt-out the same way. `test/test_command_bar_fold.py` pins each case.
 
-What makes the app worth existing is a single invariant: **the first page issues no network
+What makes the Command Bar worth existing is a single invariant: **the first page issues no network
 request.** The palette it replaces ran an unindexed scan over the sessions corpus on every
 keystroke, so fast typing could stall unrelated streaming. Command Bar's root carries only
 locally-known rows — sessions awaiting a user decision, commands, app destinations, and system
 settings — and every corpus search is a view the reader ENTERS, so the expensive work is explicit
 and chosen.
 
-Four such views exist: session search, artifact search, folder search, and mate search. The
-mate feature adds three rows — the view row, the query-carrying fallback row, and the
+Four such views exist: session search, artifact search, folder search, and Bot search. The
+Bot feature adds three rows — the view row, the query-carrying fallback row, and the
 empty-state row. The artifacts view
 asks `GET /api/artifacts?q=<query>` and nothing else — no `content=1`, no `snippet=1` — so the
 server matches NAMES only (`name_contains` in `api_artifacts_list`) and never opens a stored
@@ -49,35 +52,35 @@ on a cold cache. The folder list used to be spread through the root as its own g
 demoted and capped while the query was empty, so the feature read as missing, and competing with
 commands once it was not.
 
-That corpus lives in THIS app (`apps/command-bar/foldersProvider.ts`), and the host palette
+That corpus lives in the Command Bar (`components/commandBar/foldersProvider.ts`), and the legacy palette
 carries no Folders tab. Reaching a folder by name is a launcher capability, so the launcher owns
-it: the alternative is two implementations of the same gesture, one in the app and one in the
-surface the app replaces, differing over ranking and reveal and answering to nobody. The corpus
+it: the alternative is two implementations of the same gesture, one in the bar and one in the
+surface the bar replaces, differing over ranking and reveal and answering to nobody. The corpus
 is hook-free for the same reason the session and artifact engines are — the React-Query fetch and
 the `usePaletteActions` route change are wired in `CommandBarOverlay` (its
-`useCommandBarOverlayEngines` owner), which is the only thing holding this app's seams. It still
+`useCommandBarOverlayEngines` owner), which is the only thing holding the bar's seams. It still
 renders the host's `Result` row contract, because forking the row shape would fork the Enter
 matrix with it.
 
-The mates view (`apps/command-bar/matesProvider.ts`) reaches the reader's own crew: typing
-filters the roster by fuzzy name and Enter lands on that mate's pinned DM thread
+The Bots view (`components/commandBar/matesProvider.ts`) reaches the reader's own crew: typing
+filters the roster by fuzzy name and Enter lands on that Bot's pinned DM thread
 (`/members?member=<name>`, encoded — a crew may be called `Review & QA`). It is a VIEW rather
 than a root group, and the roster's size is the reason it looks like it should be the other way
 round. The deciding fact is that the corpus is a FETCH: `GET /api/agents/catalog`, which
 `useAgents` calls on mount and which no WebSocket push seeds into the cache. A root group would
-therefore either issue that request on every open of the bar — the one invariant this app
-exists for — or subscribe to a cache nothing fills and render an empty Mates group on a cold
+therefore either issue that request on every open of the bar, breaking the one invariant
+the bar exists for, or subscribe to a cache nothing fills and render an empty Bots group on a cold
 install, which reads as the feature being absent. Like the folders view it has no minimum query
 length and no row cap: once the catalog resolves, a keystroke is a local filter over the
 reader's own crew.
 
 Two fields of a row come from different places, and only one of them is cached. Identity,
-label, role and avatar are the catalog's; whether the mate is WORKING is read from the live slot
+label, role and avatar are the catalog's; whether the Bot is WORKING is read from the live slot
 frames the root's attention group already uses (`mode === 'member'` and
 `running || subagents_running`), keyed on `slot.agent`, which a member slot is born with pinned
 to its crew's exact name. That running set is part of the view's query KEY, not merely a
 dependency of the engine: rebuilding the engine does not re-run a resolved query, so without it
-a mate that had finished would keep its busy dot for the rest of the stale window. The same key
+a Bot that had finished would keep its busy dot for the rest of the stale window. The same key
 carries `placeholderData`, which is the cost of that decision paid back — this is the only view
 whose key moves on an event the reader did not cause, and without held-over rows a member slot
 finishing anywhere in the dashboard blanks the list and the selection clamp pulls the reader's
@@ -87,9 +90,9 @@ is one state, the sessions view is one keystroke away, and two words for it left
 to tell whether they meant the same thing. Only members are listed — the catalog also answers
 with installed templates, and a template has no DM thread, so a row for one would navigate to a
 page that cannot open it. The built-in `default` assistant is excluded for the same reason
-in a second shape: it arrives tagged as a member, and the Mates page treats a roster
+in a second shape: it arrives tagged as a member, and the Bots page treats a roster
 holding only `default` as EMPTY — it draws the empty-roster hero, never opens a thread for
-it, and skips it when choosing which mate to open. It is also what a fresh install has
+it, and skips it when choosing which Bot to open. It is also what a fresh install has
 instead of a crew, so listing it would make the first thing a new reader sees in this view
 a row that cannot be opened, in place of the empty state that tells them where to make one.
 
@@ -100,13 +103,13 @@ the role — otherwise the row cannot explain itself, and typing `qa` surfaced a
 "reviewer" with no highlight anywhere that read as a wrong result. That is the answer
 `foldersProvider` already gives when an ancestry path is why a folder surfaced, with one
 difference that matters: the identity is GLOSSED ("also called qa-bot"), because a bare second
-name under a different title reads as a possible second mate, where `kirocrew › oss`
+name under a different title reads as a possible second Bot, where `kirocrew › oss`
 self-evidently reads as a path. The highlight offsets are recomputed against the glossed
 string, since the gloss shifts every position. The description is rendered on every other row
 and deliberately never matched — that would make this a content search over prose, and the row
 could not honestly highlight it.
 
-The view's EMPTY state is a row, not a centred sentence. Naming the Mates page without a
+The view's EMPTY state is a row, not a centred sentence. Naming the Bots page without a
 way to reach it was the dead end — a reader reported that "nothing looks like a link", so the
 one thing they came to do had no affordance. As a row it carries both halves the way the
 no-match row does (what is true, and what Enter does about it) and the keyboard reaches it
@@ -114,7 +117,7 @@ without leaving the list. It is gated on the roster having actually answered, so
 draws the skeleton rather than briefly claiming the reader has no crew.
 
 Adding this view cost the `commands` group its shared cap. Six builtin rows (New Session, Toggle
-Theme, and one corpus entry each for sessions, artifacts, folders and mates) exactly filled
+Theme, and one corpus entry each for sessions, artifacts, folders and Bots) exactly filled
 `PER_GROUP_LIMIT`, which silently evicted every app-CONTRIBUTED command from the idle page: the
 app installed fine, its manifest was accepted, its row was simply absent. The sixth builtin only
 revealed the defect, which is a cap counting the product's own rows against an app's.
@@ -129,8 +132,8 @@ eviction.
 
 ## Responsibilities
 
-1. **Claim the slot** — declare `ui.overlays` in the manifest and take over the `quick-search`
-   host slot while enabled, without the shell ever naming an app
+1. **Serve the gesture**: open on the quick-search gesture while `dashboard.command_bar_enabled`
+   is on and no built-in app overlay owns the `quick-search` slot
 2. **Root index** — build the attention / command / app / settings rows from local data only,
    rank them, and cap each group. Settings rows match through `scoreSettingEntry`, the scorer
    the palette and the Settings search share (label, synonyms, then a description or tab that
@@ -143,15 +146,15 @@ eviction.
 3. **Ranking** — fuzzy match against the live query plus a frecency boost, so habit surfaces
    without out-ranking a clearly better string match
 4. **Scopes** — enter a sub-surface (today: session search, artifact name search, folder search,
-   and mate search) as a navigation state, with its own engine loaded on entry
+   and Bot search) as a navigation state, with its own engine loaded on entry
 5. **Fallback** — for any non-empty root query, offer Ask plus rows that carry the query into
-   the sessions, artifacts, folders, and mates views; when no root row matches, also offer
-   the app page that can disable Command Bar
+   the sessions, artifacts, folders, and Bots views; when no root row matches, also offer
+   the Command Bar's own switch in Settings, opened highlighted
 
 ## Source layout
 
-`website/src/apps/command-bar/CommandBarOverlay.tsx` is the overlay's only import path (the
-`overlayRegistry.ts` lazy entry, the specs that mount it). It keeps the dialog: the navigation
+`website/src/components/commandBar/CommandBarOverlay.tsx` is the overlay's only import path (the
+`QuickSearchSurface.tsx` lazy entry, the specs that mount it). It keeps the dialog: the navigation
 state, the lifecycle effects, copy, the argument state, the key handler and the rendered panel.
 It calls each owner hook at the point its code sits in the component's hook order; owners never
 import the facade, and nothing else imports an owner.
@@ -160,7 +163,7 @@ import the facade, and nothing else imports an owner.
 |---|---|---|
 | `commandBarOverlayModel.ts` | `Scope`, `Slot`, the view limits, the row, header and footer labels | a slot tag, scope, limit or label |
 | `CommandBarOverlayRootRows.tsx` | the root's rows and their ranking | a root row or group |
-| `useCommandBarOverlayEngines.ts` | every view's engine (the sessions search and listing, artifacts, folders, mates), the cache entries read without fetching | a view's engine, a cache entry the bar reads |
+| `useCommandBarOverlayEngines.ts` | every view's engine (the sessions search and listing, artifacts, folders, Bots), the cache entries read without fetching | a view's engine, a cache entry the bar reads |
 | `useCommandBarOverlaySlots.ts` | each view's read, `rowsAnswerTheQuery`, the slot list and its loading state | a view's read or a tail row |
 | `useCommandBarOverlayActivation.ts` | what Enter and a click do, the session seeding, the stale-Enter latch | a slot's activation |
 | `CommandBarOverlaySlot.tsx` | how one slot renders | a slot's look |
@@ -172,7 +175,9 @@ import the facade, and nothing else imports an owner.
 `ui.overlays` is a manifest array of `{id, replaces}`; both fields are required and
 kebab-validated (`_OVERLAY_SLUG_RE` in `apps/manifest_sections.py`). `replaces` names a HOST SLOT, and
 the only slot that exists is `quick-search` (`HOST_OVERLAY_SLOTS` in
-`website/src/apps/overlayRegistry.ts`).
+`website/src/apps/overlayRegistry.ts`). The Command Bar no longer comes through this seam, and
+`BUILTIN_OVERLAY_REGISTRY` is empty, so no shipped app claims the slot; an owner, if one ever
+resolved, would still take the gesture ahead of the Command Bar setting.
 
 Resolution lives in `website/src/apps/overlaySlots.ts`. `resolveSlotOverlays` accepts a claim
 only when all of these hold:
@@ -186,8 +191,8 @@ only when all of these hold:
 The provenance check is load-bearing, not decoration. `register_external_app` takes `source`,
 `origin`, `resources` and `lifecycle` as caller parameters and refuses only `origin ==
 "builtin"`, and it never runs `_validate_source_path`. Without the check, a self-managed app
-could persist a manifest declaring `id: "command-bar"` and take over the gesture WHILE Command
-Bar itself was disabled. `origin` is stamped by `discover_builtin_apps()` and reaches
+could persist a manifest declaring a builtin's overlay id and take over the gesture WHILE that
+builtin was disabled. `origin` is stamped by `discover_builtin_apps()` and reaches
 `InstalledApp(origin="builtin")` in `apps/manager_builtins.py`, which is why it is the field to trust.
 
 Manifest data from a third party is untrusted input, so a bad declaration is warned about and
@@ -201,7 +206,7 @@ that.
 
 ## Root rows
 
-`website/src/apps/command-bar/rootIndex.ts` owns the row model.
+`website/src/components/commandBar/rootIndex.ts` owns the row model.
 
 - `ROOT_GROUPS = ['attention', 'recent', 'commands', 'apps', 'settings']`, rendered in that
   order while the query is EMPTY. `attention` is normally absent and contains only live sessions
@@ -253,7 +258,7 @@ that.
   of the title and only survived as a scattered subsequence. The cap on weak matches holds under
   a query for the same reason it holds on the idle page: a word that merely scatters across six
   long setting titles would otherwise spend six rows and push the overlay's recovery rows (Ask
-  the agent, Search sessions / artifacts / folders / mates) below the fold — and those rows
+  the agent, Search sessions / artifacts / folders / Bots) below the fold — and those rows
   are the whole answer to "the root does not search content" for a reader who typed a name. A
   DIRECT settings hit (the query is a substring of the title) is the user naming the setting, so
   it ranks up to `PER_GROUP_LIMIT` like any row and searching settings on their own name surfaces
@@ -284,7 +289,7 @@ that.
 
 ## Ranking and frecency
 
-`website/src/apps/command-bar/frecency.ts` keeps a per-browser usage map in `localStorage`
+`website/src/components/commandBar/frecency.ts` keeps a per-browser usage map in `localStorage`
 with a 14-day half-life, read through a guarded accessor (a disabled or full store degrades to
 no boost rather than throwing). `FRECENCY_WEIGHT` is sized so habit beats a marginally better
 string match but not a clearly better one: an exact prefix hit on a never-used row still wins
@@ -327,7 +332,7 @@ an INDEX, and that index means a different row once the rows move under it — w
 acts on the rows in that window. It does not drop the keystroke either: type-a-name-then-confirm
 is the launcher's primary gesture, and eating it left a fast typist pressing Enter at a bar that
 said nothing. The Enter is LATCHED — held, then fired once, on the rows that answer the query it
-was pressed against — so the gesture lands on the right session, artifact, folder or mate
+was pressed against — so the gesture lands on the right session, artifact, folder or Bot
 instead of the wrong one or none.
 
 The latch remembers the query the reader confirmed and the row they had selected, and it fires
@@ -361,7 +366,7 @@ from the same debounced query its results are, so a check that covered results a
 latched Enter act on a stale no-match or empty-crewmates row at the dead end where a reader types
 another character.
 
-The query matching is not on its own enough for the mates view, which holds its previous rows
+The query matching is not on its own enough for the Bots view, which holds its previous rows
 across a key change (see the running-set key above). That hold is scoped to the running set: rows
 are never held across a change of the query, because those answer the previous words while the
 debounced query already matches the new ones.
@@ -380,6 +385,14 @@ debounced query already matches the new ones.
   its row.
 - Escape is owned by the dialog, not the input, so it works from any focusable child. In a
   scope the first Escape pops back to the root and only the second closes.
+- A dismiss (Escape, an outside click, the gesture toggling the bar shut, a pane switch) gives
+  focus back to the control the bar was opened from: the header button, or the composer a
+  Ctrl+K came from. `useCommandPalette` reads that control at the gesture and the host passes it
+  as `opener`, because by the time the bar mounts its loading field or its own `autoFocus` input
+  holds focus; the focus trap runs with `restoreFocus: false` for the same reason. The backdrop's
+  `mousedown` is default-prevented, since the browser's own handling of that press runs after
+  the close and would clear focus again. A row that closes the bar gives nothing back: the
+  action it ran owns focus, as in the legacy palette.
 - The input is `role="combobox"` with `aria-activedescendant`; rows are `role="option"` with
   `aria-selected`. Arrow keys move the active option without moving DOM focus.
 - Because the input is focused for the whole life of the dialog, a `focus-visible` utility on
@@ -426,16 +439,16 @@ debounced query already matches the new ones.
 |---|---|
 | the root issues no request | a provider constructed at mount can subscribe a query even when the root never calls it |
 | the artifacts view matches NAMES only | a `content=1` or `snippet=1` param turns each entry into a read of every stored body |
-| the artifacts fallback row issues no request while it is merely OFFERED | offering a way into the corpus becomes a scan on every keystroke, which is the cost this app exists to avoid |
+| the artifacts fallback row issues no request while it is merely OFFERED | offering a way into the corpus becomes a scan on every keystroke, which is the cost the bar exists to avoid |
 | the artifacts row cap names its remainder, from OUTSIDE the listbox | a silent slice reads as "these are all of them"; a counted row inside the listbox is an option Enter cannot act on |
 | the root ranks from the live query | a debounced read discards a fast-entered query |
-| the mates view is entered, never fetched from the root | the catalog `useAgents` calls on mount becomes a request on every open of the bar |
-| the mates view lists MEMBERS only | a template row navigates to a page with no thread to open |
-| the mates view excludes the built-in `default` | a fresh install's first row is one the Mates page opens for nobody, in place of the empty state |
-| the mates read shares `['agents-catalog', 'global']` | two caches of one sessionless response, so the dialog fetches and the bar refetches the same bytes |
-| a mate route is encoded | a crew called `Review & QA` truncates the parameter and opens the page on nothing |
-| a mate row is keyed on the immutable `name`, not the display label | a renamed crew routes to a member that does not exist, and reads as idle while it is working |
-| the running set is part of the mates query key | a resolved query keeps a finished mate's busy dot for the rest of the stale window |
+| the Bots view is entered, never fetched from the root | the catalog `useAgents` calls on mount becomes a request on every open of the bar |
+| the Bots view lists MEMBERS only | a template row navigates to a page with no thread to open |
+| the Bots view excludes the built-in `default` | a fresh install's first row is one the Bots page opens for nobody, in place of the empty state |
+| the Bots read shares `['agents-catalog', 'global']` | two caches of one sessionless response, so the dialog fetches and the bar refetches the same bytes |
+| a Bot route is encoded | a crew called `Review & QA` truncates the parameter and opens the page on nothing |
+| a Bot row is keyed on the immutable `name`, not the display label | a renamed crew routes to a member that does not exist, and reads as idle while it is working |
+| the running set is part of the Bots query key | a resolved query keeps a finished Bot's busy dot for the rest of the stale window |
 | that query holds its previous rows across the key change | a slot finishing elsewhere blanks the list and resets the reader's keyboard selection to row 0 |
 | it holds them across the RUNNING SET only, never across the query | rows answering the previous words stay actionable for as long as the new read takes |
 | a scoped-view Enter is latched and fired on the rows that answer the query it was pressed against | a dropped keystroke makes a fast typist confirm into silence, and acting now opens the row selected against an older query |
@@ -443,17 +456,18 @@ debounced query already matches the new ones.
 | the latch fires only at a settled result row, and drops at a synthesized dead end | a latch firing a no-match row discards the query just typed, and one firing an empty-roster row navigates away |
 | that guard binds the keyboard, not the pointer | a row the reader can read and press stops responding |
 | the guard compares what the view WOULD ask against what it DID ask | a sub-floor query freezes Enter on a listing that is the correct answer to it |
-| a mate row says BUSY in the same word as a session row | two vocabularies for one state, one keystroke apart, that a reader cannot tell apart |
+| a Bot row says BUSY in the same word as a session row | two vocabularies for one state, one keystroke apart, that a reader cannot tell apart |
 | an identity match shows the identity it matched | a row surfaces with no highlight anywhere and reads as a wrong result |
-| that identity is GLOSSED, and its highlight recomputed against the gloss | a bare second name reads as a second mate, and carried-over offsets mark the gloss's own words |
-| those offsets are shifted by the template's INTERPOLATION SITE | a mate named `cal` glosses to "also called cal" and the highlight marks the `cal` inside "called" |
-| the empty mates state is an Enter-able row | the view names the Mates page with no way to reach it, and nothing looks like a link |
+| that identity is GLOSSED, and its highlight recomputed against the gloss | a bare second name reads as a second Bot, and carried-over offsets mark the gloss's own words |
+| those offsets are shifted by the template's INTERPOLATION SITE | a Bot named `cal` glosses to "also called cal" and the highlight marks the `cal` inside "called" |
+| the empty Bots state is an Enter-able row | the view names the Bots page with no way to reach it, and nothing looks like a link |
 | that row waits for the roster to answer | a cold fetch briefly claims the reader has no crew |
-| a failed mate read renders an ErrorNotice | the retry row carries no text by design, so the failure is unexplained and indistinguishable from a crew-less install |
+| a failed Bot read renders an ErrorNotice | the retry row carries no text by design, so the failure is unexplained and indistinguishable from a crew-less install |
 | the `commands` cap counts CONTRIBUTED rows only | a builtin added here evicts an app-contributed row with nothing on screen saying so |
 | that cap still bounds one app's contributions | an app with twenty commands turns the first page into its index |
 | the product's own command list is uncapped | a builtin silently dropped from a page this repository reviews |
 | `aria-modal` and the focus trap travel together | a dialog that traps nothing while claiming modality |
+| a dismiss gives focus back to the opener, a row that closes the bar does not (`CommandBarOverlay.restoreFocus.test.tsx`) | Escape leaves the keyboard user on `<body>` (#29716); a split-view pick of the active session hands focus back to the other pane's composer, where the next Enter sends |
 | a session opened from the bar ends with the caret in its composer, same-key or not | a keyboard-first switch that ends in a mouse click on the composer (#15732) |
 | the caret moves only once the opened session's `switchSlot` has fulfilled; a refused switch gets none from the bar | keystrokes typed during the gateway round trip filed under a slot the 404 unwind then evicts |
 | an older same-key read landing first defers the caret to the newer claim | a stale fulfilment focusing while the live read is still out, then its 404 stranding the typed text |
@@ -657,19 +671,17 @@ of the reader's session appearing at all.
 
 ## Switching it off, and back on
 
-Both directions have to work in the UI, and one of them nearly did not. The Apps page
-builds its Discover shelf from the network-fetched catalog, which carries no row for this
-app, and its Library list hides disabled builtins -- so with the app off it would have
-appeared on neither surface and could only be re-enabled over the API. Library therefore
-keeps listing a disabled builtin unless its manifest sets `hidden`
-(`keepInLibrary` in `website/src/pages/apps/useAppsData.ts`): an app a reader turns off and
-then needs to find again has to stay on the one surface that carries Enable, and this app's
-own description tells them to disable it to get the old surface back. The rule is keyed on
-being installed, not on this app's name, and it lists the other default-off builtins too.
+Both directions are one toggle: Settings, Display, View, "Use Command Bar", which writes
+`dashboard.command_bar_enabled` through `PATCH /api/config/kirocrew`. The shell and the toggle
+read the same `['kirocrewConfig']` cache, so the gesture follows the switch at once with no
+reload. The recovery row at the bar's dead end opens that toggle, highlighted, through the
+settings registry entry (`display.use-command-bar`), so turning the bar off never needs the reader to
+know where the switch is. While the bar was an app this lived on its Library card, which
+`keepInLibrary` in `website/src/pages/apps/useAppsData.ts` kept listed while it was disabled.
 
 ## Deliberately not here
 
-- **Session search on the root.** Removed on purpose; it is the cost the app exists to avoid.
+- **Session search on the root.** Removed on purpose; it is the cost the bar exists to avoid.
 - **Artifact CONTENT search.** The artifacts view matches names only. Reading bodies means
   `snippet=1` on every entry, and a snippet response then needs a payload budget, a sort
   guarantee and somewhere to put "more results" — a contract to design against a response shape

@@ -483,7 +483,9 @@ def _build_helper(name: str, source: str, *, build: bool = True) -> str | None:
     # into a directory that stayed world-traversable.
     try:
         if (os.stat(cache).st_mode & 0o077) != 0:
-            logger.warning("%s is not owner-only; helper stays group/other readable", cache)
+            logger.warning(
+                "SECURITY: %s is not owner-only; helper stays group/other readable", cache
+            )
     except OSError:
         pass
     binary = cache / name
@@ -837,6 +839,15 @@ async def transcribe(
                 except (OSError, ProcessLookupError):
                     pass
                 return None, {"error": f"timed out after {timeout_secs}s"}
+            except asyncio.CancelledError:
+                # The caller gave up (an uploader that disconnected): stop the
+                # helper before its launcher and audio are removed below.
+                try:
+                    proc.kill()
+                    await proc.communicate()
+                except (OSError, ProcessLookupError):
+                    pass
+                raise
         except OSError as exc:
             return None, {"error": f"could not run speech helper: {exc}"}
         finally:

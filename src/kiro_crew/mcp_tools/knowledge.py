@@ -22,6 +22,9 @@ from typing import Any
 
 from kiro_crew import mcp_core
 from kiro_crew.knowledge import store as knowledge_store
+from kiro_crew.mcp_tools.catalog.knowledge import (  # noqa: F401
+    schemas,
+)
 from kiro_crew.validation import (
     KNOWLEDGE_ADD_DOCUMENT_SCHEMA,
     KNOWLEDGE_DEDUP_SCHEMA,
@@ -58,167 +61,6 @@ def _fetch_remote_results(query: str, limit: int, source_id: str | None) -> list
     return [r for r in results if isinstance(r, dict)] if isinstance(results, list) else []
 
 
-def schemas() -> list[dict[str, Any]]:
-    """Descriptors for the knowledge tools."""
-    return [
-        {
-            "name": "local_knowledge_search",
-            "description": (
-                "Search the user's indexed knowledge library: project docs, "
-                "measurements, past decisions, and cross-session notes. Call it "
-                "before re-deriving prior work that may already be settled: when "
-                "you need a project fact from memory or a summary, do not know "
-                "which document holds it, or the user references earlier work. "
-                "Skip it when you know the exact file (read that instead) or the "
-                "answer is fully in context. Use one default-limit query; this "
-                "index spans projects, so treat results as leads and verify "
-                "load-bearing facts in their cited source."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query to find relevant knowledge chunks",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": (
-                            "Max results to return (default 3, max 5). One extra "
-                            "result may be appended when an exact-keyword match "
-                            "would otherwise be dropped."
-                        ),
-                        "default": 3,
-                    },
-                    "source_id": {
-                        "type": "string",
-                        "description": (
-                            "Optional source ID to scope keyword/vector seeding "
-                            "to one knowledge source (graph traversal still "
-                            "surfaces cross-source connections). Discover valid "
-                            "IDs with knowledge_list_sources."
-                        ),
-                    },
-                    "namespace": {
-                        "type": "string",
-                        "description": (
-                            "Optional namespace to scope keyword/vector seeding "
-                            "to documents filed under one organisational label "
-                            "(graph traversal still surfaces cross-namespace "
-                            "connections). This is a relevance filter, not a "
-                            "security boundary. Discover namespaces in the "
-                            "dashboard Knowledge panel; composes with source_id."
-                        ),
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-        {
-            "name": "knowledge_list_sources",
-            "description": (
-                "Read-only counts for the user's knowledge library: how many "
-                "sources, documents and items it holds in total, then one "
-                "'name — id (N items)' line per source. Use it to answer 'how "
-                "much is in my knowledge base', and to discover a valid "
-                "source_id before scoping local_knowledge_search to a single "
-                "source. It only counts -- it never rebuilds, repairs or "
-                "flushes anything."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {},
-            },
-        },
-        {
-            "name": "knowledge_add_document",
-            "description": (
-                "Add a document you have READ during this task to the user's "
-                "knowledge library, so it stays searchable later. Use it for a "
-                "document that turned out to be load-bearing -- a design doc, "
-                "spec, RFC, runbook, or wiki page that explains intent, a "
-                "decision, or how something works, and that you would want to "
-                "find again in a future session.\n\n"
-                "It works only when the operator turned on "
-                "knowledge.auto_add_documents (off by default). A refusal naming "
-                "that key means it is off: tell the user, do not retry.\n\n"
-                "Pass the document TEXT you already have as `content` -- this tool "
-                "never opens files, so read the document with your own tools first, "
-                "then hand over the text. Also pass where it came from as "
-                "`source_uri` (the path or URL you read it from): that is what tells "
-                'two documents apart, so a second "README" does not silently '
-                "replace the first. Adding the same document twice is harmless: "
-                "identical content is refused, not duplicated.\n\n"
-                "Do NOT add: source code, agent instruction files (AGENTS.md, "
-                "SKILL.md), generated or machine-readable files, chat transcripts, "
-                "your own notes and summaries, or a page you only skimmed. When in "
-                "doubt, skip it -- a polluted library makes every future search "
-                "worse."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "title": {
-                        "type": "string",
-                        "description": (
-                            "Human-readable document title, as the user would " "recognise it."
-                        ),
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "The document text, as you already have it.",
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": (
-                            "One line on why this document is worth keeping. "
-                            "Recorded in the audit trail."
-                        ),
-                    },
-                    "source_uri": {
-                        "type": "string",
-                        "description": (
-                            "Where you read this document from -- a file path, "
-                            "URL, or any stable handle. This is the document's "
-                            "identity: re-adding the same source_uri replaces that "
-                            "document, and two documents with different URIs stay "
-                            "separate even when their titles match. Nothing here "
-                            "is opened or fetched -- it is only stored as a label. "
-                            "Required: without it two documents sharing a title "
-                            "would overwrite each other."
-                        ),
-                    },
-                },
-                "required": ["title", "content", "source_uri"],
-            },
-        },
-        {
-            "name": "knowledge_dedup",
-            "description": (
-                "Find and collapse cross-source duplicate documents in the Knowledge "
-                "Base (e.g. the same file uploaded directly AND synced via a folder). "
-                "Defaults to a DRY-RUN preview that lists which duplicate would be "
-                "deleted and which copy is kept, changing nothing. Pass apply=true to "
-                "perform the hard deletes. Use when the user asks to de-duplicate, "
-                "clean up, or preview duplicates in their knowledge base."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "apply": {
-                        "type": "boolean",
-                        "description": (
-                            "false (default) = dry-run preview, no changes. "
-                            "true = perform the hard deletes."
-                        ),
-                        "default": False,
-                    },
-                },
-            },
-        },
-    ]
-
-
 # Appended when the embedding model cannot serve this search, so the caller
 # knows meaning-based (and CJK) matches were not tried.
 _KEYWORD_ONLY_NOTE = " (vector path unavailable; keyword results only)"
@@ -236,6 +78,7 @@ def local_knowledge_search(name: str, args: dict[str, Any]) -> str:
     limit = args.get("limit", 3)
     source_id = args.get("source_id") or None
     namespace = args.get("namespace") or None
+    status = args.get("status", "active")
 
     db_path = Path(mcp_core.config_dir()) / "workspace" / "knowledge" / "knowledge.db"
     if not db_path.exists():
@@ -288,7 +131,13 @@ def local_knowledge_search(name: str, args: dict[str, Any]) -> str:
     embed_fn, embed_sig = mcp_core.vector_leg(embedder if available else None)
     retriever = mcp_core.HybridRetriever(store, embedder=embed_fn, embed_sig=embed_sig)
 
-    results = retriever.search(query, limit=limit, source_id=source_id, namespace=namespace)
+    results = retriever.search(
+        query,
+        limit=limit,
+        source_id=source_id,
+        namespace=namespace,
+        status=None if status == "all" else status,
+    )
 
     # Filter by minimum confidence score
     min_score = 0.012
@@ -321,7 +170,9 @@ def local_knowledge_search(name: str, args: dict[str, Any]) -> str:
     # answers from local results alone. A source_id scope keeps the leg --
     # the gateway route applies that filter to the remote rows itself.
     remote = (
-        _fetch_remote_results(query, limit, source_id) if has_remote and namespace is None else []
+        _fetch_remote_results(query, limit, source_id)
+        if has_remote and namespace is None and status != "archived"
+        else []
     )
     if remote:
         from kiro_crew.knowledge.connectors import bedrock_kb

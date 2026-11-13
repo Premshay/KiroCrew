@@ -86,6 +86,14 @@ export default [
       // consumers (`ToolCallLine.tsx`, `app-sdk/messageRenderers.tsx`) stay
       // fully covered; `toolRailColor.test.ts` pins that it imports nothing.
       'src/utils/toolRailColor.ts',
+      // The pane port probe: a loopback URL and an `ssh -L` command line that
+      // the user pastes into a terminal, so neither is read as words. The
+      // command is interpolated into the `pane_port_unreachable` catalog
+      // string as `{{command}}`, and that string carries the copy. Stated as a
+      // false-negative class: copy added here would not be reported. Verified
+      // copy-free -- the module has no imports and no render path, and its
+      // consumer `InstancesViewport.tsx` stays fully covered.
+      'src/utils/panePortProbe.ts',
       // Pierre's shared render configuration: injected stylesheet text
       // (`unsafeCSS` templates of selectors, lengths and `var(--…)` references),
       // theme ids the library matches on, and an extension→grammar map. None of
@@ -108,6 +116,17 @@ export default [
       // to this module will not be reported. Keep it stylesheet-only; anything a
       // person reads belongs in the component with `i18nT`.
       'src/components/fileChangeChipsCss.ts',
+      // Stylesheet text for the library card's SVG, set inside the SVG's own shadow
+      // root by SvgShadow: one selector and three lengths handed to the CSS parser.
+      // Extracted from `ArtifactThumbs.tsx` so that file -- which does carry copy --
+      // stays fully covered. Stated as a false-negative class: copy added to this
+      // module will not be reported. Keep it stylesheet-only.
+      'src/components/library/artifactThumbSvgCss.ts',
+      // Keeps the rules of an SVG artifact's own stylesheet that select inside the
+      // drawing, for SvgShadow: CSSOM rule class names and CSS patterns handed to
+      // the browser's parser, no copy. Stated as a false-negative class: copy
+      // added to this module will not be reported. Keep it stylesheet-only.
+      'src/components/svgStylesheet.ts',
       // The Liquid Glass surface: SVG path data, an inline SVG displacement-map
       // document, `url("data:image/svg+xml…")`, `linear-gradient(…)`, `path("…")`
       // and `color-mix(…)` values, every one built as a string and handed to the
@@ -185,6 +204,17 @@ export default [
       // false positive it fixes. A path this narrow cannot exempt a future file
       // that does hold copy.
       'src/apps/meetings/lib/sketchSrcdoc.ts',
+      // The Meetings "export all outputs" bundle builder (#32982). Same
+      // parser-only category as `sketchSrcdoc.ts` directly above and listed the
+      // same way, by exact path: every literal in it is HTML/CSS handed to a
+      // parser — a DOCTYPE, `<section>`/`<pre>`/`<iframe>` markup, the bundle's
+      // own CSS. It imports no `i18nT`/`useTranslation` and renders no text node;
+      // its ONE user-facing string, the "no output" marker, is passed in already
+      // translated from the gated call site in `ExportMenuItems.tsx`, so the
+      // module itself holds no copy. Stated as this file's false-negative class:
+      // any user-visible copy ever added here will not be reported — keep it
+      // parser-facing and resolve copy at the call site.
+      'src/apps/meetings/lib/meetingBundle.ts',
       // The widget and MCP-app srcdoc builders — the same category as
       // `sketchSrcdoc.ts` directly above, and listed by the same exact-path rule
       // rather than a shared `*Srcdoc.ts` glob. Every literal in both is handed to
@@ -208,6 +238,15 @@ export default [
       // user-visible copy ever added to these two paths will not be reported —
       // keep both modules parser-facing only.
       'src/lib/widgetSrcdoc.ts',
+      // The height-reporter script split out of widgetSrcdoc.ts (for the file
+      // line cap) -- ONE template literal of in-iframe JS (postMessage + layout
+      // measurement), no human-facing copy. Same parser-only boundary and same
+      // false-negative class as widgetSrcdoc.ts above: keep it parser-only.
+      'src/lib/widgetHeightReporter.ts',
+      // The fragment-scroll script injected beside the height reporter: ONE
+      // template literal of in-iframe JS (postMessage + scroll geometry), no
+      // human-facing copy. Same false-negative class: keep it parser-only.
+      'src/lib/widgetFragmentScroll.ts',
       'src/lib/mcpAppSrcdoc.ts',
       // Same parser-only boundary as the srcdoc builders above: this module
       // sanitizes model markup and injects CSP, a DOCTYPE and theme CSS. None
@@ -749,6 +788,10 @@ export default [
               // that grows only when a new provider CLI is wired in on purpose.
               '^(?:gh|glab) auth login$',
               '^az login$',
+              // The install command the Decisions card's SageMaker option shows
+              // when the gateway has no boto3: typed into a terminal, so the
+              // same wire-string class, and enumerated for the same reason.
+              '^pip install "boto3>=1\\.34,<2"$',
               // A `mc:`-NAMESPACED BROWSER-STORAGE KEY, e.g.
               // `mc:notif:activeKinds:v2`, `mc:notif:seenChannels`. The dashboard
               // namespaces every localStorage key it owns under `mc:`, and such
@@ -889,10 +932,8 @@ export default [
               '^\\[Stop-hook nudge cap reached\\]$',
               // The knowledge envelope's close marker, enumerated for the same
               // closed-set reason. `expandKnowledgeBlock` writes it into the
-              // model-facing wire text and `splitKnowledgeEnvelope` finds it there
-              // to take the envelope off the queue card, so it is never shown and
-              // a translated marker would stop the split from finding it
-              // (`pages/chat/useKnowledgeFetch.ts`). Its open marker already
+              // model-facing wire text (`pages/chat/useKnowledgeFetch.ts`), so it
+              // is protocol the model reads, not copy. Its open marker already
               // matches the em-dash shape above.
               '^\\[END KNOWLEDGE CONTEXT\\]$',
               // NOTE ON SHAPE: the plugin wraps every pattern as `^<pattern>$`
@@ -1000,6 +1041,15 @@ export default [
               // exempt, and the sentences AROUND it stayed in the catalog (that is
               // what `{{provider}}` is for).
               '^(GitHub|GitLab|Azure DevOps|Bitbucket|Bitbucket Server|Gerrit)$',
+              // The Connections page's one Google entry: the bare brand is its
+              // settings-search suffix (`settingsManual.ts`), the same in every
+              // language, like the provider names the other OAuth app entries
+              // take from the registry. Whole-value-anchored like the entries above.
+              '^Google$',
+              // The local editor brands the "Open in {{editor}}" row names
+              // (utils/remoteEditorUrl.ts `REMOTE_EDITORS`): a product name, the same in
+              // every language. Whole-value-anchored like the entries above.
+              '^VS Code$',
               // The PPTX Maker chat-token KEYWORDS (`[Style: name]`,
               // `[Template: name]`). Enumerated and whole-value-anchored, exactly like
               // the modifier-key caps below: the agent prompts parse this literal
@@ -1096,7 +1146,7 @@ export default [
               // above give -- and the name is deliberately long and specific rather
               // than a generic `warnSkip`, so a future helper elsewhere cannot
               // inherit this by accident. TWO definitions exist today:
-              // `src/apps/command-bar/contributedCommands.ts`, which renders nothing,
+              // `src/components/commandBar/contributedCommands.ts`, which renders nothing,
               // and `src/apps/fileMenuContributions.tsx`, the same shim for a refused
               // `contributes.fileMenuItems` row. The second REUSES this name rather
               // than adding a second global exemption for a differently-named shim:
@@ -1545,7 +1595,7 @@ export default [
   // third suppression channel this config does not count, which is exactly what
   // centralizing suppression here exists to prevent.
   {
-    files: ['src/apps/command-bar/sessionFolder.ts'],
+    files: ['src/components/commandBar/sessionFolder.ts'],
     rules: {
       'i18next/no-literal-string': 'off',
     },

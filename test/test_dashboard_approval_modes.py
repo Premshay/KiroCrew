@@ -27,6 +27,7 @@ from dashboard_approval_helpers import (
     _permission_event,
     _set_stream,
 )
+from real_session_manager import open_session, real_sessions
 
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.chat import _run_chat
@@ -475,18 +476,14 @@ class TestApprovalModes:
         [
             ("killed", {"exit_code": -9, "stderr": ""}),
             ("timeout", {"exit_code": -1, "error": "Timed out after 3s"}),
-            (
-                "refused",
-                {"exit_code": 2, "refused": True, "error": "Blocked by security policy: x"},
-            ),
         ],
     )
-    async def test_auto_approve_allowed_when_a_spec_hook_fails_or_is_refused(
+    async def test_auto_approve_allowed_when_a_spec_hook_fails(
         self, tmp_path, label, result_kwargs
     ):
-        """An agent spec's own hook keeps kiro-cli's contract: only a delivered
-        exit 2 blocks. A refused, killed or timed-out spec hook warns and the
-        tool runs, so one broken hook cannot stop every tool call."""
+        """An agent spec's own hook keeps kiro-cli's contract: a killed or
+        timed-out spec hook warns and the tool runs, so one broken hook cannot
+        stop every tool call."""
         cb = _context_builder(ToolHookResult.auto_approve())
         hook_store = _make_hook_store()
         hook_store.fire = AsyncMock(
@@ -509,6 +506,37 @@ class TestApprovalModes:
 
         client.approve_tool.assert_called_once()
         client.reject_tool.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_refused_spec_hook_blocks_with_the_refusal(self, tmp_path):
+        """P0-12: a spec hook a policy refused to run gave no verdict; the tool is
+        blocked, and the refusal is the reason."""
+        cb = _context_builder(ToolHookResult.auto_approve())
+        hook_store = _make_hook_store()
+        hook_store.fire = AsyncMock(
+            return_value=[
+                ScriptHookResult(
+                    hook_id="spec:a1:PreToolUse:0",
+                    hook_name="a1 spec hook (PreToolUse #1)",
+                    event=HOOK_EVENT_PRE_TOOL_USE,
+                    from_spec=True,
+                    exit_code=2,
+                    refused=True,
+                    error="Blocked by security policy: x",
+                )
+            ]
+        )
+        state, client = _make_state(tmp_path, context_builder=cb, hook_store=hook_store)
+        slot = _make_slot()
+        _set_stream(client, [_permission_event(), _complete_event()])
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+
+        client.reject_tool.assert_called_once()
+        client.approve_tool.assert_not_called()
+        msgs = _tool_messages(slot)
+        assert any("hook blocked" in m.get("content", "").lower() for m in msgs), msgs
 
     @pytest.mark.asyncio
     async def test_auto_approve_allowed_when_pretooluse_hook_exits_zero(self, tmp_path):
@@ -693,24 +721,30 @@ class TestApprovalModes:
 
 
 class TestTrustYoloPropagation:
-    """Trust/YOLO mode propagates approval policy to session manager."""
+    """Trust/YOLO mode leaves its approval policy on the real session."""
+
+    @staticmethod
+    def _real_state(tmp_path):
+        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        state.sessions = real_sessions(client)
+        return state, client
 
     @pytest.mark.asyncio
     async def test_run_chat_propagates_trust_to_session(self, tmp_path):
         """When slot has _trust=True, _run_chat sets session approval policy to auto."""
-        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        state, client = self._real_state(tmp_path)
         slot = _make_slot(trust=True)
         _set_stream(client, [_complete_event()])
 
         with _patch_stats():
             await _run_chat(state, slot, "hello")
 
-        state.sessions.set_approval_policy.assert_called_with(f"dashboard:{slot.key}", "auto")
+        assert state.sessions.get_approval_policy(f"dashboard:{slot.key}") == "auto"
 
     @pytest.mark.asyncio
     async def test_run_chat_propagates_yolo_to_session(self, tmp_path):
         """When state._yolo=True, _run_chat sets session approval policy to auto."""
-        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        state, client = self._real_state(tmp_path)
         state.enable_yolo()
         slot = _make_slot()
         _set_stream(client, [_complete_event()])
@@ -718,20 +752,23 @@ class TestTrustYoloPropagation:
         with _patch_stats():
             await _run_chat(state, slot, "hello")
 
-        state.sessions.set_approval_policy.assert_called_with(f"dashboard:{slot.key}", "auto")
+        assert state.sessions.get_approval_policy(f"dashboard:{slot.key}") == "auto"
 
     @pytest.mark.asyncio
     @pytest.mark.xdist_group(name="serial")
     async def test_run_chat_no_propagation_without_trust_or_yolo(self, tmp_path):
-        """Without trust or YOLO, set_approval_policy clears to default."""
-        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        """Without trust or YOLO, a session left on auto is cleared to default."""
+        state, client = self._real_state(tmp_path)
         slot = _make_slot()
+        key = f"dashboard:{slot.key}"
+        await open_session(state.sessions, key)
+        state.sessions.set_approval_policy(key, "auto")
         _set_stream(client, [_complete_event()])
 
         with _patch_stats():
             await _run_chat(state, slot, "hello")
 
-        state.sessions.set_approval_policy.assert_called_once_with(f"dashboard:{slot.key}", "")
+        assert state.sessions.get_approval_policy(key) == ""
 
 
 class TestResolveApprovalSlotFallback:
@@ -757,7 +794,7 @@ class TestResolveApprovalSlotFallback:
             "approval_resolved",
             # ``slot`` keys the frame for the slot-scoped WS gate — it must name
             # the slot that actually owned the resolved future.
-            {"id": "req-42", "approved": True, "slot": "chat-1-test"},
+            {"id": "req-42", "approved": True, "slot": "chat-1-test", "origin": "native"},
         )
         state.push_slots_update.assert_called_once()
 
@@ -780,7 +817,7 @@ class TestResolveApprovalSlotFallback:
         # decision in the frame.
         state.broadcast_ws.assert_called_with(
             "approval_resolved",
-            {"id": "req-43", "approved": False, "slot": "chat-1-test"},
+            {"id": "req-43", "approved": False, "slot": "chat-1-test", "origin": "native"},
         )
 
     @pytest.mark.asyncio

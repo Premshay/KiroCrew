@@ -320,7 +320,7 @@ describe('MembersPage Profile card Schedules tab', () => {
     vi.mocked(api.crons).mockResolvedValue({ jobs: [] } as never)
     await openCrewmate()
     const list = await openSchedulesTab()
-    expect(await within(list).findByTestId('crew-schedule-empty')).toHaveTextContent(/Nothing wakes this Bot on its own yet/i)
+    expect(await within(list).findByTestId('crew-schedule-empty')).toHaveTextContent(/Nothing wakes this bot on its own yet/i)
     // No `0` anywhere — not on the rail, not in the list.
     expect(screen.queryByTestId('member-schedules-count')).toBeNull()
     expect(within(screen.getByTestId('crew-profile-tabs')).queryByText('0')).toBeNull()
@@ -346,7 +346,7 @@ describe('MembersPage Profile card Schedules tab', () => {
     // The failed read is handled once the list draws its error line; the empty line is withheld with it.
     await screen.findByTestId('crew-schedule-error')
     expect(within(list).queryByTestId('crew-schedule-empty')).toBeNull()
-    expect(list).not.toHaveTextContent(/Nothing wakes this Bot/i)
+    expect(list).not.toHaveTextContent(/Nothing wakes this bot/i)
   })
 
   it('a row opens that job on the Schedule page; the footer opens the page itself', async () => {
@@ -402,11 +402,11 @@ describe('MembersPage Profile card — New schedule', () => {
     // second "What wakes this crewmate" and no second close control under the bar.
     expect(section).toHaveAttribute('data-chromeless', 'true')
     expect(within(section).queryByTestId('crew-wake-add')).toBeNull()
-    expect(within(page).queryByText('What wakes this Bot')).toBeNull()
+    expect(within(page).queryByText('What wakes this bot')).toBeNull()
     expect(within(page).queryAllByRole('button', { name: /cancel new schedule/i })).toHaveLength(0)
     // The form's pinned-crew hint speaks this page's noun: the reader is on the
     // crewmate's Profile, not in the crew editor the editor's sentence names.
-    expect(within(section).getByText("Created from this Bot's profile, so the job runs as this Bot.")).toBeInTheDocument()
+    expect(within(section).getByText("Created from this bot's profile, so the job runs as this bot.")).toBeInTheDocument()
     expect(within(section).queryByText(/this crew's editor/)).toBeNull()
     // A clean form: back pops to the list with no question asked.
     fireEvent.click(screen.getByTestId('crew-profile-back'))
@@ -1092,11 +1092,17 @@ describe('MembersPage Profile card — Goals retention and delivery', () => {
       expect(holdsDocument()).toBe(false)
     } else {
       const notice = await screen.findByTestId(status === 'refused' ? 'crew-goals-new-goal-error' : 'crew-goals-new-goal-unconfirmed')
-      if (status !== 'refused') expect(notice).toHaveTextContent('check the conversation above before sending it again')
-      // The modal stays open over the card, for another try.
+      if (status !== 'refused') expect(notice).toHaveTextContent('open the chat and check the conversation before sending it again')
+      // The modal stays open over the card: a refusal for another try, an
+      // unconfirmed delivery with Open chat in place of Send.
       expect(screen.getByRole('dialog', { name: 'New goal' })).toContainElement(notice)
       expect(screen.getByTestId('crew-profile-modal')).toBeInTheDocument()
-      expect(screen.getByTestId('crew-goals-new-goal-send')).toBeEnabled()
+      expect(screen.getByTestId(status === 'refused' ? 'crew-goals-new-goal-send' : 'crew-goals-new-goal-open-chat')).toBeEnabled()
+      if (status !== 'refused') {
+        // Open chat sends nothing and, floating over the thread, closes the card.
+        fireEvent.click(screen.getByTestId('crew-goals-new-goal-open-chat'))
+        await waitFor(() => expect(screen.queryByTestId('crew-profile-panel')).toBeNull())
+      }
     }
     expect(api.sendChat).toHaveBeenCalledTimes(1)
     const [message, slot] = vi.mocked(api.sendChat).mock.calls[0]

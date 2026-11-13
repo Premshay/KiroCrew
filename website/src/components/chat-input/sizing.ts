@@ -4,6 +4,7 @@ import { safeSetItem } from '../../utils/safeStorage'
 import { usePointerDrag } from '../../hooks/usePointerDrag'
 import { useIsTouchDevice } from '../../hooks/useIsTouchDevice'
 import { useMeasuredHeight } from '../../hooks/useMeasuredHeight'
+import { useKeyboardLift } from '../../hooks/useKeyboardLift'
 import { afterSlide, forgetAfterSlide, slideHeld } from '../../utils/panelSlide'
 
 /* The composer's height: the content-driven autosize (measured on an
@@ -11,8 +12,8 @@ import { afterSlide, forgetAfterSlide, slideHeld } from '../../utils/panelSlide'
    stacked above the textarea that the drag floor and the transient
    adjustment both count. */
 const INPUT_MIN_H = 44
-const INPUT_DEFAULT_MAX_H = 140
-const INPUT_PREFILL_MAX_H = 320
+export const INPUT_DEFAULT_MAX_H = 140
+export const INPUT_PREFILL_MAX_H = 320
 export const INPUT_DRAG_MIN_H = 93
 const INPUT_DRAG_MAX_RATIO = 0.5
 const INPUT_HEIGHT_LS_KEY = 'mc-input-height'
@@ -345,6 +346,20 @@ export function useManualHeight({ wrapperRef, pendingFilesCount, pendingSessions
   return { manualHeight, setManualHeight, isTouch, dragging, dragMinHRef, inputResize, resizeHandleLifecycleRef, resetHeight }
 }
 
+/** The composer root sits at the bottom of the height-locked shell, so an
+ *  on-screen keyboard covers it on iPadOS, where Safari's focus pan does not
+ *  clear it. While the composer holds focus it grows by whatever part of the
+ *  keyboard the pan has not covered (0 on desktop), as bottom padding: the
+ *  controls rise and the dock's measured height grows, so the transcript
+ *  keeps its newest lines above the composer -- see useKeyboardLift. The
+ *  shelf's fade (`.glass-shelf::before`) is anchored to the dock wrapper's
+ *  bottom, so ChatInput also hands it the lift as `--glass-shelf-lift`. */
+export function useInputAreaKeyboardLift() {
+  const inputAreaRef = useRef<HTMLDivElement>(null)
+  const keyboardLift = useKeyboardLift(inputAreaRef, true)
+  return { inputAreaRef, keyboardLift }
+}
+
 /** The strips stacked above the textarea (staged files and folders, session
  *  refs): their measured heights, the drag floor they raise, and the manual
  *  height's transient adjustment when one appears or leaves. */
@@ -521,3 +536,21 @@ export function useTextareaAutosize({ inputRef, mirrorRef, value, prefillHint, m
 
   return { handleInput }
 }
+
+// Half the one-row box: the 44px text line plus its 1px border each side.
+export const COMPOSER_ONE_ROW_RADIUS = 23
+// The one-row text line's padding, equal above and below so the line sits on
+// the buttons' centre whatever its height. INPUT_TYPO's 12px over 4px puts it
+// lower by half of (line height - 20px): 2px at the 16px touch floor. Set on
+// the text column, so the textarea, its paste mirror and the Lexical editor
+// all take it; `1.5em` is INPUT_TYPO's `leading-normal` line, and resolves on
+// each of them at its own font size. Not `1lh`: Safari before 16.4 has no
+// such unit, and an invalid value would drop the padding to 0.
+export const ONE_ROW_TEXT_PAD = '[--composer-pt:max(0px,calc((44px_-_1.5em)_/_2))] [--composer-pb:max(0px,calc((44px_-_1.5em)_/_2))]'
+// The one-row clusters' edge padding (pl-1.5 + pr-1.5), which the text column
+// gives up besides the clusters themselves.
+export const ONE_ROW_CLUSTER_PAD_PX = 12
+// The glass rim is a slice of the pane's smaller side. A one-row composer
+// would get half the rim of a two-row one, so the rim is sized from the
+// two-row height (one wrapped line of text plus the toolbar) in both shapes.
+export const COMPOSER_RIM_FROM_PX = 102

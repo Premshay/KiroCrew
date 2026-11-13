@@ -72,7 +72,6 @@ def _write_app(root, *, installed: bool) -> None:
 
 
 class TestAppOwnedSectionsAreNotUnrecognized:
-    @pytest.mark.skipif(not validation._HAS_JSONSCHEMA, reason="jsonschema not installed")
     def test_installed_app_manifest_key_is_not_reported(
         self, tmp_path, monkeypatch, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -84,7 +83,6 @@ class TestAppOwnedSectionsAreNotUnrecognized:
             validation.validate_config_data({"secretary": {"channel": "slack"}})
         assert _unrecognized_warnings(caplog) == []
 
-    @pytest.mark.skipif(not validation._HAS_JSONSCHEMA, reason="jsonschema not installed")
     def test_gateway_load_before_refresh_warns_once_then_loads_cleanly(
         self, tmp_path, monkeypatch, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -102,7 +100,6 @@ class TestAppOwnedSectionsAreNotUnrecognized:
                 validation.validate_config_data(dict(data))
         assert _unrecognized_warnings(caplog) == []
 
-    @pytest.mark.skipif(not validation._HAS_JSONSCHEMA, reason="jsonschema not installed")
     def test_uninstalled_app_manifest_key_is_reported(
         self, tmp_path, monkeypatch, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -115,7 +112,6 @@ class TestAppOwnedSectionsAreNotUnrecognized:
         warnings = _unrecognized_warnings(caplog)
         assert warnings and "secretary" in warnings[0]
 
-    @pytest.mark.skipif(not validation._HAS_JSONSCHEMA, reason="jsonschema not installed")
     def test_repeated_validation_does_not_rescan_installed_apps(
         self, tmp_path, monkeypatch
     ) -> None:
@@ -190,9 +186,14 @@ class TestAppOwnedSectionsAreNotUnrecognized:
         (broken / "app.json").write_text(
             json.dumps({"name": "broken", "config_keys": ["broken-key"]})
         )
-        (broken / "installed.json").write_text(
-            json.dumps({"name": "broken", "schemaVersion": "not-an-int"})
-        )
+        # Truly-corrupt JSON: _read_installed returns None (it catches the
+        # JSONDecodeError), so the app is unreadable and its config keys are
+        # dropped, and the scan still publishes the valid app's keys. A
+        # non-integer schemaVersion would NOT exercise this path: it degrades to
+        # 1 like any other malformed field (see
+        # test_non_integer_schema_version_falls_back), leaving the app readable
+        # with its manifest keys kept.
+        (broken / "installed.json").write_text("{ this is not valid json")
         monkeypatch.setattr(app_manager, "apps_dir", lambda: apps_root)
 
         assert app_manager.refresh_app_config_keys() == frozenset({"secretary"})
@@ -257,7 +258,6 @@ class TestAppOwnedSectionsAreNotUnrecognized:
         assert validation.extension_config_keys("apps") == frozenset({"newer"})
         assert validation._installed_extension_config_keys() == {"newer"}
 
-    @pytest.mark.skipif(not validation._HAS_JSONSCHEMA, reason="jsonschema not installed")
     def test_startup_prime_suppresses_first_load_warning_for_app_and_plugin(
         self, tmp_path, monkeypatch, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -298,7 +298,6 @@ class TestAppOwnedSectionsAreNotUnrecognized:
         assert _unrecognized_warnings(caplog) == []
 
     @pytest.mark.asyncio
-    @pytest.mark.skipif(not validation._HAS_JSONSCHEMA, reason="jsonschema not installed")
     async def test_event_loop_validation_uses_snapshot_without_registry_io(
         self, monkeypatch, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -328,7 +327,6 @@ class TestAppOwnedSectionsAreNotUnrecognized:
             data = {"agent": {"provider": "acp"}}
             assert validation.validate_config_data(data) is data
 
-    @pytest.mark.skipif(not validation._HAS_JSONSCHEMA, reason="jsonschema not installed")
     def test_validation_never_calls_discovery_or_filesystem_paths(
         self, monkeypatch, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -353,14 +351,12 @@ class TestAppOwnedSectionsAreNotUnrecognized:
             )
         assert _unrecognized_warnings(caplog) == []
 
-    @pytest.mark.skipif(not validation._HAS_JSONSCHEMA, reason="jsonschema not installed")
     def test_dev_fleet_section_is_not_reported(self, caplog: pytest.LogCaptureFixture) -> None:
         data = {"agent": {"provider": "acp"}, "dev_fleet": {"repo_path": "/opt/kc"}}
         with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
             validation.validate_config_data(data)
         assert _unrecognized_warnings(caplog) == []
 
-    @pytest.mark.skipif(not validation._HAS_JSONSCHEMA, reason="jsonschema not installed")
     def test_genuinely_unknown_key_still_warns_beside_an_app_owned_one(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -372,7 +368,6 @@ class TestAppOwnedSectionsAreNotUnrecognized:
         assert warnings and "totally_unknown_key" in warnings[0]
         assert "dev_fleet" not in warnings[0]
 
-    @pytest.mark.skipif(not validation._HAS_JSONSCHEMA, reason="jsonschema not installed")
     @pytest.mark.parametrize("malformed", ["/opt/kc", ["/opt/kc"], 7, None])
     def test_a_non_object_dev_fleet_value_still_warns(
         self, malformed: object, caplog: pytest.LogCaptureFixture
@@ -388,7 +383,6 @@ class TestAppOwnedSectionsAreNotUnrecognized:
         warnings = _unrecognized_warnings(caplog)
         assert warnings and "dev_fleet" in warnings[0]
 
-    @pytest.mark.skipif(not validation._HAS_JSONSCHEMA, reason="jsonschema not installed")
     def test_full_load_of_a_dev_fleet_config_logs_no_unrecognized_warning(
         self, tmp_path, monkeypatch, caplog: pytest.LogCaptureFixture
     ) -> None:

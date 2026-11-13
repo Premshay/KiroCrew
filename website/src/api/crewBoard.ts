@@ -72,6 +72,9 @@ export interface WorkBoardItem {
   orphaned: boolean
   /** The move is with the worker and it has gone quiet. */
   stale: boolean
+  /** Its worker's own loop will wake it (waiting on CI): idle, yet running.
+   *  Absent from an older gateway. */
+  looping?: boolean
   /** The bar is one `accept_eval.py` can actually evaluate. */
   acceptance_concrete: boolean
   /** The worker's last `work_report` / `work_brief` call never reached the
@@ -119,10 +122,27 @@ export interface WorkBoardResponse {
    *  field), read by the Ultra Mode Board's Needs your input. Absent on an older
    *  gateway. */
   asks?: Record<string, string[]>
+  /** What the warm welcome's own GitHub read last saw for each open item's pull
+   *  request (the `objects` fold), with its read time. Never a network read on
+   *  page load. Absent on an older gateway. */
+  pr_facts?: Record<string, CrewPrFacts>
 }
 
-/** The two affordances Phase 4 names for an orphaned item. */
-export type CrewBoardAction = 'stop' | 'take_over'
+export interface CrewPrRead {
+  facts: Record<string, unknown>
+  /** Seconds since the epoch. */
+  observed_at: number
+}
+
+export interface CrewPrFacts {
+  label: string
+  url: string
+  reads: { warm_brief?: CrewPrRead }
+}
+
+/** The two affordances Phase 4 names for an orphaned item, and the person's
+ *  dismiss of an ask that waits on them (until a newer report asks again). */
+export type CrewBoardAction = 'stop' | 'take_over' | 'dismiss'
 
 /**
  * What an action answers. Deliberately narrow: the server allow-lists its reply

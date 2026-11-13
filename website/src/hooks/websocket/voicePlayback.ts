@@ -20,7 +20,7 @@ import { markFirstAudio } from '../../utils/voiceTurnMetrics'
 import type { Notification } from '../../types'
 import type { FrameData } from './frames'
 import { storeFocusedSlot } from '../../lib/storeFocusedSlot'
-import { getMountedMemberThreadSlot } from '../../lib/mountedMemberThread'
+import { getMountedMemberThreadSlot, subscribeMountedMemberThread } from '../../lib/mountedMemberThread'
 import { isCrewmateSpeech } from '../../components/chat/crewmateBubbles'
 
 type VoiceProgress = {
@@ -87,6 +87,7 @@ export interface VoicePlayback {
 export function useVoicePlayback(dispatch: AppDispatch): VoicePlayback {
   const voiceQueueRef = useRef<string[]>([])
   const voicePlayingRef = useRef(false)
+  const pcmPlayingRef = useRef(false)
   const pcmPlayerRef = useRef<VoicePcmPlayer | null>(null)
   const voiceEpochRef = useRef(0)
   const voiceRequestsRef = useRef(new Map<string, string>())
@@ -125,7 +126,7 @@ export function useVoicePlayback(dispatch: AppDispatch): VoicePlayback {
 
   return useMemo<VoicePlayback>(() => {
     const updateVoiceBusy = () => {
-      const busy = synthInFlightRef.current > 0 || awaitingAudioRef.current.size > 0 || clientSpeakingRef.current || voiceQueueRef.current.length > 0 || voicePlayingRef.current
+      const busy = synthInFlightRef.current > 0 || awaitingAudioRef.current.size > 0 || clientSpeakingRef.current || pcmPlayingRef.current || voiceQueueRef.current.length > 0 || voicePlayingRef.current
       if (busy !== voiceBusyRef.current) {
         voiceBusyRef.current = busy
         dispatch(setVoiceBusy(busy))
@@ -275,7 +276,11 @@ export function useVoicePlayback(dispatch: AppDispatch): VoicePlayback {
 
     const getPcmPlayer = () => {
       pcmPlayerRef.current ??= new VoicePcmPlayer(
-        playing => dispatch(setVoicePlaying(playing)),
+        playing => {
+          pcmPlayingRef.current = playing
+          dispatch(setVoicePlaying(playing))
+          updateVoiceBusy()
+        },
         code => {
           reportVoiceFailure({ slot: storeFocusedSlot(), code })
           // A playback failure affects the stream, not just one 200 ms chunk.
@@ -373,7 +378,9 @@ export function useVoicePlayback(dispatch: AppDispatch): VoicePlayback {
         reportVoiceFailure({ slot: storeFocusedSlot(), code: 'voice_playback_failed' })
         stopVoice()
       }
-      audio.play().then(markFirstAudio).catch(error => {
+      audio.play().then(() => {
+        if (activeAudioRef.current === audio) markFirstAudio()
+      }).catch(error => {
         if (activeAudioRef.current !== audio) return
         reportVoiceFailure({
           slot: storeFocusedSlot(),
@@ -387,6 +394,12 @@ export function useVoicePlayback(dispatch: AppDispatch): VoicePlayback {
     // conversation.
     const refreshAutoSpeak = () => {
       api.voiceConfig().then(c => { configuredAutoSpeakRef.current = !!c.autoSpeak; updateAutoSpeak() }).catch(() => {})
+    }
+
+    const resetForNewTurn = () => {
+      stopVoice()
+      voiceMutedRef.current = false
+      voiceProgressRef.current = null
     }
 
     return {
@@ -436,11 +449,7 @@ export function useVoicePlayback(dispatch: AppDispatch): VoicePlayback {
           refreshAutoSpeak()
         }
       },
-      resetForNewTurn() {
-        stopVoice()
-        voiceMutedRef.current = false
-        voiceProgressRef.current = null
-      },
+      resetForNewTurn,
       onVoiceChunk(data) {
         if (voiceMutedRef.current || data.slot !== storeFocusedSlot()) return
         const { audio: b64, audioMime, request_id } = data as { audio: string; audioMime?: string; request_id?: string }
@@ -486,6 +495,7 @@ export function useVoicePlayback(dispatch: AppDispatch): VoicePlayback {
         reportVoiceFailure({ slot: data.slot, request_id, code: code || 'voice_synthesis_failed' })
       },
       attachWindowEvents() {
+        const detachMountedThread = subscribeMountedMemberThread(resetForNewTurn)
         const onVoiceStop = () => {
           stopVoice()
           if (autoSpeakRef.current && typeof AudioContext !== 'undefined') getPcmPlayer().unlock()
@@ -545,6 +555,7 @@ export function useVoicePlayback(dispatch: AppDispatch): VoicePlayback {
         window.addEventListener('handsfree-speech-changed', onHandsFreeSpeechChanged)
         window.addEventListener('voice-play-url', onVoicePlayUrl)
         return () => {
+          detachMountedThread()
           window.removeEventListener('voice-stop', onVoiceStop)
           window.removeEventListener('voice-synthesis-start', onVoiceStart)
           window.removeEventListener('voice-synthesis-failed', onVoiceFailed)

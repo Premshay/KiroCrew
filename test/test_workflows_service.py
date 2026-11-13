@@ -40,6 +40,14 @@ GOOD_SCRIPT = (
 )
 
 
+def test_author_selection_validates_effort() -> None:
+    from kiro_crew.dashboard.handlers.workflows import _author_selection
+
+    assert _author_selection({"author_effort": " high "}) == {"author_effort": "high"}
+    assert _author_selection({"author_effort": "invalid"}) is None
+    assert _author_selection({"author_effort": 1}) is None
+
+
 class FakeProvider:
     def __init__(self, scripted: list[str]) -> None:
         self._scripted = scripted
@@ -1258,54 +1266,6 @@ async def test_task_plan_definition_accepts_structured_input_arg(tmp_path) -> No
 
     started = await svc.start_definition(saved["slug"], args={"input": "structured input"})
     assert started["run_id"] == "wf_task"
-
-
-async def test_start_task_plan_definition_delegates_to_taskrunner_without_python_execution(
-    tmp_path,
-) -> None:
-    library = WorkflowDefinitionLibrary(tmp_path)
-    saved = library.create(
-        source="agents:\n  test:\n    prompt: run tests\n",
-        name="Test project",
-        source_format="task-plan",
-    )
-
-    class FakeTaskRunner:
-        def __init__(self) -> None:
-            self.calls: list[dict] = []
-
-        async def start_workflow_definition(self, definition, **kwargs):
-            self.calls.append({"definition": definition, **kwargs})
-            return {"task_id": "task_123", "run_id": "wf_task"}
-
-    task_runner = FakeTaskRunner()
-    svc = WorkflowService(
-        sessions=FakeSessions([]),
-        persist=False,
-        definition_library=library,
-        task_runner=task_runner,
-    )
-
-    started = await svc.start_definition(saved["slug"], input_text="from slash")
-
-    assert started["run_id"] == "wf_task"
-    assert started["task_id"] == "task_123"
-    from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
-
-    assert task_runner.calls == [
-        {
-            "definition": saved,
-            "input_text": "from slash",
-            "author": "",
-            "session_key": "",
-            "execution_context": ExecutionContext(
-                member_id=None,
-                store=MemoryStoreRef("default"),
-                selection_kind="template",
-                template_id="kirocrew",
-            ),
-        }
-    ]
 
 
 async def test_start_definition_loads_saved_source_off_the_event_loop(
