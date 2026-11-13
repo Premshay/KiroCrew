@@ -26,7 +26,7 @@ const API_KEY_ORDER = [
   'sessionStorageCleanup', 'sessionStorageRestore', 'sessionStorageEmpty', 'sessionStorageEmptyStatus',
   'sessionInventory', 'sessionInventoryDetail', 'sessionInventoryTrash', 'reportUiControlClick', 'sessionCrewLogProjections', 'sessionWorkProjection',
   'telemetryStartup', 'telemetryContextTrace', 'telemetryContextTurn', 'usageTurns', 'usageSeries',
-  'wakatimeStats', 'wakatimeExportUrl', 'crewBoard', 'crewBoardAction', 'arcBoardArcs', 'arcBoardDetail', 'arcBoardCreate', 'arcBoardAddMember', 'arcBoardSettings', 'arcBoardOpenChannel', 'arcBoardAnswer', 'arcBoardRemoveMember', 'arcBoardAutonomy', 'arcBoardNote', 'arcBoardReport', 'arcBoardAccept', 'wakatimeExportDownload',
+  'wakatimeStats', 'wakatimeExportUrl', 'crewBoard', 'crewBoardAction', 'arcBoardArcs', 'arcBoardDetail', 'arcBoardClose', 'arcBoardCreate', 'arcBoardAddMember', 'arcBoardSettings', 'arcBoardOpenChannel', 'arcBoardAnswer', 'arcBoardRemoveMember', 'arcBoardAutonomy', 'arcBoardNote', 'arcBoardReport', 'arcBoardAccept', 'wakatimeExportDownload',
   'sessionSummary', 'dashboardCard', 'generateSessionSummary',
   'beaconStatus', 'collectionStatus', 'kiroPrerequisite', 'repairKiroPrerequisiteSpecs',
   'updateKiroPrerequisiteCli', 'kasLoginStatus', 'kasLoginBeginDevice', 'kasLoginPoll',

@@ -56,6 +56,8 @@ def _show(arc_id: str) -> str:
     milestones = arc["milestones"]
     index = arc["milestone_index"]
     out = [f"{line(arc['title'])} ({arc['id']})"]
+    if arc.get("closed_at"):
+        out.append(f"Closed: {line(arc['closed_at'])}")
     if index < len(milestones):
         current = milestones[index]
         out.append(
@@ -120,6 +122,11 @@ def _arc(args: argparse.Namespace) -> None:
             print(arcs.create_arc(spec)["id"])
         elif action == "add-member":
             arcs.add_member(args.arc_id, args.session_key, args.role)
+        elif action == "remove-member":
+            arcs.remove_member(args.arc_id, args.session_key)
+        elif action == "close":
+            arc = arcs.close_arc(args.arc_id)
+            print(f"Closed {arc['id']}; board history remains readable.")
         elif action == "show":
             print(_show(args.arc_id))
         elif action == "answer":
@@ -141,7 +148,11 @@ def _arc(args: argparse.Namespace) -> None:
                     file=sys.stderr,
                 )
         elif action == "accept":
-            arcs.accept_milestone(args.arc_id)
+            arc = arcs.accept_milestone(args.arc_id)
+            if arc["milestone_index"] == len(arc["milestones"]) and not arc.get("closed_at"):
+                print(
+                    f"All milestones accepted. Stop arc context with: kirocrew arc close {arc['id']}"
+                )
         elif action == "settings":
             if args.repo is None and args.coordinator is None:
                 _fail("give --repo and/or --coordinator")
@@ -160,7 +171,7 @@ def _arc(args: argparse.Namespace) -> None:
                     print(f"{arc_id}: {'failed' if count < 0 else f'recorded {count}'}")
         else:
             print(
-                "Usage: kirocrew arc {create|add-member|show|answer|accept|settings|sync}",
+                "Usage: kirocrew arc {create|add-member|remove-member|close|show|answer|accept|settings|sync}",
                 file=sys.stderr,
             )
             sys.exit(1)

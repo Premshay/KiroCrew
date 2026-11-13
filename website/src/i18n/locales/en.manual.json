@@ -10014,6 +10014,12 @@
       "window_footer_shards_other": "OTEL sections · period: {{period}} · {{n}} shards · source: <dir/> · local-only, no egress"
     },
     "arcBoard": {
+      "lifecycle": "Arc status",
+      "close_arc": "Close arc",
+      "closed": "Closed",
+      "close_confirm": "Close “{{name}}”?",
+      "close_hint": "This stops arc context in every member session. Board history and entries stay readable.",
+      "close_failed": "Could not close the arc",
       "page_title": "Arc board",
       "subtitle": "What each arc is for, where it stands, and what is waiting on you.",
       "new_arc": "New arc",

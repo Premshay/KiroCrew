@@ -24,6 +24,8 @@ export interface ArcBoardMilestone {
 
 /** One arc as `GET /api/arc-board/arcs` reports it: the left rail's row. */
 export interface ArcBoardSummary {
+  /** Empty or absent until the owner closes the arc. */
+  closed_at?: string
   id: string
   title: string
   goal: string
@@ -79,6 +81,8 @@ export interface ArcBoardAsk extends ArcBoardEntry {
 }
 
 export interface ArcBoardArc {
+  /** Closed arcs retain their members and entries, but add no turn context. */
+  closed_at?: string
   id: string
   title: string
   goal: string
@@ -210,6 +214,8 @@ export function createArcBoardEndpoints({ get, post, j }: ClientTransport) {
       arcBoardArcs: () => get('/api/arc-board/arcs').then(j) as Promise<{ arcs: ArcBoardSummary[] }>,
       arcBoardDetail: (arcId: string) =>
         get('/api/arc-board/arcs/' + id(arcId)).then(j) as Promise<ArcBoardDetail>,
+      arcBoardClose: (arcId: string) =>
+        post('/api/arc-board/arcs/' + id(arcId) + '/close', {}).then(j) as Promise<{ arc: ArcBoardArc }>,
       arcBoardCreate: (spec: ArcBoardCreateSpec) =>
         post('/api/arc-board/arcs', spec).then(j) as Promise<{ arc: ArcBoardArc; lanes: ArcBoardLaneJoin[] }>,
       /** Adds the lane, joins it to the arc's channel and sends its kickoff. */

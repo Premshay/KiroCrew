@@ -20730,6 +20730,12 @@
       "reset": "重置布局"
     },
     "arcBoard": {
+      "lifecycle": "Arc 状态",
+      "close_arc": "关闭 Arc",
+      "closed": "已关闭",
+      "close_confirm": "关闭“{{name}}”？",
+      "close_hint": "这将停止向所有成员会话添加 Arc 上下文。看板历史和条目仍可读取。",
+      "close_failed": "无法关闭 Arc",
       "page_title": "弧线面板",
       "subtitle": "每条弧线为了什么、进展到哪、还有什么在等你。",
       "new_arc": "新建弧线",

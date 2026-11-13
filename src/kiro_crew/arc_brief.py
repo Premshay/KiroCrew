@@ -241,7 +241,7 @@ def arc_turn_prefix(session_key: str) -> str:
     Within an arc the oldest unseen entries come first, ``ENTRY_LIMIT`` per turn.
     """
     try:
-        member_arcs = arcs.arcs_for_member(session_key)
+        member_arcs = [arc for arc in arcs.arcs_for_member(session_key) if not arc.get("closed_at")]
     except Exception as exc:
         _warn_once(exc)
         return ""

@@ -275,6 +275,7 @@ def create_arc(spec: dict[str, Any], members: list[dict[str, Any]] | None = None
         "members": member_records,
         "milestone_index": 0,
         "created_at": _now().isoformat(timespec="seconds"),
+        "closed_at": "",
     }
     dir_path = _arc_dir(arc["id"])
     dir_path.mkdir(parents=True, exist_ok=True)
@@ -336,6 +337,17 @@ def remove_member(arc_id: str, session_key: str) -> dict[str, Any]:
             raise ArcError(f"{key!r} is not a member of arc {arc_id}")
         del arc["members"][key]
         _write_json(dir_path / "arc.json", arc)
+        return arc
+
+
+def close_arc(arc_id: str) -> dict[str, Any]:
+    """Stop turn injection without removing members or entries (owner only)."""
+    dir_path = _arc_dir(arc_id)
+    with _locked(dir_path):
+        arc = _load_arc(dir_path)
+        if not arc.get("closed_at"):
+            arc["closed_at"] = _now().isoformat(timespec="seconds")
+            _write_json(dir_path / "arc.json", arc)
         return arc
 
 

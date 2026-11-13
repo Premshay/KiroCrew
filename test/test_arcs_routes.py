@@ -38,7 +38,12 @@ def arc():
     from kiro_crew import arcs
 
     made = arcs.create_arc(
-        {"title": "Pilot", "goal": "ship", "milestones": [{"name": "m1"}], "rules": ["be brief"]}
+        {
+            "title": "Pilot",
+            "goal": "ship",
+            "milestones": [{"name": "m1"}],
+            "rules": ["be brief"],
+        }
     )
     arcs.add_member(made["id"], MEMBER, "builder")
     arcs.add_member(made["id"], PEER, "reviewer")
@@ -81,6 +86,22 @@ def _get(arc_id: str, suffix: str, key: str = MEMBER) -> web.Request:
     return _request(
         "GET", f"/api/arcs/{arc_id}/{suffix}", match_info={"arc_id": arc_id}, session_key=key
     )
+
+
+@pytest.mark.asyncio
+async def test_members_can_still_read_a_closed_arc(routes, arc):
+    from kiro_crew import arc_brief, arcs
+
+    entry = arcs.append_entry(arc["id"], MEMBER, {"kind": "FACT", "text": "Evidence stays"})
+    arcs.close_arc(arc["id"])
+    for member in (MEMBER, PEER):
+        assert arc_brief.arc_turn_prefix(member) == ""
+        brief = await routes.api_arc_brief(_get(arc["id"], "brief", member))
+        assert brief.status == 200
+        assert "ship" in json.loads(brief.text)["brief"]
+        entries = await routes.api_arc_entries_read(_get(arc["id"], "entries", member))
+        assert entries.status == 200
+        assert json.loads(entries.text)["entries"] == [entry]
 
 
 @pytest.mark.asyncio
@@ -275,7 +296,12 @@ async def test_write_returns_reply_to_own_ask_and_claim_collision(routes, arc):
             )
         ).text
     )["entry"]
-    claim_body = {"kind": "CLAIM", "text": "taking it", "step": "wire api", "checked": ["ADR-1"]}
+    claim_body = {
+        "kind": "CLAIM",
+        "text": "taking it",
+        "step": "wire api",
+        "checked": ["ADR-1"],
+    }
     await routes.api_arc_entries_write(_post(arc["id"], claim_body))
     answer = arcs.append_entry(
         arc["id"], PEER, {"kind": "FACT", "text": "this", "reply_to": ask["id"]}

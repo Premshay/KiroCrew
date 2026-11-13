@@ -21730,6 +21730,12 @@
       "reset": "Réinitialiser la disposition"
     },
     "arcBoard": {
+      "lifecycle": "État de l’arc",
+      "close_arc": "Fermer l’arc",
+      "closed": "Fermé",
+      "close_confirm": "Fermer « {{name}} » ?",
+      "close_hint": "Le contexte de l’arc ne sera plus ajouté aux sessions des membres. L’historique et les entrées du tableau resteront accessibles.",
+      "close_failed": "Impossible de fermer l’arc",
       "page_title": "Tableau des arcs",
       "subtitle": "À quoi sert chaque arc, où il en est, et ce qui t'attend.",
       "new_arc": "Nouvel arc",
