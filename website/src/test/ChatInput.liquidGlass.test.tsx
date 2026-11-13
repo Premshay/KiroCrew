@@ -139,9 +139,12 @@ describe('composer liquid glass', () => {
     // against them instead of the dock wrapper (Design, round 1).
     expect(CHAT_INPUT_SRC).toMatch(/className=\{`input-area px-4 pb-1 \$\{hasApproval \? 'pt-0' : 'pt-1'\} mx-auto w-full flex flex-col`\}/)
     expect(CHAT_INPUT_SRC).not.toMatch(/className=\{`input-area [^`]*\b(relative|absolute|fixed|sticky)\b/)
-    // Fork: the shelf also scrolls horizontally (overflow-x-auto) so every chip
-    // stays reachable on a phone.
-    expect(CHAT_INPUT_SRC).toMatch(/data-testid="composer-context-shelf" className="glass-shelf pt-1 flex items-center gap-2 min-w-0 overflow-x-auto overflow-y-hidden" style=\{\{ \['--glass-shelf-h' as string\]: `\$\{shelfHeight\}px` \}\}/)
+    // Only the inner scroll row is masked; the shelf's full-width scrim survives.
+    expect(CHAT_INPUT_SRC).toMatch(/data-testid="composer-context-shelf" className="glass-shelf pt-1 min-w-0" style=\{\{ \['--glass-shelf-h' as string\]: `\$\{shelfHeight\}px` \}\}/)
+    renderWithProviders(<ChatInput value="" onChange={vi.fn()} onSend={vi.fn()} onProjectClick={vi.fn()} />)
+    const shelf = screen.getByTestId('composer-context-shelf')
+    expect(shelf).toContainElement(screen.getByTestId('composer-shelf-scroll'))
+    expect(screen.getByTestId('composer-shelf-scroll')).toHaveClass('edge-fade-x', 'overflow-x-auto')
   })
 
   it('lets the follow-up chips keep their top and bottom hairline', () => {

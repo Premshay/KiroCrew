@@ -1,9 +1,8 @@
 /**
  * Composer shelf: the context readout and model chip never paint over the agent
- * and project chips. The right group shrinks (its model name truncates); the
- * chip group keeps a floor sized for the chips' content once their labels have
- * truncated to nothing, one per shelf band. happy-dom does no layout, so this
- * pins the classes that decide it, and the chip geometry the floor is sized for.
+ * and project chips. Groups retain their intrinsic width inside one scroller.
+ * happy-dom pins the layout contract; verify-composer-shelf-mobile.mjs checks
+ * actual geometry and activation after scrolling in Chromium.
  */
 import { describe, it, expect, vi } from 'vitest'
 import { act, screen } from '@testing-library/react'
@@ -35,17 +34,17 @@ async function renderShelf() {
 }
 
 describe('ChatInput — shelf chips keep their room', () => {
-  it('lets the readout and model chip give way instead of covering the chips', async () => {
+  it('keeps controls at their usable width inside a single scroll row', async () => {
     // No ResizeObserver in happy-dom: the shelf stays in its wide band.
     const { agentChip, projectChip, chipGroup, rightGroup } = await renderShelf()
 
-    expect(rightGroup).toHaveClass('min-w-0')
-    expect(rightGroup).not.toHaveClass('shrink-0')
-    // Wide, labels truncated to nothing: 2 x (px-2.5 + 13px icon + gap-1.5) + gap-2 = 86,
-    // + branch separator (gap-1.5 + '·' + gap-1.5) = 102, + the AWS segment's gap-1.5 = 108
-    // <= min-w-28 (7rem = 112px at a 16px root).
-    expect(chipGroup).toHaveClass('flex-1', 'gap-2', 'min-w-28')
-    expect(chipGroup).not.toHaveClass('min-w-21')
+    expect(rightGroup).toHaveClass('shrink-0')
+    expect(chipGroup).toHaveClass('flex-auto', 'shrink-0', 'gap-2')
+    const scroller = screen.getByTestId('composer-shelf-scroll')
+    expect(scroller).toHaveClass('overflow-x-auto')
+    expect(scroller).toContainElement(chipGroup)
+    expect(scroller).toContainElement(rightGroup)
+    expect(screen.getByTestId('composer-context-shelf')).not.toHaveClass('relative', 'edge-fade-x')
     expect(chipGroup).toContainElement(projectChip)
     for (const chip of [agentChip, projectChip]) {
       expect(chip).toHaveClass('px-2.5', 'gap-1.5')
@@ -53,7 +52,7 @@ describe('ChatInput — shelf chips keep their room', () => {
     }
   })
 
-  it('keeps an icon-sized floor once the shelf is compact', async () => {
+  it('collapses labels without shrinking the controls on a narrow shelf', async () => {
     const observers = new Map<Element, ResizeObserverCallback>()
     vi.stubGlobal('ResizeObserver', class {
       constructor(private callback: ResizeObserverCallback) {}
@@ -70,10 +69,8 @@ describe('ChatInput — shelf chips keep their room', () => {
       const agentChip = screen.getByRole('button', { name: 'Agent: kirocrew' })
       const projectChip = screen.getByTestId('composer-project-chip')
       const chipGroup = agentChip.parentElement as HTMLElement
-      // Compact, icons only: 2 x (px-2.5 + 13px icon) + gap-2 = 74, + the pill's gap-1.5
-      // before the AWS segment = 80 <= min-w-21 (5.25rem = 84px at a 16px root).
-      expect(chipGroup).toHaveClass('flex-1', 'gap-2', 'min-w-21')
-      expect(chipGroup).not.toHaveClass('min-w-28')
+      expect(chipGroup).toHaveClass('flex-auto', 'shrink-0', 'gap-2')
+      expect(projectChip).not.toHaveTextContent('Project')
       expect(chipGroup).toContainElement(projectChip)
       for (const chip of [agentChip, projectChip]) {
         expect(chip).toHaveClass('px-2.5')
