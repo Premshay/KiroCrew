@@ -21730,6 +21730,12 @@
       "reset": "Reimposta layout"
     },
     "arcBoard": {
+      "lifecycle": "Stato dell’arco",
+      "close_arc": "Chiudi arco",
+      "closed": "Chiuso",
+      "close_confirm": "Chiudere «{{name}}»?",
+      "close_hint": "Il contesto dell’arco non verrà più aggiunto alle sessioni dei membri. La cronologia e le voci della bacheca resteranno leggibili.",
+      "close_failed": "Impossibile chiudere l’arco",
       "page_title": "Board degli archi",
       "subtitle": "A cosa serve ogni arco, dove sta e cosa ti aspetta.",
       "new_arc": "Nuovo arco",

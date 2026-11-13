@@ -16,6 +16,7 @@ vi.mock('../api/client', () => ({
     arcBoardAccept: vi.fn(),
     arcBoardAnswer: vi.fn(),
     arcBoardSettings: vi.fn(),
+    arcBoardClose: vi.fn(),
     arcBoardAddMember: vi.fn(),
     arcBoardReport: vi.fn(),
     agentCatalog: vi.fn(),
@@ -30,6 +31,8 @@ import { api } from '../api/client'
 import ArcBoardPage from './ArcBoardPage'
 
 const ARC = 'arc_' + 'a'.repeat(32)
+// The arc-list query enables the detail query before its controls render.
+const ARC_LOAD_TIMEOUT_MS = 5_000
 const arc = {
   id: ARC,
   title: 'Classics references',
@@ -68,6 +71,7 @@ function renderPage() {
 }
 
 beforeEach(() => {
+  vi.mocked(api.arcBoardClose).mockReset()
   vi.mocked(api.arcBoardArcs).mockResolvedValue({
     arcs: [
       {
@@ -111,6 +115,60 @@ beforeEach(() => {
 })
 
 describe('ArcBoardPage', () => {
+  it('closes only after confirmation and keeps the history visible', async () => {
+    renderPage()
+    const button = await screen.findByRole('button', { name: 'Close arc' }, { timeout: ARC_LOAD_TIMEOUT_MS })
+    const detail = await vi.mocked(api.arcBoardDetail).mock.results[0].value
+    const closed = { ...arc, closed_at: '2026-11-13T10:00:00+00:00' }
+    vi.mocked(api.arcBoardClose).mockImplementation(async () => {
+      vi.mocked(api.arcBoardDetail).mockResolvedValue({ ...detail, arc: closed })
+      return { arc: closed }
+    })
+    fireEvent.click(button)
+    const dialog = await screen.findByRole('dialog', { name: 'Close “Classics references”?' })
+    expect(api.arcBoardClose).not.toHaveBeenCalled()
+    expect(within(dialog).getByText(/Board history and entries stay readable/)).toBeTruthy()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close arc' }))
+    await waitFor(() => expect(api.arcBoardClose).toHaveBeenCalledExactlyOnceWith(ARC))
+    expect(await screen.findByRole('button', { name: 'Closed' })).toBeDisabled()
+    expect(screen.getByText('rendered')).toBeTruthy()
+  })
+
+  it('cancelling close leaves the arc open', async () => {
+    renderPage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Close arc' }, { timeout: ARC_LOAD_TIMEOUT_MS }))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    expect(api.arcBoardClose).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'Close arc' })).toBeEnabled()
+  })
+
+  it('shows a close failure and permits a retry', async () => {
+    vi.mocked(api.arcBoardClose).mockRejectedValue(new Error('Arc store is busy'))
+    renderPage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Close arc' }, { timeout: ARC_LOAD_TIMEOUT_MS }))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close arc' }))
+    expect(await screen.findByText('Arc store is busy')).toBeTruthy()
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    expect(screen.getByRole('button', { name: 'Close arc' })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'Closed' })).toBeNull()
+  })
+
+  it('keeps an already closed arc and its entries on the board', async () => {
+    const detail = await api.arcBoardDetail(ARC)
+    const closed = { ...arc, closed_at: '2026-11-13T10:00:00+00:00' }
+    vi.mocked(api.arcBoardDetail).mockResolvedValue({ ...detail, arc: closed })
+    const list = await api.arcBoardArcs()
+    vi.mocked(api.arcBoardArcs).mockResolvedValue({ arcs: [{ ...list.arcs[0], closed_at: closed.closed_at }] })
+    renderPage()
+    expect(await screen.findByRole('button', { name: 'Closed' }, { timeout: ARC_LOAD_TIMEOUT_MS })).toBeDisabled()
+    expect(screen.getAllByText('Closed')).toHaveLength(2)
+    expect(screen.getByText('rendered')).toBeTruthy()
+    expect(api.arcBoardClose).not.toHaveBeenCalled()
+  })
+
   it('renders the arc, its lane, the owner ask and the selected lane brief', async () => {
     renderPage()
     expect(await screen.findAllByText('Classics references')).not.toHaveLength(0)

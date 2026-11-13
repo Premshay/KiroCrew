@@ -23,6 +23,9 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/arc-board/arcs", arc_board_handlers.api_arc_board_create)
     app.router.add_get("/api/arc-board/arcs/{arc_id}", arc_board_handlers.api_arc_board_detail)
     app.router.add_post(
+        "/api/arc-board/arcs/{arc_id}/close", arc_board_handlers.api_arc_board_close
+    )
+    app.router.add_post(
         "/api/arc-board/arcs/{arc_id}/members",
         arc_board_handlers.api_arc_board_add_member,
     )

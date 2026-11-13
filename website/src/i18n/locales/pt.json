@@ -21730,6 +21730,12 @@
       "reset": "Redefinir layout"
     },
     "arcBoard": {
+      "lifecycle": "Estado do arco",
+      "close_arc": "Fechar arco",
+      "closed": "Fechado",
+      "close_confirm": "Fechar “{{name}}”?",
+      "close_hint": "Isso deixa de adicionar o contexto do arco às sessões de todos os membros. O histórico e as entradas do quadro continuam disponíveis.",
+      "close_failed": "Não foi possível fechar o arco",
       "page_title": "Painel dos arcos",
       "subtitle": "Para que serve cada arco, onde está e o que te espera.",
       "new_arc": "Novo arco",

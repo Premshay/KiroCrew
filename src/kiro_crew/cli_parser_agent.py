@@ -573,6 +573,8 @@ def register_arc_parser(sub: _Commands) -> None:
 Examples:
   kirocrew arc create --file arc.json
   kirocrew arc add-member ARC_ID SESSION_KEY --role builder
+  kirocrew arc remove-member ARC_ID SESSION_KEY
+  kirocrew arc close ARC_ID
   kirocrew arc show ARC_ID
   kirocrew arc answer ARC_ID ASK_ID "use the staging key"
   kirocrew arc accept ARC_ID
@@ -588,6 +590,11 @@ Examples:
     arc_member.add_argument("arc_id", help="Arc id")
     arc_member.add_argument("session_key", help="Session key of the new member")
     arc_member.add_argument("--role", required=True, help="Role the member plays")
+    arc_remove = arc_sub.add_parser("remove-member", help="Detach a session; keep its entries")
+    arc_remove.add_argument("arc_id", help="Arc id")
+    arc_remove.add_argument("session_key", help="Session key of the member to remove")
+    arc_close = arc_sub.add_parser("close", help="Stop arc context in member turns; keep the board")
+    arc_close.add_argument("arc_id", help="Arc id")
     arc_show = arc_sub.add_parser("show", help="Show milestone, open claims and asks, entries")
     arc_show.add_argument("arc_id", help="Arc id")
     arc_answer = arc_sub.add_parser("answer", help="Answer an open ASK as the owner")

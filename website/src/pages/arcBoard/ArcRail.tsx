@@ -117,6 +117,7 @@ export default function ArcRail({
                 }
               />
               <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                {a.closed_at ? <Badge variant="muted">{i18nT('pages.arcBoard.closed')}</Badge> : null}
                 {a.open_asks > 0 ? (
                   <Badge variant="warn" className="px-1.5 text-[10px]">
                     {i18nT('pages.arcBoard.asks_n', { n: a.open_asks })}

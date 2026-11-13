@@ -23,6 +23,19 @@ a milestone. The original claim and closure remain in the stream.
 
 ## Overview
 
+The owner closes an arc with `kirocrew arc close ARC_ID` or **Close arc**
+on the Arc board. The owner-only `/api/arc-board/arcs/{arc_id}/close` route
+and CLI share the locked, idempotent `arcs.close_arc` store operation.
+Its `closed_at` timestamp stops that arc's next-turn prefix for every member.
+An absent timestamp means open, including arcs created before closure existed.
+Closing keeps membership, entries, cursors and channels intact; it does not
+freeze board writes or resolve open claims and asks. `arc_brief`,
+`arc_board_read`, `kirocrew arc show` and the dashboard still read the board.
+Closed arcs remain listed with a Closed badge. Accepting the last milestone
+does not close an arc automatically; the CLI prints the close command as a hint.
+`kirocrew arc remove-member ARC_ID SESSION_KEY` exposes the existing locked
+member removal: only that session loses membership and arc context; its entries stay.
+
 Agent model-key normalization belongs to `dashboard/agent_admin/model_discovery.py`.
 The agents facade re-exports it and preserves patches through the existing import
 surface; the composition contract verifies its single owner.

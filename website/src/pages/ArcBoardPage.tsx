@@ -38,6 +38,7 @@ import {
 } from '../api/client/arcBoard'
 import ArcRail from './arcBoard/ArcRail'
 import ArcSettings from './arcBoard/ArcSettings'
+import ArcLifecycle from './arcBoard/ArcLifecycle'
 import ArcStage from './arcBoard/ArcStage'
 import ClampText from './arcBoard/ClampText'
 import BoardFeed from './arcBoard/BoardFeed'
@@ -485,6 +486,7 @@ export default function ArcBoardPage() {
                     settingsMut.isError ? errMessage(settingsMut.error) || i18nT('pages.arcBoard.settings_failed') : null
                   }
                 />
+                <ArcLifecycle key={data.arc.id} arc={data.arc} />
               </div>
             ) : null}
           </div>

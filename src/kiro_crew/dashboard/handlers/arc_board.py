@@ -229,6 +229,7 @@ def _arc_summary(arc: dict[str, Any]) -> dict[str, Any]:
         "open_asks": len(arcs.open_asks(arc["id"])),
         "open_claims": len(arcs.open_claims(arc["id"])),
         "created_at": arc["created_at"],
+        "closed_at": arc.get("closed_at", ""),
     }
 
 
@@ -437,6 +438,15 @@ async def api_arc_board_remove_member(request: web.Request) -> web.Response:
         return _error_response(exc, "arc_board.remove_member")
     left = _leave_channel(request.app.get("state"), arc, ledger_key(session_key))
     return web.json_response({"arc": arc, "left_channel": left})
+
+
+async def api_arc_board_close(request: web.Request) -> web.Response:
+    """POST /api/arc-board/arcs/{arc_id}/close — stop turn context, retain the board."""
+    _body, err = await _gate_body(request, "arc_board.close")
+    if err is not None:
+        return err
+    arc_id = request.match_info.get("arc_id", "")
+    return await _run("arc_board.close", lambda: {"arc": arcs.close_arc(arc_id)})
 
 
 async def api_arc_board_open_channel(request: web.Request) -> web.Response:

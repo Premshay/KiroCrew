@@ -21230,6 +21230,12 @@
       "reset": "Layout zurücksetzen"
     },
     "arcBoard": {
+      "lifecycle": "Arc-Status",
+      "close_arc": "Arc schließen",
+      "closed": "Geschlossen",
+      "close_confirm": "„{{name}}“ schließen?",
+      "close_hint": "Der Arc-Kontext wird nicht mehr zu den Sitzungen der Mitglieder hinzugefügt. Der Board-Verlauf und die Einträge bleiben lesbar.",
+      "close_failed": "Der Arc konnte nicht geschlossen werden",
       "page_title": "Arc-Board",
       "subtitle": "Wofür jeder Arc da ist, wo er steht und was auf dich wartet.",
       "new_arc": "Neuer Arc",

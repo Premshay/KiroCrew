@@ -30,11 +30,17 @@ async def test_owner_note_can_resolve_claim_with_reason(client: TestClient) -> N
     arc = arcs.create_arc({"title": "Pilot"})
     arcs.add_member(arc["id"], MEMBER, "builder")
     claim = arcs.append_entry(
-        arc["id"], MEMBER, {"kind": "CLAIM", "text": "work", "step": "schema", "checked": ["ADR"]}
+        arc["id"],
+        MEMBER,
+        {"kind": "CLAIM", "text": "work", "step": "schema", "checked": ["ADR"]},
     )
     response = await client.post(
         f"/api/arc-board/arcs/{arc['id']}/note",
-        json={"text": "replaced by new work", "resolution": "superseded", "reply_to": claim["id"]},
+        json={
+            "text": "replaced by new work",
+            "resolution": "superseded",
+            "reply_to": claim["id"],
+        },
     )
     assert response.status == 200
     entry = (await response.json())["entry"]
@@ -227,6 +233,53 @@ async def test_detail_entry_text_is_redacted(client: TestClient) -> None:
     arcs.append_entry(arc["id"], MEMBER, {"kind": "FACT", "text": f"key {SECRET}"})
     body = await (await client.get(f"/api/arc-board/arcs/{arc['id']}")).json()
     assert SECRET not in json.dumps(body)
+
+
+@pytest.mark.asyncio
+async def test_close_keeps_the_board_channels_and_members_readable(client, channels):
+    from kiro_crew import arc_brief, arcs
+
+    arc = await _make_arc(client, members=[{"session_key": MEMBER, "role": "builder"}])
+    entry = arcs.append_entry(arc["id"], MEMBER, {"kind": "FACT", "text": "Keep the evidence"})
+    assert "[Arc board:" in arc_brief.arc_turn_prefix(MEMBER)
+    url = f"/api/arc-board/arcs/{arc['id']}"
+    response = await client.post(url + "/close", json={})
+    assert response.status == 200
+    closed = (await response.json())["arc"]
+    assert closed["closed_at"]
+    assert closed["members"] == arc["members"]
+    assert closed["milestone_index"] == arc["milestone_index"]
+    assert arc_brief.arc_turn_prefix(MEMBER) == ""
+    response = await client.get(url)
+    assert response.status == 200
+    detail = await response.json()
+    assert detail["arc"] == closed
+    assert detail["entries"] == [entry]
+    assert detail["briefs"][MEMBER]
+    response = await client.get("/api/arc-board/arcs")
+    assert (await response.json())["arcs"][0]["closed_at"] == closed["closed_at"]
+    response = await client.post(url + "/close", json={})
+    assert (await response.json())["arc"] == closed
+    assert channels.get(arc["channel_id"]) is not None
+    assert channels.closed == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("headers", [{"X-Test-User": "peer"}, {"X-Test-App": "worker"}])
+async def test_non_owner_cannot_close_an_existing_arc(client, headers):
+    from kiro_crew import arcs
+
+    arc = await _make_arc(client)
+    response = await client.post(f"/api/arc-board/arcs/{arc['id']}/close", json={}, headers=headers)
+    assert response.status == 403
+    assert not arcs.read_arc(arc["id"]).get("closed_at")
+
+
+@pytest.mark.asyncio
+async def test_close_of_unknown_arc_returns_404(client):
+    response = await client.post("/api/arc-board/arcs/arc_" + "0" * 32 + "/close", json={})
+    assert response.status == 404
+    assert (await response.json())["code"] == "arc_not_found"
 
 
 @pytest.mark.asyncio
@@ -532,6 +585,7 @@ async def test_every_owner_route_is_gated() -> None:
                 {"ask_id": "ae_" + "0" * 32, "text": "t"},
             ),
             ("POST", f"/api/arc-board/arcs/{MEMBER}/accept", {"expected_index": 0}),
+            ("POST", f"/api/arc-board/arcs/{MEMBER}/close", {}),
             ("GET", f"/api/arc-board/arcs/{MEMBER}/report", None),
             (
                 "POST",
@@ -558,7 +612,10 @@ async def test_every_owner_route_is_gated() -> None:
 
 
 async def _create(client: TestClient, **over: Any):
-    spec: dict[str, Any] = {"title": "Own channel", "milestones": [{"name": "m1"}, {"name": "m2"}]}
+    spec: dict[str, Any] = {
+        "title": "Own channel",
+        "milestones": [{"name": "m1"}, {"name": "m2"}],
+    }
     spec.update(over)
     return await client.post("/api/arc-board/arcs", json=spec)
 
@@ -627,7 +684,8 @@ async def test_add_lane_joins_and_kickoff_is_optional(
 async def test_a_lane_with_no_live_session_stays_on_the_arc(client: TestClient) -> None:
     arc = (await (await _create(client)).json())["arc"]
     response = await client.post(
-        f"/api/arc-board/arcs/{arc['id']}/members", json={"session_key": "chat-gone", "role": "r"}
+        f"/api/arc-board/arcs/{arc['id']}/members",
+        json={"session_key": "chat-gone", "role": "r"},
     )
     body = await response.json()
     assert "chat-gone" in body["arc"]["members"]
@@ -672,7 +730,10 @@ async def test_open_channel_gives_a_channelless_arc_its_own(
 async def test_detail_shows_the_channel_and_who_is_in_it(client: TestClient) -> None:
     arc = await _make_arc(
         client,
-        members=[{"session_key": MEMBER, "role": "b"}, {"session_key": "chat-gone", "role": "x"}],
+        members=[
+            {"session_key": MEMBER, "role": "b"},
+            {"session_key": "chat-gone", "role": "x"},
+        ],
     )
     body = await (await client.get(f"/api/arc-board/arcs/{arc['id']}")).json()
     assert body["channel"]["id"] == "ch1" and body["channel"]["open"] is True
@@ -742,7 +803,10 @@ def test_autonomy_three_brief_lists_the_milestones_ahead(autonomy: int, shown: b
         {
             "title": "t",
             "autonomy": autonomy,
-            "milestones": [{"name": "first", "criteria": "a"}, {"name": "second", "criteria": "b"}],
+            "milestones": [
+                {"name": "first", "criteria": "a"},
+                {"name": "second", "criteria": "b"},
+            ],
         },
         members=[{"session_key": MEMBER, "role": "b"}],
     )
