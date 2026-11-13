@@ -47,7 +47,8 @@ def _managed_mcp_env() -> dict[str, str]:
     other direction.
 
     Returns ``{}`` on a default install, which keeps the emitted spec
-    byte-for-byte what it is today (``_prune_empty`` drops an empty ``env``).
+    byte-for-byte what it is today: :func:`managed_mcp_spec_entry` sets ``env`` only
+    when this is non-empty, and :func:`_enforce_managed_mcp_ownership` pops an empty one.
     That is safe only because a default-install child DERIVES the same home the
     gateway did, from an inherited ``HOME``. Preserving a user's ``env`` puts
     that inheritance in reach of a config, so the companion control lives in
@@ -233,7 +234,7 @@ def _mcp_registry_mode() -> bool:
     change exists to prevent.
     """
     try:
-        # Function-local like the model resolver a few frames up: importing the
+        # Function-local like spec_build._background_agent_model's: importing the
         # loader at module scope closes an import cycle through the config plane.
         from kiro_crew.config.loader import KiroCrewConfig
 
@@ -415,17 +416,19 @@ def managed_mcp_spec_entry(name: str, *, include_opt_in: bool = False) -> dict[s
     ``spec_gate`` is closed — the same predicate the two spec writers use, so a
     caller cannot resurrect a server emission withholds.
 
-    ``include_opt_in`` resolves an ``opt_in`` entry's invocation anyway, and exists
-    for the ONE caller that is not asking the emission question:
-    ``mcp_gateway.gatewayd._spawns_own_control_plane``, which compares a spawn's
-    binary and argv against the invocation this name is DEFINED as. A closed
-    ``spec_gate`` still yields ``None`` under the flag; the branch below says why the
-    two disqualifiers part company there. It grants nothing on its own, because
-    neither spec writer passes it: an opt-in entry a writer omits is still omitted.
+    ``include_opt_in`` resolves an ``opt_in`` entry's invocation anyway, for callers
+    that are not asking the emission question: the control-plane check
+    (``mcp_gateway.gatewayd._spawns_own_control_plane``), which compares a spawn's
+    binary and argv against the invocation this name is DEFINED as, and the paths
+    that resolve a server a spec or grant already names (the app-agent copier in
+    ``apps/bridges_agents.py`` among them). A closed ``spec_gate`` still yields
+    ``None`` under the flag; the branch below says why the two disqualifiers part
+    company there. It grants nothing on its own: neither host spec writer passes it,
+    and the app-agent copier passes it only for a server the agent already names.
 
-    ``autoApprove`` is deliberately NOT carried, unlike the emit loop in
-    :func:`build_agent_config`. The flag is kiro-cli's local approval, and the
-    one caller here (the claude MCP translation, :mod:`kiro_crew.acp.session_mcp`)
+    ``autoApprove`` is deliberately NOT carried, unlike :func:`emit_managed_servers`
+    (the emit loop :func:`build_agent_config` runs). The flag is kiro-cli's local
+    approval, and one caller (the claude MCP translation, :mod:`kiro_crew.acp.session_mcp`)
     targets a backend whose nearest equivalent — a ``permissions.allow`` entry —
     means Claude never asks, so the call never reaches Crew's gate. Emitting the
     entry un-approved keeps every call gated.
@@ -467,6 +470,36 @@ def managed_mcp_spec_entry(name: str, *, include_opt_in: bool = False) -> dict[s
     if env:
         entry["env"] = env
     return entry
+
+
+def with_managed_launch(entry: Any, managed: Any) -> Any:
+    """*entry* launching the managed invocation *managed*, every other key its own.
+
+    For a reserved ``kirocrew-*`` declaration a session mounts as written: a KAS
+    agent-block entry that a ``timeout`` keeps out of the session-level array, or
+    an entry of a native skill view. The managed path names the installed version,
+    so a spec copied from ``kirocrew.json`` names a payload that a later upgrade
+    removes, and the server would fail to start. Only ``command`` and ``args`` are
+    replaced: the restrictions (``timeout``, ``disabled``, ``disabledTools``,
+    ``type``) and the ``env`` stay as the caller shaped them.
+
+    *entry* comes back unchanged when it is not an object, declares no ``command``
+    (a remote server), already launches *managed*, or *managed* has no command
+    (not managed, a closed ``spec_gate``, an unresolvable launcher). Pure: the
+    caller resolves *managed* (:func:`managed_mcp_spec_entry`).
+    """
+    if not isinstance(entry, dict) or "command" not in entry:
+        return entry
+    if not isinstance(managed, dict) or not managed.get("command"):
+        return entry
+    raw_args = managed.get("args")
+    launch = {
+        "command": str(managed["command"]),
+        "args": [str(a) for a in raw_args] if isinstance(raw_args, (list, tuple)) else [],
+    }
+    if all(entry.get(key) == value for key, value in launch.items()):
+        return entry
+    return {**entry, **launch}
 
 
 def _enforce_managed_mcp_ownership(
@@ -690,12 +723,13 @@ def emit_managed_servers(mcp: dict, *, gated_off: frozenset[str], registry_mode:
         else:
             cmd = spec.get("command") or spec["command_fn"]()
             args = list(spec["args"])
-        # The deep merge above may have supplied user-owned options such as a
-        # timeout or extra environment variables. Keep those on a clean build,
-        # while replacing the invocation and transport fields that define our
-        # trusted managed server. Ownership of every other field is enforced
-        # by the same helper the refresh path uses (_enforce_managed_mcp_ownership),
-        # so the two loops cannot silently diverge on what counts as "ours".
+        # The user override file merged into the base may have supplied user-owned
+        # options such as a timeout or extra environment variables. Keep those on a
+        # clean build, while replacing the invocation and transport fields that
+        # define our trusted managed server. Ownership of every other field is
+        # enforced by the same helper the refresh path uses
+        # (_enforce_managed_mcp_ownership), so the two loops cannot silently diverge
+        # on what counts as "ours".
         existing = mcp.get(name)
         entry = dict(existing) if isinstance(existing, dict) else {}
         entry["command"] = cmd
@@ -782,17 +816,26 @@ def refresh_managed_servers(mcp: dict, *, gated_off: frozenset[str], registry_mo
             entry[MERGED_MARK] = True
 
 
-def register_managed_refs(config: dict, *, fresh_install: bool, gated_off: frozenset[str]) -> None:
+def register_managed_refs(
+    config: dict,
+    *,
+    fresh_install: bool,
+    gated_off: frozenset[str],
+    mounted_aliases: dict[str, str],
+) -> None:
     """Reference the managed servers in ``tools`` and audit the ones a gate withholds."""
     valid_servers: dict[str, Any] = config["mcpServers"]
     # On fresh installs, ensure managed MCP tools are in tools (but NOT
     # allowedTools — new MCPs may have destructive tools; user opts in).
     # On existing configs, don't touch tools/allowedTools — user controls those.
+    # An edition server first supplied on an existing config gets its ref once
+    # from ``guide_platform.grant_edition_refs_once`` instead.
     if fresh_install:
         added_refs: list[str] = []
         # Managed servers + edition-contributed servers both get their @ref
         # registered so their tools are callable. Edition servers are injected
-        # into config['mcpServers'] via _extra_mcp_servers() above; their @ref
+        # into config['mcpServers'] by build_agent_config's _extra_mcp_servers()
+        # loop, which builds every fresh install's config; their @ref
         # must also be added to config['tools'], otherwise kiro-cli exposes the
         # server but not its tools. The public edition contributes none, so this
         # is a no-op there.
@@ -800,8 +843,9 @@ def register_managed_refs(config: dict, *, fresh_install: bool, gated_off: froze
             n for n in agent_mod._extra_mcp_servers() if n not in agent_mod._MANAGED_MCP_SERVERS
         ]
         for mcp_name in _register_names:
-            ref = f"@{mcp_name}"
-            if mcp_name in valid_servers and ref not in config.get("tools", []):
+            alias = mounted_aliases.get(mcp_name, mcp_name)
+            ref = f"@{alias}"
+            if alias in valid_servers and ref not in config.get("tools", []):
                 config.setdefault("tools", []).append(ref)
                 added_refs.append(ref)
         if added_refs:

@@ -1241,6 +1241,23 @@ class TestRetirementCoverage:
                 and node.func.value.attr == "_session_map"
             )
 
+        def refuses_retired(test: ast.AST) -> bool:
+            if isinstance(test, ast.Attribute):
+                return test.attr == "retire_on_identity_change"
+            return (
+                isinstance(test, ast.BoolOp)
+                and isinstance(test.op, ast.Or)
+                and any(refuses_retired(value) for value in test.values)
+            )
+
+        assert refuses_retired(
+            ast.parse("s.retire_on_identity_change or s.cwd_retracted", mode="eval").body
+        )
+        assert not refuses_retired(
+            ast.parse("s.retire_on_identity_change and ready", mode="eval").body
+        )
+        assert not refuses_retired(ast.parse("not s.retire_on_identity_change", mode="eval").body)
+
         def has_prior_identity_guard(
             call: ast.Call,
             parents: dict[ast.AST, ast.AST],
@@ -1254,10 +1271,7 @@ class TestRetirementCoverage:
                     for sibling in value[: value.index(child)]:
                         if not isinstance(sibling, ast.If):
                             continue
-                        tests_identity_marker = (
-                            isinstance(sibling.test, ast.Attribute)
-                            and sibling.test.attr == "retire_on_identity_change"
-                        )
+                        tests_identity_marker = refuses_retired(sibling.test)
                         exits_writer_path = bool(sibling.body) and isinstance(
                             sibling.body[-1], (ast.Continue, ast.Return)
                         )

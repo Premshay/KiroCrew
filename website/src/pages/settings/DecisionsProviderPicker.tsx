@@ -2,21 +2,208 @@ import { useId, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { api } from '../../api/client'
-import { isNotFoundError } from '../../api/apiError'
+import { ApiError, apiErrorCode, isNotFoundError } from '../../api/apiError'
 import type {
   DecisionsLocalModel,
   DecisionsLocalRuntimeData,
   DecisionsProviderData,
   DecisionsRuntimeStatus,
+  DecisionsSageMakerTarget,
+  DecisionsSageMakerTestResult,
 } from '../../api/client/decisions'
 import ErrorNotice from '../../components/ErrorNotice'
-import { Btn } from '../../components/ui'
+import { Btn, Input } from '../../components/ui'
 import { fmtPercent, fmtUnit } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
-import { DECISIONS_PROVIDER_QUERY_KEY, PRESET_NONE } from './decisionsProviderQuery'
+import { DecisionsHostedKeyField } from './DecisionsHostedKeyField'
+import {
+  DECISIONS_PROVIDER_QUERY_KEY,
+  PRESET_HOSTED,
+  PRESET_NONE,
+  allModelsRefused,
+  isRefusedHostedDefault,
+  isRefusedSageMaker,
+  providerPermitted,
+} from './decisionsProviderQuery'
 
-/** Preset id for hosted Jev; the gateway's `local_models.PRESET_JEV`. */
-export const PRESET_JEV = 'jev'
+/** Preset id for the hosted provider; the gateway's `local_models.PRESET_JEV`. */
+export const PRESET_JEV = PRESET_HOSTED
+/** The picker's id for a SageMaker endpoint; the gateway's `PRESET_SAGEMAKER`. */
+export const PRESET_SAGEMAKER = 'sagemaker'
+/** What the SageMaker option asks to install when the gateway has no boto3. */
+/** The settings-search anchor of the hosted provider's entry: the registry id of its
+ *  API key, which lives in that entry (`settingsManual.ts` points the id here). */
+const HOSTED_ENTRY_SETTING_ID = 'developer.jev-api-key'
+const BOTO3_INSTALL = 'pip install "boto3>=1.34,<2"'
+const EMPTY_SAGEMAKER: DecisionsSageMakerTarget = { endpoint_name: '', region: '', profile: '' }
+
+const sameSageMaker = (a: DecisionsSageMakerTarget, b: DecisionsSageMakerTarget | null | undefined) =>
+  !!b && a.endpoint_name === b.endpoint_name && a.region === b.region && a.profile === b.profile
+
+/** The field a refused SageMaker body names (`endpoint_name`, `region`, `profile`), or `''`. */
+function refusedField(e: unknown): string {
+  if (!(e instanceof ApiError)) return ''
+  try {
+    const field = (JSON.parse(e.body) as { field?: unknown }).field
+    return typeof field === 'string' ? field : ''
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * The sentence for a refused SageMaker save or test, from the gateway's code and
+ * field, or `null` when the refusal is not about the SageMaker fields.
+ */
+function sageMakerRefusal(e: unknown): string | null {
+  const code = apiErrorCode(e)
+  if (code === 'decisions_provider_sagemaker_unknown_profile') {
+    return i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_unknown_profile')
+  }
+  if (code === 'decisions_provider_sagemaker_unavailable') {
+    return i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_boto3_missing', { command: BOTO3_INSTALL })
+  }
+  if (code !== 'decisions_provider_sagemaker_invalid') return null
+  const field = refusedField(e)
+  if (field === 'region') return i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_invalid_region')
+  if (field === 'profile') return i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_invalid_profile')
+  return i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_invalid_name')
+}
+
+/** The sentence for a connection test that ran and got no answer, by the gateway's fixed word. */
+function testFailure(error: string): string {
+  switch (error) {
+    case 'credentials':
+      return i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_test_credentials')
+    case 'not_found':
+      return i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_test_not_found')
+    case 'timeout':
+      return i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_test_timeout')
+    case 'throttled':
+      return i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_test_throttled')
+    case 'unavailable':
+      return i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_test_unavailable')
+    case 'model_error':
+      return i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_test_model_error')
+    case 'protocol':
+      return i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_test_protocol')
+    default:
+      return i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_test_failed')
+  }
+}
+
+/**
+ * The three fields that name a SageMaker endpoint, and the connection test.
+ *
+ * The card sends the parts, never an address: the gateway checks each one and
+ * builds the `sagemaker://` address itself.
+ */
+function SageMakerFields({
+  value,
+  onChange,
+  disabled,
+  available,
+  notSending,
+}: {
+  value: DecisionsSageMakerTarget
+  onChange: (next: DecisionsSageMakerTarget) => void
+  disabled: boolean
+  available: boolean
+  /** The saved endpoint is shown and has no consent yet, so nothing reaches it. */
+  notSending: boolean
+}) {
+  const baseId = useId()
+  const testMut = useMutation<DecisionsSageMakerTestResult, unknown, DecisionsSageMakerTarget>({
+    mutationFn: target => api.testDecisionsSageMaker(target),
+  })
+  // A result describes the fields it was run with; editing them retires it.
+  const edit = (patch: Partial<DecisionsSageMakerTarget>) => {
+    testMut.reset()
+    onChange({ ...value, ...patch })
+  }
+  const complete = value.endpoint_name.trim() !== '' && value.region.trim() !== ''
+  const field = (key: keyof DecisionsSageMakerTarget, label: string, placeholder: string) => (
+    <label htmlFor={`${baseId}-${key}`} className="flex flex-col gap-0.5 text-[12px] text-text">
+      {label}
+      <Input
+        id={`${baseId}-${key}`}
+        type="text"
+        autoComplete="off"
+        spellCheck={false}
+        className="font-mono text-[12px]"
+        placeholder={placeholder}
+        value={value[key]}
+        disabled={disabled || !available}
+        onChange={e => edit({ [key]: e.target.value.trim() })}
+      />
+    </label>
+  )
+  const result = testMut.data
+  return (
+    <div className="flex flex-col gap-1.5 rounded-md border border-border bg-bg-accent px-2.5 py-1.5">
+      {!available && (
+        <p className="text-[12px] text-warn m-0" role="status">
+          {i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_boto3_missing', { command: BOTO3_INSTALL })}
+        </p>
+      )}
+      {/* The switch and the screenshot toggle are named by their own labels, so the
+          line points at exactly what the reader sees on this card. */}
+      {notSending && (
+        <p className="text-[12px] text-warn m-0" role="status">
+          {i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_not_sending', {
+            switch: i18nT('pages.developer.featurePreviewsTab.decisions'),
+            screenshots: i18nT('pages.developer.featurePreviewsTab.decisions_browser_images'),
+            point: i18nT('pages.developer.featurePreviewsTab.decisions_point_browser_step'),
+          })}
+        </p>
+      )}
+      {field('endpoint_name', i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_name'), 'my-endpoint')}
+      {field('region', i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_region'), 'us-west-2')}
+      {/* No placeholder: a greyed "default" reads as a value already set. */}
+      {field('profile', i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_profile'), '')}
+      <p className="text-[12px] text-muted m-0">
+        {i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_profile_hint')}
+      </p>
+      <div className="flex flex-wrap items-center gap-2">
+        <Btn disabled={disabled || !available || !complete || testMut.isPending} onClick={() => testMut.mutate(value)}>
+          {testMut.isPending
+            ? i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_testing')
+            : i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_test')}
+        </Btn>
+        {result?.ok && (
+          <span className="text-[12px] text-accent" role="status">
+            {i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_test_ok', {
+              latency: fmtUnit(result.latency_ms / 1000, 'second', { maximumFractionDigits: 1 }),
+            })}
+          </span>
+        )}
+      </div>
+      {result && !result.ok && (
+        // The gateway's own fixed text goes below the translated reason: it names the
+        // AWS error code, and it never quotes the request or a credential.
+        // No hand-off: the typed SageMaker fields are an unsaved draft, and asking
+        // the agent unmounts the card.
+        <ErrorNotice
+          variant="block"
+          title={result.message ? testFailure(result.error) : undefined}
+          message={result.message || testFailure(result.error)}
+          messagePlacement="below"
+          messageClassName="font-mono text-[11px] break-words"
+        />
+      )}
+      {/* No hand-off, for the same unsaved draft as the notice above. */}
+      {testMut.isError && (
+        <ErrorNotice
+          variant="inline"
+          message={
+            sageMakerRefusal(testMut.error) ??
+            i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_test_request_failed')
+          }
+        />
+      )}
+    </div>
+  )
+}
 
 // The gateway reports memory in GiB after firmware and kernel reserve, so a 24 GB
 // machine reads about 23.5; the nominal threshold is met within this slack.
@@ -32,9 +219,9 @@ const gigabytes = (bytes: number) => fmtUnit(bytes / 1e9, 'gigabyte', { maximumF
 
 /**
  * The preset recommended for a machine with `totalGb` of memory: the first local
- * preset, in the gateway's order, whose threshold the machine meets, else hosted
- * Jev. An unknown size recommends Jev, because suggesting a model the machine
- * cannot hold is worse than suggesting nothing local.
+ * preset, in the gateway's order, whose threshold the machine meets, else the hosted
+ * provider. An unknown size recommends the hosted provider, because suggesting a
+ * model the machine cannot hold is worse than suggesting nothing local.
  */
 export function recommendedPreset(presets: DecisionsLocalModel[], totalGb: number | null | undefined): string {
   if (typeof totalGb !== 'number' || !Number.isFinite(totalGb) || totalGb <= 0) return PRESET_JEV
@@ -47,12 +234,19 @@ function RuntimeStatus({
   onRetry,
   retryDisabled,
   consentOn,
+  refused = false,
 }: {
   status: DecisionsRuntimeStatus
   onRetry: () => void
   retryDisabled: boolean
   consentOn: boolean
+  /** The administrator's policy refuses this model: say so instead of giving steps. */
+  refused?: boolean
 }) {
+  // While a refused model is prepared, the note says why it will not answer, not when.
+  const preparingNote = refused
+    ? i18nT('pages.developer.featurePreviewsTab.decisions_configured_blocked')
+    : i18nT('pages.developer.featurePreviewsTab.decisions_runtime_preparing_note')
   if (status.state === 'downloading') {
     const total = Math.max(status.bytes_total, 1)
     return (
@@ -69,9 +263,7 @@ function RuntimeStatus({
           value={Math.min(status.bytes_done, total)}
           aria-label={i18nT('pages.developer.featurePreviewsTab.decisions_runtime_downloading_label')}
         />
-        <p className="text-[12px] text-muted m-0">
-          {i18nT('pages.developer.featurePreviewsTab.decisions_runtime_preparing_note')}
-        </p>
+        <p className="text-[12px] text-muted m-0">{preparingNote}</p>
       </div>
     )
   }
@@ -81,9 +273,7 @@ function RuntimeStatus({
         <p className="text-[12px] text-text m-0">
           {i18nT('pages.developer.featurePreviewsTab.decisions_runtime_installing')}
         </p>
-        <p className="text-[12px] text-muted m-0">
-          {i18nT('pages.developer.featurePreviewsTab.decisions_runtime_preparing_note')}
-        </p>
+        <p className="text-[12px] text-muted m-0">{preparingNote}</p>
       </div>
     )
   }
@@ -97,7 +287,7 @@ function RuntimeStatus({
   if (status.state === 'running') {
     return (
       // Running is not answering: the server is up, but nothing reaches it while the
-      // Decisions switch is off, and the line must not read as if it were in use.
+      // main switch is off, and the line must not read as if it were in use.
       <p className={`text-[12px] m-0 ${consentOn ? 'text-accent' : 'text-muted'}`} role="status">
         {consentOn
           ? i18nT('pages.developer.featurePreviewsTab.decisions_runtime_running')
@@ -131,21 +321,32 @@ function RuntimeStatus({
 }
 
 /**
- * Which System One server answers the seam: hosted Jev, or a model on this machine.
+ * Which decision model answers: the hosted provider, a model on this machine, or the
+ * owner's own SageMaker endpoint.
  *
- * Each local preset states, in the reader's terms, how close it comes to Jev, what
- * memory it needs and how slow it is, and the card marks the one this machine's
- * memory suits. Choosing one writes a preset id -- never an address or a port --
+ * Each local preset states, in the reader's terms, how close it comes to the
+ * reference model, what memory it needs and how slow it is, and the card marks the
+ * one this machine's memory suits. Choosing one writes a preset id -- never an address or a port --
  * through the owner-only provider route, which builds the loopback URL itself and
  * then downloads, installs and runs the model; the card follows that progress.
+ * A SageMaker endpoint is written as its name, region and profile, from which the
+ * same route builds the `sagemaker://` address.
+ *
+ * Every option the administrator's policy does not allow (`providerPermitted`: its
+ * row, its host and its own entry in the `providers` allow list) is drawn, greyed,
+ * with the administrator's wording, and cannot be chosen; "No model" never is. The
+ * hosted provider's API key is part of that provider's own entry: choosing the entry
+ * opens it (`DecisionsHostedKeyField`), and nothing outside the entry names it. A
+ * settings-search hit on the key lands on that entry and highlights it; the reader
+ * opens it by choosing it.
  */
 export function DecisionsProviderPicker({
-  frozen,
+  frozen: frozenByCard,
   cardReadFailed = false,
   consentOn = true,
 }: {
   frozen: boolean
-  /** Whether the Decisions switch is on: a model only answers while it is. */
+  /** Whether consent stands for the configured endpoint: a model only answers while it does. */
   consentOn?: boolean
   /** The card already shows its own read-failure notice: one failure, one notice. */
   cardReadFailed?: boolean
@@ -181,9 +382,18 @@ export function DecisionsProviderPicker({
     staleTime: 5 * 60_000,
   })
   const [selected, setSelected] = useState<string | null>(null)
+  // Whether the key field has been drawn: once it has, it stays MOUNTED (hidden while
+  // another model is picked), so a typed, unsaved key survives a look at the others.
+  const [hostedKeyMounted, setHostedKeyMounted] = useState(false)
+  // The SageMaker fields as typed; null until edited, which shows the configured ones.
+  const [smDraft, setSmDraft] = useState<DecisionsSageMakerTarget | null>(null)
   const saveMut = useMutation({
-    mutationFn: (preset: string) => api.saveDecisionsProvider(preset),
-    onSuccess: () => setSelected(null),
+    mutationFn: (choice: { preset: string; sagemaker?: DecisionsSageMakerTarget }) =>
+      choice.sagemaker ? api.saveDecisionsSageMaker(choice.sagemaker) : api.saveDecisionsProvider(choice.preset),
+    onSuccess: () => {
+      setSelected(null)
+      setSmDraft(null)
+    },
     // The endpoint moved, so the consent row's "sent to" line and the config read
     // both change with it.
     onSettled: () =>
@@ -203,7 +413,12 @@ export function DecisionsProviderPicker({
   // and the card's own pointer already says where the address is set, so nothing
   // is drawn. Any other failed read says so, with the hand-off -- there is no draft
   // to lose before the list has loaded.
-  if (providerQ.isError) {
+  // A failed RE-read keeps the last answer on screen (react-query keeps the data),
+  // so nothing the reader typed is unmounted -- the hosted key field above all --
+  // while every write is held until a read succeeds again.
+  const providerStale = providerQ.isError && providerQ.data !== undefined
+  const frozen = frozenByCard || providerStale
+  if (providerQ.isError && !providerStale) {
     return isNotFoundError(providerQ.error) || cardReadFailed ? null : (
       <ErrorNotice
         variant="inline"
@@ -214,12 +429,16 @@ export function DecisionsProviderPicker({
   }
   if (!data) return null
 
-  // Policy decides which side may be chosen; an older gateway reports neither, which
-  // is the permissive answer it always had.
-  const hostedBlocked = data.hosted_permitted === false
-  const localBlocked = data.local_permitted === false
-  // "No model" sends and runs nothing, so no policy withholds it.
-  const blockedId = (id: string) => (id === PRESET_NONE ? false : id === PRESET_JEV ? hostedBlocked : localBlocked)
+  // The administrator's policy decides which options may be chosen, per model; an
+  // older gateway reports none of it, which is the permissive answer it always had.
+  // A refused option is SHOWN, greyed and saying so, never hidden: a model that
+  // silently vanished would read as one this build does not ship.
+  const blockedId = (id: string) => !providerPermitted(data, id)
+  // An older gateway reports no SageMaker fields and would refuse the body.
+  const sageMakerOffered = typeof data.sagemaker_available === 'boolean'
+  const hiddenId = (id: string) => id === PRESET_SAGEMAKER && !sageMakerOffered
+  const sageMakerAvailable = data.sagemaker_available === true
+  const smValue = smDraft ?? data.sagemaker ?? EMPTY_SAGEMAKER
   // The polled status is newer than the provider read while that read still shows
   // the model being prepared. Once a fresh provider read has settled, its own
   // runtime is current and the last poll -- kept by react-query -- is not.
@@ -230,20 +449,56 @@ export function DecisionsProviderPicker({
     providerBusy && !pollFailed && polled && typeof polled.runtime === 'object' && Array.isArray(polled.installed) ? polled : undefined
   const presets = live ? data.presets.map(p => ({ ...p, installed: live.installed.includes(p.id) })) : data.presets
   const totalGb = memQ.data
-  const recommended = recommendedPreset(localBlocked ? [] : presets, totalGb)
-  const chosen = selected ?? (data.active === 'custom' ? '' : data.active)
+  const recommended = recommendedPreset(presets.filter(p => !blockedId(p.id)), totalGb)
+  // A refused model still saved in the settings: the gateway reports `active: "none"`
+  // for it, but "No model" is not what is saved, so no option is drawn selected; the
+  // saved one is marked as saved and refused instead.
+  const refusedDefault = isRefusedHostedDefault(data)
+  const savedRefusedId = refusedDefault ? (isRefusedSageMaker(data) ? PRESET_SAGEMAKER : PRESET_JEV) : null
+  const configuredChoice =
+    data.active === 'custom' || hiddenId(data.active) || refusedDefault ? '' : data.active
+  const chosen = selected ?? configuredChoice
+  // The hosted provider's key field: shown while that entry is chosen, and never for a
+  // provider the policy refuses.
+  const hostedKeyShown = chosen === PRESET_JEV && !blockedId(PRESET_JEV)
+  if (hostedKeyShown && !hostedKeyMounted) setHostedKeyMounted(true)
   const chosenPreset = presets.find(p => p.id === chosen)
   const runtime = live?.runtime ?? data.runtime
   // The runtime's report applies only to the preset it is running.
   const chosenRuntime =
     runtime && chosenPreset && runtime.preset === chosenPreset.id && runtime.state !== 'idle' ? runtime : undefined
-  const needsSave = chosen !== '' && chosen !== data.active
-  const canSave = needsSave && !frozen && !saveMut.isPending && !blockedId(chosen)
+  const sageMakerChosen = chosen === PRESET_SAGEMAKER
+  // Another endpoint while one is in use is a change too, not only another option.
+  // A refused hosted default is reported as "No model" while the config still names
+  // it, so choosing "No model" over it is a change that has to be written.
+  const needsSave =
+    chosen !== '' &&
+    (chosen !== data.active ||
+      (chosen === PRESET_NONE && refusedDefault) ||
+      (sageMakerChosen && !sameSageMaker(smValue, data.sagemaker)))
+  const sageMakerReady = !sageMakerChosen || (sageMakerAvailable && smValue.endpoint_name !== '' && smValue.region !== '')
+  const canSave = needsSave && sageMakerReady && !frozen && !saveMut.isPending && !blockedId(chosen)
+  const save = () => saveMut.mutate(sageMakerChosen ? { preset: chosen, sagemaker: smValue } : { preset: chosen })
   const removable = presets.filter(p => p.installed && p.id !== data.active && p.id !== runtime?.preset)
+  // Every option the picker offers is refused; "No model" is then the only choice.
+  const allBlocked = allModelsRefused({ ...data, presets })
+  // The button names the model it would switch to, so a pending pick under another
+  // option's "In use" badge cannot be mistaken for the one in use.
+  const useLabel =
+    chosen === PRESET_NONE
+      ? i18nT('pages.developer.featurePreviewsTab.decisions_provider_use_none')
+      : i18nT('pages.developer.featurePreviewsTab.decisions_provider_use_named', {
+          name:
+            chosen === PRESET_JEV
+              ? i18nT('pages.developer.featurePreviewsTab.decisions_provider_jev')
+              : chosen === PRESET_SAGEMAKER
+                ? i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker')
+                : (presets.find(p => p.id === chosen)?.name ?? chosen),
+        })
 
   // A preset that just failed to start here is not one to recommend for this machine.
   const failedHere = (id: string) => runtime?.preset === id && runtime.state === 'error'
-  // Memory decides only between local models; hosted Jev is the fallback, not a fit.
+  // Memory decides only between local models; the hosted provider is the fallback, not a fit.
   const recommendedBadge = (id: string) =>
     id === recommended && id !== PRESET_JEV && typeof totalGb === 'number' && !failedHere(id) ? (
       <span className="rounded bg-accent/15 px-1.5 text-[11px] text-accent">
@@ -254,11 +509,40 @@ export function DecisionsProviderPicker({
     ) : null
   // "In use" means answering: a local preset earns it only once its server runs,
   // and until then the status block below says what is happening instead.
+  // A refused model still saved is marked as saved and refused rather than in use, and
+  // "No model" is not what is in use there either: nothing is.
+  // The refused model still saved, and nothing picked over it yet: inside that model's
+  // entry, the sentence saying it is saved and refused and the button that clears it
+  // (writes `none`), labelled for exactly that. A pick of another option takes over
+  // with the usual button at the foot of the picker.
+  const clearSaved = (id: string, name: string) =>
+    savedRefusedId === id ? (
+      <div className="flex flex-col gap-1" data-testid="decisions-saved-refused">
+        <p className="text-[12px] text-warn m-0">
+          {i18nT('pages.developer.featurePreviewsTab.decisions_hosted_refused', { name })}
+        </p>
+        {selected === null && (
+          <div>
+            <Btn
+              disabled={frozen || saveMut.isPending}
+              onClick={() => saveMut.mutate({ preset: PRESET_NONE })}
+            >
+              {i18nT('pages.developer.featurePreviewsTab.decisions_provider_clear_saved')}
+            </Btn>
+          </div>
+        )}
+      </div>
+    ) : null
   const answering = (id: string) =>
-    id === PRESET_NONE ||
-    (consentOn && (id === PRESET_JEV || (runtime?.preset === id && runtime.state === 'running')))
+    (id === PRESET_NONE && !refusedDefault) ||
+    (consentOn &&
+      (id === PRESET_JEV || id === PRESET_SAGEMAKER || (runtime?.preset === id && runtime.state === 'running')))
   const activeBadge = (id: string) =>
-    id === data.active && answering(id) ? (
+    id === savedRefusedId ? (
+      <span className="rounded bg-bg px-1.5 text-[11px] text-warn border border-border">
+        {i18nT('pages.developer.featurePreviewsTab.decisions_provider_saved_refused')}
+      </span>
+    ) : id === data.active && answering(id) ? (
       <span className="rounded bg-bg px-1.5 text-[11px] text-muted border border-border">
         {i18nT('pages.developer.featurePreviewsTab.decisions_provider_active')}
       </span>
@@ -267,9 +551,11 @@ export function DecisionsProviderPicker({
   const option = (id: string, name: string, details: ReactNode) => (
     <label
       key={id}
-      className={`flex items-start gap-2 rounded-md border px-2.5 py-1.5 cursor-pointer ${
-        chosen === id ? 'border-accent bg-bg' : 'border-border bg-bg'
-      }`}
+      data-provider-entry={id}
+      data-provider-blocked={blockedId(id) ? 'true' : undefined}
+      className={`flex items-start gap-2 rounded-md border px-2.5 py-1.5 ${
+        blockedId(id) ? 'cursor-not-allowed' : 'cursor-pointer'
+      } ${chosen === id ? 'border-accent bg-bg' : 'border-border bg-bg'}`}
     >
       <input
         type="radio"
@@ -281,12 +567,16 @@ export function DecisionsProviderPicker({
         onChange={() => setSelected(id)}
       />
       <span className="flex flex-col gap-0.5 min-w-0">
-        <span className="flex flex-wrap items-center gap-1.5 text-[12px] font-medium text-text">
-          {name}
-          {activeBadge(id)}
-          {recommendedBadge(id)}
+        {/* A refused model's name and figures fade; the line saying why does not, so
+            the reason keeps its full contrast. */}
+        <span className={`flex flex-col gap-0.5 min-w-0 ${blockedId(id) ? 'opacity-60' : ''}`}>
+          <span className="flex flex-wrap items-center gap-1.5 text-[12px] font-medium text-text">
+            {name}
+            {activeBadge(id)}
+            {recommendedBadge(id)}
+          </span>
+          {details}
         </span>
-        {details}
         {blockedId(id) && (
           <span className="text-[12px] text-warn">
             {i18nT('pages.developer.featurePreviewsTab.decisions_provider_blocked')}
@@ -302,6 +592,14 @@ export function DecisionsProviderPicker({
         {i18nT('pages.developer.featurePreviewsTab.decisions_provider_label')}
       </p>
       <p className="text-[12px] text-muted m-0">{i18nT('pages.developer.featurePreviewsTab.decisions_provider_desc')}</p>
+      {/* No hand-off: an unsaved key may be typed in the hosted provider's entry, and
+          asking the agent unmounts this card with it. */}
+      {providerStale && !cardReadFailed && (
+        <ErrorNotice
+          variant="inline"
+          message={i18nT('pages.developer.featurePreviewsTab.decisions_provider_unavailable')}
+        />
+      )}
       {/* Without the memory figure no preset can be marked recommended; say so
           rather than let the badge silently vanish. The picker itself still works. */}
       {memQ.isError && !cardReadFailed && (
@@ -311,13 +609,40 @@ export function DecisionsProviderPicker({
           message={i18nT('pages.developer.featurePreviewsTab.decisions_provider_memory_unavailable')}
         />
       )}
-      {option(
-        PRESET_JEV,
-        i18nT('pages.developer.featurePreviewsTab.decisions_provider_jev'),
-        <span className="text-[12px] text-muted">
-          {i18nT('pages.developer.featurePreviewsTab.decisions_provider_jev_detail')}
-        </span>,
+      {/* Every option is refused: one plain sentence above them, so a list of greyed
+          rows is never the only way to read it. */}
+      {allBlocked && (
+        <p className="text-[12px] text-warn m-0" role="status" data-testid="decisions-all-models-blocked">
+          {i18nT('pages.developer.featurePreviewsTab.decisions_all_models_blocked')}
+        </p>
       )}
+      {/* The hosted provider's ENTRY: its option, the line saying a configured hosted
+          default is refused, and its API key. The only place its name is drawn, and
+          the anchor a settings-search hit on the key lands on (`settingsManual.ts`):
+          the reader opens the entry, and so the key, by choosing it. Flashed in the
+          neutral style, so the highlight is not read as a selection. */}
+      <div
+        className="flex flex-col gap-1.5"
+        data-testid="decisions-provider-hosted-entry"
+        data-setting-id={HOSTED_ENTRY_SETTING_ID}
+        data-setting-flash="neutral"
+      >
+        {option(
+          PRESET_JEV,
+          i18nT('pages.developer.featurePreviewsTab.decisions_provider_jev'),
+          <span className="text-[12px] text-muted">
+            {i18nT('pages.developer.featurePreviewsTab.decisions_provider_jev_detail')}
+          </span>,
+        )}
+        {clearSaved(PRESET_JEV, i18nT('pages.developer.featurePreviewsTab.decisions_provider_jev'))}
+        {/* Mounted once drawn and kept mounted (hidden) whatever the policy or the
+            next read says, so a typed, unsaved key is never discarded by a refresh. */}
+        {hostedKeyMounted && (
+          <div hidden={!hostedKeyShown}>
+            <DecisionsHostedKeyField disabled={frozen} saveDisabled={blockedId(PRESET_JEV)} />
+          </div>
+        )}
+      </div>
       {presets.map(p =>
         option(
           p.id,
@@ -344,6 +669,26 @@ export function DecisionsProviderPicker({
           </>,
         ),
       )}
+      {sageMakerOffered &&
+        option(
+          PRESET_SAGEMAKER,
+          i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker'),
+          <span className="text-[12px] text-muted">
+            {i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker_detail')}
+          </span>,
+        )}
+      {clearSaved(PRESET_SAGEMAKER, i18nT('pages.developer.featurePreviewsTab.decisions_provider_sagemaker'))}
+      {sageMakerOffered && sageMakerChosen && (
+        <SageMakerFields
+          value={smValue}
+          onChange={setSmDraft}
+          disabled={frozen || saveMut.isPending || blockedId(PRESET_SAGEMAKER)}
+          available={sageMakerAvailable}
+          // Only once saved, and only while the fields still show that saved
+          // endpoint: an unsaved draft is not "this endpoint" yet.
+          notSending={!consentOn && data.active === PRESET_SAGEMAKER && sameSageMaker(smValue, data.sagemaker)}
+        />
+      )}
       {option(
         PRESET_NONE,
         i18nT('pages.developer.featurePreviewsTab.decisions_provider_none'),
@@ -363,17 +708,24 @@ export function DecisionsProviderPicker({
           {chosenRuntime ? (
             <RuntimeStatus
               status={chosenRuntime}
-              onRetry={() => saveMut.mutate(chosenPreset.id)}
+              onRetry={() => saveMut.mutate({ preset: chosenPreset.id })}
               retryDisabled={frozen || saveMut.isPending || blockedId(chosenPreset.id)}
               consentOn={consentOn}
+              refused={blockedId(chosenPreset.id)}
             />
           ) : (
-            <p className="text-[12px] text-muted m-0">
-              {chosenPreset.installed
-                ? i18nT('pages.developer.featurePreviewsTab.decisions_provider_ready')
-                : i18nT('pages.developer.featurePreviewsTab.decisions_provider_download_note', {
-                    size: gigabytes(chosenPreset.download_bytes),
-                  })}
+            <p className="text-[12px] text-muted m-0" data-testid="decisions-preset-note">
+              {/* A refused model gets the administrator's answer, not steps it cannot
+                  take; "press the button below" only while that button is drawn. */}
+              {blockedId(chosenPreset.id)
+                ? i18nT('pages.developer.featurePreviewsTab.decisions_configured_blocked')
+                : !chosenPreset.installed
+                  ? i18nT('pages.developer.featurePreviewsTab.decisions_provider_download_note', {
+                      size: gigabytes(chosenPreset.download_bytes),
+                    })
+                  : needsSave
+                    ? i18nT('pages.developer.featurePreviewsTab.decisions_provider_ready')
+                    : i18nT('pages.developer.featurePreviewsTab.decisions_provider_downloaded')}
             </p>
           )}
           {/* What running it costs the rest of the machine, before and while it runs. */}
@@ -388,21 +740,29 @@ export function DecisionsProviderPicker({
       <p className="text-[11px] text-muted m-0">{i18nT('pages.developer.featurePreviewsTab.decisions_provider_measured')}</p>
       {needsSave && (
         <div className="flex flex-col gap-1">
-          {/* The picked option is not live yet; say what keeps answering meanwhile. */}
-          <p className="text-[12px] text-muted m-0">
-            {i18nT('pages.developer.featurePreviewsTab.decisions_provider_pending')}
-          </p>
+          {/* The picked option is not live yet; say what keeps answering meanwhile.
+              Over a refused configured model nothing answers, so there is nothing to say. */}
+          {!refusedDefault && (
+            <p className="text-[12px] text-muted m-0">
+              {i18nT('pages.developer.featurePreviewsTab.decisions_provider_pending')}
+            </p>
+          )}
           <div>
-            <Btn disabled={!canSave} onClick={() => saveMut.mutate(chosen)}>
-              {i18nT('pages.developer.featurePreviewsTab.decisions_provider_use')}
+            <Btn disabled={!canSave} onClick={save}>
+              {useLabel}
             </Btn>
           </div>
         </div>
       )}
       {/* No hand-off: a failed save leaves the reader's unsaved pick on the card, and
-          asking the agent unmounts it. */}
+          asking the agent unmounts it. A refused SageMaker field says which one. */}
       {saveMut.isError && (
-        <ErrorNotice variant="inline" message={i18nT('pages.developer.featurePreviewsTab.decisions_provider_save_failed')} />
+        <ErrorNotice
+          variant="inline"
+          message={
+            sageMakerRefusal(saveMut.error) ?? i18nT('pages.developer.featurePreviewsTab.decisions_provider_save_failed')
+          }
+        />
       )}
       {removable.map(p => (
         <div key={p.id}>

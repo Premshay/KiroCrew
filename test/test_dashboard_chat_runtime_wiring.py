@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -980,7 +981,9 @@ class TestRuntimeWiring:
         # leave the "dashboard_s1" cache entry stale.
         history_key = "dashboard:s1"
         state.conversation_log.append(history_key, "user", "hi", agent="old-agent")
-        state.conversation_log.update_metadata(history_key, {"model": "gpt-5.6-terra"})
+        await asyncio.to_thread(
+            state.conversation_log.update_metadata, history_key, {"model": "gpt-5.6-terra"}
+        )
         assert state.conversation_log.get_metadata(history_key).get("agent") == "old-agent"
 
         # Minimal config stub (agent-binding resolution is exercised by the

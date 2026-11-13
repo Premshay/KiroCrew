@@ -34,6 +34,7 @@ from kiro_crew.dashboard.relay_archive import (
     RELAY_ARCHIVE_ERROR,
     is_relay_archive,
 )
+from kiro_crew.dashboard.slot_buffers import flush_restored_hold
 from kiro_crew.dashboard.slot_ownership import app_owns_slot_session
 from kiro_crew.dashboard.state import DashboardState, _normalize_slot_key, load_window_off_loop
 from kiro_crew.dashboard.turn_dispatch import chat_turn_timeout_secs
@@ -376,6 +377,23 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
         # Membership must be checked on the canonical (filename-charset) key —
         # get_or_create_slot folds unsafe chars, so a raw slot_id may map to an
         # existing slot even when the raw string is absent from _slots.
+        # Authorization first: an app caller can never mint a slot here (the fresh slot
+        # has no app, so it is refused below exactly as for any unknown key), so only
+        # the dashboard's own caller is told a restored tab is still loading.
+        if not request.get("app", "") and await state.session_still_loading(
+            _normalize_slot_key(slot_id)
+        ):
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "Session is still loading",
+                        "type": "invalid_request_error",
+                        "code": "session_loading",
+                    },
+                    "code": "session_loading",
+                },
+                status=409,
+            )
         freshly_created = _normalize_slot_key(slot_id) not in state._slots
         try:
             slot = state.get_or_create_slot(slot_id)
@@ -665,6 +683,8 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
                     status=409,
                 )
         slot.agent = agent
+    # A hold a restart restored into this idle slot is owed to this turn.
+    flush_restored_hold(slot, logger=logger)
     slot.append("user", prompt, "msg msg-u")
 
     # SEL audit for tool invocation visibility

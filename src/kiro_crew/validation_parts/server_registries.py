@@ -2,7 +2,9 @@
 
 These two servers' schemas live in several owners, so their registries live here;
 a server whose schemas share one owner keeps its registry beside them. A tool absent
-from its server's registry has its arguments passed through raw.
+from its server's registry has its arguments passed through raw, except a tool an
+installed app declares, which ``mcp_core._validate_args`` checks against its declared
+schema (``mcp_tools.app_tools.tool_schema``).
 
 Callers import these names from :mod:`kiro_crew.validation`, which serves them; this
 module never imports that facade.
@@ -10,25 +12,12 @@ module never imports that facade.
 
 from __future__ import annotations
 
-from kiro_crew.apps import builtin_agent_tools as _builtin_agent_tools
-from kiro_crew.validation_parts.app_schemas import (
-    CODE_REVIEW_SAGE_API_SCHEMA,
-    ISSUE_RADAR_CREW_READ_SCHEMA,
-    ISSUE_RADAR_CREW_RECORD_SCHEMA,
-    ISSUE_RADAR_RECORD_INVESTIGATION_SCHEMA,
-    OPS_MISSION_CONTROL_API_SCHEMA,
-    POD_DOWN_SCHEMA,
-    POD_LS_SCHEMA,
-    POD_RESTART_SCHEMA,
-    POD_STATUS_SCHEMA,
-    POD_UP_SCHEMA,
-)
-from kiro_crew.validation_parts.arc_schemas import (  # noqa: F401 - preserved facade exports
+from kiro_crew.validation_parts.app_schemas import CODE_REVIEW_SAGE_API_SCHEMA
+from kiro_crew.validation_parts.arc_schemas import (
     ARC_BOARD_GREP_SCHEMA,
     ARC_BOARD_READ_SCHEMA,
     ARC_BOARD_WRITE_SCHEMA,
     ARC_BRIEF_SCHEMA,
-    ARC_ENTRY_ROUTE_SCHEMA,
 )
 from kiro_crew.validation_parts.artifact_schemas import (
     ARTIFACT_DELETE_COMMENT_SCHEMA,
@@ -74,6 +63,7 @@ from kiro_crew.validation_parts.core_agent_schemas import (
     LEARN_ADD_SCHEMA,
     LEARN_LIST_SCHEMA,
     LEARN_REMOVE_SCHEMA,
+    LEARN_UPDATE_SCHEMA,
     MONITOR_INSPECT_SCHEMA,
     MONITOR_START_SCHEMA,
     MONITOR_STOP_SCHEMA,
@@ -108,12 +98,15 @@ from kiro_crew.validation_parts.core_turn_schemas import (
 )
 from kiro_crew.validation_parts.field_engine import ToolSchema
 from kiro_crew.validation_parts.messaging_session_schemas import (
+    DISMISS_NOTIFICATION_SCHEMA,
     GET_CHAT_SESSION_SCHEMA,
     KNOWLEDGE_ADD_DOCUMENT_SCHEMA,
     KNOWLEDGE_DEDUP_SCHEMA,
     KNOWLEDGE_LIST_SOURCES_SCHEMA,
     LIST_SESSIONS_SCHEMA,
     LOCAL_KNOWLEDGE_SEARCH_SCHEMA,
+    MCP_SERVER_WAIT_SCHEMA,
+    READ_SLACK_HISTORY_SCHEMA,
     READ_SLACK_PROFILE_SCHEMA,
     REGISTER_HOOK_SCHEMA,
     ROUTE_CREW_SCHEMA,
@@ -133,6 +126,7 @@ from kiro_crew.validation_parts.messaging_session_schemas import (
     SESSION_GENERATE_TITLE_SCHEMA,
     SESSION_HANDOFF_SCHEMA,
     SESSION_HISTORY_LIST_SCHEMA,
+    SESSION_QUEUE_SCHEMA,
     SESSION_READ_MESSAGE_SCHEMA,
     SESSION_RELEASE_SCHEMA,
     SESSION_RELOAD_SCHEMA,
@@ -143,42 +137,35 @@ from kiro_crew.validation_parts.messaging_session_schemas import (
     SESSION_SEND_SCHEMA,
     SESSION_SET_COLOR_SCHEMA,
     SESSION_SET_MODEL_SCHEMA,
+    SESSION_SET_NOTE_SCHEMA,
     SESSION_STATUS_SCHEMA,
     SESSION_STOP_SCHEMA,
     SESSION_SUMMARY_SCHEMA,
     WAIT_SCHEMA,
     WORK_DISPATCH_SCHEMA,
 )
-from kiro_crew.validation_parts.work_item_schemas import (  # noqa: F401 - preserved facade exports
+from kiro_crew.validation_parts.work_item_schemas import (
     WORK_CYCLE_ARCHIVE_LIST_SCHEMA,
     WORK_CYCLE_ARCHIVE_READ_SCHEMA,
     WORK_CYCLE_CLOSE_SCHEMA,
     WORK_CYCLE_OPEN_SCHEMA,
-    WORK_ITEM_ASSIGNED_HANDOFF_ROUTE_SCHEMA,
     WORK_ITEM_ASSIGNED_LIST_SCHEMA,
-    WORK_ITEM_ASSIGNED_PROGRESS_ROUTE_SCHEMA,
     WORK_ITEM_ASSIGNED_READ_SCHEMA,
     WORK_ITEM_CREATE_SCHEMA,
-    WORK_ITEM_DISPATCH_RETRY_ROUTE_SCHEMA,
     WORK_ITEM_DISPATCH_RETRY_SCHEMA,
     WORK_ITEM_EVALUATE_SCHEMA,
     WORK_ITEM_LAUNCH_CANDIDATES_SCHEMA,
-    WORK_ITEM_LAUNCH_ROUTE_SCHEMA,
     WORK_ITEM_LAUNCH_SCHEMA,
     WORK_ITEM_LIST_SCHEMA,
     WORK_ITEM_READ_SCHEMA,
     WORK_ITEM_REPORT_PROGRESS_SCHEMA,
     WORK_ITEM_REVOKE_ASSIGNMENT_SCHEMA,
-    WORK_ITEM_REVOKE_ROUTE_SCHEMA,
     WORK_ITEM_SUBMIT_HANDOFF_SCHEMA,
-    WORK_ITEM_TRANSITION_ROUTE_SCHEMA,
     WORK_ITEM_TRANSITION_SCHEMA,
-    WORK_ITEM_UPDATE_ROUTE_SCHEMA,
     WORK_ITEM_UPDATE_SCHEMA,
 )
 
 # ── Schema Registry ──
-
 
 MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "route_crew": ROUTE_CREW_SCHEMA,
@@ -190,38 +177,20 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "learn_add": LEARN_ADD_SCHEMA,
     "learn_list": LEARN_LIST_SCHEMA,
     "learn_remove": LEARN_REMOVE_SCHEMA,
+    "learn_update": LEARN_UPDATE_SCHEMA,
     "session_ledger_read": SESSION_LEDGER_READ_SCHEMA,
     "session_ledger_record": SESSION_LEDGER_RECORD_SCHEMA,
-    "arc_brief": ARC_BRIEF_SCHEMA,
-    "arc_board_read": ARC_BOARD_READ_SCHEMA,
-    "arc_board_grep": ARC_BOARD_GREP_SCHEMA,
-    "arc_board_write": ARC_BOARD_WRITE_SCHEMA,
-    "work_cycle_open": WORK_CYCLE_OPEN_SCHEMA,
-    "work_item_create": WORK_ITEM_CREATE_SCHEMA,
-    "work_item_update": WORK_ITEM_UPDATE_SCHEMA,
-    "work_item_transition": WORK_ITEM_TRANSITION_SCHEMA,
-    "work_item_evaluate": WORK_ITEM_EVALUATE_SCHEMA,
-    "work_cycle_close": WORK_CYCLE_CLOSE_SCHEMA,
-    "work_item_list": WORK_ITEM_LIST_SCHEMA,
-    "work_item_read": WORK_ITEM_READ_SCHEMA,
-    "work_cycle_archive_list": WORK_CYCLE_ARCHIVE_LIST_SCHEMA,
-    "work_cycle_archive_read": WORK_CYCLE_ARCHIVE_READ_SCHEMA,
-    "work_item_launch_candidates": WORK_ITEM_LAUNCH_CANDIDATES_SCHEMA,
-    "work_item_launch": WORK_ITEM_LAUNCH_SCHEMA,
-    "work_item_dispatch_retry": WORK_ITEM_DISPATCH_RETRY_SCHEMA,
-    "work_item_revoke_assignment": WORK_ITEM_REVOKE_ASSIGNMENT_SCHEMA,
-    "work_item_assigned_list": WORK_ITEM_ASSIGNED_LIST_SCHEMA,
-    "work_item_assigned_read": WORK_ITEM_ASSIGNED_READ_SCHEMA,
-    "work_item_report_progress": WORK_ITEM_REPORT_PROGRESS_SCHEMA,
-    "work_item_submit_handoff": WORK_ITEM_SUBMIT_HANDOFF_SCHEMA,
     "skill_search": SKILL_SEARCH_SCHEMA,
     "skill_discover": SKILL_DISCOVER_SCHEMA,
     "skill_fetch": SKILL_FETCH_SCHEMA,
     "task_run": TASK_RUN_SCHEMA,
     "send_message": SEND_MESSAGE_SCHEMA,
     "send_notification": SEND_NOTIFICATION_SCHEMA,
+    "dismiss_notification": DISMISS_NOTIFICATION_SCHEMA,
     "read_slack_profile": READ_SLACK_PROFILE_SCHEMA,
+    "read_slack_history": READ_SLACK_HISTORY_SCHEMA,
     "wait": WAIT_SCHEMA,
+    "mcp_server_wait": MCP_SERVER_WAIT_SCHEMA,
     "register_hook": REGISTER_HOOK_SCHEMA,
     "file_send": FILE_SEND_SCHEMA,
     "autonudge_stop": AUTONUDGE_STOP_SCHEMA,
@@ -246,10 +215,6 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "chat_tag": CHAT_TAG_SCHEMA,
     "request_server": REQUEST_SERVER_SCHEMA,
     "suggest_followup": SUGGEST_FOLLOWUP_SCHEMA,
-    "session_checkpoint": SESSION_CHECKPOINT_SCHEMA,
-    "session_restart_continuation": SESSION_RESTART_CONTINUATION_SCHEMA,
-    "session_channel_post": SESSION_CHANNEL_POST_SCHEMA,
-    "session_channel_manage": SESSION_CHANNEL_MANAGE_SCHEMA,
     "artifact_save": ARTIFACT_SAVE_SCHEMA,
     "artifact_get": ARTIFACT_GET_SCHEMA,
     "artifact_update": ARTIFACT_UPDATE_SCHEMA,
@@ -282,22 +247,33 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "workflow_rerun_subtree": WORKFLOW_RERUN_SCHEMA,
     "workflow_library_list": WORKFLOW_LIBRARY_LIST_SCHEMA,
     "deploy_artifact": DEPLOY_ARTIFACT_SCHEMA,
-    "issue_radar_record_investigation": ISSUE_RADAR_RECORD_INVESTIGATION_SCHEMA,
-    "ops_mission_control_api": OPS_MISSION_CONTROL_API_SCHEMA,
+    "arc_brief": ARC_BRIEF_SCHEMA,
+    "arc_board_read": ARC_BOARD_READ_SCHEMA,
+    "arc_board_grep": ARC_BOARD_GREP_SCHEMA,
+    "arc_board_write": ARC_BOARD_WRITE_SCHEMA,
+    "work_cycle_open": WORK_CYCLE_OPEN_SCHEMA,
+    "work_item_create": WORK_ITEM_CREATE_SCHEMA,
+    "work_item_update": WORK_ITEM_UPDATE_SCHEMA,
+    "work_item_transition": WORK_ITEM_TRANSITION_SCHEMA,
+    "work_item_evaluate": WORK_ITEM_EVALUATE_SCHEMA,
+    "work_cycle_close": WORK_CYCLE_CLOSE_SCHEMA,
+    "work_item_list": WORK_ITEM_LIST_SCHEMA,
+    "work_item_read": WORK_ITEM_READ_SCHEMA,
+    "work_cycle_archive_list": WORK_CYCLE_ARCHIVE_LIST_SCHEMA,
+    "work_cycle_archive_read": WORK_CYCLE_ARCHIVE_READ_SCHEMA,
+    "work_item_launch_candidates": WORK_ITEM_LAUNCH_CANDIDATES_SCHEMA,
+    "work_item_launch": WORK_ITEM_LAUNCH_SCHEMA,
+    "work_item_dispatch_retry": WORK_ITEM_DISPATCH_RETRY_SCHEMA,
+    "work_item_revoke_assignment": WORK_ITEM_REVOKE_ASSIGNMENT_SCHEMA,
+    "work_item_assigned_list": WORK_ITEM_ASSIGNED_LIST_SCHEMA,
+    "work_item_assigned_read": WORK_ITEM_ASSIGNED_READ_SCHEMA,
+    "work_item_report_progress": WORK_ITEM_REPORT_PROGRESS_SCHEMA,
+    "work_item_submit_handoff": WORK_ITEM_SUBMIT_HANDOFF_SCHEMA,
+    "session_checkpoint": SESSION_CHECKPOINT_SCHEMA,
+    "session_restart_continuation": SESSION_RESTART_CONTINUATION_SCHEMA,
+    "session_channel_post": SESSION_CHANNEL_POST_SCHEMA,
+    "session_channel_manage": SESSION_CHANNEL_MANAGE_SCHEMA,
     "code_review_sage_api": CODE_REVIEW_SAGE_API_SCHEMA,
-    "pod_up": POD_UP_SCHEMA,
-    "pod_restart": POD_RESTART_SCHEMA,
-    "pod_down": POD_DOWN_SCHEMA,
-    "pod_status": POD_STATUS_SCHEMA,
-    "pod_ls": POD_LS_SCHEMA,
-    # Registered even though ``issue_radar_crew_read`` takes no arguments: an
-    # unregistered tool's args pass through raw, and the empty-field schema is
-    # also what makes an unknown arg an "Error:" string instead of a stdio-loop
-    # crash that takes the whole kirocrew-core server down for the session.
-    "issue_radar_crew_read": ISSUE_RADAR_CREW_READ_SCHEMA,
-    "issue_radar_crew_record": ISSUE_RADAR_CREW_RECORD_SCHEMA,
-    # The tools a built-in app declares as data, each checked by its declared fields.
-    **_builtin_agent_tools.tool_schemas(),
 }
 
 
@@ -319,6 +295,7 @@ MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
     "session_set_model": SESSION_SET_MODEL_SCHEMA,
     "session_reload": SESSION_RELOAD_SCHEMA,
     "session_set_color": SESSION_SET_COLOR_SCHEMA,
+    "session_set_note": SESSION_SET_NOTE_SCHEMA,
     "session_rename": SESSION_RENAME_SCHEMA,
     "session_generate_title": SESSION_GENERATE_TITLE_SCHEMA,
     "session_close": SESSION_CLOSE_SCHEMA,
@@ -333,6 +310,7 @@ MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
     "session_read_message": SESSION_READ_MESSAGE_SCHEMA,
     "session_summary": SESSION_SUMMARY_SCHEMA,
     "work_dispatch": WORK_DISPATCH_SCHEMA,
+    "session_queue": SESSION_QUEUE_SCHEMA,
     "chat_folder_tree": CHAT_FOLDER_TREE_SCHEMA,
     "chat_folder_create": CHAT_FOLDER_CREATE_SCHEMA,
     "chat_folder_move": CHAT_FOLDER_MOVE_SCHEMA,

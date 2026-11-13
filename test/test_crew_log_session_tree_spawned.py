@@ -31,6 +31,7 @@ from kiro_crew.crew_log.session_tree import (
 )
 from kiro_crew.crew_log.session_tree_projection import CHECKPOINT_NAME, SessionTreeProjection
 from kiro_crew.dashboard.session_memory import lineage_parents
+from kiro_crew.testing.wait import wait_until
 
 GATEWAY = "gateway"
 
@@ -249,6 +250,47 @@ def test_a_childs_first_turn_after_a_restart_cites_the_creator_from_the_spawn():
     assert stp.projection().nodes()["W"].parent_slot == "L"
 
 
+@pytest.mark.parametrize("driver", ["recent", "open"])
+def test_a_boot_restore_keeps_only_the_creator_the_spawn_records(tmp_path, monkeypatch, driver):
+    """A restarted gateway restores tabs before anything else has folded the crew
+    log; the restore folds it first, so the creator a line names is kept when the
+    spawn records it and refused when nothing does."""
+    from chat_test_helpers import _make_state
+
+    from kiro_crew.config.paths import config_dir
+    from kiro_crew.dashboard.chat import restore_open_slots, restore_recent_sessions
+    from kiro_crew.dashboard.session_control import UNVERIFIED_CREATOR
+
+    _open_creator("s-l", "chat-l")
+    emit.on_session_spawned("s-l", creator_slot="chat-l", child_slot="chat-w")
+    assert_drained()
+    stp.reset_for_tests()
+    emit.reset_caches()
+    assert stp.projection().seeded is False
+
+    monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+    history = tmp_path / "history"
+    history.mkdir()
+    for slot in ("chat-w", "chat-x"):
+        (history / f"dashboard_{slot}.jsonl").write_text(
+            json.dumps({"_type": "metadata", "title": slot, "created_by": "chat-l"})
+            + "\n"
+            + json.dumps({"role": "user", "content": "task"})
+            + "\n",
+            encoding="utf-8",
+        )
+    (config_dir() / "open_slots.json").write_text(
+        json.dumps({"keys": ["chat-w", "chat-x"], "ts": 0.0}), encoding="utf-8"
+    )
+    state = _make_state(history)
+
+    restore = restore_recent_sessions if driver == "recent" else restore_open_slots
+    kwargs = {"window_minutes": 60} if driver == "recent" else {}
+    assert restore(state, **kwargs) == 2
+    assert state._slots["chat-w"]._created_by == "chat-l"
+    assert state._slots["chat-x"]._created_by == UNVERIFIED_CREATOR
+
+
 def test_the_spawn_survives_a_restart_through_the_checkpoint_too():
     _open_creator("s-l", "L")
     emit.on_session_spawned("s-l", creator_slot="L", child_slot="W")
@@ -411,7 +453,13 @@ def test_the_self_parented_filter_never_drops_a_spawn_from_the_held_set(_floor_m
     # Drop the live writer's cached handles first: Windows refuses to unlink a file a
     # handle still holds open, which is exactly the lease a live log handle keeps.
     emit.reset_caches()
-    shutil.rmtree(w2_dir)
+    # Windows refuses the unlink while ANY process has the file open, and a scanner on
+    # the runner can hold a freshly written log for a moment: wait for the removal.
+    wait_until(
+        lambda: shutil.rmtree(w2_dir) is None,
+        ignoring=(PermissionError,),
+        describe=lambda: sorted(p.name for p in w2_dir.iterdir()) if w2_dir.exists() else [],
+    )
     rooted = SessionTree().reading(with_edges=True)
     assert rooted.nodes["W2"].parent_slot == "L"
 
@@ -446,7 +494,7 @@ def test_a_capped_scan_is_never_cached_even_when_self_parented_suppresses_the_cu
     # Every evicted spawn is self-parented, so the reading is complete (not cut) ...
     assert first.reading().incomplete is False
     # ... but the capped unit must NOT be cached: the next boot has to re-read it.
-    assert "s-l" not in first._spawn_scans
+    assert "s-l" not in first._marks
 
 
 def test_a_cut_replay_is_not_cached_as_the_units_whole_answer(_floor_monkeypatch):
@@ -465,7 +513,7 @@ def test_a_cut_replay_is_not_cached_as_the_units_whole_answer(_floor_monkeypatch
     revived.ensure_seeded()
     assert revived.nodes()["W3"].parent_slot == "L"
     assert revived.reading().incomplete is True
-    assert "s-l" not in revived._spawn_scans
+    assert "s-l" not in revived._marks
 
 
 def test_eviction_past_the_cap_is_not_undone_by_the_replay_scan_cache(_floor_monkeypatch):
@@ -479,7 +527,7 @@ def test_eviction_past_the_cap_is_not_undone_by_the_replay_scan_cache(_floor_mon
     path = _checkpoint_path()
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["spawned"] = []
-    payload["spawn_scans"] = {}
+    payload["marks"] = {}
     path.write_text(json.dumps(payload), encoding="utf-8")
     _floor_monkeypatch.setattr(stp, "TREE_UNIT_CAP", 3)
 
@@ -493,7 +541,7 @@ def test_eviction_past_the_cap_is_not_undone_by_the_replay_scan_cache(_floor_mon
     assert evicted_units
     assert revived.reading().incomplete is True
     for sid in evicted_units:
-        assert sid not in revived._spawn_scans
+        assert sid not in revived._marks
 
 
 # ── session_control's call ─────────────────────────────────────────────────

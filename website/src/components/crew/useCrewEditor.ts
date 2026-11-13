@@ -1002,8 +1002,8 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
   })
   const boundWebhookTokens = useMemo(
     () => (webhooksQuery.data?.tokens || []).filter(
-      (t: WebhookTokenEntry) => webhookBoundToCrew(t, editing)),
-    [webhooksQuery.data, editing],
+      (t: WebhookTokenEntry) => webhookBoundToCrew(t, editingAgent)),
+    [webhooksQuery.data, editingAgent],
   )
   const boundWebhooks = boundWebhookTokens.length
   const activeWebhooks = boundWebhookTokens.filter(

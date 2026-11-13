@@ -219,6 +219,16 @@ def continuation_runtime(tmp_path, monkeypatch):
             return self.client._session_id
 
         @property
+        def session_resumed(self):
+            return self.client.resumed
+
+        @property
+        def session_provider_label(self):
+            from kiro_crew.acp.types import PROVIDER_LABEL_DEFAULT
+
+            return PROVIDER_LABEL_DEFAULT
+
+        @property
         def process_instance(self):
             return self.incarnation
 

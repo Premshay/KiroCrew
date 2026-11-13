@@ -18,7 +18,7 @@ import json  # noqa: F401 - preserved facade import
 import logging  # noqa: F401 - preserved facade import
 import secrets  # noqa: F401 - preserved facade import
 import sys as _sys  # noqa: F401 - preserved facade import
-from contextlib import ExitStack  # noqa: F401 - preserved facade import
+from contextlib import ExitStack, suppress  # noqa: F401 - preserved facade import
 from pathlib import Path  # noqa: F401 - preserved facade import
 from typing import Any, Callable  # noqa: F401 - preserved facade import
 
@@ -41,6 +41,10 @@ from kiro_crew.agent_capabilities_redaction import (  # noqa: F401 - compatibili
     _contains_mask,
     _safe_view,
     safe_view,
+)
+from kiro_crew.agent_capabilities_tool_limits import (  # noqa: F401 - re-exported
+    disabled_tool_names,
+    tool_limited_servers,
 )
 from kiro_crew.agent_capabilities_withheld import (  # noqa: F401 - preserved facade import
     withheld_approvals as _withheld_approvals,
@@ -75,7 +79,7 @@ from kiro_crew.platform.governance import (  # noqa: F401 - preserved facade imp
 from kiro_crew.platform.governance_profiles import (  # noqa: F401 - preserved facade import
     governance_answer_generation,
 )
-from kiro_crew.validation import is_registered_agent_name  # noqa: F401 - preserved facade import
+from kiro_crew.validation import is_registered_agent_name
 
 logger = logging.getLogger(__name__)
 
@@ -176,14 +180,14 @@ def projection_gaps(spec: dict[str, Any]) -> tuple[str, ...]:
 def _read_spec(path: Path) -> dict:
     from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
 
-    try:
-        raw = safe_read_file_bytes_nolink(str(path), str(path.parent), max_bytes=MAX_DOCUMENT_BYTES)
+    with suppress(ValueError, FileTooLargeError):
+        raw = safe_read_file_bytes_nolink(
+            str(path), str(path.parent), max_bytes=MAX_DOCUMENT_BYTES, canonical_gate=True
+        )
         result = parse_agent_spec_bytes(raw, path) if raw is not None else None
-    except (ValueError, FileTooLargeError):
-        raise CapabilityError("source_unreadable") from None
-    if not isinstance(result, dict):
-        raise CapabilityError("source_unreadable")
-    return result
+        if isinstance(result, dict):
+            return result
+    raise CapabilityError("source_unreadable")
 
 
 def _source(name: str, project: str, *, allow_private: bool = False) -> tuple[Path, dict, dict]:
@@ -1843,28 +1847,9 @@ def prepare_member_capabilities(member: str, project_dir: str | Path | None = No
         # Launched servers whose entry turns single tools off. Not every member
         # backend can carry that (``ACP_BACKENDS_MEMBER_TOOL_LIMITS``).
         "tool_limited_servers": tool_limited_servers(spec),
+        # ``server/tool`` per tool those servers turn off, for the bell to name.
+        "disabled_tools": disabled_tool_names(spec),
     }
-
-
-def tool_limited_servers(spec: dict) -> tuple[str, ...]:
-    """Launched MCP servers in *spec* whose entry turns single tools off.
-
-    The one definition both the chat-start seam (via
-    :func:`prepare_member_capabilities`) and the Capabilities page warning read,
-    so the page cannot name a different set than the start refuses on.
-    """
-    servers = spec.get("mcpServers", {})
-    if not isinstance(servers, dict):
-        return ()
-    return tuple(
-        sorted(
-            name
-            for name, server in servers.items()
-            if isinstance(server, dict)
-            and server.get("disabledTools")
-            and not mcp_entry_is_muted(server)
-        )
-    )
 
 
 def member_backend_gap(backend: str, limited_servers: tuple[str, ...]) -> str | None:

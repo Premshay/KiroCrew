@@ -170,6 +170,37 @@ async def test_a_key_the_job_did_not_mint_is_not_its_report(monkeypatch, woken):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("slot_agent", ["beta", "old-alpha"])
+async def test_a_cron_report_refuses_a_stale_thread_member(monkeypatch, woken, slot_agent):
+    monkeypatch.setattr(mate_worker, "cron_worker_execution", lambda execution, config=None: True)
+    state = _State()
+    state.thread.agent = slot_agent
+
+    assert not await wakes.note_cron_result(state, _job(), "cron:hourly", "private result")
+    await _settle()
+    assert not getattr(state, "_mate_wakes", {})
+    assert woken == []
+
+
+@pytest.mark.asyncio
+async def test_a_cron_report_accepts_the_bound_members_current_alias(monkeypatch, woken):
+    monkeypatch.setattr(mate_worker, "cron_worker_execution", lambda execution, config=None: True)
+    monkeypatch.setattr(
+        members_mod,
+        "read_dm_binding",
+        lambda member: {"slot_key": "member-alpha", "member": "renamed-alpha"},
+    )
+    state = _State()
+    state.thread.agent = "renamed-alpha"
+
+    assert await wakes.note_cron_result(state, _job(), "cron:hourly", "current alias report")
+    await _settle()
+    assert len(woken) == 1
+    assert woken[0][0] == "member-alpha"
+    assert "current alias report" in woken[0][1]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode, reported", [("milestones", True), ("off", False)])
 async def test_worker_reports_mode_decides_a_cron_result_report(monkeypatch, woken, mode, reported):
     # ``milestones`` thins worker turn ends only; ``off`` silences cron results too.

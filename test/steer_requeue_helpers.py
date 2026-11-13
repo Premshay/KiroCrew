@@ -20,9 +20,14 @@ def _patch_sel():
         yield mock_sel
 
 
+class _TurnTask(MagicMock):
+    def __await__(self):
+        return iter(())
+
+
 def _running_slot(state, key="test"):
     slot = state.get_or_create_slot(key)
-    task = MagicMock()
+    task = _TurnTask()
     task.done.return_value = False
     slot.task = task
     return slot

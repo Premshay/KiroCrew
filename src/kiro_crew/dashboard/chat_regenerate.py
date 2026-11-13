@@ -19,14 +19,20 @@ from kiro_crew.dashboard.chat_runner import (
     release_regenerate_on_done,
 )
 from kiro_crew.dashboard.chat_utils import (
+    GATEWAY_PROMPT_INJECT_KINDS,
     adopt_variant_text,
     effective_session_key,
     reject_if_slot_under_construction,
     slot_history_key,
     variant_from_row,
 )
-from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
+from kiro_crew.dashboard.kiro_readiness import (
+    refuse_rerun_after_signed_out_turn,
+    reject_if_kiro_unverified,
+    rerun_signs_in_via_kiro_cli,
+)
 from kiro_crew.dashboard.relay_archive import relay_archive_refusal
+from kiro_crew.dashboard.slot_buffers import flush_restored_hold
 from kiro_crew.dashboard.slot_ownership import (
     checkpoint_slot_replaced,
     deny_app_slot_session_access,
@@ -88,6 +94,24 @@ _MAX_EDIT_CONTENT_CHARS = 32_768
 _SAVE_DRAIN_ATTEMPTS = 8
 
 
+def _crew_paused(slot: "_ChatSlot") -> bool:
+    """Whether an Ultra Mode "Pause all" holds *slot*: its history is not rewritten.
+
+    Asked before anything is truncated, so a refused edit leaves the chat as it
+    was instead of a rewritten history with no turn behind it.
+    """
+    from kiro_crew import crew_pause
+
+    return crew_pause.holds_slot(slot)
+
+
+def _crew_paused_response() -> web.Response:
+    return web.json_response(
+        {"error": "this crew is paused; resume it from the Board", "code": "crew_paused"},
+        status=409,
+    )
+
+
 def _destructive_history_busy(slot: "_ChatSlot") -> web.Response | None:
     """Refuse history mutation while a turn, admission reservation, or teardown owns
     the slot.
@@ -110,6 +134,21 @@ def _destructive_history_busy(slot: "_ChatSlot") -> web.Response | None:
     return None
 
 
+def _is_gateway_prompt_row(row: dict) -> bool:
+    """The gateway's own prompt that opened a turn: a workflow follow-up or a
+    heartbeat prompt, drawn as an ``inject`` row (``GATEWAY_PROMPT_INJECT_KINDS``).
+
+    Regenerate treats it as the request its reply answers, as it did while these
+    prompts were ``user`` rows. Mirrors ``isGatewayPromptRow`` in ``turnActions.ts``.
+    """
+    meta = row.get("meta")
+    return (
+        row.get("role") == "inject"
+        and isinstance(meta, dict)
+        and meta.get("injectKind") in GATEWAY_PROMPT_INJECT_KINDS.values()
+    )
+
+
 async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
     """POST /api/chat/slots/{slot}/regenerate — regenerate the last assistant reply.
 
@@ -117,12 +156,13 @@ async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
     ``chat_turn.regenerate_swap``.
     """
     # The readiness latch is honored before the turn is dispatched, as for the
-    # other history actions.
-    blocked = await reject_if_kiro_unverified(request)
-    if blocked is not None:
-        return blocked
+    # other history actions, when that turn signs in via kiro-cli.
     state: DashboardState = request.app["state"]
     name = request.match_info["slot"]
+    if await rerun_signs_in_via_kiro_cli(state.sessions, state._slots.get(name)):
+        blocked = await reject_if_kiro_unverified(request)
+        if blocked is not None:
+            return blocked
     slot = state._slots.get(name)
     # The app claim, recorded on the audit row below. Ownership itself is decided
     # before this handler runs, by the per-slot checkpoint (slot_ownership.py),
@@ -141,12 +181,20 @@ async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
     if refusal is not None:
         return refusal
 
+    # The stored Ultra Mode pause is read (off the loop) before the pause
+    # check under the lock, so a paused crew's history is not rewritten
+    # right after a restart.
+    from kiro_crew import crew_pause as _crew_pause
+
+    await _crew_pause.ensure_loaded()
     async with slot._lock:
         if request_app and state._slots.get(name) is not slot:
             return slot_not_found()
         busy = _destructive_history_busy(slot)
         if busy is not None:
             return busy
+        if _crew_paused(slot):
+            return _crew_paused_response()
 
         msgs = slot.messages
         ai_idx = -1
@@ -159,8 +207,8 @@ async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
             # Never cross a real user turn: the replace step removes everything
             # after the target reply's user row, so a reply found PAST a newer
             # user row (e.g. a /compact row awaiting only its notice) would take
-            # that newer turn with it.
-            if role == "user":
+            # that newer turn with it. A gateway prompt row opens a turn too.
+            if role == "user" or _is_gateway_prompt_row(msgs[i]):
                 break
             if role != "assistant":
                 continue
@@ -179,7 +227,9 @@ async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
             )
         u_idx = -1
         for i in range(ai_idx - 1, -1, -1):
-            if msgs[i].get("role") == "user" and not is_retracted_steer_row(msgs[i]):
+            if (
+                msgs[i].get("role") == "user" and not is_retracted_steer_row(msgs[i])
+            ) or _is_gateway_prompt_row(msgs[i]):
                 u_idx = i
                 break
         if u_idx < 0:
@@ -241,16 +291,36 @@ async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
             "vary phrasing, structure, or angle. Do not say you already answered or "
             "reference the prior reply."
         )
-        # The regenerated turn's owner mark is THIS request's: see ``api_chat``.
+        # The regenerated turn's owner mark is THIS request's (see ``api_chat``); and the
+        # row being regenerated may be a Dashboard card's, so its re-run stays a card turn
+        # with the same limits as the first run (no auto-approval, no person's authority
+        # over session directives).
+        from kiro_crew.dashboard.card_send import CARD_ORIGIN_META_KEY
         from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
 
+        _card_row = (msgs[u_idx].get("meta") or {}).get(CARD_ORIGIN_META_KEY) is True
+        _regen_kwargs: dict = {}
+        if _card_row:
+            _regen_kwargs["_card_origin"] = True
+        # A gateway prompt is the gateway's text: it re-runs as the synthetic payload
+        # it first ran as, never as words the person typed.
+        _gateway_prompt = _is_gateway_prompt_row(msgs[u_idx])
+        # A hold a restart restored into this idle slot is owed to this turn.
+        # Regenerate writes no row of its own, so the notes land after the reply it
+        # replaces, above the new one, and stay when the swap retires that reply:
+        # ``replacing`` was captured above, before these rows existed.
+        request_row = msgs[u_idx]
+        flush_restored_hold(slot, logger=logger)
         task = asyncio.create_task(
             _run_chat(
                 state,
                 slot,
                 user_msg,
                 regenerate_hint=hint,
-                _directive_user_origin=not bool(request.get("app", "")),
+                _synthetic_payload=_gateway_prompt,
+                _directive_user_origin=(
+                    not bool(request.get("app", "")) and not _card_row and not _gateway_prompt
+                ),
                 # A regenerated row is not new typed text (it may be an API
                 # request's flattened prompt), so it never starts an MCP sign-in.
                 _message_is_typed=False,
@@ -263,7 +333,8 @@ async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
                 # previous reply now stays in the window, so a later steer,
                 # inject or subagent row can sit after the request, and a cold
                 # start would replay the request as an unanswered turn.
-                _current_message=msgs[u_idx],
+                _current_message=request_row,
+                **_regen_kwargs,
             )
         )
         slot.task = task
@@ -450,12 +521,15 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
 
     # Destructive: this truncates and PERSISTS history before the background
     # turn runs, so a failed turn cannot undo it. Unlike an ordinary send, the
-    # readiness latch must be honored BEFORE the mutation.
-    blocked = await reject_if_kiro_unverified(request)
-    if blocked is not None:
-        return blocked
+    # readiness latch must be honored BEFORE the mutation, when that turn signs
+    # in via kiro-cli.
     state: DashboardState = request.app["state"]
     name = request.match_info["slot"]
+    kiro_turn = await rerun_signs_in_via_kiro_cli(state.sessions, state._slots.get(name))
+    if kiro_turn:
+        blocked = await reject_if_kiro_unverified(request)
+        if blocked is not None:
+            return blocked
     slot = state._slots.get(name)
     request_app = request.get("app", "")
     if not slot:
@@ -523,6 +597,12 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
             status=400,
         )
 
+    # The stored Ultra Mode pause is read (off the loop) before the pause
+    # check under the lock, so a paused crew's history is not rewritten
+    # right after a restart.
+    from kiro_crew import crew_pause as _crew_pause
+
+    await _crew_pause.ensure_loaded()
     async with slot._lock:
         # Reading the body above was an await, and ``linked_session_key`` can
         # be rebound on an already-live slot by a cron or workflow injection, so
@@ -536,6 +616,8 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
         busy = _destructive_history_busy(slot)
         if busy is not None:
             return busy
+        if _crew_paused(slot):
+            return _crew_paused_response()
 
         # The session whose native resume identity the discard below clears.
         # Resolved here because the two guards that follow are about THAT
@@ -556,6 +638,14 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
         )
         if attached is not None:
             return attached
+        # The probe awaited a store read: a Pause all that landed meanwhile would
+        # drop the edited turn at dispatch after the history was already cut.
+        if _crew_paused(slot):
+            return _crew_paused_response()
+        if not kiro_turn:
+            signed_out = refuse_rerun_after_signed_out_turn(slot)
+            if signed_out is not None:
+                return signed_out
 
         msgs = slot.messages
 
@@ -579,6 +669,25 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": "index or ts required", "code": "index_or_ts_required"}, status=400
             )
+
+        # A hold a restart restored into this idle slot is owed to this turn, above
+        # its user row. Flushed on the LIVE slot, not the scratch copy below: the
+        # copy shares the hold and its note dicts, so a flush there would retire
+        # notes from the live hold for rows a refused edit then throws away. A
+        # refused edit leaves the notes delivered here, as the next seam would.
+        edited_row = msgs[index]
+        pre_flush_rows = list(slot.messages)
+        pre_flush_ids = {id(row) for row in pre_flush_rows}
+        flush_restored_hold(slot, logger=logger)
+        restored_rows = [row for row in slot.messages if id(row) not in pre_flush_ids]
+        # The flush's append can trim the window's front, which moves the index.
+        edited_at = next((i for i, row in enumerate(slot.messages) if row is edited_row), -1)
+        if edited_at < 0:
+            return web.json_response(
+                {"error": "user message not found", "code": "user_message_not_found"},
+                status=400,
+            )
+        index = edited_at
 
         # Capture routing state BEFORE any live mutation, exactly like rewind:
         # the truncation is a real conversation boundary, so the native ACP
@@ -606,7 +715,8 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
         # reach it -- the sole question left is whether an app drives the edit.
         _bc = queued_text_for_display(content, user_origin=not bool(request_app))
         prospective_slot = copy.copy(slot)
-        prospective_slot.messages = list(slot.messages[:index])
+        # The restored notes' rows follow the kept prefix, above the edited row.
+        prospective_slot.messages = list(slot.messages[:index]) + restored_rows
         # ``copy.copy`` is SHALLOW, so every mutable attribute still IS the live
         # slot's object. Reassigning ``messages`` alone is not enough, because
         # ``_ChatSlot.append`` below writes through four more of them: it

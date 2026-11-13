@@ -185,6 +185,7 @@ echoed back in `rejected` rather than silently dropped.
 **Pinned invariants.**
 
 - `POST /setup-clone`'s success path is exercised end to end, asserting the persisted config, not only the 200. (D-82)
+- `POST /setup-clone` stores `target_url` rebuilt from the validated `owner/repo`, never as pasted, so a query, fragment or path tail on the pasted URL never reaches `config.json` (`test_a_token_in_the_pasted_url_is_never_persisted`).
 
 ## PR status and the watcher verdict
 
@@ -228,6 +229,7 @@ and never drive the verdict, or one flaky optional job would nudge forever.
 | Edit allowlist | `spine/gate.py` + profile | ruler/harness/tests/auth are mechanically off-limits |
 | Do-not-pollute gate | `spine/pollute.py` | host state hashed before/after; drift blocks the run |
 | Second reproduce | `spine/pr_pipeline.py` | an independent A/B must confirm before a PR is drafted |
+| Candidate admission check (opt-in) | `spine/candidate_admission.py:admit_candidate` | `candidateAdmissionCommand` set (file-only, so a config-API caller cannot unset it; POSIX only, a set value refuses the run on Windows): both keep paths ask it, in the tests' `strict` sandbox and its own process group (killed whole when the check ends, by an answer or the 60 s timeout), before the provisional commit; only a fresh matching `admitted` answer from a clone clean before and unchanged after the check keeps, anything else is `failed_verify` (MANUAL §7) |
 | Pre-push review gate | `spine/driver_publish.py:_prepush_review_clean` | optional, fail-closed; an unfounded "clean" cannot pass it |
 | Tool-request gate | `spine/agent_runner_gate.py:_tool_permitted` + `shell_command_refusal` | the caller's `allowed_tools` is ENFORCED, and state-mutating shell verbs are refused even when Bash is allowed |
 | Audit-or-deny approval | `spine/agent_runner.py:_approve` | the unattended auto-approve is logged to the SEL with `critical=True` **before** it is granted; an unwritable audit REJECTS the tool |
@@ -518,7 +520,13 @@ caller treats ``""`` as "no push target", so each refusal below fails closed.
    legitimate offline setup. On Windows a drive path (``C:\work\repo.git`` or
    ``C:/work/repo.git``) is local too, even though ``urlparse`` reads the drive letter as a
    scheme. Elsewhere the same text stays refused, because git on POSIX parses ``C:path``
-   as scp-like ssh to a host named ``C``.
+   as scp-like ssh to a host named ``C``. A value git reads as remote is refused on every
+   platform: git's scp-like rule sends a ``:`` before any ``/`` to ssh (``user@host:path``,
+   and ``file:x`` to a host named ``file``), and a ``file://`` url naming a host other than
+   ``localhost`` reaches that host. On Windows a UNC path (``\\host\share``,
+   ``//host/share``, ``\\?\UNC\host\...``) is refused too, read after the
+   percent-decoding git applies to a url; on POSIX the same text is a local path and stays
+   allowed. Spell a Windows drive url ``file:///C:/...``.
 
 With no ``origin_url``, the legacy ``target_url`` is re-validated and its rebuilt clone URL
 is used. The security guidance on untrusted URL destinations asks for exactly this:
@@ -528,6 +536,7 @@ allowlist the destination rather than trust persisted input.
 
 - `resolve_origin_url` host-allowlists a stored `origin_url` (exact host, no `http://`/`git://`, no sentinel); local paths stay allowed. (D-57)
 - A Windows drive path is a local `origin_url` only when running on Windows; on POSIX the same text is ssh to a one-letter host and stays refused (`test_a_drive_shaped_origin_stays_refused_where_git_reads_it_as_ssh`).
+- A value git reads as remote (scp-like `user@host:path`, `file:x`, `file://<host>/`) is not a local `origin_url` on any platform; `file:///` and `file://localhost/` stay local (`test_a_value_git_reads_as_remote_is_not_a_local_origin`). A UNC path is refused on Windows only (`test_a_unc_path_is_not_a_local_origin_on_windows`); on POSIX it is a local path (`test_a_unc_shaped_path_stays_a_local_origin_on_posix`).
 - A network `origin_url` must name the same `owner/repo` as the validated `target_url` (`_remote_slug`); a mismatch or an invalid `target_url` leaves no push target (`test_origin_url_wins_when_present`). (D-138)
 
 ### Why tool approval is one-shot and a queued change is not "filed"
@@ -600,7 +609,8 @@ gate — can modify same-user files outside the worktree.
 
 **Kiro Crew's own control files are closed.** The paths in `security.write_protected_home_paths()`
 are protected by the platform HOOK layer, which a sandboxed subprocess never passes through. So
-`_run` passes the PARENT directory of each write-protected path as `extra_hidden_dirs`,
+`_run` passes the PARENT directory of each write-protected path as `extra_hidden_dirs`
+(`spine/push_policy.py:write_protected_targets`, shared with the candidate admission checker),
 bind-mounting an empty dir over it, and the write fails at the kernel; the interpreter and the
 real-subprocess gate tests are unaffected.
 
@@ -657,6 +667,23 @@ are seen too. An option's VALUE goes with it (`nice -n 5 git push` must not leav
 like the command), and the recursion budget REFUSES on exhaustion — for a denylist, "gave up"
 must not mean "allowed".
 
+`eval` and `script -c` / `script --command` run a script too, so their script is re-analyzed
+the same way, and `watch` runs its joined arguments through `sh -c`. Two splits find the
+commands. A quote-aware split walks the characters with quote state and splits only on
+UNQUOTED separators, so `sh -c 'git push; true'` still yields `git push` while quoted data
+(`printf '%s\n' ';' curl`, `rg -F '$(curl' src`) runs nothing. Main's quote-blind split
+always runs as well, so anything it refuses stays refused. When the quote-aware split cannot
+read the text (an unclosed quote, an apostrophe in a heredoc body), only the quote-blind
+split runs, as on main; no command is refused for being unreadable.
+The walk reads bash's `$'...'` / `$"..."` as an ordinary quote opening at the `$`, so the
+script inside is re-analyzed: `eval $'gh pr ready 1'` is refused because the command is
+found, and `bash -c "printf $'a\n'"` stays allowed.
+The walk follows bash's comment rule: an unquoted `#` at the start of a word comments out
+the rest of the line, so an apostrophe in `# it's` never pairs with a quote on another
+line. A `#` inside a word (`echo a#b`) is not a comment. Heredoc bodies are not tracked:
+quotes in a body can still pair up across lines, as on main.
+A redirect target is a file name, so `echo hi > ./curl` stays allowed.
+
 Reaching the subcommand also means skipping GLOBAL OPTIONS correctly. A valueless option must not
 swallow the verb: `git --no-pager push`, `--paginate`, `--bare`, `--literal-pathspecs` and
 `--no-replace-objects` must be refused like a bare `git push`. Value-taking global options are
@@ -687,6 +714,7 @@ pushing) and `exec pytest -q` stay allowed. A dedicated test pins that non-over-
 - Value-taking global options are enumerated per binary (`_VALUE_TAKING_OPTIONS`) and everything else is valueless, so `git --no-pager push` is refused like `git push`; `--exec-path` is excluded because its value is optional. (D-63)
 - Value-taking wrapper long options (`_WRAPPER_VALUE_TAKING_LONG_OPTIONS`, such as `env --unset`) consume their value, so the command behind them is inspected. (D-117)
 - A bare `&` splits commands like `;`, and `(` and `)` split too, so `true & gh pr comment …` and `echo $(gh pr ready)` are refused; a benign trailing `& true` passes. (D-128)
+- `eval`, `script -c` and `watch` scripts are re-analyzed; a quoted separator stays in its word, while main's quote-blind split still runs; text the quote-aware split cannot read gets only the quote-blind split, as on main, and is never refused for that alone; `$'...'` / `$"..."` opens a quote at the `$`, so `eval $'gh pr ready 1'` is refused and `bash -c "printf $'a\n'"` passes; an unquoted word-initial `#` comments out the line, so comment apostrophes cannot hide `sh -c "true;gh pr ready"` on the next line, while `eval 'echo hi' # it's`, `echo a#b` and `printf '%s\n' ';' curl` pass. (D-143)
 
 ### Why the protected-branch denylist normalizes before it matches
 
@@ -1128,7 +1156,9 @@ mid-truncate ~31% of the time, reporting a calibrated ruler as uncalibrated.
 
 Session record keys are validated against `^[A-Za-z0-9][A-Za-z0-9._-]{0,249}$` and
 rejected — not sanitized — when unsafe, because silently rewriting a key would
-make two subjects share one record. The frontend sanitizer strips dot-runs and
+make two subjects share one record. The pattern is applied with `fullmatch`, so
+a key with a trailing newline is refused with a 400 rather than reaching the
+file system (where Windows raises an unhandled `OSError`). The frontend sanitizer strips dot-runs and
 path separators before the key is ever sent, so the two gates agree.
 
 **Pinned invariants.**
@@ -1264,6 +1294,14 @@ So the sequence is **provisional commit → draft → amend**:
    duplicate, error), so a non-win never advances HEAD.
 
 A diff that will not apply is refused *before* the expensive reproduce A/B.
+An opt-in `candidateAdmissionCommand` checker is asked before step 1 on both tracks, and a
+refusal records `failed_verify` without reaching the provisional commit (on perf it is asked
+before the survivors are archived, and on both tracks the refused winner's archive row reads
+`failed_verify`, not `kept`); the isolation probe runs after every check and before any more
+host git, so a check that left the clone's git metadata unsafe retires it and every later
+keep refuses without running git; otherwise a check that changed the clone, or left git unable
+to read it, has the branch and tracked files restored through `_reset_provisional`, and any
+untracked file left in it refuses later keeps (`test_candidate_admission.py`).
 `TestWinnerIsInTheTreeBeforeDrafting` pins the order and the rollback in both tracks.
 
 **Pinned invariants.**

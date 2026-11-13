@@ -14,6 +14,7 @@ import re
 from typing import Any
 
 from kiro_crew.constants import MAX_SHORT_STRING, WINDOWS_DEVICE_STEMS
+from kiro_crew.effort import EFFORT_VALUES
 from kiro_crew.validation_parts.field_engine import FieldSpec, ToolSchema, ValidationError
 from kiro_crew.validation_parts.input_bounds import (
     MAX_LONG_STRING,
@@ -340,6 +341,7 @@ WORKFLOW_AUTHOR_SCHEMA = ToolSchema(
         FieldSpec("intent", str, required=True, max_len=MAX_MEDIUM_STRING),
         FieldSpec("author_agent", str, max_len=MAX_SHORT_STRING),
         FieldSpec("author_model", str, max_len=MAX_SHORT_STRING),
+        FieldSpec("author_effort", str, allowed=EFFORT_VALUES),
     ],
 )
 
@@ -351,6 +353,7 @@ WORKFLOW_RUN_SCHEMA = ToolSchema(
         FieldSpec("intent", str, max_len=MAX_MEDIUM_STRING),
         FieldSpec("author_agent", str, max_len=MAX_SHORT_STRING),
         FieldSpec("author_model", str, max_len=MAX_SHORT_STRING),
+        FieldSpec("author_effort", str, allowed=EFFORT_VALUES),
         FieldSpec("workflow", str, max_len=MAX_SHORT_STRING, pattern=_WF_RUN_ID_RE),
         FieldSpec("input", str, max_len=MAX_MEDIUM_STRING),
         FieldSpec("name", str, max_len=MAX_SHORT_STRING),

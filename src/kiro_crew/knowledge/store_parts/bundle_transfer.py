@@ -20,11 +20,13 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+from kiro_crew.knowledge.store_parts.entity_graph import index_entity_aliases
 from kiro_crew.knowledge.store_parts.item_ownership import _DOC_STATE_KEY_COL
 from kiro_crew.knowledge.store_parts.source_rows import (
     _ACCOUNT_BOUND_SOURCE_TYPE,
     _ACCOUNT_BOUND_URI_PREFIX,
     _WALKING_SOURCE_TYPES,
+    PENDING_REASON_PROP,
     _without_sync_status,
 )
 
@@ -472,6 +474,14 @@ def import_bundle(self: KnowledgeStore, bundle: dict) -> dict:
             # such a key on the next open without ever promoting it, so this
             # is the boundary holding, not a second line of defence.
             props_text = _validated_properties(src.get("properties"))
+            # A pending reason explains a wait the EXPORTING store's import
+            # budget caused, and export ships it even on a row that synced
+            # since. The row lands here at its own initial status, so the key
+            # stays behind rather than explain a wait this store never had.
+            props = json.loads(props_text)
+            if PENDING_REASON_PROP in props:
+                del props[PENDING_REASON_PROP]
+                props_text = json.dumps(props)
             # Both identity columns become DICTIONARY KEYS while the bundle's
             # source ids are rewritten, so a list or dict here raises an
             # unhashable-type TypeError rather than the typed rejection the
@@ -696,11 +706,15 @@ def import_bundle(self: KnowledgeStore, bundle: dict) -> dict:
                 items_imported += 1
                 inserted_items.add(item["id"])
                 row = self.db.execute(
-                    "SELECT rowid FROM items WHERE id = ?", (item["id"],)
+                    "SELECT rowid, title, content, tags FROM items WHERE id = ?", (item["id"],)
                 ).fetchone()
                 if row:
-                    self._fts_index(row[0], item["title"], item["content"], item.get("tags", "[]"))
+                    # The stored columns, not the bundle's raw values: a TEXT
+                    # column keeps a non-string value as text, and the index has
+                    # to hold the same text the row's later unindex reads back.
+                    self._fts_index(row[0], row[1], row[2], row[3])
         for ent in bundle.get("entities", []):
+            aliases_text = _validated_aliases(ent.get("aliases"))
             cursor = self.db.execute(
                 "INSERT OR IGNORE INTO entities (id, name, entity_type, description, aliases, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -709,7 +723,7 @@ def import_bundle(self: KnowledgeStore, bundle: dict) -> dict:
                     ent["name"],
                     ent["entity_type"],
                     ent.get("description"),
-                    _validated_aliases(ent.get("aliases")),
+                    aliases_text,
                     ent.get("created_at", now),
                     now,
                 ),
@@ -717,6 +731,10 @@ def import_bundle(self: KnowledgeStore, bundle: dict) -> dict:
             if cursor.rowcount > 0:
                 entities_created += 1
                 inserted_entities.add(ent["id"])
+                # Same transaction as the row, like every alias writer.
+                index_entity_aliases(
+                    self.db, ent["id"], json.loads(aliases_text) if aliases_text else []
+                )
         # Every row below points at an item by foreign key, so one naming an item
         # this import withheld has nothing to attach to. Skipping such a row keeps
         # the rest of an otherwise valid bundle: leaving it in makes the constraint

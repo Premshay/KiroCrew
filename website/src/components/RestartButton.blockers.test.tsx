@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import RestartButton from './RestartButton'
 import { api } from '../api/client'
 import { ApiError } from '../api/apiError'
@@ -19,6 +19,15 @@ vi.mock('../api/client', async importOriginal => {
 const restartSessions = vi.mocked(api.restartSessions)
 const restartBlockers = vi.mocked(api.restartBlockers)
 
+async function requestRestart() {
+  fireEvent.click(screen.getByRole('button', { name: /apply & restart/i }))
+  const dialog = await screen.findByRole('dialog')
+  await act(async () => {
+    fireEvent.click(within(dialog).getByRole('button', { name: /apply & restart/i }))
+  })
+  await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+}
+
 const ackRequired = () =>
   new ApiError(
     409,
@@ -32,7 +41,6 @@ const ackRequired = () =>
 
 describe('RestartButton with blocked restarts', () => {
   beforeEach(() => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     restartSessions.mockReset()
     restartBlockers.mockReset()
     restartBlockers.mockResolvedValue({
@@ -66,7 +74,7 @@ describe('RestartButton with blocked restarts', () => {
     restartSessions.mockRejectedValue(ackRequired())
     render(<RestartButton />)
 
-    fireEvent.click(screen.getByText(/apply & restart/i))
+    await requestRestart()
 
     expect(await screen.findByTestId('restart-blockers')).toBeInTheDocument()
     expect(screen.getByText('Logs Agent')).toBeInTheDocument()
@@ -79,7 +87,7 @@ describe('RestartButton with blocked restarts', () => {
     restartSessions.mockRejectedValue(new Error('zzq-restart-broke'))
     render(<RestartButton />)
 
-    fireEvent.click(screen.getByText(/apply & restart/i))
+    await requestRestart()
 
     expect(await screen.findByText('Could not restart — zzq-restart-broke. Wait a moment, then press Apply & Restart again.')).toBeInTheDocument()
     expect(screen.queryByTestId('restart-blockers')).not.toBeInTheDocument()
@@ -90,7 +98,7 @@ describe('RestartButton with blocked restarts', () => {
     restartSessions.mockRejectedValueOnce(ackRequired())
     render(<RestartButton />)
 
-    fireEvent.click(screen.getByText(/apply & restart/i))
+    await requestRestart()
     expect(await screen.findByTestId('restart-blockers')).toBeInTheDocument()
 
     restartSessions.mockResolvedValue({
@@ -99,7 +107,7 @@ describe('RestartButton with blocked restarts', () => {
       mcp_synced: 0,
       mcp_sync_ok: true,
     })
-    fireEvent.click(screen.getByText(/apply & restart/i))
+    await requestRestart()
 
     await waitFor(() =>
       expect(screen.queryByTestId('restart-blockers')).not.toBeInTheDocument(),

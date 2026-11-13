@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 
 from aiohttp import web
 
-from kiro_crew import aws_consent, speech_providers
+from kiro_crew import aws_consent, platform_compat, speech_providers
 from kiro_crew.config.loader import (
     ConfigReadError,
     ConfigWriteRefused,
@@ -33,6 +33,7 @@ from kiro_crew.config.loader import (
 from kiro_crew.dashboard.chat_utils import run_config_write
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.metrics import voice as voice_metrics
 from kiro_crew.piper_runtime import PiperRuntime
 from kiro_crew.sandbox import SandboxUnavailableError, without_python_env
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -276,7 +277,7 @@ def _sandbox_refusal_response(
 
 
 #: The built-in TTS providers, in the order the picker lists them.
-_TTS_BUILTINS: tuple[str, ...] = (PROVIDER_SYSTEM, PROVIDER_POLLY)
+_TTS_BUILTINS: tuple[str, ...] = (PROVIDER_SYSTEM, PROVIDER_POLLY, PROVIDER_PIPER, PROVIDER_POCKET)
 
 
 async def _voice_provider_rows() -> list[dict]:
@@ -472,9 +473,7 @@ async def api_voice_config(request: web.Request) -> web.Response:
                 {"error": "config.json is corrupt", "code": "config_corrupt"}, status=500
             )
         except ConfigWriteRefused as exc:
-            return web.json_response(
-                {"error": str(exc), "code": "config_write_refused"}, status=400
-            )
+            return web.json_response({"error": str(exc), "code": exc.code}, status=400)
         except OSError:
             logger.warning("voice config PUT: config.json write failed", exc_info=True)
             return web.json_response(
@@ -536,12 +535,40 @@ async def api_voice_synthesize(request: web.Request) -> web.Response:
     task = asyncio.current_task()
     assert task is not None
     jobs.tasks[key] = task
+    # Counted only for a request that reached synthesis: the 400/409/429 answers
+    # above are request-shape and dedupe refusals, not a reply that failed.
+    # The provider is read before the await: a settings change mid-synthesis must
+    # not move this reply onto the provider that did not speak it.
+    provider = _vc.provider
+    timing = voice_metrics.tts_request_begin()
+    status: object = None
+    code: object = None
     try:
-        return await _synthesize_request(
+        resp = await _synthesize_request(
             request.app["state"], body, text, slot_key, request_id, jobs.piper
         )
+        status = resp.status
+        code = _response_code(resp)
+        return resp
+    except asyncio.CancelledError:
+        # A Stop (/api/voice/cancel) or shutdown cancels this task: a cancellation,
+        # the same outcome the 409 above reports, never a failure.
+        status = 409
+        raise
     finally:
+        voice_metrics.tts_request_end(provider, status, code, timing)
         jobs.tasks.pop(key, None)
+
+
+def _response_code(resp: web.Response) -> object:
+    """The ``code`` of a JSON error body, for the reply counter; ``None`` otherwise."""
+    if resp.status < 400:
+        return None
+    try:
+        body = json.loads(resp.body) if isinstance(resp.body, (bytes, bytearray)) else None
+    except (TypeError, ValueError):
+        return None
+    return body.get("code") if isinstance(body, dict) else None
 
 
 async def _synthesize_request(
@@ -605,6 +632,7 @@ async def _synthesize_request(
             chunk_paths.append(chunk_path)
 
             # Broadcast to dashboard for immediate playback
+            voice_metrics.note_tts_chunk()
             state.broadcast_ws(
                 "voice_chunk",
                 {
@@ -630,10 +658,20 @@ async def _synthesize_request(
                         "audioMime": "audio/mpeg",
                     },
                 )
+            else:
+                # Every chunk has already been sent, so the request still
+                # settles, only without the replay clip.
+                logger.warning("Voice stitch failed; completing the request without a replay clip")
+                state.broadcast_ws("voice_complete", {**identity, "chunks": len(chunk_paths)})
 
         if not chunk_paths:
+            # Probed like the built-in engine's path: only a host with no AWS CLI
+            # is the client's to voice. Any other empty stream (every sentence
+            # denied or timed out) gets the generic notice, not browser speech.
+            no_cli = await asyncio.to_thread(resolve_polly_cli) is None
             raise VoiceSynthesisError(
-                "voice_unavailable", "The selected voice provider returned no audio."
+                "voice_unavailable" if no_cli else "voice_synthesis_failed",
+                "The selected voice provider returned no audio.",
             )
         return web.json_response({"ok": True, "chunks": len(chunk_paths), "request_id": request_id})
     except SandboxUnavailableError as exc:
@@ -710,6 +748,7 @@ async def _synthesize_registered_stream(
             audio = bytes(chunk.audio)
             chunks.append((audio, chunk.mime))
             sentence = getattr(chunk, "sentence", "")
+            voice_metrics.note_tts_chunk()
             state.broadcast_ws(
                 "voice_chunk",
                 {
@@ -823,6 +862,7 @@ async def _synthesize_nonstreaming(
             )
         audio_b64 = base64.b64encode(audio_bytes).decode()
         audio_mime = "audio/wav" if audio_path.lower().endswith(".wav") else "audio/mpeg"
+        voice_metrics.note_tts_chunk()
         state.broadcast_ws(
             "voice_chunk",
             {
@@ -1070,6 +1110,7 @@ async def api_voice_voices(request: web.Request) -> web.Response:
     if region:
         cmd += ["--region", region]
 
+    proc = None
     try:
         # A Python-based `aws` (aws-cli v1) must not import the gateway's own
         # interpreter packages, so the launcher's Python settings stay behind.
@@ -1100,7 +1141,13 @@ async def api_voice_voices(request: web.Request) -> web.Response:
         _voices_cache_ts = now
         _voices_cache_key = cache_key
         return web.json_response({"voices": voices})
+    except asyncio.CancelledError:
+        # A torn-down request must not leave the aws child running with no owner.
+        if proc is not None:
+            await platform_compat.kill_and_reap(proc)
+        raise
     except asyncio.TimeoutError:
+        assert proc is not None  # only the wait under wait_for can time out
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
         # Reap via communicate(), not wait(): wait_for cancelled the pipe

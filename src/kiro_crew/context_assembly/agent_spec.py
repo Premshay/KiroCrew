@@ -46,17 +46,6 @@ logger = logging.getLogger("kiro_crew.context")
 
 _WIDGET_TOKEN = "{{WIDGET_BLOCK}}"
 
-#: Built-in agents that draw for a person in the dashboard chat (the conductor's
-#: introduction card and task board, a team lead's progress) and so get the
-#: per-surface widget pointer in their ``[AGENT SYSTEM PROMPT]`` block. Each maps
-#: the ``widgets`` / ``living-ui`` / ``artifacts`` skills the pointer names.
-#: ``kirocrew-ledger-conductor`` is the conductor's deprecated alias with the same
-#: body. ``kirocrew-worker`` is absent on purpose: it reports to the work ledger,
-#: not to a person.
-WIDGET_BLOCK_AGENTS = frozenset(
-    {"kirocrew-conductor", "kirocrew-ledger-conductor", "kirocrew-team-lead"}
-)
-
 
 def steering_target_admissible(resolved: Path, base: Path | None = None) -> bool:
     """Admission gate for a steering document's RESOLVED path.
@@ -64,16 +53,20 @@ def steering_target_admissible(resolved: Path, base: Path | None = None) -> bool
     The session loader (:func:`_load_steering_resources`) admits a glob hit —
     symlinks included, since ``Path.resolve()`` follows them — when the target
     stays under the trust base, is a regular file, and is not a sensitive
-    location. *base* defaults to ``$HOME``, the loader's own anchor; the
-    dashboard's steering listing admits a leaf symlink through this same
-    predicate with the source's LINK trust base (``$HOME`` for ``user``, the
-    steering root itself for ``workspace``), so a repository-committed link
+    location. The loader passes each entry's own anchor as *base* (the
+    project, the home, or an absolute entry's glob-free prefix); *base*
+    defaults to ``$HOME``. The dashboard's steering listing admits a leaf
+    symlink through this same predicate with the source's LINK trust base
+    (``$HOME`` for ``user``, the steering root itself for ``workspace``), so
+    a repository-committed link
     can never read outside the root it ships in, and the ``user`` case cannot
     disagree with what the loader injects.
     """
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
 
-    base_resolved = str((base or Path.home()).resolve()) + os.sep
+    base_resolved = str((base or Path.home()).resolve())
+    if not base_resolved.endswith(os.sep):
+        base_resolved += os.sep  # a filesystem root already ends in one
     return (
         str(resolved).startswith(base_resolved)
         and resolved.is_file()
@@ -81,24 +74,98 @@ def steering_target_admissible(resolved: Path, base: Path | None = None) -> bool
     )
 
 
-def _load_steering_resources() -> str:
-    """Load steering files from the agent config's resources array.
+#: The project half of the resources kiro-cli adds to an agent's own while a
+#: workspace inherits its defaults (``acp/skill_projection_parts/preparation.py``):
+#: the project's steering and ``AGENTS.md``, when a project is bound. The global
+#: half is ``_GLOBAL_DEFAULT_RESOURCE``. A harness this load serves reads none of
+#: them from the spec. Codex reads ``AGENTS.md`` from its working directory, so
+#: the load leaves that file out there (``harness_reads_agents_md``).
+_PROJECT_DEFAULT_RESOURCES = ("file://.kiro/steering/**/*.md", "file://AGENTS.md")
+
+
+#: The global half: the operator's steering under the host ``~/.kiro``. It stays
+#: there under a relocated ``KIRO_HOME`` because the folder-steering dedup
+#: (``folder_steering._double_load_roots``) skips the host tree as delivered on
+#: the harnesses this load serves, and a root it skips must be the root this load
+#: reads.
+_GLOBAL_DEFAULT_RESOURCE = "file://~/.kiro/steering/**/*.md"
+
+
+def _steering_glob_anchor(pattern: str, project: Path | None) -> tuple[Path, str]:
+    """``(anchor directory, glob relative to it)`` for one ``file://`` *pattern*.
+
+    kiro-cli's anchoring: ``~/`` is the home, an absolute path is globbed from
+    its own glob-free prefix, and anything else is relative to the session's
+    project, or to the home when none is bound. The anchor is also the trust
+    base the hits are admitted against.
+    """
+    if pattern.startswith("~/"):
+        return Path.home(), pattern[2:]
+    path = Path(pattern)
+    if not path.is_absolute():
+        return (project or Path.home()), pattern
+    parts = path.parts
+    split = next(
+        (i for i, part in enumerate(parts) if any(c in part for c in "*?[")), len(parts) - 1
+    )
+    return Path(*parts[:split]), str(Path(*parts[split:]))
+
+
+def _load_steering_resources(
+    project: str | None = None, *, harness_reads_agents_md: bool = False
+) -> str:
+    """The steering text :func:`steering_resource_documents` keeps, joined."""
+    parts = [
+        body
+        for _path, _resolved, body in steering_resource_documents(
+            project, harness_reads_agents_md=harness_reads_agents_md
+        )
+        if body is not None
+    ]
+    if parts:
+        logger.debug(
+            "loaded %d steering bytes from %d files", sum(len(p) for p in parts), len(parts)
+        )
+    return "\n".join(parts)
+
+
+def steering_resource_documents(
+    project: str | None = None, *, harness_reads_agents_md: bool = False
+) -> list[tuple[Path, Path, str | None]]:
+    """``(path, resolved, body)`` for each document the steering load admits.
+
+    The one reader behind :func:`_load_steering_resources` and the dashboard's
+    per-chat steering list, so the two cannot disagree. *body* is ``None`` for an
+    admitted document :func:`kiro_crew.folder_steering.every_session_body` withholds.
+
+    *harness_reads_agents_md* says the harness reads ``<project>/AGENTS.md`` itself
+    from its working directory. The load then leaves that file out, whether the
+    default or the spec's own entry names it, because the harness reads it
+    whatever the spec lists, and a second copy only doubles its tokens.
+
+    Loads steering files from the agent config's resources array.
 
     kiro-cli injects these automatically for its sessions; the dashboard
     must do it explicitly so that dashboard chat sessions also benefit
-    from project-specific steering conventions.
-    Only loads ``file://`` resources matching ``*.md``, and of those only the
-    documents :func:`kiro_crew.folder_steering.every_session_body` keeps: one
-    declaring ``inclusion`` ``manual``, ``auto`` or ``fileMatch`` is withheld,
-    and the front matter is stripped from the rest.
+    from project-specific steering conventions. Only loads ``file://``
+    resources matching ``*.md``, each anchored by
+    :func:`_steering_glob_anchor` against *project*, plus the defaults
+    kiro-cli adds (``_GLOBAL_DEFAULT_RESOURCE``, and
+    ``_PROJECT_DEFAULT_RESOURCES`` when *project* is set), and of those only
+    the documents :func:`kiro_crew.folder_steering.every_session_body` keeps:
+    one declaring ``inclusion`` ``manual``, ``auto`` or ``fileMatch`` is
+    withheld, and the front matter is stripped from the rest. A document two
+    entries match is read once. An entry that cannot be globbed or read skips
+    only itself.
     """
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
+    from kiro_crew.file_uri import file_uri_path_text
     from kiro_crew.folder_steering import every_session_body
 
     try:
         cfg_path = ctx.kiro_agents_dir() / "kirocrew.json"
         if not cfg_path.exists():
-            return ""
+            return []
         # The agents dir is user-writable and shared with other tools, so the
         # spec goes through the hardened agent-spec reader. ``safe_read_file``
         # screens the resolved target but reads it with an unbounded
@@ -116,30 +183,50 @@ def _load_steering_resources() -> str:
             source="unknown",
         )
         if cfg is None:
-            return ""
-        resources = cfg.get("resources", [])
-        parts: list[str] = []
-        for res in resources:
-            if not isinstance(res, str) or not res.startswith("file://"):
-                continue
-            raw_pattern = res.removeprefix("file://")
-            base = Path.home()
-            for p in sorted(base.glob(raw_pattern)):
-                if p.suffix == ".md" and steering_target_admissible(p.resolve()):
-                    try:
-                        body = every_session_body(ctx.safe_read_file(str(p)))
-                    except PermissionError:
-                        continue
-                    if body is not None:
-                        parts.append(body)
-        if parts:
-            logger.debug(
-                "loaded %d steering bytes from %d files", sum(len(p) for p in parts), len(parts)
-            )
-        return "\n".join(parts) if parts else ""
+            return []
+        declared = cfg.get("resources", [])
+        project_root = Path(project).expanduser() if project else None
+        resources = [
+            *(declared if isinstance(declared, list) else []),
+            _GLOBAL_DEFAULT_RESOURCE,
+            *(_PROJECT_DEFAULT_RESOURCES if project_root is not None else ()),
+        ]
+        # Matched by resolved path, as the de-duplication below is: an entry
+        # that reaches the same file another way is the same file.
+        read_by_harness = (
+            {(project_root / "AGENTS.md").resolve()}
+            if harness_reads_agents_md and project_root is not None
+            else set()
+        )
     except Exception as exc:
         logger.debug("steering load failed: %s", type(exc).__name__)
-        return ""
+        return []
+    documents: list[tuple[Path, Path, str | None]] = []
+    seen: set[Path] = set(read_by_harness)
+    for res in resources:
+        if not isinstance(res, str) or not res.startswith("file://"):
+            continue
+        try:
+            anchor, pattern = _steering_glob_anchor(file_uri_path_text(res), project_root)
+            hits = sorted(anchor.glob(pattern))
+        except Exception as exc:
+            # pathlib refuses some patterns outright; skip this entry only.
+            logger.debug("steering resource skipped: %s", type(exc).__name__)
+            continue
+        for p in hits:
+            if p.suffix != ".md":
+                continue
+            try:
+                resolved = p.resolve()
+                if resolved in seen or not steering_target_admissible(resolved, base=anchor):
+                    continue
+                body = every_session_body(ctx.safe_read_file(str(p)))
+            except Exception as exc:
+                logger.debug("steering document skipped: %s", type(exc).__name__)
+                continue
+            seen.add(resolved)
+            documents.append((p, resolved, body))
+    return documents
 
 
 def _read_include_crew_context(agent: str, pins: Mapping[str, str] | None = None) -> bool:
@@ -512,6 +599,7 @@ def _load_agent_prompt(
     """
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
     from kiro_crew.agent_discovery import _read_agent_spec
+    from kiro_crew.file_uri import file_uri_path_text
     from kiro_crew.member_essential_context import (
         read_template_spec,
         resolve_relative_prompt_path,
@@ -548,7 +636,7 @@ def _load_agent_prompt(
         if agent == owner_template:
             return ""
         if prompt.startswith("file://"):
-            source = Path(prompt[7:]).expanduser()
+            source = Path(file_uri_path_text(prompt)).expanduser()
             if not source.is_absolute():
                 resolved_source = resolve_relative_prompt_path(source, path, project)
                 if resolved_source is None:
@@ -660,24 +748,35 @@ def _resolve_agent_prompt(
         pp = ctx._prompt_path()
         logger.debug("Prompt selection: mode=%r → %s", mode, pp)
         agent_prompt = _read_prompt_file(pp)
+    from kiro_crew.crew_mode import CONDUCTOR_TEMPLATES
+    from kiro_crew.mate_worker import MATE_CONDUCTOR_AGENT, MATE_WORKER_AGENT
+    from kiro_crew.members import is_member_session_key
+
     # After every branch: the worker is a default-named agent, so it takes the
     # default contract above, and its crewmate's prompt follows that base.
     agent_prompt = _crewmate_worker_prompt(agent or "", agent_prompt, session_key or "")
+    # That worker reports to its crewmate's conductor, not to a person, so it
+    # drops the widget pointer the default contract carries.
+    if agent == MATE_WORKER_AGENT:
+        agent_prompt = agent_prompt.replace(_WIDGET_TOKEN, "")
     # A crewmate's conductor dispatches to worker sessions and mounts no spawn
     # tools, so it gets its own delegation rule where the sub-agent span was.
     # Resolved before the capacity token below, which sits inside that span.
+    # A session without a member key never gets the session tools, so outside its
+    # own thread it is told to do the work itself. The key never changes within
+    # a session, so every render of the block agrees.
     if _sections.SUBAGENTS_BEGIN in agent_prompt or _sections.SUBAGENTS_END in agent_prompt:
-        from kiro_crew.mate_worker import MATE_CONDUCTOR_AGENT
-
         agent_prompt = _sections.subagent_section(
-            agent_prompt, conductor=agent == MATE_CONDUCTOR_AGENT
+            agent_prompt,
+            conductor=agent == MATE_CONDUCTOR_AGENT,
+            own_thread=is_member_session_key(session_key),
         )
-    # A built-in spec whose own prompt asks for widgets gets the widget pointer
-    # here rather than as a token in its spec: kiro-cli loads that spec prompt
-    # natively and a crewmate's essentials deliver it verbatim, and neither path
-    # resolves a token. This block is the one copy that is resolved per surface,
+    # Every shipped conductor talks to a person in the dashboard chat, so it gets
+    # the widget pointer here, not as a token in its spec: kiro-cli loads that
+    # spec prompt natively and a crewmate's essentials deliver it verbatim, and
+    # neither resolves a token. This block is the one copy resolved per surface,
     # and the only one a private crewmate gets, so it may hold just the pointer.
-    if agent in WIDGET_BLOCK_AGENTS and _WIDGET_TOKEN not in agent_prompt:
+    if agent in CONDUCTOR_TEMPLATES and _WIDGET_TOKEN not in agent_prompt:
         agent_prompt = f"{agent_prompt}\n\n{_WIDGET_TOKEN}" if agent_prompt else _WIDGET_TOKEN
     if not agent_prompt:
         return ""

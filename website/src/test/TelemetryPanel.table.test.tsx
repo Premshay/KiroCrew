@@ -93,14 +93,17 @@ async function mount(payload: Record<string, unknown>) {
   render(<TelemetryPanel />, { wrapper: Wrapper })
 }
 
-/** Row labels in document order for one column, identified by its header. */
+/** Row labels in document order for one column, identified by its header. A
+ *  `hidden` description copy (`TruncatedText`) is not part of a shown label. */
 function columnOrder(header: string): string[] {
   const ths = Array.from(document.querySelectorAll('thead th'))
   const idx = ths.findIndex(th => th.textContent?.startsWith(header))
   expect(idx).toBeGreaterThanOrEqual(0)
-  return Array.from(document.querySelectorAll('tbody tr')).map(
-    tr => tr.children[idx]?.textContent?.trim() ?? '',
-  )
+  return Array.from(document.querySelectorAll('tbody tr')).map(tr => {
+    const cell = tr.children[idx]?.cloneNode(true) as Element | undefined
+    cell?.querySelectorAll('[hidden]').forEach(n => n.remove())
+    return cell?.textContent?.trim() ?? ''
+  })
 }
 
 /**
@@ -360,13 +363,14 @@ describe('TelemetryPanel — latency distribution order', () => {
       }),
     }))
     await waitFor(() => expect(screen.getAllByText('all background').length).toBeGreaterThan(0))
-    // The session view must not show the raw enum.
-    expect(screen.queryByText('bg')).toBeNull()
+    // The session view must not show the raw enum. A `hidden` description copy
+    // of it is not shown.
+    expect(screen.queryByText('bg', { ignore: 'script, style, [hidden]' })).toBeNull()
 
     // The category grouping must agree rather than drift back to the enum.
     await userEvent.click(screen.getAllByRole('radio', { name: 'Origin' })[0])
     await waitFor(() => expect(screen.getAllByText('all background').length).toBeGreaterThan(0))
-    expect(screen.queryByText('bg')).toBeNull()
+    expect(screen.queryByText('bg', { ignore: 'script, style, [hidden]' })).toBeNull()
   })
 
   it('gives each trend day a resolvable height so the bars are visible', async () => {
@@ -404,6 +408,29 @@ describe('TelemetryPanel — latency distribution order', () => {
     // The tallest sample in the fixture defines the peak, so its bar is full height.
     expect(heights[0]).toBe('100%')
     expect(heights.every(h => parseFloat(h) > 0)).toBe(true)
+  })
+
+  it('labels a trend day with no cold start as a dash, not as an instant start', async () => {
+    // A day with no cold start reports 0 and its column is drawn empty; its label
+    // must say the same absence instead of "cold 0 ms".
+    await mount(
+      only({
+        startup: {
+          overall: stat({ count: 3 }), cold: stat(), warm: stat(),
+          outcome: { ready: 3 },
+          daily: [
+            { date: '2026-07-02', count: 2, cold_p50_ms: 6000, warm_p50_ms: 2000 },
+            { date: '2026-07-03', count: 3, cold_p50_ms: 0, warm_p50_ms: 2500 },
+          ],
+          distribution: { buckets: [], bounds: [] },
+          phases: [],
+          by_channel: [],
+        },
+      }),
+    )
+    const day = await screen.findByRole('img', { name: /2026-07-03/ })
+    expect(day.getAttribute('aria-label')).toContain('cold —')
+    expect(day.getAttribute('title')).toBe(day.getAttribute('aria-label'))
   })
 
   it('renders buckets in bound order, not by sample count', async () => {

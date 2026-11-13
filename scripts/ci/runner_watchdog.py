@@ -57,20 +57,18 @@ rate limit is honoured against its ``Retry-After`` / ``X-RateLimit-Reset`` with
 one cheap in-budget retry; when the reset is too far off, the tick stops
 gathering, acts on the runs it has already classified, and records an
 ``aborted-rate-limited`` outcome that the summary names. That outcome is a
-FAILURE, so ANY aborted tick exits nonzero, however much it classified first:
-the same abort skips the cancelled-orphan recovery pass, and a cancelled run in
-the last tick-interval of its window ages out before a later tick reaches it.
-Every other
+FAILURE, however much the tick classified first: the abort skips the recovery
+pass, and a cancelled run late in its window ages out before a later tick. A
+header-proven spent quota (``aborted-quota-exhausted``) only warns. Every other
 status -- 401, 404, 5xx -- and every malformed payload still raises exactly as
 before.
 
-The re-run is a FULL re-run, not ``rerun-failed-jobs``, because of how the
-label is computed: ``ci.yml`` computes it ONCE, in its ``changes`` job, and the
-routed jobs read it from that job's outputs. A failed-jobs re-run does not run
-``changes`` again, so the re-queued jobs would carry a label whose attempt
-suffix is stale, and CodeBuild's documentation does not say whether it honours
-that. A full re-run recomputes the label. The cost is one CI round; the
-alternative was a ten-hour hold.
+The re-run is a FULL re-run, not ``rerun-failed-jobs``, so ``ci.yml``'s
+``changes`` job re-runs as well and the new attempt decides its surface and
+fleet admission afresh instead of reusing the cancelled attempt's outputs.
+Either form asks for a current label: every routed job spells it from its own
+``github.run_attempt``. The cost is one CI round; the alternative was a
+ten-hour hold.
 
 Slow is not dead
 ----------------
@@ -239,6 +237,7 @@ WATCHED_WORKFLOWS: tuple[str, ...] = (
     "build.yml",
     "ci.yml",
     "code-review.yml",
+    "codeql.yml",
     "dependency-review.yml",
     "dependency-vulnerability.yml",
     "fast-gate.yml",
@@ -250,9 +249,11 @@ WATCHED_WORKFLOWS: tuple[str, ...] = (
     "macos-on-demand.yml",
     "main-ratchet-audit.yml",
     "pages.yml",
+    "pr-hygiene.yml",
     "pr-merge-conflict-label.yml",
     "pr-policy.yml",
     "pr-readiness.yml",
+    "release-lts.yml",
     "release.yml",
     "sensitive-change-review.yml",
 )
@@ -327,6 +328,7 @@ HEAL_SAFE_PULL_REQUEST_WORKFLOWS: frozenset[str] = frozenset(
     {
         "code-review.yml",
         "dependency-review.yml",
+        "pr-hygiene.yml",
         "pr-policy.yml",
     }
 )
@@ -674,6 +676,10 @@ OUTCOME_HEAL_SAFETY_UNKNOWN = "heal-safety-unreadable-at-run-revision"
 # limit persists. The runs classified ahead of the abort are still acted on; what
 # the outcome refuses is calling a tick healthy when it could not look.
 OUTCOME_ABORTED_RATE_LIMITED = "aborted-rate-limited"
+# The same abort when the headers prove the shared installation quota is at 0.
+# NOT a failed outcome: every workflow spends that quota, so a red tick names no
+# run to act on. It warns instead; a classified run keeps its own outcome.
+OUTCOME_QUOTA_EXHAUSTED = "aborted-quota-exhausted"
 
 # A live candidate listing stopped on its page cap, so the OLDEST live runs were
 # never read -- and the tail is exactly where an orphan sits. The depth needed to
@@ -763,6 +769,7 @@ class ApiError(Exception):
         ambiguous: bool = False,
         retry_after: float | None = None,
         remaining: str | None = None,
+        reset_at: float | None = None,
     ) -> None:
         self._message = _safe_text(message)
         super().__init__(f"HTTP {status}: {self._message}")
@@ -770,6 +777,7 @@ class ApiError(Exception):
         self.ambiguous = ambiguous
         self.retry_after = retry_after
         self.remaining = remaining
+        self.reset_at = reset_at
 
     @property
     def rate_limited(self) -> bool:
@@ -778,6 +786,11 @@ class ApiError(Exception):
         if "rate limit" in self._message.lower():
             return True
         return self.remaining == "0"
+
+    @property
+    def quota_exhausted(self) -> bool:
+        """``X-RateLimit-Remaining`` is 0: the primary quota, never judged from body text."""
+        return self.status in (403, 429) and self.remaining == "0"
 
 
 class Api(Protocol):
@@ -828,7 +841,9 @@ from runner_watchdog_parts.classify import (  # noqa: E402,F401
 from runner_watchdog_parts.client import (  # noqa: E402,F401
     GitHubApi,
     _rate_limit_hints,
+    _rate_limit_reset,
     _ReadsThrough,
+    rate_limit_abort_detail,
 )
 from runner_watchdog_parts.heal import (  # noqa: E402,F401
     HoldCheck,
@@ -922,9 +937,12 @@ def render_summary(verdicts: list[RunVerdict], outcomes: dict[int, str], policy:
     lines.append(f"Inspected {len(real)} run(s).")
     if aborted_markers:
         lines.append("")
+        quota = outcomes.get(RATE_LIMIT_MARKER_ID) == OUTCOME_QUOTA_EXHAUSTED
         lines.append(
-            f"Aborted (rate limited): {_md(aborted_markers[0].detail)} -- acted on the runs already "
-            f"classified; the next tick re-lists."
+            f"Aborted ({'quota exhausted' if quota else 'rate limited'}): "
+            f"{_md(aborted_markers[0].detail)} -- acted on the runs already classified; the next "
+            f"tick re-lists."
+            + (" Warning only: the cancelled-orphan recovery pass did not run." if quota else "")
         )
     if truncated_markers:
         lines.append("")
@@ -1005,6 +1023,7 @@ def run_watchdog(
         started_clock=start,
     )
     aborted: str | None = None
+    aborted_on_quota = False
 
     def cheap_retry(thunk: Callable[[], Any]) -> Any:
         """Run ``thunk``; on a rate limit whose reset is cheap and in budget, wait once and retry.
@@ -1136,7 +1155,7 @@ def run_watchdog(
         # re-lists. Any other error is the caller's to raise, untouched here.
         if not exc.rate_limited:
             raise
-        aborted = str(exc)
+        aborted, aborted_on_quota = rate_limit_abort_detail(exc), exc.quota_exhausted
         log(
             f"::warning::the tick hit a GitHub rate limit while gathering ({exc}); it stops listing, "
             f"acts on the {len(verdicts)} run(s) already classified, and the next tick re-lists"
@@ -1166,7 +1185,7 @@ def run_watchdog(
         except ApiError as exc:
             if not exc.rate_limited:
                 raise
-            aborted = str(exc)
+            aborted, aborted_on_quota = rate_limit_abort_detail(exc), exc.quota_exhausted
             log(
                 f"::warning::the recovery pass hit a GitHub rate limit ({exc}); it is left for the "
                 f"next tick"
@@ -1345,7 +1364,9 @@ def run_watchdog(
                 detail=aborted,
             )
         )
-        outcomes[RATE_LIMIT_MARKER_ID] = OUTCOME_ABORTED_RATE_LIMITED
+        outcomes[RATE_LIMIT_MARKER_ID] = (
+            OUTCOME_QUOTA_EXHAUSTED if aborted_on_quota else OUTCOME_ABORTED_RATE_LIMITED
+        )
     if listing_truncated:
         # Same device, for the reach rather than the quota: the listing stopped on
         # its page cap, so the oldest live runs were never classified and an orphan
@@ -1553,6 +1574,14 @@ def main(argv: list[str] | None = None) -> int:
             "::error::a GitHub rate limit cut this tick short, so the cancelled-orphan recovery "
             "pass did not run; a cancelled run near the end of its recovery window can age out "
             "before a later tick reaches it"
+        )
+    if outcomes.get(RATE_LIMIT_MARKER_ID) == OUTCOME_QUOTA_EXHAUSTED:
+        detail = next(
+            (v.detail for v in verdicts if v.verdict == TICK_ABORTED_RATE_LIMITED), "no detail"
+        )
+        print(
+            f"::warning::the shared GitHub token quota is spent ({detail}), so this tick stopped "
+            "early and the cancelled-orphan recovery pass did not run; the next tick re-lists"
         )
     if outcomes.get(LISTING_TRUNCATED_MARKER_ID) == OUTCOME_LISTING_TRUNCATED:
         print(

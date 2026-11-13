@@ -10,8 +10,8 @@ confirmation over what it recorded. The live round trip is
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
-import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -198,18 +198,40 @@ def test_a_missing_member_spec_mounts_no_stub(agents_dir, tmp_path) -> None:
     assert _stub_names(_pi_member(tmp_path), member=True) == []
 
 
-def test_every_session_composition_reads_pi_s_array_before_its_pooled_stubs() -> None:
-    """The allowlist the stubs read is recorded by the pi array's resolve.
-
-    ``_pooled_mcp_servers`` reads only that field (H13), so each ``session/new`` /
-    ``session/load`` splice must evaluate the pi array -- which warms the cache
-    through ``_mirrorless_member_mounts`` -- before the pooled stubs.
-    """
+def test_every_session_composition_uses_the_bound_roster() -> None:
     source = (Path(client_start.__file__)).read_text(encoding="utf-8")
-    pooled = [m.start() for m in re.finditer(r"self\._pooled_mcp_servers\b", source)]
-    assert len(pooled) == 3
-    for at in pooled:
-        assert "self._pi_session_mcp_servers()" in source[max(0, at - 400) : at], at
+    assert source.count("self._bound_session_mcp_servers") == 3
+    assert "self._pooled_mcp_servers" not in source
+    # The adapter for pi answers with pi's own array.
+    from kiro_crew.acp.harness.pi import PiLaunch
+
+    assert "session._pi_session_mcp_servers()" in inspect.getsource(PiLaunch.session_mcp_servers)
+
+
+def test_the_bound_roster_reads_pi_s_array_before_its_pooled_stubs(tmp_path, monkeypatch):
+    client = AcpClient(work_dir=tmp_path, agent="kirocrew", acp_backend=ACP_BACKEND_PI)
+    client._session_mcp_withheld = False
+    allowlist = session_mcp._tools_allowlist({"tools": ["@docs"]})
+    projected = {"name": "docs", "command": "spec-docs"}
+    pooled = {"name": "search", "command": "pooled-search"}
+    seen = []
+
+    def projection():
+        seen.append("array")
+        client._member_stub_allowlist = allowlist
+        return [projected]
+
+    def stubs():
+        assert seen and seen[-1] == "array"
+        assert client._member_stub_allowlist is allowlist
+        seen.append("pooled")
+        return [{"name": "docs", "command": "duplicate-docs"}, pooled]
+
+    monkeypatch.setattr(client, "_session_mcp_servers", projection)
+    monkeypatch.setattr(client, "_pooled_mcp_servers", stubs)
+    monkeypatch.setattr(client, "_session_capability_mcp_servers", lambda: [])
+    assert client._bound_session_mcp_servers() == [projected, pooled]
+    assert seen[-1] == "pooled"
 
 
 def test_kiro_stub_composition_makes_no_projection_lookup(tmp_path, monkeypatch) -> None:
@@ -297,6 +319,7 @@ def _confirmed_pi_provider() -> SimpleNamespace:
         is_process_alive=lambda: True,
         process_instance="proc-1",
         session_id="pi-session-1",
+        capability_stamp_session_id="pi-session-1",
         loaded_capability_template="kirocrew",
         capability_projection_gaps=(),
         mcp_session_report=McpSessionReport,

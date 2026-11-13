@@ -139,7 +139,8 @@ OFF_CARD_CONCERNS: Mapping[str, str] = {
     ),
     "TOOLS_SETTINGS": (
         "no mirrored harness applies toolsSettings (its subagent.availableAgents aside, "
-        "which Crew's spawn gate reads on every backend), so every mirror line would read "
+        "which Crew's spawn gate reads on every backend, and claude's shell and write "
+        "allowlists, which Crew's gate applies), so every mirror line would read nearly "
         "the same and tell a reader choosing between them nothing; what reaches the "
         "person who wrote the field is a session-start notice naming what of it goes "
         "unapplied, on every mirrored backend"
@@ -311,8 +312,8 @@ def _broker_only_dispositions(backend: str) -> Dict[str, str]:
     A ``broker-only`` projection is handed no agent spec, so the spec's ``hooks``
     field reaches the harness by no route. Unless Crew fires that field itself
     (``ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS``), nothing runs it, and an empty map would
-    tell the card and the session-start notice the opposite. Every other kind keeps
-    its ``{}``, as before this ruling: this answers the broker-only kind alone.
+    tell the card and the session-start notice the opposite. Every other kind
+    answers ``{}``: this rules on the broker-only kind alone.
     """
     # circular import -- see :func:`_declaration`.
     from kiro_crew.agent_sdk.backends import ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS
@@ -427,7 +428,7 @@ def ability_payload(backend: str) -> Dict[str, object]:
 
 #: The card line the ``hooks`` one narrows to where Crew fires every spec hook event
 #: but ``preToolUse`` (``ACP_BACKENDS_CREW_FIRES_SPEC_OBSERVER_HOOKS`` without
-#: ``ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS``, claude). The mirror still rules ``hooks``
+#: ``ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS``: claude, codex). The mirror still rules ``hooks``
 #: no-channel there, which is the route's truth and what ``kirocrew doctor`` prints,
 #: but "your hooks will not run" would tell the reader the opposite of what happens.
 HOOKS_PRE_TOOL_USE_CARD_ID = "hooks_pre_tool_use"

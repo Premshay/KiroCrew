@@ -134,17 +134,24 @@ def _reject_pending_approvals(slot: _ChatSlot) -> None:
             # resolved value stays a plain "rejected" so no caller of this future
             # has to learn a new one.
             slot._approval_stopped.add(aid)
-            fut.set_result("rejected")
-            if _mark_permission_resolved(slot.messages, aid, "rejected"):
-                slot._dirty = True
-            sel().log_tool_invocation(
-                session_key=effective_session_key(slot),
-                agent=getattr(slot, "agent", "") or "kirocrew",
-                source="dashboard",
-                tool_name=f"approval_reject:{aid}",
-                tool_kind="permission",
-                outcome="rejected_on_stop",
-            )
+            _settle_approval_rejected(slot, aid, fut, "rejected_on_stop")
+
+
+def _settle_approval_rejected(
+    slot: _ChatSlot, aid: str, fut: asyncio.Future[str], outcome: str
+) -> None:
+    """Reject the pending approval *aid*, mark its card resolved and audit *outcome*."""
+    fut.set_result("rejected")
+    if _mark_permission_resolved(slot.messages, aid, "rejected"):
+        slot._dirty = True
+    sel().log_tool_invocation(
+        session_key=effective_session_key(slot),
+        agent=getattr(slot, "agent", "") or "kirocrew",
+        source="dashboard",
+        tool_name=f"approval_reject:{aid}",
+        tool_kind="permission",
+        outcome=outcome,
+    )
 
 
 def _resolve_stop_event(slot: _ChatSlot, outcome: str) -> None:
@@ -161,6 +168,11 @@ def _resolve_stop_event(slot: _ChatSlot, outcome: str) -> None:
         # cooperative Stop was declined. The card becomes the notice,
         # so the row the press opened tells the user what happened to it.
         final_state = "stop_declined_compacting"
+    elif slot._stop_escalated_card_id == stop_id:
+        # The user pressed Stop again to get this hard kill, so it did not fail.
+        # Keyed on the card, not on which callback fires: the first press's own
+        # timeout callback can settle this card before the forced one does.
+        final_state = "force_stopped"
     else:
         final_state = "stop_failed_reset"
     found = False
@@ -186,7 +198,7 @@ def _resolve_stop_event(slot: _ChatSlot, outcome: str) -> None:
         slot._dirty = True
         found = True
         # Re-broadcast updated stop_event so frontend StopEventCard
-        # transitions from "stopping" → "stopped"/"stop_failed_reset".
+        # transitions from "stopping" to its settled state.
         on_msg = getattr(slot, "_on_message", None)
         if on_msg:
             try:
@@ -318,10 +330,10 @@ def _make_stop_resolver(
     and clears it once it has settled the card, so a state gate buys nothing
     there. What the state gate did buy was a bug. A turn tearing down
     concurrently drives `_stop_state` back to "idle" (`_finish_queue_cycle` in
-    chat_runner.py, through the `_stopping` setter in state_parts/chat_slot.py), and that
+    chat_turn/queue_cycle.py, through the `_stopping` setter in state_parts/chat_slot.py), and that
     teardown races the escalation. When teardown won, the hard callback bailed,
     `_resolve_stop_event` never ran, and the card pulsed at "stopping" for the
-    rest of the session instead of settling to "stop_failed_reset".
+    rest of the session instead of settling.
 
     Precedence needs its own non-racy marker. A cooperative ack that arrives
     after the user escalated must not relabel a hard kill as a clean stop, and
@@ -471,6 +483,44 @@ def _cancel_target(slot: _ChatSlot) -> str:
     return getattr(slot, "_active_turn_session_key", "") or effective_session_key(slot)
 
 
+async def _cancel_cron_run(state: "DashboardState", cancel_key: str) -> bool:
+    """Cancel the scheduled run on *cancel_key*, a cron tab's ``cron:<job_id>`` session.
+
+    The cron service's own cancel, the Schedule page's: the run posts nothing and
+    counts as neither a success nor a failure, where a bare turn cancel ends it as
+    a normal completion that delivers its partial text. False when *cancel_key*
+    names no cron job's own session or no run of it is going. Raises the cancel's
+    ``CronPauseNotSaved`` (the run is cancelled; only a one-shot's pause did not
+    reach the store) for the caller to report as the Schedule page does.
+    """
+    job_id = cancel_key.removeprefix("cron:")
+    crons = getattr(state, "crons", None)
+    if crons is None or job_id == cancel_key or not job_id or ":" in job_id:
+        return False
+    return bool(await crons.cancel(job_id))
+
+
+async def _may_cancel_cron_run(
+    request: web.Request, state: "DashboardState", cancel_key: str
+) -> bool:
+    """Whether this Stop may end a cron tab's run through the cron service's cancel.
+
+    Only for a press on a ``cron:<job_id>`` tab, and only for a caller
+    ``POST /api/crons/{id}/cancel`` itself admits: the dashboard owner, or an app
+    acting on its own job. Anyone else's Stop cancels the turn alone.
+    """
+    job_id = cancel_key.removeprefix("cron:")
+    if job_id == cancel_key or not job_id or ":" in job_id:
+        return False
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+    from kiro_crew.dashboard.handlers.cron_shared import _refuse_foreign_app_job
+
+    if request.get("app") == "":
+        if await require_owner_dashboard_request(request, "crons.cancel") is not None:
+            return False
+    return await _refuse_foreign_app_job(request, state, [job_id], "crons.cancel") is None
+
+
 async def _settle_discarded_stage_deliveries(
     state: "DashboardState",
     slot: "_ChatSlot",
@@ -502,6 +552,7 @@ async def stop_slot_turn(
     source: str = "dashboard",
     cancel_key: str = "",
     escalate: bool = True,
+    cron_cancel: bool = False,
 ) -> dict[str, Any]:
     """Stop the slot's turn: cooperative cancel, hard kill on a second call.
 
@@ -530,6 +581,10 @@ async def stop_slot_turn(
     lands between the check and the cancel, which is the whole reason the route
     resolves it up front. Omitted only by callers with nothing to authorize
     against, which fall back to the slot's own routing.
+
+    *cron_cancel*: the caller passed the cron cancel route's own checks
+    (:func:`_may_cancel_cron_run`), so a linked cron run is ended by the cron
+    service's cancel. Every other stop of a cron tab's run leaves it alone.
     """
     name = slot.key
     cancel_key = cancel_key or _cancel_target(slot)
@@ -624,6 +679,7 @@ async def stop_slot_turn(
         # circular import: session_control imports this package's modules at module level.
         from kiro_crew.dashboard.session_control import (
             SEND_DISCARD_HARD_STOP,
+            SEND_DISCARD_HARD_STOP_STEER,
             notify_send_origin_discarded,
         )
 
@@ -641,7 +697,8 @@ async def stop_slot_turn(
             [str(entry.get("content", "")) for entry in discarded],
         )
         # Hard kill = "discard everything": drop unconsumed steers too, so the
-        # end-of-turn requeue (chat_runner finally) has nothing to resurrect.
+        # end-of-turn requeue (`_hand_off_queue` in chat_turn/queue_cycle.py) has
+        # nothing to resurrect.
         # Mirrors the queue clear above; a soft stop preserves both.
         #
         # Their delivery ids go with them, and that is load-bearing rather than
@@ -651,7 +708,23 @@ async def stop_slot_turn(
         # therefore what tells the two apart -- absence means this hard kill
         # discarded the text, so the caller is told it was not delivered instead
         # of having a row persisted for a message that never ran.
+        # An owner's module imports are inert for its functions, which run on the facade's globals.
+        from kiro_crew.config import live
+
+        _config = live.snapshot()
+        _peer_recovery = _config is not None and _config.agent.peer_steer_loss_recovery
         for _discarded in slot._pending_steers:
+            # With the key on a peer steer can wait for its turn's clean end, so a hard stop tells
+            # its sender; one still in its RPC will answer unavailable and be queued instead.
+            _admission = slot._steer_admissions.get(_discarded)
+            if _peer_recovery and _admission and _discarded not in slot._steer_rpc_in_flight:
+                notify_send_origin_discarded(
+                    state,
+                    entry_meta=_admission,
+                    target_slot=slot,
+                    text=_discarded,
+                    cause=SEND_DISCARD_HARD_STOP_STEER,
+                )
             slot._steer_delivery_ids.pop(_discarded, None)
             # Lockstep with the line above (see `_ChatSlot._steer_send_ids`): a hard
             # kill discards the text, so there is no requeued entry left to carry
@@ -714,6 +787,40 @@ async def stop_slot_turn(
     # compaction decline is mirrored here: a decline arms the marker, and the
     # next press -- or an explicit force -- is the hard stop.
     if slot._stop_state == "idle" and not slot.running and slot.linked_turn_running:
+        from kiro_crew.cron import CronPauseNotSaved
+
+        try:
+            cron_cancelled = cron_cancel and await _cancel_cron_run(state, cancel_key)
+        except CronPauseNotSaved as exc:
+            return {
+                "ok": False,
+                "error": str(exc),
+                "code": "cron_pause_not_saved",
+                "retryable": False,
+            }
+        if cron_cancelled:
+            logger.info("Stop: cancelled the cron run on slot %s", name)
+            sel().log_tool_invocation(
+                session_key=_history_key_for(name),
+                agent=getattr(slot, "agent", "") or "kirocrew",
+                source="dashboard",
+                tool_name="dashboard_stop",
+                tool_kind="command",
+                outcome="linked_cron_cancelled",
+                metadata={"slot": name, "via": source, "session": cancel_key},
+            )
+            return {"ok": True, "info": "stopping linked turn"}
+        if cancel_key.startswith("cron:") and not cron_cancel:
+            # A caller the cron cancel route refuses leaves the run alone, and is
+            # told so with that route's own code: "not running" would idle the
+            # pane and hide Stop while the run goes on.
+            logger.info("Stop: slot %s runs a cron this caller may not cancel", name)
+            return {
+                "ok": False,
+                "error": "only the dashboard owner can stop a scheduled run",
+                "code": "owner_only",
+                "retryable": False,
+            }
         # Same escape rules as the dashboard's own turn above: a hard stop is
         # only the way out of a compaction decline (the armed second press, or
         # an explicit force), and a marker for a compaction that has ended is
@@ -819,6 +926,10 @@ async def stop_slot_turn(
 
     # First press: soft stop
     slot._stop_state = "soft_pending"
+    # This press's identity across the ``stop_turn`` await below. A turn end
+    # can reset the posture mid-await and a LATER press can claim a fresh one;
+    # this press's outcome may then settle only its own claim, never that one.
+    stop_generation = slot._stop_generation
     # NOTE: Do NOT clear the queue here — stop should only cancel the
     # currently running turn, leaving queued messages intact for the user
     # to process or dismiss individually.
@@ -859,12 +970,15 @@ async def stop_slot_turn(
     _idle_running = outcome == "idle" and slot.running
     if outcome in {"hard", "idle"}:
         await _cancel_terminal_stop_task(slot, task_at_stop)
-    if outcome == "idle":
-        if slot._stop_event_id:
-            _resolve_stop_event(slot, "soft")
+    # A newer press owns the card and the posture now: settling either here
+    # would idle its stop, and its next press would start over instead of
+    # escalating to the hard kill.
+    _owns_posture = slot._stop_generation == stop_generation
+    if outcome == "idle" and slot._stop_event_id and _owns_posture:
+        _resolve_stop_event(slot, "soft")
         slot._stop_state = "idle"
         state.push_slots_update()
-    elif outcome == "compacting":
+    elif outcome == "compacting" and _owns_posture:
         # The race the pre-check above cannot close: the compaction committed
         # between that read and the cancel. Same answer, and the soft-stop side
         # effects taken above are undone: ``_stop_state`` back to idle (nothing
@@ -941,6 +1055,7 @@ async def api_chat_slot_stop(request: web.Request) -> web.Response:
             force=force,
             cancel_key=cancel_key,
             source=f"app:{request_app}" if request_app else "dashboard",
+            cron_cancel=await _may_cancel_cron_run(request, state, cancel_key),
         )
     )
 
@@ -1040,8 +1155,24 @@ async def api_chat_slot_interrupt(request: web.Request) -> web.Response:
     # live turn (possibly someone else's, in a shared thread).
     linked_turn = not slot.running and slot.linked_turn_running
 
+    from kiro_crew.cron import CronPauseNotSaved
+
+    def _pause_not_saved(exc: CronPauseNotSaved) -> web.Response:
+        # As the Schedule page's Cancel answers: the run is cancelled, its pause is not.
+        return web.json_response(
+            {"error": str(exc), "code": "cron_pause_not_saved", "retryable": False}, status=409
+        )
+
+    cron_cancel = linked_turn and await _may_cancel_cron_run(request, state, cancel_key)
+    if cancel_key.startswith("cron:") and not cron_cancel:
+        # A caller the cron cancel route refuses does not reach the run, as before.
+        linked_turn = False
+
     async def _cancel_linked_turn() -> str:
-        outcome = await state.sessions.stop_turn(cancel_key, preserve_queue=True)
+        if cron_cancel and await _cancel_cron_run(state, cancel_key):
+            outcome = "cron_cancelled"
+        else:
+            outcome = await state.sessions.stop_turn(cancel_key, preserve_queue=True)
         sel().log_tool_invocation(
             session_key=_history_key_for(name),
             agent=getattr(slot, "agent", "") or "kirocrew",
@@ -1054,7 +1185,10 @@ async def api_chat_slot_interrupt(request: web.Request) -> web.Response:
         return outcome
 
     if linked_turn and not slot._queue:
-        outcome = await _cancel_linked_turn()
+        try:
+            outcome = await _cancel_linked_turn()
+        except CronPauseNotSaved as exc:
+            return _pause_not_saved(exc)
         if outcome == "compacting":
             return web.json_response({"ok": True, "info": "compacting", "compacting": True})
         if outcome == "idle":
@@ -1092,7 +1226,10 @@ async def api_chat_slot_interrupt(request: web.Request) -> web.Response:
         if linked_turn:
             # Validated: cancel the channel-path turn, then dispatch the selected
             # card below, which starts once the channel path releases the session.
-            await _cancel_linked_turn()
+            try:
+                await _cancel_linked_turn()
+            except CronPauseNotSaved as exc:
+                return _pause_not_saved(exc)
         async with slot._lock:
             # The request body and lock acquisition both yield. A close followed
             # by same-name recreation during either await must not let this stale
@@ -1351,10 +1488,12 @@ async def api_chat_slot_interrupt(request: web.Request) -> web.Response:
     )
     if outcome in {"hard", "idle"}:
         await _cancel_terminal_stop_task(slot, task_at_stop)
+    # Same ownership rule as ``stop_slot_turn``: a later press that claimed a
+    # new generation during the await owns the card and the posture.
+    _owns_posture = slot._stop_generation == claim_generation
     # Resolve orphaned card when provider reports no active turn
-    if outcome == "idle":
-        if slot._stop_event_id:
-            _resolve_stop_event(slot, "soft")
+    if outcome == "idle" and slot._stop_event_id and _owns_posture:
+        _resolve_stop_event(slot, "soft")
         slot._stop_state = "idle"
         state.push_slots_update()
     # Nothing was running to stop, or the stop settled after the turn it
@@ -1372,9 +1511,10 @@ async def api_chat_slot_interrupt(request: web.Request) -> web.Response:
         # ``_unblock_pending_waits`` rejected cannot be un-rejected, which is
         # why both probes run first. ``_stop_state`` goes back to idle; no
         # escalation marker, for the reason the pre-check gives.
-        _resolve_stop_event(slot, "compacting")
-        slot._stop_event_id = None
-        slot._stop_state = "idle"
+        if _owns_posture:
+            _resolve_stop_event(slot, "compacting")
+            slot._stop_event_id = None
+            slot._stop_state = "idle"
         # Same as the second probe: a restored card's choice is undone and the
         # answer below releases it.
         if chosen_restored:

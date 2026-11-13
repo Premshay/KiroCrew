@@ -19,12 +19,14 @@ foreground, so we use ``-N`` (no remote command) *without* ``-f``, mirroring how
 ``TunnelManager`` supervises its own child. Connection multiplexing is pinned
 off in the argv (``ControlPath=none``) for the same reason: it lets a user's
 ``~/.ssh/config`` recreate that fork-and-exit shape from outside this module.
-``ExitOnForwardFailure=yes`` ensures
-ssh exits if the local forward can't be bound, so a failed connect is detected
-rather than hanging. The SSM transport gets the equivalent detection from the
-generic ready-poll (:meth:`_Tunnel._wait_until_ready`) plus a post-hoc ownership
-recheck, since the ``session-manager-plugin`` child does not expose an
-``ExitOnForwardFailure``-style flag.
+A local forward that can't be bound is a detected failure rather than a hang:
+ssh names the port it could not listen on, and the stderr drain ends the child
+when that is this tunnel's own port, so the exit is reported as ssh's own exit
+was. ``ExitOnForwardFailure=no`` keeps a forward the user's ssh_config adds for
+the same host, on another port, from ending the tunnel when that port is already
+taken. The SSM transport gets its detection from the generic ready-poll
+(:meth:`_Tunnel._wait_until_ready`) plus a post-hoc ownership recheck, since the
+``session-manager-plugin`` child prints no such line.
 
 Scope (Phase 1 / Stage 4): connect, disconnect, status, and shutdown-all, with
 port allocation + token mint wired in. The health-probe loop and 2-tier
@@ -316,6 +318,7 @@ class SshTunnelManager:
     _on_tunnel_healthy = _self_heal._on_tunnel_healthy
     _on_tunnel_exit = _self_heal._on_tunnel_exit
     _recover_after = _self_heal._recover_after
+    _retry_recovery = _self_heal._retry_recovery
     _rebuild = _self_heal._rebuild
     _mark_recovered = _self_heal._mark_recovered
     _recover = _self_heal._recover
@@ -373,9 +376,9 @@ class SshTunnelManager:
         # its own port but spawns the backend without passing it through — the
         # two disagree, the claim names a port the parent is not served on, and
         # the remote's ``frame-ancestors`` then blocks the iframe ("Pane failed
-        # to load"). The gateway already knows its real port (``app["port"]``,
-        # passed to ``_register_instances_hooks``), so it is threaded in here
-        # rather than re-derived.
+        # to load"). The gateway already knows its real port (the reserved
+        # socket's name, passed to ``_register_instances_hooks``), so it is
+        # threaded in here rather than re-derived.
         self._parent_port = parent_port if parent_port else _LOCAL_DASHBOARD_PORT
         self._allocator = PortAllocator(base_port=base_port)
         self._connect_timeout = connect_timeout_secs
@@ -454,6 +457,8 @@ class SshTunnelManager:
         # successful rebuild) + live recovery task refs (stored so they aren't
         # GC'd mid-flight; cancelled on shutdown).
         self._recover_attempts: dict[str, int] = {}
+        #: Monotonic time of the first failed recovery of the current outage, per instance.
+        self._recover_since: dict[str, float] = {}
         self._recovery_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
         # Same tasks, indexed by instance: a reconfiguration must cancel the
         # recovery in flight for ITS instance only, and a recovery that

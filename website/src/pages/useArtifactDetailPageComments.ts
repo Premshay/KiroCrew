@@ -21,6 +21,7 @@ import { type SelectionAction } from '../components/SelectionToolbar'
 import { findCoords, resolveSourcePos } from '../components/MarkdownPanel'
 import { containedSelectionRange } from '../utils/selectionContainment'
 import { anchorFromRange } from '../utils/selectionAnchor'
+import { svgSelectionAnchor, svgSelectionRange } from '../utils/svgSelection'
 import { paintAnnotationHighlight } from '../utils/annotationHighlight'
 import { useSelectionComposerAnchor } from '../hooks/useSelectionComposerAnchor'
 import { announceCommentsChanged, onCommentsChanged } from '../utils/artifactCommentsSync'
@@ -56,10 +57,8 @@ export function useArtifactDetailPageComments({
   const { slug, queryClient, editing } = stateRead
   const { previewRef, isCurrent, artifact } = documentRead
   // ── Inline-comment handlers ──────────────────────────────────────────────
-  // Comments only make sense for kinds where text→source coords resolve
-  // cleanly: markdown (via data-sourcepos) and text (rendered === source).
-  // JSON / SVG selection produces noisy anchors; revisit when there's a real
-  // user demand.
+  // Markdown maps to source positions, text to source rows, and SVG labels
+  // carry quote/context anchors without XML source offsets.
   // Anchored (selection-driven) comment creation: select text in the rendered
   // body to pin a comment to that exact span. The anchor (quote + prefix/suffix
   // + rendered-text offsets + version) is persisted server-side and surfaced to
@@ -83,6 +82,13 @@ export function useArtifactDetailPageComments({
     const sel = window.getSelection()
     const root = previewRef.current
     if (!sel || !root || sel.rangeCount === 0) return null
+    if (artifact?.kind === 'svg') {
+      const range = svgSelectionRange(sel, root)
+      const derived = range && svgSelectionAnchor(range)
+      if (!range || !derived) return null
+      paintAnnotationHighlight(highlightOwner, range)
+      return { anchor: derived.quote, prefix: derived.prefix, suffix: derived.suffix }
+    }
     const inCode = !isMarkdown ? shadowSelectionRange(sel, root) : null
     if (inCode) {
       const derived = codeSourceAnchor(root, inCode, sourceContent)
@@ -117,7 +123,7 @@ export function useArtifactDetailPageComments({
     // prefix/suffix ride along: `rangesForAnchor` scores a repeated quote by its
     // neighbours, so a comment on the second "beta" re-anchors to the second.
     return { anchor, line: coords?.line, column: coords?.column, prefix: derived.prefix, suffix: derived.suffix, startOffset: derived.startOffset, endOffset: derived.endOffset }
-  }, [isMarkdown, sourceContent, previewRef])
+  }, [artifact?.kind, isMarkdown, sourceContent, previewRef])
 
   const invalidateComments = useCallback(() => {
     queryClient.invalidateQueries({ queryKey: ['artifact-comments', slug] })

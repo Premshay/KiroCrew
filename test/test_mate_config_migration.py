@@ -195,6 +195,60 @@ def test_a_shared_template_crewmate_carries_its_kit_and_nothing_the_base_has(lay
     assert (user / "builder.json").is_file()  # kept, so the binding can point back
 
 
+def test_a_server_the_old_agent_mounted_through_a_star_stays_mounted(layout, persisted):
+    """``tools: ["*"]`` already mounted the agent's own server: its ``@server`` is no gain."""
+    user, mates = layout
+    _write(user, "builder", {"name": "builder", "tools": ["*"], "mcpServers": {"jira": JIRA}})
+    cfg = _cfg(zxc=KiroCrewAgentConfig(member_id="zxc", kiro_agent="builder"))
+    persisted(cfg)
+
+    assert migrate_existing_crewmates(cfg).migrated == ["zxc"]
+
+    assert "@jira" in _file(mates, "zxc")["tools"]
+    adds = mate_worker.worker_additions(BASE, _file(mates, "zxc"))
+    assert "@jira" in mate_worker.merge_worker_spec(BASE, adds)["tools"]
+
+
+def test_a_narrower_selector_than_the_old_agent_s_own_is_no_gain(layout, monkeypatch):
+    """Old ``@jira`` covers a file's ``@jira/search``: the plan keeps it and withholds nothing."""
+    from kiro_crew import mate_config_migration as migration
+
+    old = _template("builder", tools=["@jira"], mcpServers={"jira": JIRA})
+    real = migration.migration_file
+
+    def narrower(name, base, source):
+        planned = real(name, base, source)
+        planned["tools"] = [r for r in planned["tools"] if r != "@jira"] + ["@jira/search"]
+        return planned
+
+    monkeypatch.setattr(migration, "migration_file", narrower)
+    planned, diff, withheld = migration.plan_move("zxc", BASE, old)
+
+    assert withheld == set() and diff.gained == set()
+    assert planned["tools"] == ["@jira/search"]
+
+
+def test_a_prompt_that_does_not_resolve_keeps_a_server_its_star_mounted(layout, persisted):
+    """The default-template move keeps ``@jira`` when the old agent's ``*`` mounted jira."""
+    user, mates = layout
+    _write(user, "kirocrew", _template("kirocrew", tools=["@jira"], mcpServers={"jira": JIRA}))
+    _write(
+        user,
+        "starry",
+        _template(
+            "starry", prompt="file://missing-prompt.md", tools=["*"], mcpServers={"jira": JIRA}
+        ),
+    )
+    cfg = _cfg(rfv=KiroCrewAgentConfig(member_id="rfv", kiro_agent="starry"))
+    persisted(cfg)
+
+    report = migrate_existing_crewmates(cfg)
+
+    assert report.moved_from_default == ["rfv"]
+    written = _file(mates, "rfv")
+    assert "jira" in written["mcpServers"] and "@jira" in written["tools"]
+
+
 def test_a_template_switched_during_the_pass_is_not_overwritten(layout, persisted, monkeypatch):
     user, _ = layout
     _write(user, "builder", _template("builder", prompt="Follow the release SOP."))
@@ -928,6 +982,44 @@ def test_a_second_boot_reads_no_thread_again(layout, persisted, threads, monkeyp
 
     assert second.threads_repointed == {} and scanned == []
     assert _now(threads, key) == moved
+
+
+def test_an_unlistable_sessions_folder_leaves_the_thread_pass_owed(
+    layout, persisted, threads, monkeypatch
+):
+    import os
+
+    from kiro_crew.history_files import _sessions_dir
+    from kiro_crew.mate_config_migration import repoint_moved_threads
+
+    user, mates = layout
+    _write(user, "builder", _template("builder", mcpServers={"jira": JIRA}, tools=["@jira"]))
+    cfg = _cfg(zxc=KiroCrewAgentConfig(member_id="zxc", kiro_agent="builder"))
+    persisted(cfg)
+    key = "dashboard:member-zxc.memory-member-zxc-0123"
+    _thread(threads, key, "zxc", "builder")
+
+    sessions = Path(_sessions_dir())
+    real_scandir = os.scandir
+
+    def unlistable(path=".", *args, **kwargs):
+        if Path(path) == sessions:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", unlistable)
+    report = migrate_existing_crewmates(cfg)
+    monkeypatch.setattr(os, "scandir", real_scandir)
+
+    assert report.migrated == ["zxc"]
+    # No thread was read, so the pass is still owed.
+    assert _ledger(mates)["threads"]["zxc"]["done"] is False
+    assert _now(threads, key).template_id == "builder"
+
+    # A later boot, with the folder readable again, moves the thread.
+    assert repoint_moved_threads() == {"zxc": [key]}
+    assert _now(threads, key).template_id == mate_worker.MATE_CONDUCTOR_AGENT
+    assert _ledger(mates)["threads"]["zxc"]["done"] is True
 
 
 def test_a_rolled_back_crewmate_s_threads_stay_on_its_old_agent(layout, persisted, threads):

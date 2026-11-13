@@ -32,6 +32,7 @@ const {
   describeLocation,
 } = require("./bundle-location");
 const { DEFAULT_REMOTE_BIN } = require("./remote-token");
+const { themeSplashUrl } = require("./theme-splash");
 const {
   fallbackLocalPort,
   isSelectablePort,
@@ -41,13 +42,20 @@ const {
 } = require("./host-config");
 const { isLocalGatewayEnabled } = require("./local-gateway");
 const { seedRenamedStore } = require("./store-rename");
+const { STORE_FILE_MODE, tightenStoreFileMode } = require("./store-file-mode");
 const { resolveHome } = require("./home-dir");
 const { internalSecretFor } = require("./local-token");
 const { identityFamily } = require("./instance-guard");
+const { EDITION_LTS, readBakedEdition } = require("./edition");
 const { describeSingletonLock } = require("./singleton-lock");
 const { startLinuxDesktopIntegration } = require("./linux-desktop-integration");
-const { resolveLinuxInstall } = require("./auto-update");
+const { describeChromiumSandboxOff, showChromiumSandboxNotice } = require("./chromium-sandbox-notice");
+const { findKirocrewBin } = require("./find-bin");
+const { resolveLinuxInstall, readExternallyManaged, runStartupApply } = require("./auto-update");
+const { createStartupGatewayProbe } = require("./runtime/update/gateway-probe");
+const { reregisterBundleIfManaged } = require("./mac-launch-services");
 const { initNativeLogging } = require("./native-logging");
+const { watchSessionLock } = require("./session-lock");
 const { armCrashCollector, collectCrashReports } = require("./crash-collector");
 const { initGpuPolicy } = require("./disable-gpu");
 const { applyAuthServerAllowlist } = require("./auth-allowlist");
@@ -56,15 +64,17 @@ const { cancelPendingTrayHide } = require("./hide-to-tray");
 const { exitImmersiveModes } = require("./blocking-prompt");
 const { createMetricsRecorder } = require("./perf-metrics");
 const { initMochi, shutdownMochi } = require("./mochi/index");
-const { borrowSessionToken } = require("./mochi-session-token");
+const { borrowSessionToken, sessionCookieHeader } = require("./mochi-session-token");
+const { createAppWindowHost } = require("./app-window-host");
 const { clearCacheOnUpgrade } = require("./upgrade-cache");
 const {
   initCrewCompanion,
   shutdownCrewCompanion,
   suspendCrewCompanion,
   resumeCrewCompanion,
-  hostsDashboard,
 } = require("./crew-companion/index");
+const { hostsDashboard, openDashboardSession } = require("./dashboard-session");
+const { openExternalSafely } = require("./external-scheme");
 const { createDeepLinkHandler, installDeepLinks, installNavigateReady } = require("./deep-link-handler");
 
 // An update install stops the gateway and quits the app. Close the Crew
@@ -73,12 +83,17 @@ const { createDeepLinkHandler, installDeepLinks, installNavigateReady } = requir
 // gateway is restored. suspend/resume keep the companion's loop and IPC handlers
 // intact, so the failure path needs no re-init. Both are best-effort — a
 // companion teardown must never block an update or its recovery.
+// The same holds for the windows apps declare through the desktop window host.
 function closeCrewCompanionForUpdate() {
   try { suspendCrewCompanion(); } catch { /* best effort */ }
+  try { appWindowHost?.suspend(); } catch { /* best effort */ }
 }
 function reopenCrewCompanionAfterUpdate() {
   try { resumeCrewCompanion(); } catch { /* best effort */ }
+  try { appWindowHost?.resume(); } catch { /* best effort */ }
 }
+/** The desktop windows and shortcuts apps declare in their manifest; see app-window-host.js. */
+let appWindowHost = null;
 const { createGatewaySupervisor } = require("./gateway-supervisor");
 const {
   createShellBundleWatch,
@@ -120,6 +135,8 @@ const renameSeedCarriedSettings = seedRenamedStore(app.getPath("userData"), {
 const isFreshInstall = !storeFileExistedBeforeBoot && !renameSeedCarriedSettings;
 
 const store = new Store({
+  // Owner-only on every save; see store-file-mode.js.
+  configFileMode: STORE_FILE_MODE,
   defaults: {
     remoteHost: "",
     kirocrewBinPath: DEFAULT_REMOTE_BIN,
@@ -134,12 +151,15 @@ const store = new Store({
     runLocalGateway: true,
     // "background" or "quit". See close-action.js.
     closeAction: "background",
+    // Only false hides it, and only while the close button quits. See tray-icon.js.
+    showTrayIcon: true,
     linuxFrameless: null,
     // Written by gpu-crash-fallback.js when the GPU process dies at startup;
     // read before Chromium initializes on the next launch.
     gpuSoftwareFallback: null,
   },
 });
+tightenStoreFileMode(store.path, { log: (message) => glog("store mode: " + message) });
 
 // Opt the summon hotkey OUT for FRESH installs only. Before this, a null/unset
 // globalHotkey auto-bound the platform default (Cmd+Shift+K on macOS, which is
@@ -210,17 +230,23 @@ function resolvePort() {
 const PORT = resolvePort();
 const BACKEND_URL = "http://localhost:" + PORT;
 
+// The LTS edition is a side-by-side app like nightly (packaging/build-desktop.sh
+// "KiroCrew LTS"), so its own name and app ID keep it apart from production. // brand-ok
+const IS_LTS_BUILD = readBakedEdition() === EDITION_LTS;
 app.name = identityFamily(app.getVersion()) === "nightly"
   ? "Kiro Crew Nightly"
-  : "Kiro Crew";
+  : IS_LTS_BUILD ? "Kiro Crew LTS" : "Kiro Crew";
 
-// Windows groups and pins the live window by this ID. Nightly must remain
-// side-by-side with stable, matching the packaged app IDs.
+// Windows groups and pins the live window by this ID. Nightly and LTS must
+// remain side-by-side with stable, matching the packaged app IDs.
 if (process.platform === "win32") {
   const appUserModelId = identityFamily(app.getVersion()) === "nightly"
     ? "com.amazon.kiro.crew.nightly"
     : "com.amazon.kiro.crew";
-  app.setAppUserModelId(appUserModelId);
+  // LTS: the production ID plus ".lts", the packaged win.appId build-desktop.sh
+  // derives from package.json build.appId (electron-builder strips `build` from
+  // the packaged package.json, so it cannot be read here).
+  app.setAppUserModelId(IS_LTS_BUILD ? `${appUserModelId}.lts` : appUserModelId);
 }
 
 function gatewayLogPath() {
@@ -427,7 +453,9 @@ if (!app.requestSingleInstanceLock()) {
     log: glog,
   });
 
-  // Chromium reads GPU switches during initialization, so the opt-in policy
+  // Chromium reads GPU switches during initialization, so the GPU policy (opt-in
+  // via KIROCREW_DISABLE_GPU / --disable-gpu, auto on a Windows RDP session,
+  // forced on by KIROCREW_DISABLE_GPU=0 / --enable-gpu)
   // must run inside the lock-winner branch and before app ready. Reading the
   // winning process's env/argv also avoids pretending a second-instance argv
   // handoff can repair the renderer that already launched.
@@ -446,7 +474,7 @@ if (!app.requestSingleInstanceLock()) {
     log: glog,
   });
 
-  // Same timing constraint as the opt-in above: a persisted software-rendering
+  // Same timing constraint as the GPU policy above: a persisted software-rendering
   // decision has to reach Chromium before it initializes. Also arms the
   // `child-process-gone` listener that makes that decision, so a GPU process
   // that dies before the dashboard loads relaunches the app once in software
@@ -540,6 +568,7 @@ const gateway = createGatewaySupervisor({
   predictLocalPort: () => fallbackLocalPort(store, glog),
   // The respawned backend can be healthy while this app's own bundle is gone.
   onStaleBundleRespawn: () => shellBundleWatch.checkNow(),
+  currentThemeSplash: () => themeSplashUrl(app.getPath("userData")),
 });
 
 // Shared single-use registry of downloads the renderer explicitly asked for.
@@ -579,6 +608,8 @@ const ipcRegistrar = createIpcRegistrar({
   crashScan: scanCrashArtifacts,
   downloadExpectations,
   readInternalSecret,
+  fetchGatewayAuth: () => fetchMochiGatewayAuth(BACKEND_URL),
+  cookieHeader: sessionCookieHeader,
 });
 
 /**
@@ -705,6 +736,14 @@ app.whenReady().then(async () => {
     glog("power: could not watch for resume: " + (error && error.message));
   }
 
+  // A dictation left running when the person locks the screen keeps the
+  // microphone open in an empty room; the dashboard stops it on this message.
+  try {
+    watchSessionLock(electron.powerMonitor, () => electron.BaseWindow.getAllWindows(), glog);
+  } catch (error) {
+    glog("power: could not watch for screen lock: " + (error && error.message));
+  }
+
   // Chromium has opened `--log-file` by now, so this is the moment the live log's
   // mode can be asserted rather than assumed. The pre-create in
   // `initNativeLogging` only holds if Chromium opened the inode it created; if it
@@ -743,13 +782,56 @@ app.whenReady().then(async () => {
     }
   }
 
+  // An update the user armed whose quit-time apply was interrupted or failed is
+  // finished HERE: before the gateway spawns and before any window opens, so the
+  // gateway and the app are never on different versions. On success the app
+  // relaunches once into the new bundle and this launch ends; on failure the
+  // installed version starts and the updater shows the error.
+  const startupApply = await runStartupApply({
+    app,
+    store,
+    resourcesPath: process.resourcesPath,
+    log: { info: glog, error: (m, e) => glog(m + (e ? " " + ((e && e.stack) || e) : "")) },
+    // A gateway from this bundle that outlived the quit holds the arm back.
+    probeGateway: createStartupGatewayProbe({
+      isCurrentBundleGateway: () => gateway.isCurrentBundleGateway(),
+      probePortBinding: () => gateway.probePrimaryPortBinding(),
+      probeLockHolder: () => gateway.probePrimaryLockHolder(),
+      stopCommand: `kirocrew stop --port ${PORT}`,
+    }),
+    Notification: electron.Notification,
+  });
+  if (startupApply.outcome === "relaunching") return;
+
   await offerRelocationIfUnupdatable();
 
   // Security and every non-update bridge are installed before the first
   // dashboard or untrusted browser WebContents can be created.
   ipcRegistrar.registerShell();
-  windows.createTray();
+  windows.syncTray();
   const mainWindow = windows.createMainWindow();
+
+  // An AppImage whose AppRun added --no-sandbox says why and how to fix it.
+  // Shown before the gateway boot, not awaited, so a gateway that never
+  // answers still leaves the explanation on screen.
+  try {
+    showChromiumSandboxNotice({
+      notice: describeChromiumSandboxOff({
+        platform: process.platform,
+        env: process.env,
+        argv: process.argv,
+        readSysctl: (file) => fs.readFileSync(file, "utf8"),
+        cliBin: findKirocrewBin(fs, os, path, process.resourcesPath, __dirname),
+      }),
+      dialog,
+      clipboard: electron.clipboard,
+      openExternal: (url) => shell.openExternal(url),
+      store,
+      window: mainWindow,
+    }).catch((e) => glog(`chromium-sandbox-notice: failed: ${e && e.message}`));
+  } catch (e) {
+    glog(`chromium-sandbox-notice: skipped: ${e && e.message}`);
+  }
 
   // Linux AppImage desktop integration. It creates the first launcher and then
   // reconciles only files whose hashes still match bytes Kiro Crew wrote. The
@@ -775,6 +857,22 @@ app.whenReady().then(async () => {
     });
   } catch (e) {
     try { glog(`desktop-integration: skipped: ${e && e.message}`); } catch { /* ignore */ }
+  }
+
+  // macOS Toolbox (side-by-side) integration (#33896): the running bundle is the
+  // newest version, so register it with LaunchServices now, making the next cold
+  // launch from the Dock/Spotlight/Finder open THIS version instead of an old
+  // bundle the previous update left on disk. Best-effort and fail-soft: a no-op
+  // off macOS and for a self-updating / Applications install, and never blocks.
+  try {
+    const managed = !!readExternallyManaged({ resourcesPath: process.resourcesPath });
+    reregisterBundleIfManaged({
+      managed,
+      resourcesPath: process.resourcesPath,
+      log: (m) => { try { glog(`launch-services: ${m}`); } catch { /* ignore */ } },
+    });
+  } catch (e) {
+    try { glog(`launch-services: skipped: ${e && e.message}`); } catch { /* ignore */ }
   }
 
   // The global accelerator needs an existing main window. The updater needs
@@ -823,6 +921,24 @@ app.whenReady().then(async () => {
   } catch (error) {
     glog("crew-companion: init failed — " + (error && error.message));
   }
+  try {
+    appWindowHost = createAppWindowHost({
+      electron,
+      backendUrl: BACKEND_URL,
+      fetchGatewayAuth: () => fetchMochiGatewayAuth(BACKEND_URL),
+      cookieHeader: sessionCookieHeader,
+      preloadPath: path.join(__dirname, "app-window-preload.js"),
+      log: glog,
+      displayMemoryPath: path.join(app.getPath("userData"), "app-window-displays.json"),
+      showDashboardSession: (slotKey) => openDashboardSession(
+        windows.focusedDashboardWindow() || null, BACKEND_URL, slotKey,
+      ),
+      openExternal: (url) => openExternalSafely(shell.openExternal, url, glog),
+    });
+    appWindowHost.start();
+  } catch (error) {
+    glog("app-window-host: init failed — " + (error && error.message));
+  }
 
   // Preserve the historical registration point: activation starts being
   // handled only after boot and optional companion initialization finish.
@@ -846,6 +962,11 @@ app.on("before-quit", () => {
   shutdownMochi();
   try {
     shutdownCrewCompanion();
+  } catch {
+    // Best effort during quit.
+  }
+  try {
+    appWindowHost?.stop();
   } catch {
     // Best effort during quit.
   }

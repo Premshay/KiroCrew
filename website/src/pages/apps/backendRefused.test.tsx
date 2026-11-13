@@ -33,7 +33,7 @@ vi.mock('../../i18n/t', async importOriginal => {
   }
 })
 
-import { backendRefusedNotice, backendRefusedReason } from '../../components/appstore/backendRefused'
+import { appActionNotice, backendRefusedNotice, backendRefusedReason } from '../../components/appstore/backendRefused'
 import { useAppActions } from './useAppActions'
 import { useAppUpdates } from './useAppUpdates'
 import type { AppsData } from './useAppsData'
@@ -65,12 +65,36 @@ describe('backendRefusedNotice', () => {
   })
 })
 
-function setupUpdates() {
+const WARN_ON = 'pages.appsPage.action_warnings_enabled'
+const WARN_OFF = 'pages.appsPage.action_warnings_disabled'
+
+describe('appActionNotice', () => {
+  it('says which action landed, then names the gateway warnings', () => {
+    expect(appActionNotice('Notes', { ok: true, warnings: ['hooks failed: boom', 'config sync failed: denied'] }, 'disable'))
+      .toBe(`${WARN_OFF} ${JSON.stringify({ name: 'Notes', warnings: 'hooks failed: boom; config sync failed: denied' })}`)
+    expect(appActionNotice('Notes', { ok: true, warnings: ['hooks failed: boom'] }, 'enable'))
+      .toBe(`${WARN_ON} ${JSON.stringify({ name: 'Notes', warnings: 'hooks failed: boom' })}`)
+  })
+
+  it('shows a refused backend and the warnings together, and is empty with no usable warnings', () => {
+    expect(appActionNotice('Notes', { backend_refused: REASON, warnings: ['hooks failed: boom'] }, 'enable'))
+      .toBe(`${KEY} ${JSON.stringify({ name: 'Notes', reason: REASON })} ${WARN_ON} ${JSON.stringify({ name: 'Notes', warnings: 'hooks failed: boom' })}`)
+    expect(appActionNotice('Notes', { backend_refused: REASON }, 'enable'))
+      .toBe(`${KEY} ${JSON.stringify({ name: 'Notes', reason: REASON })}`)
+    expect(appActionNotice('Notes', { ok: true }, 'disable')).toBe('')
+    expect(appActionNotice('Notes', { warnings: ['  ', 7] }, 'disable')).toBe('')
+    expect(appActionNotice('Notes', { warnings: 'hooks failed' }, 'disable')).toBe('')
+    expect(appActionNotice('Notes', undefined, 'disable')).toBe('')
+  })
+})
+
+function setupUpdates(pending: boolean = true) {
   const setError = vi.fn()
   const setSuccess = vi.fn()
   const utils = renderHook(() => useAppUpdates({
     apps: [notesApp, docsApp],
-    updatables: [notesApp, docsApp] as unknown as AppsData['updatables'],
+    // `pending: false` is a Sync: no registry row offers these path installs an update.
+    updatables: (pending ? [notesApp, docsApp] : []) as unknown as AppsData['updatables'],
     announceAppsChanged: vi.fn(),
     updateApp: vi.fn(),
     setError,
@@ -84,7 +108,7 @@ describe('useAppUpdates — a refused backend is a warning', () => {
 
   it('an in-place update reports the refusal through setError, not setSuccess', async () => {
     apiUpdateApp.mockResolvedValueOnce({ ok: true, backend_refused: REASON })
-    const { result, setError, setSuccess } = setupUpdates()
+    const { result, setError, setSuccess } = setupUpdates(false)
 
     await act(async () => { await result.current.runUpdate('notes') })
 
@@ -106,7 +130,7 @@ describe('useAppUpdates — a refused backend is a warning', () => {
 
   it('an update without a refusal still reports success', async () => {
     apiUpdateApp.mockResolvedValueOnce({ ok: true })
-    const { result, setSuccess } = setupUpdates()
+    const { result, setSuccess } = setupUpdates(false)
 
     await act(async () => { await result.current.runUpdate('notes') })
 
@@ -137,6 +161,15 @@ describe('useAppActions.runEnable — a refused backend is a warning', () => {
     await act(async () => { await result.current.runEnable('notes') })
 
     expect(result.current.displayError).toBe(`${KEY} ${JSON.stringify({ name: 'Notes', reason: REASON })}`)
+  })
+
+  it('shows the gateway warnings in the page notice after a successful enable', async () => {
+    apiEnableApp.mockResolvedValueOnce({ ok: true, warnings: ['hooks failed: boom'] })
+    const { result } = setupActions()
+
+    await act(async () => { await result.current.runEnable('notes') })
+
+    expect(result.current.displayError).toBe(`${WARN_ON} ${JSON.stringify({ name: 'Notes', warnings: 'hooks failed: boom' })}`)
   })
 
   it('leaves the notice empty when the backend was not refused', async () => {

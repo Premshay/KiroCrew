@@ -190,9 +190,15 @@ const HOOK_CALL = /(?<![\w$])use[A-Z]\w*\s*\(/
  */
 const MODULE_IMPORT = /(?:\bfrom|\bimport)\s*\(?\s*['"]((?:\.|@\/)[^'"]*)['"]/g
 
+const TYPE_ONLY_IMPORT = /\b(?:import|export)\s+type\b\s*(?:\{[^}]*\}|[A-Za-z_$][\w$]*|\*(?:\s+as\s+[A-Za-z_$][\w$]*)?)\s+from\s*['"][^'"]*['"];?/g
+
+function stripTypeOnlyImports(src: string): string {
+  return src.replace(TYPE_ONLY_IMPORT, '')
+}
+
 /** Specifiers imported by one file that could name a file in this tree. */
 export function importedSpecifiers(src: string): string[] {
-  return [...stripComments(src).matchAll(MODULE_IMPORT)].map(m => m[1])
+  return [...stripTypeOnlyImports(stripComments(src)).matchAll(MODULE_IMPORT)].map(m => m[1])
 }
 
 /**
@@ -236,7 +242,7 @@ export function carriesSeamOutputOnward(src: string): boolean {
  */
 export function languageWrapperModules(sources: Map<string, string>): Set<string> {
   const known = new Set(sources.keys())
-  const code = new Map([...sources].map(([rel, src]) => [rel, stripComments(src)]))
+  const code = new Map([...sources].map(([rel, src]) => [rel, stripTypeOnlyImports(stripComments(src))]))
   const candidates = [...sources]
     .filter(([rel, src]) =>
       rel !== LANGUAGE_SEAM && (!HOOK_CALL.test(code.get(rel)!) || carriesSeamOutputOnward(src)),
@@ -265,7 +271,7 @@ export function scanFile(src: string): {
   readsI18nextLanguage: boolean
   languageContextReads: number
 } {
-  const code = stripComments(src)
+  const code = stripTypeOnlyImports(stripComments(src))
   const boundaries = [...code.matchAll(MEMO_BOUNDARY)].length
   const subscriptions = [...code.matchAll(/\buseLanguageGeneration\(\)/g)].length
   const usesI18nT = /\bi18nT\(/.test(code)
@@ -440,6 +446,21 @@ describe('scanFile predicate', () => {
 })
 
 describe('wrapper closure and import resolution', () => {
+  it('ignores type-only imports while retaining runtime imports', () => {
+    expect(importedSpecifiers([
+      `import type { Stamp } from './typeCarrier'`,
+      `import type DefaultStamp from './defaultTypeCarrier'`,
+      `export type { Stamp } from './exportedTypeCarrier'`,
+      `export type * from './typeStar'`,
+      `import { type Stamp, formatStamp } from './mixedCarrier'`,
+      `import './runtimeSetup'`,
+    ].join('\n'))).toEqual(['./mixedCarrier', './runtimeSetup'])
+  })
+
+  it('does not treat a type-only formatter import as runtime formatting', () => {
+    expect(scanFile(`import type { Stamp } from '../i18n/format'`).importsFormat).toBe(false)
+  })
+
   it('collects relative and alias specifiers from every import form, and ignores packages', () => {
     const specs = importedSpecifiers(
       `import a from './a'\nimport { b } from '../b'\nimport '../side'\n` +

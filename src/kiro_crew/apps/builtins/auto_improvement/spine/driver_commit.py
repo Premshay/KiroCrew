@@ -28,6 +28,7 @@ from kiro_crew.platform.context import redact_log_via_context
 
 from . import ledger as L
 from . import pr_description as D
+from .candidate_admission import admit_candidate
 from .contracts import Proposal
 from .driver_git import _full_head_id, _git
 from .git_safety import GIT_SAFE_CONFIG, hook_off_args, require_pinned
@@ -46,10 +47,12 @@ def _apply_verdict_owned(
 ) -> int:
     if self._publishing_is_halted():
         return 0
+    winner = verdict.winner if verdict.keep else None
+    refused_id = None if winner is None or admit_candidate(self, winner) else winner.cand_id
     prepared_sha = None
     if (
-        verdict.keep
-        and verdict.winner is not None
+        winner is not None
+        and refused_id is None
         and getattr(self.profile, "final_regression_required", False) is True
     ):
         prepared_sha = self._prepare_finalist(verdict.winner, self._commit_winner_provisional)
@@ -60,10 +63,11 @@ def _apply_verdict_owned(
     # winner's diff_ref is reused as the CR's ``diff-ref`` (06_*.md §3.1/§3.2).
     winner_diff_ref = ""
     for prop, status, meas in archived:
+        row_status = L.STATUS_FAILED_VERIFY if prop.cand_id == refused_id else status
         diff_ref = self.archive.save_candidate(
             cand_id=prop.cand_id,
             diff=prop.diff,
-            detail={"proposal": prop, "status": status, "measurement": meas},
+            detail={"proposal": prop, "status": row_status, "measurement": meas},
         )
         if verdict.winner is not None and prop.cand_id == verdict.winner.cand_id:
             winner_diff_ref = diff_ref
@@ -72,7 +76,7 @@ def _apply_verdict_owned(
                 "cycle": cycle,
                 "cand_id": prop.cand_id,
                 "commit": "-",
-                "status": status,
+                "status": row_status,
                 "tests_pass": True,
                 "reps": self.measurer.reps,
                 "primary_delta": (meas.primary_delta if meas else ""),
@@ -102,6 +106,9 @@ def _apply_verdict_owned(
     if not verdict.keep or verdict.winner is None:
         self.stats.not_kept += 1
         self.log.info("cycle %d: no keep (%s)", cycle, verdict.reason)
+        return fresh_count
+
+    if refused_id is not None:
         return fresh_count
 
     winner = verdict.winner
@@ -291,22 +298,23 @@ def _apply_bug_winner_owned(
     reproduction analogue, §4.1) — there is no second A/B and no noise band."""
     if self._publishing_is_halted():
         return
+    status = KEPT if admit_candidate(self, winner) else L.STATUS_FAILED_VERIFY
     prepared_sha = None
-    if getattr(self.profile, "final_regression_required", False) is True:
+    if status == KEPT and getattr(self.profile, "final_regression_required", False) is True:
         prepared_sha = self._prepare_finalist(winner, self._commit_bug_winner_provisional)
         if prepared_sha is None:
             return
     diff_ref = self.archive.save_candidate(
         cand_id=winner.cand_id,
         diff=winner.diff,
-        detail={"proposal": winner, "status": KEPT, "bug_gate": bug_res},
+        detail={"proposal": winner, "status": status, "bug_gate": bug_res},
     )
     self.archive.append_row(
         {
             "cycle": cycle,
             "cand_id": winner.cand_id,
             "commit": "-",
-            "status": KEPT,
+            "status": status,
             "tests_pass": True,
             "reps": 0,  # no A/B reps for a bug fix (deterministic boolean gate)
             "primary_delta": "",  # bug track has no measured delta (§6.1)
@@ -316,6 +324,8 @@ def _apply_bug_winner_owned(
             "metric": f"RED→GREEN→STAYGREEN ({bug_res.reason})",
         }
     )
+    if status != KEPT:
+        return
     # M5 PIPELINE (bug track): the RED/GREEN gate already verified+reproduced (the
     # doubled-RED flake check IS the reproduce analogue, 06_*.md §1.1) — so emit the
     # draft CR with the RED→GREEN correctness narrative (§4.2) via the same pipeline

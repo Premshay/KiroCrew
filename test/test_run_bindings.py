@@ -52,6 +52,8 @@ SHARED_BINDINGS_CHECKS = (
     "the_member_set_is_the_frozen_inventory",
     "the_resolution_scan_can_fail",
     "nothing_else_in_src_imports_an_owner",
+    "the_test_tree_walk_reaches_every_collected_tree",
+    "leaf_test_scope_derives_this_file_as_a_corpus_gate",
 )
 
 _PACKAGE = "kiro_crew.subagent_manager"
@@ -71,12 +73,12 @@ _MEMBERS: dict[str, tuple[str, str, str]] = {
     ),
     "_publish_identity": (
         "staticmethod",
-        "(agent_id: 'str', *, session_id: 'str' = '', provider: 'str' = '', cwd: 'str' = '', keep: 'bool | None' = None, conversation_key: 'str' = '') -> 'None'",
+        "(agent_id: 'str', *, session_id: 'str' = '', provider: 'str' = '', cwd: 'str' = '', keep: 'bool | None' = None, conversation_key: 'str' = '', codex_home: 'str' = '') -> 'None'",
         "subagent_persistence",
     ),
     "_remember_identity": (
         "staticmethod",
-        "(agent_id: 'str', *, session_id: 'str' = '', provider: 'str' = '', cwd: 'str' = '', keep: 'bool | None' = None, conversation_key: 'str' = '') -> 'None'",
+        "(agent_id: 'str', *, session_id: 'str' = '', provider: 'str' = '', cwd: 'str' = '', keep: 'bool | None' = None, conversation_key: 'str' = '', codex_home: 'str' = '') -> 'None'",
         "subagent_persistence",
     ),
     "_stop_in_progress": ("staticmethod", "(info: 'SubagentInfo') -> 'bool'", "run"),
@@ -127,7 +129,7 @@ _MEMBERS: dict[str, tuple[str, str, str]] = {
     ),
     "_remember_identity_off_loop": (
         "coroutine",
-        "(self, info: 'SubagentInfo', *, session_id: 'str', provider: 'str', cwd: 'str' = '', keep: 'bool | None' = None, conversation_key: 'str' = '') -> 'None'",
+        "(self, info: 'SubagentInfo', *, session_id: 'str', provider: 'str', cwd: 'str' = '', keep: 'bool | None' = None, conversation_key: 'str' = '', codex_home: 'str' = '') -> 'None'",
         "run_records",
     ),
     "_await_identity_write": (
@@ -237,7 +239,7 @@ _MEMBERS: dict[str, tuple[str, str, str]] = {
     "_published_depth": ("function", "(self, parent_session_key: 'str') -> 'int'", "run"),
     "_publish_queue_depth": (
         "coroutine",
-        "(self, parent_session_key: 'str', depth: 'int', batch_id: 'str', *, forget_label: 'bool') -> 'None'",
+        "(self, parent_session_key: 'str', depth: 'int', batch_id: 'str') -> 'None'",
         "run",
     ),
     "_arm_queue_depth_retry": (
@@ -266,7 +268,7 @@ _MEMBERS: dict[str, tuple[str, str, str]] = {
     ),
     "_permission_policy": (
         "function",
-        "(self, info: 'SubagentInfo', *, spec: 'Any', parent_policy: 'str', consult: 'Callable[[LLMEvent], object]', sel: 'Callable[[], Any]', log: '_logging.Logger') -> 'Policy'",
+        "(self, info: 'SubagentInfo', *, spec: 'Any', parent_policy: 'str', ask_key: 'str', consult: 'Callable[[LLMEvent], object]', sel: 'Callable[[], Any]', log: '_logging.Logger', parent_revoked: 'Callable[[], bool] | None' = None) -> 'Policy'",
         "run",
     ),
     "_run_inner_impl": (
@@ -848,14 +850,6 @@ def _reach_gaps(patched: set[str], reads: dict[str, set[str]]) -> list[str]:
     return sorted(f"{owner}.{name}" for owner, names in reads.items() for name in patched & names)
 
 
-def test_the_test_tree_walk_reaches_every_collected_tree() -> None:
-    files = _test_tree_files()
-    assert Path(__file__).resolve() in files
-    assert _REPO_ROOT / "conftest.py" in files
-    assert any("/apps/builtins/" in path.as_posix() for path in files)
-    assert len(files) > 1000
-
-
 def test_the_corpus_patches_names_through_run() -> None:
     # Non-vacuity: the scan finds the seams the run module is known to serve.
     assert {"_QUEUE_DEPTH_RETRY_SECS", "permission_pre_tool_block"} <= _corpus_patched_names()
@@ -883,13 +877,3 @@ def test_the_reach_scan_can_fail(tmp_path: Path) -> None:
         f"{_PACKAGE}.run_start.ResolvedAwsProfile",
         f"{_PACKAGE}.run_yields._logging",
     ]
-
-
-def test_leaf_test_scope_derives_this_file_as_a_corpus_gate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """It reads the whole test tree, so a leaf-only diff must still run it."""
-    monkeypatch.syspath_prepend(str(_REPO_ROOT / "scripts"))
-    leaf_test_scope = importlib.import_module("leaf_test_scope")
-    rel = Path(__file__).resolve().relative_to(_REPO_ROOT).as_posix()
-    assert rel in leaf_test_scope.corpus_gates(_REPO_ROOT)

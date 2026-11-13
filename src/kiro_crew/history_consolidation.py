@@ -314,6 +314,9 @@ class HistoryConsolidator:
         self._idle_clean: dict[str, tuple[CacheIdentity, int]] = {}
         # Separate offset for prefs-only consolidation (doesn't advance main offset)
         self._prefs_offset: dict[str, int] = {}
+        # key -> the rotation_generation _prefs_offset was counted under. A
+        # rotation or rewrite replaces the rows it counts, so an offset from
+        # another generation is dropped rather than skipped past.
         self._prefs_generation: dict[str, int] = {}
         # key -> (consecutive prefs passes with no usable answer, retry-at wall
         # time). In memory like _prefs_offset: the preference-only window has no
@@ -810,8 +813,8 @@ class HistoryConsolidator:
             self._running.add(key)
         finally:
             self._release_count(claim)
+        window = PrefsWindow(self._prefs_offset.get(key, 0), self._prefs_generation.get(key))
         try:
-            window = PrefsWindow(self._prefs_offset.get(key, 0), self._prefs_generation.get(key))
             result = await self._consolidate(
                 key, include_history=include_history, prefs_window=window
             )
@@ -1306,7 +1309,10 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _EMBED_BUDGET_SECS_PER_PASS,
         _INHERIT_GLOBAL,
         _LESSON_PASSTHROUGH_FIELDS,
+        _MAX_REFUSED_SEMANTIC_NOTES,
         _PLACEHOLDER_BODIES,
+        _REFUSED_SEMANTIC_NOTE_DAYS,
+        _REFUSED_SEMANTIC_NOTE_PREFIX,
         _SEMANTIC_OMISSION_NOTICE,
         _SEMANTIC_SNAPSHOT_PAGE,
         _audit_oversized_semantic,
@@ -1319,9 +1325,12 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _OversizedItem,
         _recency,
         _refuse_oversized_semantic,
+        _refused_semantic_note,
+        _refused_semantic_notice,
         _reroute_lesson_semantic_keys,
         _semantic_snapshot_in_pages,
         _session_facets,
+        _update_refused_semantic_note,
         _v1_consolidation_confidence,
         _v1_consolidation_metadata,
         _withhold_unseen_deletes,

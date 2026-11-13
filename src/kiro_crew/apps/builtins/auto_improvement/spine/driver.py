@@ -139,8 +139,10 @@ class Driver:
         canary_advisory: bool = False,
         direct_commit: bool = False,
         prepush_review: bool = False,
+        candidate_admission: tuple[str, ...] | None = None,
     ):
         self.profile = profile
+        self.candidate_admission = candidate_admission
         # F10 DIRECT-COMMIT MODE (ROADMAP F10; operator opt-in per project). When True, a
         # VERIFIED winner is pushed straight to the operator-authorized feature branch
         # instead of filed as a CR. This deliberately relaxes the push-disabled invariant

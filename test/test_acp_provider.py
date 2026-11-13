@@ -20,7 +20,6 @@ from kiro_crew.acp.session_handle import AcpSessionHandle
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
-    ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_KAS,
     METHOD_COMMANDS_EXECUTE,
     AcpEvent,
@@ -28,6 +27,7 @@ from kiro_crew.acp.types import (
 )
 from kiro_crew.agent_sdk import capture_prompt_timeout
 from kiro_crew.providers.acp import AcpProvider
+from kiro_crew.testing.ids import UNALLOCATABLE_PID
 from kiro_crew.testing.wait import await_until
 
 
@@ -420,7 +420,9 @@ class TestToLlmEventFieldParity:
     # ``AcpSessionHandle._run_turn`` before the event leaves the ACP layer. By
     # then the held chunk has been delivered as ordinary text or turned into the
     # turn's error, so no provider consumer has a decision left to make with it.
-    _INTENTIONALLY_DROPPED: set[str] = {"unattributed"}
+    # connection_mcp_identity: read only by the Connection approval mint, which takes
+    # the AcpEvent itself on both transports, never the provider's LlmEvent.
+    _INTENTIONALLY_DROPPED: set[str] = {"unattributed", "connection_mcp_identity"}
 
     @staticmethod
     def _distinguishable(field: "dataclasses.Field") -> object | None:
@@ -617,363 +619,6 @@ class TestCompactRouting:
         assert len(body) == 4000
 
 
-class TestEffortControl:
-    """Provider-level effort orchestration: backend branch selection,
-    capability gating, live-apply, and clear semantics."""
-
-    def _effort_provider(self, backend: str, model: str) -> AcpProvider:
-        provider = _build_provider(backend=backend)
-        provider._client._model = model
-        provider._client._work_dir = MagicMock()
-        provider._client.send_command = AsyncMock()
-        provider._client.set_config_option = AsyncMock()
-        # Default: the session advertises an 'effort' option (modern adapter).
-        provider._client.supports_config_option = MagicMock(return_value=True)
-        provider._client.effort_config_option_id = MagicMock(return_value="effort")
-        provider._client.get_valid_effort_levels = MagicMock(return_value=[])
-        return provider
-
-    @pytest.mark.asyncio
-    async def test_kiro_change_effort_pushes_slash_command_and_overlay(self):
-        provider = self._effort_provider(backend="", model="claude-opus-4.7")
-        with patch("kiro_crew.providers.acp._write_cli_overlay") as wco:
-            ok = await provider.change_effort("xhigh")
-        assert ok is True
-        provider._client.send_command.assert_awaited_once_with("/effort", args={"level": "xhigh"})
-        # kiro uses the overlay, never set_config_option
-        provider._client.set_config_option.assert_not_awaited()
-        wco.assert_called_once()
-        assert provider._effort_per_model["claude-opus-4.7"] == "xhigh"
-
-    @pytest.mark.asyncio
-    async def test_claude_change_effort_uses_set_config_option(self):
-        provider = self._effort_provider(
-            backend=ACP_BACKEND_CLAUDE, model="global.anthropic.claude-opus-4-8[1m]"
-        )
-        ok = await provider.change_effort("high")
-        assert ok is True
-        provider._client.set_config_option.assert_awaited_once_with("effort", "high")
-        # claude does NOT use the kiro /effort slash command
-        provider._client.send_command.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_codex_change_effort_uses_reasoning_effort_config_option(self):
-        provider = self._effort_provider(backend=ACP_BACKEND_CLAUDE, model="gpt-5.6-sol")
-        provider._client.effort_config_option_id.return_value = "reasoning_effort"
-
-        assert await provider.change_effort("high") is True
-
-        provider._client.set_config_option.assert_awaited_once_with("reasoning_effort", "high")
-
-    @pytest.mark.asyncio
-    async def test_claude_change_effort_steps_down_when_max_unsupported(self):
-        # Adapter rejects "max" for a model whose ceiling is "xhigh"; the push
-        # must fall back down the ladder and land "xhigh" rather than failing
-        # the whole change (which would reset the session and lose state).
-        from kiro_crew.acp.client import AcpError
-
-        provider = self._effort_provider(backend=ACP_BACKEND_CLAUDE, model="claude-opus-4.7")
-
-        async def _reject_max(config_id, value):
-            if value == "max":
-                raise AcpError("Invalid value for config option effort: max")
-
-        provider._client.set_config_option = AsyncMock(side_effect=_reject_max)
-        ok = await provider.change_effort("max")
-        assert ok is True
-        calls = [c.args for c in provider._client.set_config_option.await_args_list]
-        assert ("effort", "max") in calls  # tried the requested level first
-        assert ("effort", "xhigh") in calls  # then stepped down and succeeded
-        # The slot override keeps the requested level so a future
-        # max-capable model would get it.
-        assert provider._effort_per_model["claude-opus-4.7"] == "max"
-
-    @pytest.mark.asyncio
-    async def test_claude_change_effort_propagates_non_value_errors(self):
-        # A transport/timeout error is NOT a value rejection — it must NOT be
-        # swallowed by the ladder; it propagates so the caller rolls back.
-        from kiro_crew.acp.client import AcpError
-
-        provider = self._effort_provider(backend=ACP_BACKEND_CLAUDE, model="claude-opus-4.7")
-        provider._client.set_config_option = AsyncMock(side_effect=AcpError("transport died"))
-        with pytest.raises(AcpError, match="transport died"):
-            await provider.change_effort("high")
-
-    @pytest.mark.asyncio
-    async def test_change_effort_noop_on_incapable_model(self):
-        # 'auto' is genuinely effort-incapable (no concrete model selected).
-        provider = self._effort_provider(backend="", model="auto")
-        ok = await provider.change_effort("high")
-        assert ok is False
-        provider._client.send_command.assert_not_awaited()
-        provider._client.set_config_option.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_change_effort_rejects_invalid_level(self):
-        provider = self._effort_provider(backend="", model="claude-opus-4.7")
-        with pytest.raises(ValueError):
-            await provider.change_effort("ultra")
-
-    @pytest.mark.asyncio
-    async def test_claude_apply_initial_effort_pushes_resolved_level(self):
-        provider = self._effort_provider(backend=ACP_BACKEND_CLAUDE, model="claude-opus-4.7")
-        provider._effort_per_model = {"claude-opus-4.7": "max"}
-        await provider._apply_initial_effort()
-        assert provider._client.set_config_option.await_args_list == [call("effort", "max")]
-        assert provider._client.send_command.await_count == 0
-
-    @pytest.mark.asyncio
-    async def test_claude_start_pushes_effort_keyed_by_configured_model_spelling(self):
-        # The factory keys the level by the configured spelling; startup records
-        # the advertised one on the client.
-        with patch("kiro_crew.providers.acp.AcpClient"):
-            provider = AcpProvider(
-                acp_backend=ACP_BACKEND_CLAUDE,
-                model="claude-opus-5.5",
-                effort_per_model={"claude-opus-5.5": "max"},
-            )
-        client = provider._client
-        client.backend = ACP_BACKEND_CLAUDE
-        client._model = "claude-opus-5.5"
-        client.supports_config_option = MagicMock(return_value=True)
-        client.effort_config_option_id = MagicMock(return_value="effort")
-        client.set_config_option = AsyncMock()
-
-        async def _ensure_ready():
-            client._model = "claude-opus-5-5[1m]"
-
-        client.ensure_ready = AsyncMock(side_effect=_ensure_ready)
-        await provider.start()
-        assert client._model == "claude-opus-5-5[1m]"
-        assert client.set_config_option.await_args_list == [call("effort", "max")]
-
-    @pytest.mark.asyncio
-    async def test_apply_initial_effort_noop_on_kiro_backend(self):
-        # kiro gets effort from the spawn-time overlay, not a live push.
-        provider = self._effort_provider(backend="", model="claude-opus-4.7")
-        provider._effort_per_model = {"claude-opus-4.7": "max"}
-        await provider._apply_initial_effort()
-        # A level does resolve, so the missing push is the backend gate's doing.
-        assert provider._resolve_effort() == "max"
-        provider._client.set_config_option.assert_not_awaited()
-        provider._client.send_command.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_claude_apply_initial_effort_swallows_adapter_error(self, caplog):
-        provider = self._effort_provider(backend=ACP_BACKEND_CLAUDE, model="claude-opus-4.7")
-        provider._effort_per_model = {"claude-opus-4.7": "max"}
-        provider._client.set_config_option = AsyncMock(side_effect=RuntimeError("bad"))
-        # Must not raise — a rejected effort cannot break session start.
-        with caplog.at_level("WARNING", logger="kiro_crew.providers.acp"):
-            await provider._apply_initial_effort()
-        assert provider._client.set_config_option.await_args_list == [call("effort", "max")]
-        warnings = [
-            r.getMessage()
-            for r in caplog.records
-            if r.name == "kiro_crew.providers.acp" and r.levelname == "WARNING"
-        ]
-        assert any("initial effort apply failed" in m for m in warnings), warnings
-
-    @pytest.mark.asyncio
-    async def test_claude_initial_effort_skips_when_option_unsupported(self):
-        # Older claude-agent-acp builds advertise no 'effort' config option;
-        # the initial-effort push must be a silent no-op (no set_config_option,
-        # no error) rather than spamming 'Unknown config option' every spawn.
-        provider = self._effort_provider(backend=ACP_BACKEND_CLAUDE, model="claude-opus-4.7")
-        provider._effort_per_model = {"claude-opus-4.7": "max"}
-        provider._client.effort_config_option_id.return_value = None
-        await provider._apply_initial_effort()
-        provider._client.effort_config_option_id.assert_called_with()
-        provider._client.set_config_option.assert_not_awaited()
-        assert provider._resolve_effort() == "max"
-
-    @pytest.mark.asyncio
-    async def test_claude_change_effort_returns_false_when_option_unsupported(self):
-        # change_effort must report unsupported (False) instead of attempting a
-        # push that fails with 'Unknown config option' and resets the session.
-        provider = self._effort_provider(backend=ACP_BACKEND_CLAUDE, model="claude-opus-4.7")
-        provider._client.effort_config_option_id.return_value = None
-        ok = await provider.change_effort("high")
-        assert ok is False
-        provider._client.set_config_option.assert_not_awaited()
-        # No poisoned override left behind.
-        assert "claude-opus-4.7" not in provider._effort_per_model
-
-    @pytest.mark.asyncio
-    async def test_claude_set_effort_swallows_unknown_config_option(self):
-        # Defense in depth: even if the capability guard is bypassed (e.g. the
-        # option is advertised lazily), an 'Unknown config option' rejection
-        # from the adapter must be skipped, not re-raised (which resets).
-        from kiro_crew.acp.client import AcpError
-
-        provider = self._effort_provider(backend=ACP_BACKEND_CLAUDE, model="claude-opus-4.7")
-        # Force the guard open so the ladder runs and hits the adapter error.
-        provider._client.supports_config_option = MagicMock(return_value=True)
-        provider._client.set_config_option = AsyncMock(
-            side_effect=AcpError(
-                "JSON-RPC error: {'code': -32603, 'message': 'Internal error', "
-                "'data': {'details': 'Unknown config option: effort'}}"
-            )
-        )
-        # Must not raise, and must not walk down the ladder: an unknown option
-        # is not a value rejection.
-        assert await provider._set_effort_config_option("max") is None
-        assert provider._client.set_config_option.await_args_list == [call("effort", "max")]
-
-    @pytest.mark.asyncio
-    async def test_kiro_clear_effort_no_default_returns_false_for_reset(self):
-        # No workspace default resolves → overlay cleared, nothing pushed live,
-        # and clear_effort returns FALSE so the handler resets the session
-        # (kiro respawns at the model's built-in default). Returning True here
-        # would leave the running session stuck at the old effort.
-        provider = self._effort_provider(backend="", model="claude-opus-4.7")
-        provider._effort_per_model = {"claude-opus-4.7": "high"}
-        with patch("kiro_crew.providers.acp._clear_cli_overlay_effort") as cco:
-            ok = await provider.clear_effort()
-        assert ok is False
-        assert "claude-opus-4.7" not in provider._effort_per_model
-        cco.assert_called_once()
-        provider._client.send_command.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_kiro_clear_effort_keeps_the_entry_when_the_overlay_lock_is_busy(self):
-        # Nothing changed: not the file, and not the map once the entry goes
-        # back. Neither bool can say that -- both make the handler commit the
-        # cleared slot value, so the UI would read "default" over an overlay
-        # that still holds the level. None is the third outcome, which the
-        # handler answers with a retryable 409 and no commit.
-        provider = self._effort_provider(backend="", model="claude-opus-4.7")
-        provider._effort_per_model = {"claude-opus-4.7": "high"}
-        with patch("kiro_crew.providers.acp._clear_cli_overlay_effort", return_value=False):
-            ok = await provider.clear_effort()
-        assert ok is None
-        assert provider._effort_per_model["claude-opus-4.7"] == "high"
-        provider._client.send_command.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_kiro_clear_to_default_does_not_push_when_the_overlay_write_fails(self):
-        # Clearing to a workspace default writes the overlay and pushes live. The
-        # FILE is what a respawn reads, so a live push over a write that did not
-        # persist reports a default the next spawn replaces with the level just
-        # cleared. Nothing is pushed, the override goes back, and the third
-        # outcome tells the handler to commit nothing.
-        provider = self._effort_provider(backend="", model="claude-opus-4.7")
-        provider._effort_per_model = {"claude-opus-4.7": "high"}
-        provider._effort_defaults = {"claude-opus-4.7": "low"}
-        with patch.object(type(provider), "_apply_effort_overlay", return_value=False):
-            ok = await provider.clear_effort()
-        assert ok is None
-        assert provider._effort_per_model["claude-opus-4.7"] == "high"
-        provider._client.send_command.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_kiro_effort_rollback_follows_the_file_when_the_rewrite_fails(self):
-        # The live push failed, so change_effort rolls the prior level back and
-        # rewrites the overlay to match. When THAT rewrite also fails the file
-        # keeps the attempted level and construction re-seeds from it, so the map
-        # follows the file instead of reporting an undo the next spawn contradicts.
-        from kiro_crew.acp.client import AcpError
-
-        provider = self._effort_provider(backend="", model="claude-opus-4.7")
-        provider._effort_per_model = {"claude-opus-4.7": "low"}
-        provider._client.send_command = AsyncMock(side_effect=AcpError("push failed"))
-        calls = []
-
-        def _apply(self_, **kwargs):
-            calls.append(kwargs)
-            # The pre-push write persists; the rollback rewrite loses the lock.
-            return len(calls) == 1
-
-        with patch.object(type(provider), "_apply_effort_overlay", _apply):
-            with pytest.raises(AcpError):
-                await provider.change_effort("xhigh")
-        assert provider._effort_per_model["claude-opus-4.7"] == "xhigh"
-
-    @pytest.mark.asyncio
-    async def test_kiro_change_effort_does_not_push_when_the_overlay_write_fails(self):
-        # The FILE is what a respawn reads, so pushing live over a write that did
-        # not persist reports a change the next reset undoes. The override is
-        # rolled back and the caller is told, rather than the session running a
-        # level the workspace does not hold.
-        provider = self._effort_provider(backend="", model="claude-opus-4.7")
-        provider._effort_per_model = {}
-        with patch.object(type(provider), "_apply_effort_overlay", return_value=False):
-            with pytest.raises(RuntimeError, match="could not persist effort"):
-                await provider.change_effort("high")
-        assert "claude-opus-4.7" not in provider._effort_per_model
-        provider._client.send_command.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_change_effort_rolls_back_on_push_failure(self):
-        # A failed live push must not leave a poisoned override/overlay that
-        # would re-push the rejected level on every respawn.
-        provider = self._effort_provider(backend=ACP_BACKEND_CLAUDE, model="claude-opus-4.7")
-        provider._client.set_config_option = AsyncMock(side_effect=RuntimeError("rejected"))
-        with pytest.raises(RuntimeError):
-            await provider.change_effort("xhigh")
-        # Override rolled back to unset.
-        assert "claude-opus-4.7" not in provider._effort_per_model
-
-    @pytest.mark.asyncio
-    async def test_kiro_change_effort_gpt_uses_reasoning_overlay_key(self):
-        # GPT models are effort-capable on the kiro backend; the live push is the
-        # same /effort slash command, but the spawn overlay must use the GPT
-        # `reasoning` key (verified against kiro 2.13) — not `output_config`.
-        provider = self._effort_provider(backend="", model="gpt-5.6-luna")
-        with patch("kiro_crew.providers.acp._write_cli_overlay") as wco:
-            ok = await provider.change_effort("max")
-        assert ok is True
-        provider._client.send_command.assert_awaited_once_with("/effort", args={"level": "max"})
-        wco.assert_called_once()
-        assert provider._effort_per_model["gpt-5.6-luna"] == "max"
-
-    def test_supports_effort_reflects_model(self):
-        assert self._effort_provider(backend="", model="claude-opus-4.7").supports_effort()
-        # GPT models are effort-capable on the kiro backend.
-        assert self._effort_provider(backend="", model="gpt-5.6-luna").supports_effort()
-        # 'auto' is genuinely effort-incapable (no concrete model selected). A raw
-        # kiro 'claude-haiku-4.5' is also incapable — the haiku guard wins over
-        # the registry's Sonnet fold (see test_effort.py). deepseek is a
-        # third-party model kiro does not offer effort on.
-        assert not self._effort_provider(backend="", model="auto").supports_effort()
-        assert not self._effort_provider(backend="", model="claude-haiku-4.5").supports_effort()
-        assert not self._effort_provider(backend="", model="deepseek-3.2").supports_effort()
-
-    # ── Composite-id harness (DeepSeek Harness) ──────────────────────────
-    # dsh advertises its models as JSON route pairs, so no id reaching these
-    # methods is a name the kiro/claude allowlist can classify. The session's
-    # own advertised selector is the only evidence there is, and these three
-    # pin that it is what decides.
-
-    _DSH_MODEL = '["deepseek-official","deepseek-flash"]'
-
-    def test_deepseek_supports_effort_follows_the_advertised_option(self):
-        provider = self._effort_provider(backend=ACP_BACKEND_DEEPSEEK, model=self._DSH_MODEL)
-        provider._client.effort_config_option_id.return_value = "reasoning_effort"
-        assert provider.supports_effort() is True
-        # An older adapter build that advertises no selector must not claim it.
-        provider._client.effort_config_option_id.return_value = None
-        assert provider.supports_effort() is False
-
-    @pytest.mark.asyncio
-    async def test_deepseek_change_effort_uses_the_advertised_option(self):
-        provider = self._effort_provider(backend=ACP_BACKEND_DEEPSEEK, model=self._DSH_MODEL)
-        provider._client.effort_config_option_id.return_value = "reasoning_effort"
-        assert await provider.change_effort("low") is True
-        provider._client.set_config_option.assert_awaited_once_with("reasoning_effort", "low")
-        provider._client.send_command.assert_not_awaited()
-        assert provider._effort_per_model[self._DSH_MODEL] == "low"
-
-    @pytest.mark.asyncio
-    async def test_deepseek_initial_effort_applies_a_slot_override(self):
-        provider = self._effort_provider(backend=ACP_BACKEND_DEEPSEEK, model=self._DSH_MODEL)
-        provider._client.effort_config_option_id.return_value = "reasoning_effort"
-        provider._client.get_valid_effort_levels.return_value = ["low", "high"]
-        provider._effort_per_model = {self._DSH_MODEL: "low"}
-        await provider._apply_initial_effort()
-        provider._client.set_config_option.assert_awaited_once_with("reasoning_effort", "low")
-
-
 class TestStartKiroRuntimeResume:
     """_start_kiro_runtime resume path: resume issues runtime.load_session()
     DIRECTLY (session/load, no session/new first) with the full transcript PATH
@@ -995,11 +640,15 @@ class TestStartKiroRuntimeResume:
         provider._client._model = model
         return provider
 
-    async def _run_start(self, provider, resume_sid, file_exists, load_raises=False):
+    async def _run_start(
+        self, provider, resume_sid, file_exists, load_raises=False, inherited_model="landed"
+    ):
         mock_handle = MagicMock()
         mock_handle.session_id = "kiro-sess-1"
         mock_handle.store_session_config = MagicMock()
         mock_handle.set_model = AsyncMock()
+        # What an inherit=True set_model records; "" reads as a refused inherit.
+        mock_handle.inherited_model = inherited_model
         mock_runtime = MagicMock()
         mock_runtime.pid = 4321
         mock_runtime.spawn = AsyncMock()
@@ -1144,6 +793,50 @@ class TestStartKiroRuntimeResume:
         assert provider._client._handle is handle
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("backend", "pin", "noticed"),
+        [
+            ("kas", "auto", True),
+            ("kas", "", True),
+            ("kas", "claude-opus-4.6", False),
+            ("", "auto", False),
+        ],
+    )
+    async def test_an_unpinned_kas_start_inherits_kiro_cli_chat_default_model(
+        self, monkeypatch, backend, pin, noticed
+    ):
+        """KAS reads no cli.json, so an unpinned KAS start applies kiro-cli's
+        chat.defaultModel itself, as an inherited model, and names no notice."""
+        from kiro_crew.providers import acp_runtime_start
+
+        monkeypatch.setattr(
+            acp_runtime_start, "kiro_cli_default_model", lambda cwd: "claude-sonnet-4.5"
+        )
+        provider = self._kiro_provider(model=pin)
+        provider._client.backend = backend
+        handle, _runtime = await self._run_start(provider, "", file_exists=True)
+        if noticed:
+            assert handle.set_model.await_args_list == [call("claude-sonnet-4.5", inherit=True)]
+        else:
+            expected = [call(pin)] if pin not in ("", "auto") else []
+            assert handle.set_model.await_args_list == expected
+        assert provider._client.kas_default_model_notice == ""
+
+    @pytest.mark.asyncio
+    async def test_a_kas_chat_default_model_that_does_not_land_is_named(self, monkeypatch):
+        """The inherited model was refused (nothing recorded): the notice names it."""
+        from kiro_crew.providers import acp_runtime_start
+
+        monkeypatch.setattr(
+            acp_runtime_start, "kiro_cli_default_model", lambda cwd: "claude-sonnet-4.5"
+        )
+        provider = self._kiro_provider(model="auto")
+        provider._client.backend = "kas"
+        handle, _runtime = await self._run_start(provider, "", file_exists=True, inherited_model="")
+        assert handle.set_model.await_args_list == [call("claude-sonnet-4.5", inherit=True)]
+        assert "claude-sonnet-4.5" in provider._client.kas_default_model_notice
+
+    @pytest.mark.asyncio
     async def test_default_model_does_not_call_set_model(self):
         # DEFAULT_MODEL ("auto") = let kiro-cli pick per agent config → no push.
         provider = self._kiro_provider(model="auto")
@@ -1171,6 +864,7 @@ class TestStartKiroRuntimeResume:
         # failure in this file into a sandbox verdict.
         mock_runtime.saw_sandbox_init_failure = MagicMock(return_value=False)
         mock_runtime.saw_delegate_launch_failure = MagicMock(return_value=False)
+        mock_runtime.kas_extract_broken_message = MagicMock(return_value="")
         # The shared translation settles the stderr drain before it reads
         # the latch, so this has to be awaitable: a plain MagicMock raises
         # "object MagicMock can't be used in 'await' expression".
@@ -1215,6 +909,7 @@ class TestStartKiroRuntimeResume:
         mock_runtime.saw_not_logged_in = MagicMock(return_value=False)
         mock_runtime.saw_sandbox_init_failure = MagicMock(return_value=False)
         mock_runtime.saw_delegate_launch_failure = MagicMock(return_value=False)
+        mock_runtime.kas_extract_broken_message = MagicMock(return_value="")
         mock_runtime.settle_stderr = AsyncMock()
         # Backend-authored text can carry a line break and a terminal escape;
         # neither may reach the log line, which must stay one line.
@@ -1269,6 +964,7 @@ class TestStartKiroRuntimeResume:
         mock_runtime.saw_not_logged_in = MagicMock(return_value=False)
         mock_runtime.saw_sandbox_init_failure = MagicMock(return_value=False)
         mock_runtime.saw_delegate_launch_failure = MagicMock(return_value=False)
+        mock_runtime.kas_extract_broken_message = MagicMock(return_value="")
         mock_runtime._stderr_task = asyncio.ensure_future(asyncio.sleep(3600))
         settle_entered = asyncio.Event()
 
@@ -1351,6 +1047,7 @@ class TestKiroStartupMetric:
         mock_runtime.saw_not_logged_in = MagicMock(return_value=bool(spawn_exc))
         mock_runtime.saw_sandbox_init_failure = MagicMock(return_value=False)
         mock_runtime.saw_delegate_launch_failure = MagicMock(return_value=False)
+        mock_runtime.kas_extract_broken_message = MagicMock(return_value="")
         mock_runtime.settle_stderr = AsyncMock()
         mock_runtime.kill = AsyncMock()
         mock_runtime.create_session = AsyncMock(return_value=mock_handle)
@@ -1400,6 +1097,7 @@ class TestKiroStartupMetric:
         mock_runtime.saw_not_logged_in = MagicMock(return_value=True)
         mock_runtime.saw_sandbox_init_failure = MagicMock(return_value=False)
         mock_runtime.saw_delegate_launch_failure = MagicMock(return_value=False)
+        mock_runtime.kas_extract_broken_message = MagicMock(return_value="")
         mock_runtime.settle_stderr = AsyncMock()
         mock_runtime.kill = AsyncMock()
         rec = _CapturingRecorder()
@@ -1892,6 +1590,43 @@ def test_child_fidelity_aware_survives_client_replacement():
     # to the real AcpSessionProvider at replacement time.
     provider._client = MagicMock()
     assert provider.child_fidelity_aware is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marked", [True, False])
+async def test_the_keepalive_routes_mark_survives_client_replacement(marked):
+    """The registry ``/api/session-keepalive`` reads marks the OUTER provider when it
+    publishes it, which can be before startup REPLACES the placeholder client. The
+    start marks the real ``AcpSessionProvider`` then, so its handle times calls on
+    Kiro Crew's own servers; an unmarked provider (``kirocrew chat``'s) starts one
+    that does not."""
+    provider = TestStartKiroRuntimeModelEntitlement()._kiro_provider("auto")
+    placeholder = provider._client
+    if marked:
+        provider.mark_keepalive_routed()
+        placeholder.mark_keepalive_routed.assert_called_once_with()
+    handle = MagicMock()
+    handle.session_id = "kiro-sess-1"
+    handle.model_pin_refused = ""
+    handle.available_models = []
+    runtime = MagicMock(
+        pid=UNALLOCATABLE_PID, spawn=AsyncMock(), create_session=AsyncMock(return_value=handle)
+    )
+    started: list[MagicMock] = []
+
+    def session_provider(h, r, **_kw):
+        started.append(MagicMock(_handle=h, _runtime=r, resumed=False))
+        return started[-1]
+
+    with (
+        patch("kiro_crew.providers.acp.AcpRuntime", return_value=runtime),
+        patch("kiro_crew.providers.acp.AcpSessionProvider", side_effect=session_provider),
+        patch("pathlib.Path.exists", return_value=False),
+    ):
+        await provider._start_kiro_runtime()
+
+    assert provider._client is started[0]
+    assert started[0].mark_keepalive_routed.called is marked
 
 
 def test_to_llm_event_preserves_provenance_flags():

@@ -1,4 +1,4 @@
-import { memo } from 'react'
+import { memo, type ReactNode } from 'react'
 import { Ban, CircleAlert, Info, TriangleAlert, type LucideIcon } from 'lucide-react'
 
 import { i18nT } from '../../i18n/t'
@@ -62,6 +62,7 @@ export default memo(function NoticeCard({
   tone: toneOverride,
   icon: iconOverride,
   severity: providerSeverity,
+  action,
 }: {
   content: string
   tone?: NoticeTone
@@ -69,6 +70,9 @@ export default memo(function NoticeCard({
    *  the user pressed) may name the glyph; the tone and its colour are kept. */
   icon?: LucideIcon
   severity?: unknown
+  /** A small control that follows the copy on its last line, such as a
+   *  Dismiss link. It wraps with the text, so a narrow column keeps it. */
+  action?: ReactNode
 }) {
   // Language-generation subscription: this memo() boundary renders i18nT()
   // strings, so a language switch must invalidate it.
@@ -110,6 +114,7 @@ export default memo(function NoticeCard({
         <span className="min-w-0 break-words whitespace-pre-line" data-testid="notice-card-text">
           {severity && <span className="sr-only">{severity} </span>}
           {text}
+          {action && <>{' '}{action}</>}
         </span>
       </div>
     </div>

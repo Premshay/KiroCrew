@@ -69,14 +69,14 @@ describe('Windows gateway paths show their file name (#14581)', () => {
     [POSIX_BACKSLASH, 'we\\ird.md'],
     ['/a/b/', 'b'],
   ])('usePanelTabs titles a tab for %s as %s', (path, title) => {
-    const { result } = renderHook(() => usePanelTabs(null, []))
+    const { result } = renderHook(() => usePanelTabs('slot-a', []))
     act(() => result.current.openFolder(path, 'slot-a'))
     expect(result.current.tabs.at(-1)?.title).toBe(title)
   })
 
-  // The sites listed on #14581 that are not mounted above. Each derived its
-  // name with a `/`-only split; the shared helper is the one place that knows
-  // when `\` separates. (composerDrop.ts, the Mochi drop site, is PR #10952's.)
+  // The sites not mounted above. Each derived its name with a `/`-only split;
+  // the shared helper is the one place that knows when `\` separates.
+  // (composerDrop.ts, the Mochi drop site, is PR #10952's.)
   it.each([
     'components/MarkdownPanel.tsx',
     'components/useMarkdownPanelFileState.ts',
@@ -90,6 +90,8 @@ describe('Windows gateway paths show their file name (#14581)', () => {
     'hooks/usePanelTabs.ts',
     'components/ChatInput.tsx',
     'apps/spec-builder/components/ProjectPicker.tsx',
+    'apps/fileMenuContributions.tsx',
+    'app-sdk/messageRenderers.tsx',
   ])('%s derives file names through pathBasename only', (rel) => {
     const src = readFileSync(resolve(__dirname, '..', rel), 'utf8')
     expect(src).toMatch(/import \{[^}]*\bpathBasename\b[^}]*\} from '[./]+\/utils\/pathBasename'/)

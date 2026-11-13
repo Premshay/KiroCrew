@@ -99,6 +99,34 @@ class TestInstalledApp:
         meta = InstalledApp.from_dict({"name": "bad", "resources": "self"})
         assert meta.resources == "gateway"
 
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "two",
+            [1],
+            {},
+            None,
+            True,
+            float("inf"),  # json.loads("1e400") / "Infinity" parse to this
+            float("nan"),
+        ],
+    )
+    def test_non_integer_schema_version_falls_back(self, bad):
+        # A corrupted or hand-edited installed.json whose schemaVersion is not a
+        # plain integer must degrade like every other malformed field, not crash
+        # from_dict: the str/bool fields never raise, so schemaVersion (the one
+        # int() coercion) must not either. A non-finite float (1e400 -> inf)
+        # makes int() raise OverflowError, which the helper also swallows. It
+        # reads as 1, forcing the legacy-migration pass that bumps a pre-origin
+        # record up to 2.
+        meta = InstalledApp.from_dict({"name": "bad", "schemaVersion": bad})
+        assert meta.schemaVersion == 2  # 1 -> migration pass -> 2
+
+    def test_numeric_string_schema_version_is_read(self):
+        # A JSON integer is the norm; a numeric string still coerces cleanly.
+        meta = InstalledApp.from_dict({"name": "ok", "origin": "registry", "schemaVersion": "2"})
+        assert meta.schemaVersion == 2
+
     def test_validate_fields_valid(self):
         meta = InstalledApp(origin="builtin", resources="app", lifecycle="locked")
         assert meta.validate_fields() == []
@@ -555,3 +583,55 @@ class TestEnabledReadsStrictly:
         assert get_app("strict-probe")["enabled"] is True
         rows = [r for r in list_apps() if r.get("name") == "strict-probe"]
         assert [r["enabled"] for r in rows] == [True]
+
+
+class TestRecordThatIsNotAnObject:
+    """An ``installed.json`` that parses but is not an object is reported as damaged.
+
+    Never read as "not installed" (that would let install and cleanup paths treat
+    the tree as a leftover), and never allowed to take the whole listing down.
+    """
+
+    def _write(self, app_home, name, payload):
+        app_root = app_home / "apps" / name
+        app_root.mkdir(parents=True)
+        path = app_root / "installed.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    @pytest.mark.parametrize("payload", [[], None, "x", 3])
+    def test_the_listing_skips_it_and_keeps_the_others(self, app_home, payload):
+        bad = self._write(app_home, "bad-record", payload)
+        self._write(app_home, "good-record", {"name": "good-record", "enabled": True})
+        before = bad.read_bytes()
+
+        try:
+            names = [r.get("name") for r in list_apps()]
+        except AttributeError as exc:
+            pytest.fail(f"one damaged record took the listing down: {exc}")
+
+        assert "good-record" in names
+        assert "bad-record" not in names
+        assert bad.read_bytes() == before
+
+    def test_readers_get_one_typed_error_not_absent(self, app_home):
+        from kiro_crew.apps.manager_records import InstalledRecordShapeError
+
+        self._write(app_home, "bad-record", [])
+        with pytest.raises(InstalledRecordShapeError):
+            _read_installed("bad-record")
+        assert app_enabled_state("bad-record") is None
+
+    def test_the_orphan_scan_never_marks_it_for_teardown(self, app_home):
+        from kiro_crew.apps.manager_builtins import (
+            detect_orphaned_builtins,
+            invalidate_orphan_cache,
+        )
+
+        self._write(app_home, "bad-record", [])
+        invalidate_orphan_cache()
+        assert "bad-record" not in detect_orphaned_builtins()
+
+    def test_a_legacy_record_with_a_non_string_source_still_reads(self, app_home):
+        self._write(app_home, "legacy-record", {"name": "legacy-record", "source": 1})
+        assert _read_installed("legacy-record").name == "legacy-record"

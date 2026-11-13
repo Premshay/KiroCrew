@@ -32,7 +32,7 @@
  * just ran disagree about what an item is. Only prose is localized.
  */
 
-import { useMemo, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, ChevronDown, ChevronRight, Inbox } from 'lucide-react'
@@ -43,16 +43,18 @@ import ErrorNotice from '../components/ErrorNotice'
 import { errMessage } from '../utils/thunkError'
 import { api } from '../api/client'
 import { i18nT } from '../i18n/t'
-import { fmtRelative } from '../i18n/format'
+import { fmtNumber, fmtRelative } from '../i18n/format'
 import { isNotFoundError } from '../api/apiError'
 import {
   CREW_BOARD_POLL_MS,
   crewBoardQueryKey,
   type CrewBoardAction,
+  type CrewPrFacts,
   type WorkBoardItem,
   type WorkBoardResponse,
 } from '../api/crewBoard'
 import { artifactEntries, partitionBoardRows, rowKindLabelKey } from './crewBoardRows'
+import { prFactTags } from '../components/crew/prFactTags'
 
 /** Theme tokens only. A literal hex or a palette class fails `no-raw-colors`,
  *  and more to the point a fixed palette would ignore the user's theme. */
@@ -159,12 +161,27 @@ function RowActions({
   item,
   conductor,
   takeOverAvailable,
+  returnFocusTo,
 }: {
   item: WorkBoardItem
   conductor: string
   takeOverAvailable: boolean
+  /** Takes focus if these controls unmount while holding it. */
+  returnFocusTo: RefObject<HTMLElement>
 }) {
   const queryClient = useQueryClient()
+  // Any re-read that finds the item no longer orphaned (the poll, or the one after
+  // a Stop or a 409) unmounts these controls, and a focused Stop would drop focus
+  // to <body>. A layout-effect cleanup runs before React removes the button, so it
+  // can still see the focus and hand it to the row's title.
+  const rootRef = useRef<HTMLDivElement>(null)
+  useLayoutEffect(() => {
+    const root = rootRef.current
+    const title = returnFocusTo.current
+    return () => {
+      if (root?.contains(document.activeElement)) title?.focus()
+    }
+  }, [returnFocusTo])
   // Two parts, because `ErrorNotice` treats them differently: `message` is the
   // error journal's lookup key that recovers the route, endpoint, HTTP status and
   // backend code for the agent hand-off, so the backend's own sentence belongs
@@ -212,7 +229,15 @@ function RowActions({
   })
 
   const workerGone = item.alive === 'closed'
-  const stopDisabled = workerGone || act.isPending
+  // While a request is out both buttons are inert through `aria-disabled` and the
+  // guard in `run`, never native `disabled`: disabling the button the reader just
+  // pressed blurs it to `<body>`, so a keyboard user lands at the top of the page
+  // with the failure notice somewhere below.
+  const pending = act.isPending
+  const run = (action: CrewBoardAction) => {
+    if (!pending) act.mutate(action)
+  }
+  const pendingClass = 'aria-disabled:cursor-not-allowed aria-disabled:opacity-30'
   const stopReason = workerGone ? i18nT('pages.crewBoard.stop_unavailable_closed') : ''
 
   // Shown as TEXT, not only as a `title`. A tooltip on a disabled button is not
@@ -232,15 +257,16 @@ function RowActions({
   const hint = stopReason || i18nT('pages.crewBoard.stop_consequence')
 
   return (
-    <div className="ml-[15px] mt-1 flex flex-col gap-1">
+    <div ref={rootRef} className="ml-[15px] mt-1 flex flex-col gap-1">
       <div className="flex flex-wrap items-center gap-2">
         <Btn
           danger
           type="button"
-          disabled={stopDisabled}
+          disabled={workerGone}
+          aria-disabled={pending || undefined}
           title={stopReason || undefined}
-          onClick={() => act.mutate('stop')}
-          className="px-1.5 py-0.5 text-[11px]"
+          onClick={() => run('stop')}
+          className={`px-1.5 py-0.5 text-[11px] ${pendingClass}`}
         >
           {i18nT('pages.crewBoard.action_stop')}
         </Btn>
@@ -248,9 +274,9 @@ function RowActions({
         {takeOverAvailable ? (
           <Btn
             type="button"
-            disabled={act.isPending}
-            onClick={() => act.mutate('take_over')}
-            className="px-1.5 py-0.5 text-[11px]"
+            aria-disabled={pending || undefined}
+            onClick={() => run('take_over')}
+            className={`px-1.5 py-0.5 text-[11px] ${pendingClass}`}
           >
             {i18nT('pages.crewBoard.action_take_over')}
           </Btn>
@@ -283,14 +309,19 @@ function ItemRow({
   item,
   conductor,
   takeOverAvailable,
+  prFacts,
 }: {
   item: WorkBoardItem
   conductor: string
   takeOverAvailable: boolean
+  /** What gateway code last read about this item's PR, with its read time. */
+  prFacts?: CrewPrFacts
 }) {
+  const prTags = prFactTags(prFacts)
   const [open, setOpen] = useState(false)
   const kindKey = rowKindLabelKey(item)
   const artifacts = artifactEntries(item)
+  const titleRef = useRef<HTMLSpanElement>(null)
 
   return (
     <div className="border-b py-2" style={{ borderColor: C.border }}>
@@ -303,7 +334,8 @@ function ItemRow({
 
           <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-            <span className="text-[12px] font-medium" style={{ color: C.text }}>
+            {/* `tabIndex={-1}`: a focus target for RowActions only, not a tab stop. */}
+            <span ref={titleRef} tabIndex={-1} className="text-[12px] font-medium" style={{ color: C.text }}>
               {item.title || item.item_id}
             </span>
 
@@ -392,7 +424,7 @@ function ItemRow({
       {/* Only an orphaned item gets them, which is also the only state the action
           route accepts — so the page cannot offer a click the server will refuse. */}
       {item.orphaned ? (
-        <RowActions item={item} conductor={conductor} takeOverAvailable={takeOverAvailable} />
+        <RowActions item={item} conductor={conductor} takeOverAvailable={takeOverAvailable} returnFocusTo={titleRef} />
       ) : null}
 
       <div className="ml-[15px] mt-1 flex flex-wrap items-center gap-x-3 gap-y-1">
@@ -404,6 +436,19 @@ function ItemRow({
             {i18nT('components.pullRequestPanel.pr_number', { number: item.pr })}
           </span>
         ) : null}
+        {/* The facts below are about the PR they were read for, named by its own
+            label: it can differ from the worker's reported PR above. */}
+        {prFacts?.label && prTags.length > 0 ? (
+          <span className="text-[11px] tabular-nums" style={{ color: C.dim }} data-testid="crew-board-pr-facts-label">{prFacts.label}</span>
+        ) : null}
+        {/* PR state and checks are status badges; the read time stays plain metadata. */}
+        {prTags.map((tag, i) => tag.read ? (
+          <span key={i} className="text-[11px]" style={{ color: C.dim }} data-testid="crew-board-pr-fact">{tag.text}</span>
+        ) : (
+          <span key={i} data-testid="crew-board-pr-fact" data-bad={tag.bad || undefined}>
+            <StatusBadge tone={tag.bad ? 'warn' : undefined}>{tag.text}</StatusBadge>
+          </span>
+        ))}
         {artifacts.map(([key, value]) => (
           <span key={key} className="text-[11px]" style={{ color: C.dim }}>
             <span className="mr-1 opacity-70">{key}</span>
@@ -412,7 +457,7 @@ function ItemRow({
         ))}
         {item.fails > 0 ? (
           <span className="text-[11px] tabular-nums" style={{ color: C.warn }}>
-            {i18nT('pages.crewBoard.fails')} {item.fails}
+            {i18nT('pages.crewBoard.fails', { count: item.fails, n: fmtNumber(item.fails) })}
           </span>
         ) : null}
 
@@ -474,6 +519,31 @@ export function CrewBoard({ conductor }: { conductor: string }) {
   // still loading never renders an enabled action.
   const takeOverAvailable = board.data?.take_over_available ?? false
 
+  // A 404 confirms the ledger is gone (a purge removes it), so the cached board
+  // is dropped from the query itself rather than hidden here: a later failed
+  // poll, or a remount, then has no stale board to bring back, and every other
+  // reader of this key stops showing it too. Only the data is cleared; the query
+  // keeps its 404 error and starts no fetch.
+  const queryClient = useQueryClient()
+  const notFound = isNotFoundError(board.error)
+  const purged = notFound && board.data !== undefined
+  useEffect(() => {
+    if (!purged) return
+    queryClient
+      .getQueryCache()
+      .find({ queryKey: crewBoardQueryKey(conductor), exact: true })
+      ?.setState({ data: undefined, dataUpdatedAt: 0 })
+  }, [purged, queryClient, conductor])
+
+  // Each poll of a query with no data puts it back to `pending` with no error, so
+  // without this the no-ledger state would blank out for every 10 s poll (and its
+  // retry) while the 404 is re-asked. The confirmed 404 is remembered for this
+  // conductor until an answer settles it: a board, or a different error.
+  const [absentFor, setAbsentFor] = useState<string | null>(null)
+  if (notFound && absentFor !== conductor) setAbsentFor(conductor)
+  if (absentFor !== null && !notFound && (board.data !== undefined || board.isError)) setAbsentFor(null)
+  const noLedger = notFound || (absentFor === conductor && board.data === undefined && !board.isError)
+
   if (!conductor) {
     return <EmptyState icon={<Inbox size={20} />} title={i18nT('pages.crewBoard.missing_conductor')} />
   }
@@ -482,10 +552,16 @@ export function CrewBoard({ conductor }: { conductor: string }) {
   // session dispatched through the conductor tooling opens one, so an ad-hoc
   // conductor legitimately has none. Rendering it as an error would teach people
   // the board is broken.
-  if (board.isError) {
+  // Only a read that never succeeded replaces the board, or a 404: that is the
+  // ledger's absence (a purge removes it), never a blip, so a cached board must
+  // not outlive it. Any other failed background poll keeps the last good board
+  // (React Query holds `data` beside `error`), so a gateway blip does not unmount
+  // every row with its open events and its Stop failure notice; the notice above
+  // the board says it may be out of date.
+  if (noLedger || (board.isError && !board.data)) {
     // A 404 is the ad-hoc-conductor GAP, not a failure, so it stays a neutral
     // EmptyState: rendering it as an error would teach people the board is broken.
-    if (isNotFoundError(board.error)) {
+    if (noLedger) {
       return (
         <EmptyState
           icon={<Inbox size={20} />}
@@ -511,6 +587,17 @@ export function CrewBoard({ conductor }: { conductor: string }) {
 
   const { conductor: record, items } = board.data
 
+  const refreshFailed = board.isError ? (
+    <div className="pb-2">
+      <ErrorNotice
+        title={i18nT('pages.crewBoard.refresh_failed')}
+        message={errMessage(board.error) || i18nT('components.errorBoundary.something_went_wrong')}
+        askAgent
+        variant="inline"
+      />
+    </div>
+  ) : null
+
   // The goal belongs to the LEDGER, not to the item list, so it renders on an
   // empty board too. Returning the empty state alone left a reader who followed
   // the menu entry looking at a page that named nothing -- no goal, no round, no
@@ -532,6 +619,7 @@ export function CrewBoard({ conductor }: { conductor: string }) {
   if (items.length === 0) {
     return (
       <div className="flex flex-col">
+        {refreshFailed}
         {header}
         <EmptyState icon={<Inbox size={20} />} title={i18nT('pages.crewBoard.empty_title')} />
       </div>
@@ -540,13 +628,14 @@ export function CrewBoard({ conductor }: { conductor: string }) {
 
   return (
     <div className="flex flex-col">
+      {refreshFailed}
       {header}
 
       {bands.ruling.length > 0 ? (
         <>
           <BandHeading label={i18nT('pages.crewBoard.band_ruling')} count={bands.ruling.length} />
           {bands.ruling.map((item) => (
-            <ItemRow key={item.item_id} item={item} conductor={conductor} takeOverAvailable={takeOverAvailable} />
+            <ItemRow key={item.item_id} item={item} conductor={conductor} takeOverAvailable={takeOverAvailable} prFacts={board.data?.pr_facts?.[item.item_id]} />
           ))}
         </>
       ) : null}
@@ -554,7 +643,7 @@ export function CrewBoard({ conductor }: { conductor: string }) {
         <>
           <BandHeading label={i18nT('pages.crewBoard.band_working')} count={bands.working.length} />
           {bands.working.map((item) => (
-            <ItemRow key={item.item_id} item={item} conductor={conductor} takeOverAvailable={takeOverAvailable} />
+            <ItemRow key={item.item_id} item={item} conductor={conductor} takeOverAvailable={takeOverAvailable} prFacts={board.data?.pr_facts?.[item.item_id]} />
           ))}
         </>
       ) : null}
@@ -573,7 +662,7 @@ export function CrewBoard({ conductor }: { conductor: string }) {
           </Btn>
           {showFinished
             ? bands.finished.map((item) => (
-                <ItemRow key={item.item_id} item={item} conductor={conductor} takeOverAvailable={takeOverAvailable} />
+                <ItemRow key={item.item_id} item={item} conductor={conductor} takeOverAvailable={takeOverAvailable} prFacts={board.data?.pr_facts?.[item.item_id]} />
               ))
             : null}
         </>

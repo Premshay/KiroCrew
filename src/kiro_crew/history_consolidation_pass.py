@@ -53,9 +53,12 @@ from kiro_crew.history_consolidation_memory import (
     _bounded_semantic_table,
     _is_plausible_memory_file,
     _refuse_oversized_semantic,
+    _refused_semantic_note,
+    _refused_semantic_notice,
     _reroute_lesson_semantic_keys,
     _semantic_snapshot_in_pages,
     _session_facets,
+    _update_refused_semantic_note,
     _withhold_unseen_deletes,
 )
 from kiro_crew.history_consolidation_skills import _session_touched_sensitive
@@ -703,6 +706,7 @@ async def _consolidate(
         # to update and delete them. Fetching globally would show crew B the
         # operator's semantic table and let its consolidation turn delete it.
         has_vector = vector_store is not None
+        refused_note: list[dict] = []
         if has_vector and vector_store is not None:
             private_policy = getattr(vector_store, "algorithm_version", "v1") == "v2"
             # Offload: each page of the fetch serializes on the store's _db_lock,
@@ -762,6 +766,10 @@ async def _consolidate(
                     total=len(current_semantic),
                     limit=_SEMANTIC_PROMPT_CAP_PER_CONSOLIDATION,
                 )
+            # Values an earlier pass of this session refused for size; dropped below
+            # once this pass has written its answer.
+            refused_note = await asyncio.to_thread(_refused_semantic_note, vector_store, key)
+            semantic_json += _refused_semantic_notice(refused_note)
             # The writers read every key as it was before the model call, but
             # only these fields of it: a correction is verified against all
             # three, and the V1 writer retires the old ``value_json``. The full
@@ -790,15 +798,16 @@ async def _consolidate(
             )
             from kiro_crew.memory_kind_routing import (
                 MODE_ENFORCE,
-                MODE_OFF,
                 configured_kind_routing_mode,
                 kind_rules_for,
             )
 
             routing_mode = configured_kind_routing_mode()
-            # Under off (the default) the prompt is today's, word for word.
-            kind_field = '"kind": "fact" | "event" | "state", ' if routing_mode != MODE_OFF else ""
-            # Shadow trials candidate rules; enforce asks only the adopted ones.
+            # Only enforce asks for the tag. Under off and shadow the prompt is
+            # today's, word for word; shadow labels the items in a later call.
+            kind_field = (
+                '"kind": "fact" | "event" | "state", ' if routing_mode == MODE_ENFORCE else ""
+            )
             kind_rules = kind_rules_for(routing_mode)
             # Only under enforce: in shadow the keys the model writes must stay
             # what they are today, or the shadow log would not measure today.
@@ -866,6 +875,11 @@ async def _consolidate(
                 "full file body."
             )
 
+        # The lesson tier policy's mode, read once so the prompt and the policy
+        # agree. Only enforce changes the prompt; off and shadow ask today's text.
+        from kiro_crew import memory_tier_policy as _tier_policy
+
+        tier_mode = _tier_policy.configured_mode() if include_history else _tier_policy.MODE_OFF
         if include_history:
             keys.append(
                 '"lessons": Array of corrections the user taught '
@@ -875,7 +889,8 @@ async def _consolidate(
                 # The same instruction learn_add's schema carries, from one
                 # constant, so both writers ask the model the same question.
                 f'"applies": {LESSON_APPLIES_INSTRUCTION} '
-                '"repo_scope" is OPTIONAL: include it ONLY when the correction is '
+                + _tier_policy.prompt_rule_for(tier_mode)
+                + '"repo_scope" is OPTIONAL: include it ONLY when the correction is '
                 "genuinely specific to one codebase worked on in the chat. Give a "
                 "RELATIVE directory path inside that repository that is distinctive "
                 'of it (e.g. "src/kiro_crew") -- never an absolute path, no leading '
@@ -1026,6 +1041,37 @@ async def _consolidate(
             )
             return _CONSOLIDATION_STALE
 
+        # The lesson origin gate, once on the shared result before it branches to
+        # the V1 and V2 write paths, over the rows the model read.
+        from kiro_crew.memory_origin_gate import configured_mode as _origin_mode
+        from kiro_crew.memory_origin_gate import gate_consolidation_lessons
+
+        origin = gate_consolidation_lessons(
+            result, _prompt_rows(chunk), _origin_mode(), session_key=key
+        )
+        result = origin.result
+        # The lesson tier policy, on the answer the origin gate returned, over the
+        # same rows.
+        tier = _tier_policy.apply_tier_policy(
+            result, _prompt_rows(chunk), tier_mode, session_key=key
+        )
+        result = tier.result
+
+        # Kind routing's shadow: the routed items and what the store held for them, read
+        # before any write. Both write paths then run as under off; the items are
+        # labelled once they are done.
+        from kiro_crew import memory_kind_routing as _kinds
+
+        shadow_kinds = None
+        # The mode the prompt was built under, so the prompt and the log agree.
+        if vector_store is not None and routing_mode == _kinds.MODE_SHADOW:
+            fenced, _ = _withhold_unseen_deletes(result, semantic_visible, None)
+            routed = _kinds.route_semantic_by_kind(fenced, _kinds.MODE_SHADOW)
+            if routed.decisions:
+                shadow_kinds = await _run_in_memory_background_pool(
+                    _kinds.capture_prior, vector_store, routed
+                )
+
         if member_memory:
             stage = "member memory"
             if vector_store is None:
@@ -1092,6 +1138,9 @@ async def _consolidate(
             # display-only rows carried with the head). An ordinary
             # message-aligned span keeps its receipt over ``chunk`` unchanged.
             receipt_messages = _prompt_rows(chunk) if is_sub_slice else chunk
+            from kiro_crew.memory_lesson_dedup import configured_mode as _dedup_mode
+
+            lesson_dedup_mode = _dedup_mode()
 
             def _apply_member_consolidation() -> dict:
                 with self._publication_hold_checked(key, commit_state) as publication:
@@ -1107,6 +1156,7 @@ async def _consolidate(
                         messages=receipt_messages,
                         facets=facets,
                         kind_routing=kind_routing,
+                        lesson_dedup_mode=lesson_dedup_mode,
                     )
                     publication.mark_committed()
                     return applied
@@ -1161,6 +1211,19 @@ async def _consolidate(
                 messages=unconsolidated if include_history else chunk,
                 commit_state=commit_state,
             )
+
+        # The answer to a prompt that listed refused values is written: drop them, under
+        # a hold like any write, so writes turned off before the first commit keep them.
+        if refused_note and vector_store is not None:
+            stage = "refused semantic note"
+            note_store = vector_store
+
+            def _drop_shown_refusals_under_hold() -> None:
+                with self._publication_hold_checked(key, commit_state) as publication:
+                    if _update_refused_semantic_note(note_store, key, drop=refused_note):
+                        publication.mark_committed()
+
+            await _run_in_memory_background_pool(_drop_shown_refusals_under_hold)
 
         # Legacy V1 Markdown writes (skip if migrated or private V2). Each value
         # replaces the whole file, so a non-file answer (e.g. the literal
@@ -1249,6 +1312,44 @@ async def _consolidate(
                 facets=facets,
                 key=key,
                 commit_state=commit_state,
+            )
+
+        # The origin gate's log, once the lessons it read reached a writer, under
+        # the same hold as every other write of this pass.
+        if origin.loggable and vector_store is not None and not _lesson_extraction_disabled():
+            from kiro_crew.memory_origin_gate import record_origin_gate
+
+            origin_store = vector_store
+
+            def _record_origin() -> None:
+                with self._publication_hold_checked(key, commit_state) as publication:
+                    if record_origin_gate(origin_store, origin):
+                        publication.mark_committed()
+
+            await _run_in_memory_background_pool(_record_origin)
+
+        if tier.loggable and vector_store is not None and not _lesson_extraction_disabled():
+            tier_store = vector_store
+
+            def _record_tier() -> None:
+                with self._publication_hold_checked(key, commit_state) as publication:
+                    if _tier_policy.record_tier_policy(tier_store, tier):
+                        publication.mark_committed()
+
+            await _run_in_memory_background_pool(_record_tier)
+
+        # Kind routing's shadow labels, after the pass's last memory write so the call
+        # widens no write's window: one small call on the items already written,
+        # never the transcript, feeding only the log (memory_kind_routing.log_shadow_kinds).
+        if shadow_kinds is not None and vector_store is not None:
+            stage = "kind labels"
+            store_kw = {"memory_store": store_name} if member_memory else {}
+            await _kinds.log_shadow_kinds(
+                shadow_kinds,
+                vector_store,
+                lambda prompt: self._call_llm(prompt, session_key=key, **store_kw),
+                lambda: self._publication_hold_checked(key, commit_state),
+                f"consolidation:{key}",
             )
 
         # Auto skill detection — a SEPARATE LLM pass over the full-session

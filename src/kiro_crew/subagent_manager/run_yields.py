@@ -92,6 +92,7 @@ async def _yield_for_stop_recovery_impl(
         build_tool_stall_recovery_prompt,
     )
     from kiro_crew.taskq.waits import EVIDENCE_LIVENESS_ORACLE, WaitRecord
+    from kiro_crew.timed_out_call import is_silence_timeout
 
     stop = classify_stop_reason(getattr(event, "stop_reason", ""))
     info._stop_recovery_used += 1
@@ -184,6 +185,7 @@ async def _yield_for_stop_recovery_impl(
     )
     evidence = str(getattr(event, "text", "") or "")
     idle_m = re.search(r"idle_secs=(\d+)", evidence)
+    terminated_m = re.search(r"processes_terminated=(\d+)", evidence)
     body = build_tool_stall_recovery_prompt(
         str(getattr(event, "title", "") or ""),
         int(idle_m.group(1)) if idle_m else 0,
@@ -191,6 +193,8 @@ async def _yield_for_stop_recovery_impl(
         # Typed verdict first; the evidence-text marker is the fallback for
         # a provider that forwards no status object.
         stuck_input=typed_input_wait or "stuck_input" in evidence,
+        processes_terminated=int(terminated_m.group(1)) if terminated_m else 0,
+        timed_out=is_silence_timeout(evidence),
     )
     return f"{TOOL_STALL_RECOVERY_PREFIX}\n{body}"
 
@@ -298,7 +302,14 @@ async def _yield_for_dependency_impl(
     # the wait is written or the wait is refused. The provider answered, so the
     # run also leaves startup: the startup watchdog must not reap it while parked.
     self._manager._leave_startup(info)
-    verdict = await self._dependency_verdict(coordinator, info, signal)
+    # A live waiter from before the report is queued, so a pump pass that ticks
+    # behind it delegates the wake. No await follows until ``yield_slot`` below,
+    # so the run goes straight from this mark to ``_slot_released``.
+    info._dependency_parking = True
+    try:
+        verdict = await self._dependency_verdict(coordinator, info, signal)
+    finally:
+        info._dependency_parking = False
     if verdict.outcome != "wait":
         info._resume_event = None
         logger.warning(

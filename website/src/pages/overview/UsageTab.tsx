@@ -6,7 +6,7 @@ import ErrorNotice from '../../components/ErrorNotice'
 import { useProvider } from '../../providers'
 import { providerUsageQuery } from '../../api/providerUsageQuery'
 import { api } from '../../api/client'
-import { reportsCredits } from '../../api/acpBackend'
+import { reportsCredits, reportsDollars } from '../../api/acpBackend'
 import { failedWithNoData } from '../../api/queryState'
 import { reportForError } from '../../utils/errorReport'
 import type { AcpBackendConfig } from '../../api/acpBackend'
@@ -21,6 +21,11 @@ const EM_DASH = '\u2014'
 /** A day's credits, localized, in the Billing card's two decimals; a dash when the day has no figure. */
 function fmtCredits(credits: number | undefined): string {
   return credits == null ? EM_DASH : fmtNumber(credits, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+
+/** A Billing card amount in its own unit, localized like the rest of the page. */
+function fmtBillingAmount(unit: 'credits' | 'usd' | 'tokens', value: number): string {
+  return unit === 'usd' ? formatCost(value) : unit === 'tokens' ? fmtNumber(value) : fmtCredits(value)
 }
 
 /**
@@ -51,6 +56,10 @@ export default function UsageTab() {
     queryFn: () => api.kirocrewConfig(),
   })
   const creditsHarness = reportsCredits(cfgQuery.data)
+  // A loaded config whose harness bills in dollars (Claude Code) records each
+  // turn's tokens and cost instead of credits, so the token card, the daily
+  // token chart and a spend chart in dollars stand in for the credit figures.
+  const dollarHarness = reportsDollars(cfgQuery.data)
   // A config read that failed with nothing cached is said where the card would
   // stand: on a kiro-cli install a silent absence would read as "this harness
   // has no credits". `failedWithNoData`, not `isError`, so the notice holds
@@ -76,6 +85,9 @@ export default function UsageTab() {
   const s = data.sessions
   const b = data.billing
   const pct = b?.percentUsed ?? null
+  // The Cost column appears only when a day in the window carries dollars, so a
+  // credit-billed install keeps its table exactly as it was.
+  const showCost = s.dailyHistory.some(d => d.costUsd != null)
 
   return (
     <div className="space-y-4">
@@ -86,15 +98,17 @@ export default function UsageTab() {
           <div className="grid grid-cols-2 gap-x-6 gap-y-2 max-[600px]:grid-cols-1">
             <Row label={i18nT('pages.overview.usageTab.plan')} value={b.plan} />
             <Row label={b.unit === 'tokens' ? i18nT('pages.overview.usageTab.tokens') : b.unit === 'usd' ? i18nT('pages.overview.usageTab.spend') : i18nT('pages.overview.usageTab.credits')}
-              value={b.limit ? `${b.used ?? 0} / ${b.limit}` : String(b.used ?? 0)}
+              value={b.limit
+                ? `${fmtBillingAmount(b.unit, b.used ?? 0)} / ${fmtBillingAmount(b.unit, b.limit)}`
+                : fmtBillingAmount(b.unit, b.used ?? 0)}
               badge={pct != null ? (pct >= 90 ? 'err' : pct >= 70 ? 'warn' : 'ok') : undefined}
-              badgeText={pct != null ? `${pct}%` : undefined} />
+              badgeText={pct != null ? fmtPercent(pct / 100, { maximumFractionDigits: 1 }) : undefined} />
             {b.resets && <Row label={i18nT('pages.overview.usageTab.resets')} value={b.resets} />}
           </div>
         </Card>
       )}
 
-      {data.tokens && (
+      {dollarHarness && data.tokens && (
         <Card>
           <CardTitle><BarChart3 className="lucide-inline" /> {i18nT('pages.overview.usageTab.token_usage')}</CardTitle>
           <div className="grid grid-cols-2 gap-x-6 gap-y-2 max-[600px]:grid-cols-1">
@@ -110,7 +124,7 @@ export default function UsageTab() {
         </Card>
       )}
 
-      {provider.id !== 'acp' && data.tokenDailyHistory && data.tokenDailyHistory.length > 0 && (
+      {dollarHarness && data.tokenDailyHistory && data.tokenDailyHistory.length > 0 && (
         <Card>
           <CardTitle><BarChart3 className="lucide-inline" /> {i18nT('pages.overview.usageTab.daily_token_usage')}</CardTitle>
           <TokenDailyChart
@@ -129,13 +143,22 @@ export default function UsageTab() {
       {creditsHarness ? (
         <Card>
           <CardTitle><ChartArea className="lucide-inline" /> {i18nT('pages.overview.usageTab.spend_over_time')}</CardTitle>
-          <TokenStackedAreaChart />
+          <TokenStackedAreaChart key="credits" />
+        </Card>
+      ) : dollarHarness ? (
+        <Card>
+          <CardTitle><ChartArea className="lucide-inline" /> {i18nT('pages.overview.usageTab.spend_over_time_usd')}</CardTitle>
+          {/* Keyed by unit: a harness switch remounts the chart, so the
+              credits series it held is never drawn under dollar ticks. */}
+          <TokenStackedAreaChart key="cost" metric="cost" />
         </Card>
       ) : harnessUnread ? (
         <Card>
           <ErrorNotice message={i18nT('pages.overview.usageTab.harness_unread')} report={reportForError(cfgQuery.error)} askAgent testId="usage-series-harness-unread" />
-          <Btn className="mt-3 min-h-11" disabled={cfgQuery.isFetching} onClick={() => void cfgQuery.refetch()}>
-            {i18nT('pages.overview.usageSeriesChart.retry')}
+          {/* aria-disabled, not disabled: a disabled button leaves the tab
+              order and drops the keyboard focus of the user who pressed it. */}
+          <Btn className="mt-3 min-h-11 aria-disabled:opacity-60 aria-disabled:cursor-default aria-disabled:hover:bg-transparent aria-disabled:hover:border-border aria-disabled:active:scale-100" aria-disabled={cfgQuery.isFetching || undefined} onClick={() => { if (!cfgQuery.isFetching) void cfgQuery.refetch() }}>
+            {cfgQuery.isFetching ? i18nT('pages.sessionsTab.retrying') : i18nT('pages.overview.usageSeriesChart.retry')}
           </Btn>
         </Card>
       ) : null}
@@ -146,7 +169,17 @@ export default function UsageTab() {
           <div data-testid="usage-session-refreshing" className="skeleton h-32 rounded" />
         ) : (
           <>
-            {s.refusedTranscripts > 0 && (
+            {/* A session directory that did not load hides an unknown number of
+                chats, so that warning states no count and takes precedence. */}
+            {s.unreadableSessionDirs > 0 ? (
+              <ErrorNotice
+                variant="inline"
+                askAgent
+                className="mb-4"
+                testId="usage-unreadable-session-dirs"
+                message={i18nT('pages.overview.usageTab.unreadable_session_dirs_warning')}
+              />
+            ) : s.refusedTranscripts > 0 && (
               <ErrorNotice
                 variant="inline"
                 askAgent
@@ -182,12 +215,14 @@ export default function UsageTab() {
                   <th className="pb-2 font-medium text-right max-[600px]:hidden" title={i18nT('pages.overview.usageTab.credits_used_pct_title')}>
                     {i18nT('pages.overview.usageTab.credits_used_pct')}
                   </th>
+                  {showCost && <th className="pb-2 pl-4 font-medium text-right whitespace-nowrap max-[600px]:hidden">{i18nT('pages.overview.usageTab.cost_usd')}</th>}
                 </tr>
               </thead>
               <tbody>
                 {[...s.dailyHistory].reverse().map(d => {
                   const credits = fmtCredits(d.credits)
                   const pct = fmtCreditsPct(d.credits, b?.limit)
+                  const cost = d.costUsd == null ? EM_DASH : formatCost(d.costUsd)
                   return (
                     <Fragment key={d.date}>
                       <tr className="border-t border-border">
@@ -197,6 +232,7 @@ export default function UsageTab() {
                         <td className="py-1.5 text-right">{d.toolCalls}</td>
                         <td className="py-1.5 text-right max-[600px]:hidden">{credits}</td>
                         <td className="py-1.5 text-right max-[600px]:hidden">{pct}</td>
+                        {showCost && <td className="py-1.5 pl-4 text-right whitespace-nowrap max-[600px]:hidden">{cost}</td>}
                       </tr>
                       {/* Phone: six columns would wrap every cell, and the repo forbids a
                           sideways-scrolling table, so the two credit figures fold onto a
@@ -204,6 +240,7 @@ export default function UsageTab() {
                       <tr className="hidden max-[600px]:table-row text-muted text-[12px]" data-phone-line="">
                         <td colSpan={4} className="pb-1.5 text-right">
                           {i18nT('pages.overview.usageTab.credits_used_compact', { credits, pct })}
+                          {showCost && <div>{i18nT('pages.overview.usageTab.cost_usd_compact', { cost })}</div>}
                         </td>
                       </tr>
                     </Fragment>

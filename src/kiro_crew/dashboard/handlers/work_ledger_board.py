@@ -49,6 +49,7 @@ from kiro_crew.dashboard.handlers.work_ledger import (
     _own_ledger,
     _refuse_if_dirty,
     _slot_closed,
+    _slot_loop_held,
     _slot_looping,
     _slot_open,
     _slot_running,
@@ -80,8 +81,13 @@ _KEY_BEARING_EVENT_KINDS = frozenset({"bind"})
 #: this is the half that exists today.
 _ASKING_STATUS = "question"
 
-#: The two affordances Phase 4 names for an orphaned item.
-_BOARD_ACTIONS = ("stop", "take_over")
+#: The two affordances Phase 4 names for an orphaned item, and the person's dismiss
+#: of an item that waits on them.
+_BOARD_ACTIONS = ("stop", "take_over", "dismiss")
+
+#: The ``steer`` text a dismiss writes. Fixed words, so nothing from the page lands
+#: in the ledger.
+DISMISSED_TEXT = "The person dismissed this ask without replying."
 
 # A conductor key arrives in a query string or a body, so it is caller-supplied text
 # and not every string can name a ledger directory: `work_ledger.conductor_dir`
@@ -136,11 +142,12 @@ def _parse_ts(raw: Any) -> datetime | None:
     text = str(raw or "").strip()
     if not text:
         return None
-    try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
+    # Through ``work_ledger.parse_stamp``, which answers aware datetimes only: a
+    # peer's stamp may carry no offset, and an aware/naive compare raises.
+    stamp = work_ledger.parse_stamp(text.replace("Z", "+00:00"))
+    if stamp is None:
         logger.debug("crew board: unparseable timestamp %r", text)
-        return None
+    return stamp
 
 
 #: Event kinds that answer a worker's question: the conductor's decision, and the
@@ -157,12 +164,24 @@ def _is_outstanding(item: work_ledger.WorkItem, events: list[dict[str, Any]]) ->
     ``steer`` newer than the ask answers it too: the person outranks the conductor,
     and the worker already has the answer.
 
-    Falls back to ``last_report_at`` when the asking report has aged off the event
+    With the report on the tail, an answer recorded after it answers it. Falls back
+    to stamps and ``last_report_at`` when the asking report has aged off the event
     tail, and treats an unparseable or missing ask as outstanding — a question the
     page failed to date is one a human should still look at.
     """
     if item.status != _ASKING_STATUS:
         return False
+    # Stamps are seconds-precision: with the report on the tail its ORDER decides, as
+    # in :func:`answered_since_report`, so an answer in the same second still counts.
+    last_report = max(
+        (n for n, e in enumerate(events) if isinstance(e, dict) and e.get("kind") == "report"),
+        default=None,
+    )
+    if last_report is not None:
+        return not any(
+            isinstance(e, dict) and e.get("kind") in _ANSWER_KINDS
+            for e in events[last_report + 1 :]
+        )
     asked: datetime | None = None
     answered: datetime | None = None
     for event in events:
@@ -349,16 +368,144 @@ def answered_since_report(item: work_ledger.WorkItem, events: list[dict[str, Any
     return False
 
 
-def awaits_person(item: work_ledger.WorkItem, events: list[dict[str, Any]]) -> bool:
+def awaits_person(
+    item: work_ledger.WorkItem, events: list[dict[str, Any]], *, running: bool = False
+) -> bool:
     """Whether *item* waits on the PERSON: its last report is ``blocked`` / ``question``
-    naming one (:data:`~kiro_crew.work_vocab.WORK_BLOCKED_REASONS`), and nobody has
-    answered it since (:func:`answered_since_report`). The one test behind the
-    sidebar's crew count and the Ultra Mode Board's Needs your input, so they agree."""
+    naming one (:data:`~kiro_crew.work_vocab.WORK_BLOCKED_REASONS`), nobody has
+    answered it since (:func:`answered_since_report`), and its worker's turn is not
+    *running*. The one test behind the sidebar's crew count and the Ultra Mode Board's
+    Needs your input, so they agree.
+
+    A running turn means the worker moved on: the conductor messaged it or a loop
+    woke it, and neither writes a ledger answer. A tool approval it waits on mid-turn
+    has its own approval card, so it is not lost here."""
     return (
-        item.status in work_ledger.WAITING_STATUSES
+        not running
+        and item.status in work_ledger.WAITING_STATUSES
         and item.reason in WORK_BLOCKED_REASONS
         and not answered_since_report(item, events)
     )
+
+
+def item_awaits_person(slot_key: str, item: Mapping[str, Any], *, running: bool = False) -> bool:
+    """:func:`awaits_person` for one work-item payload on *slot_key*'s ledger, over
+    its own event tail: the warm welcome's reader, so it and this board agree. A
+    tail that cannot be read leaves the item's stamps to decide; a closed item
+    waits on nobody, as on the board. *running* is :func:`item_running`, read on
+    the loop beforehand; a remote item reads its stored record here. FILE I/O."""
+    if work_item_is_terminal(item.get("state")):
+        return False
+    try:
+        tail = _tail_events(slot_key, str(item.get("item_id")), _MAX_EVENT_TAIL)
+    except Exception:
+        logger.debug("no event tail for a warm welcome item", exc_info=True)
+        tail = []
+    stored = work_ledger.WorkItem.from_dict(dict(item))
+    remote = work_ledger.remote_liveness(slot_key, stored)
+    running = remote[0] if remote is not None else running
+    return awaits_person(stored, [event.to_dict() for event in tail], running=running)
+
+
+def ask_is_current(events: list[dict[str, Any]]) -> bool:
+    """Whether the item's ``ask`` record explains the question waiting now, by the
+    ledger's own event order (*events*, oldest first): no ``report`` was appended
+    after the newest ``ask`` event. Stamps have whole-second resolution and would
+    tie, so the order decides. A tail cut short of the ``ask`` event counts as
+    current only when it holds no report either."""
+    for event in reversed(events):
+        kind = event.get("kind")
+        if kind == "ask":
+            return True
+        if kind == "report":
+            return False
+    return True
+
+
+def item_ask_is_current(slot_key: str, item: Mapping[str, Any]) -> bool:
+    """:func:`ask_is_current` over *item*'s own event tail on *slot_key*'s ledger.
+    A tail that cannot be read hides the record: the welcome then says the reason
+    was not written, never shows an old one. FILE I/O."""
+    try:
+        tail = _tail_events(slot_key, str(item.get("item_id")), _MAX_EVENT_TAIL)
+    except Exception:
+        logger.debug("no event tail for a warm welcome ask", exc_info=True)
+        return False
+    return ask_is_current([event.to_dict() for event in tail])
+
+
+def item_running(state: DashboardState, item: Mapping[str, Any]) -> bool:
+    """Whether *item*'s local worker has a turn in flight, as the board reads it.
+    A remote item answers False here: :func:`item_awaits_person` reads its record
+    off the loop. Memory reads."""
+    stored = work_ledger.WorkItem.from_dict(dict(item))
+    if stored.worker_instance_id:
+        return False
+    running, _closed, _looping, _held = work_ledger.item_liveness(
+        "",
+        stored,
+        running=lambda k: _slot_running(state, k),
+        closed=lambda k: _slot_closed(state, k),
+        looping=_slot_looping,
+        held=_slot_loop_held,
+    )
+    return running
+
+
+#: The producers whose pull-request observations the Board draws: the warm
+#: welcome's own read only.
+_PR_FACT_PRODUCERS = ("warm_brief",)
+
+
+def pr_facts(slot: str, items: list[work_ledger.WorkItem]) -> dict[str, dict[str, Any]]:
+    """Per open item holding a ledger pull request, what code last read about it:
+    ``{label, url, reads: {producer: {facts, observed_at}}}`` from the slot's
+    ``objects`` fold (``object/observed``, gateway-written only). Never a network
+    read. FILE I/O -- call off the loop. TOTAL: ``{}`` when the fold cannot be read."""
+    from kiro_crew.dashboard.warm_task_brief_inputs import ledger_ref
+
+    try:
+        from kiro_crew.crew_log import projection
+
+        # Request path: a slot with no warm cell answers "not ready" (no PR facts)
+        # rather than folding on the loop, and asks one background prime to fold
+        # it, so a later poll reads a warm cell.
+        try:
+            value = projection.read_slot_projection(slot, "objects", cold=False).value
+        except projection.SlotFoldNotReady:
+            from kiro_crew.crew_log import slot_prime
+
+            slot_prime.schedule(slot, "objects", for_reader=True)
+            return {}
+        latest = value.get("latest") if isinstance(value, Mapping) else None
+    except Exception:
+        logger.debug("no pull-request observations for this board", exc_info=True)
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    if not isinstance(latest, Mapping):
+        return out
+    for item in items:
+        if item.is_terminal:
+            continue
+        ref = ledger_ref(item.to_dict())
+        row = latest.get(ref.url) if ref is not None else None
+        if ref is None or not isinstance(row, Mapping):
+            continue
+        reads = {
+            producer: {
+                "facts": dict(cell.get("facts") or {}),
+                "observed_at": cell.get("observed_at"),
+            }
+            for producer, cell in row.items()
+            if producer in _PR_FACT_PRODUCERS and isinstance(cell, Mapping)
+        }
+        if reads:
+            out[item.item_id] = {
+                "label": f"{ref.repo}#{ref.number}",
+                "url": ref.url,
+                "reads": reads,
+            }
+    return out
 
 
 def closed_items(slot_key: str) -> list[dict[str, Any]]:
@@ -448,20 +595,30 @@ def with_worker_facts(value: Any, state: Any, conductor: str = "") -> Any:
         facts: dict[str, Any] = {}
         if conductor_alive is not None:
             facts["orphaned"] = work_ledger.is_orphaned(item, conductor_slot_exists=conductor_alive)
-        running, closed, looping = work_ledger.item_liveness(
+        running, closed, looping, held = work_ledger.item_liveness(
             "",
             item,
             running=lambda k: _slot_running(state, k),
             closed=lambda k: _slot_closed(state, k),
             looping=_slot_looping,
+            held=_slot_loop_held,
         )
         facts["stale"] = work_ledger.is_stale(
-            item, worker_running=running, worker_closed=closed, worker_looping=looping
+            item,
+            worker_running=running,
+            worker_closed=closed,
+            worker_looping=looping,
+            worker_loop_held=held,
         )
+        # Idle, and its worker's own loop will wake it (waiting on CI): the page reads
+        # it as working, not waiting. A running turn keeps its own live reading.
+        facts["looping"] = looping and not running
         facts["worker"] = _alive_of(state, item.worker_session_key or "")
         events = raw.get("events")
         facts["awaits_person"] = not item.is_terminal and awaits_person(
-            item, [e for e in events if isinstance(e, dict)] if isinstance(events, list) else []
+            item,
+            [e for e in events if isinstance(e, dict)] if isinstance(events, list) else [],
+            running=running,
         )
         out.append({**raw, **facts})
     return out
@@ -555,22 +712,30 @@ async def api_work_ledger_board(request: web.Request) -> web.Response:
     for item in items:
         row = item.to_dict()
         row["orphaned"] = work_ledger.is_orphaned(item, conductor_slot_exists=conductor_alive)
-        running, closed, looping = work_ledger.item_liveness(
+        running, closed, looping, held = work_ledger.item_liveness(
             key,
             item,
             running=lambda k: _slot_running(state, k),
             closed=lambda k: _slot_closed(state, k),
             looping=_slot_looping,
+            held=_slot_loop_held,
             remote=remote_live.get(item.item_id) or (False, False),
         )
         row["stale"] = work_ledger.is_stale(
-            item, worker_running=running, worker_closed=closed, worker_looping=looping
+            item,
+            worker_running=running,
+            worker_closed=closed,
+            worker_looping=looping,
+            worker_loop_held=held,
         )
+        # Idle, and its worker's own loop will wake it (waiting on CI): the Crew panel
+        # reads it as running, not waiting. A running turn keeps its own reading.
+        row["looping"] = looping and not running
         row["acceptance_concrete"] = work_ledger.is_acceptance_concrete(item.acceptance)
         row["report_undelivered"] = undelivered.get(item.item_id)
         events = [event.to_dict() for event in event_tails[item.item_id]]
         # Waits on the PERSON: the one test the sidebar's crew_work count uses too.
-        row["awaits_person"] = not item.is_terminal and awaits_person(item, events)
+        row["awaits_person"] = not item.is_terminal and awaits_person(item, events, running=running)
         row["events"] = _mask_events(events)
         rows.append(
             _project_item(
@@ -590,12 +755,15 @@ async def api_work_ledger_board(request: web.Request) -> web.Response:
     asks = await asyncio.to_thread(
         _conductor_asks, requested, {item.item_id for item in items if not item.is_terminal}
     )
+    # What the warm welcome last read about each item's pull request, with its read time.
+    facts_by_item = await asyncio.to_thread(pr_facts, requested, items)
 
     payload = {
         "conductor": record.to_dict(),
         "conductor_alive": "idle" if conductor_alive else "closed",
         "items": rows,
         "asks": asks,
+        "pr_facts": facts_by_item,
         # The ONE capability the page actually reads, because it changes what the
         # page renders: no take-over button is rendered while this is false.
         #
@@ -624,10 +792,53 @@ def _refuse(code: str, message: str, status: int) -> web.Response:
     return web.json_response({"ok": False, "error": message, "code": code}, status=status)
 
 
-async def api_work_ledger_board_action(request: web.Request) -> web.Response:
-    """POST /api/crew-board/action — act on one orphaned item.
+async def _dismiss(
+    state: DashboardState, caller: str, key: str, item_id: str, report_id: str
+) -> web.Response:
+    """The person sets aside *item_id*'s ask without replying.
 
-    Body: ``{"conductor": KEY, "item_id": "it_...", "action": "stop"|"take_over"}``.
+    Written as one person ``steer`` event (:data:`DISMISSED_TEXT`), the ledger's own
+    answer to a report, so every reader of :func:`awaits_person` drops the item and a
+    NEWER report brings it back. Nothing reaches the worker. Only while the item still
+    waits on the person AND *report_id* (the ask the page showed) is still its newest
+    report, judged under the board lock; otherwise ``409 not_waiting``, so a newer ask
+    filed after the page's last poll is never dismissed unseen.
+    """
+    # Through the facade, as every caller outside the family is; deferred because the
+    # steer owner reads this module lazily and a module-scope import would close it.
+    from kiro_crew.dashboard.handlers.work_ledger import (
+        _last_report_id,
+        record_person_steer_result,
+    )
+
+    def _still_shown(item: work_ledger.WorkItem, events: list[dict[str, Any]]) -> bool:
+        return _last_report_id(events) == report_id and awaits_person(item, events)
+
+    landed, why = await record_person_steer_result(
+        state, key, item_id, DISMISSED_TEXT, only_while=_still_shown, id_salt=report_id
+    )
+    if not landed:
+        _audit(
+            caller,
+            "crew_board_action",
+            "denied",
+            resources=f"conductor={key} item={item_id}:dismiss:{why}",
+        )
+        return _refuse(
+            why or "not_recorded",
+            "Nothing was skipped: this ask changed or was answered since the page loaded.",
+            409,
+        )
+    _audit(caller, "crew_board_action", "ok", resources=f"conductor={key} item={item_id}:dismiss")
+    return web.json_response({"ok": True, "action": "dismiss", "item_id": item_id})
+
+
+async def api_work_ledger_board_action(request: web.Request) -> web.Response:
+    """POST /api/crew-board/action — act on one orphaned item, or dismiss one ask.
+
+    Body: ``{"conductor": KEY, "item_id": "it_...", "action": "stop"|"take_over"|"dismiss"}``,
+    plus ``report_id`` for ``dismiss``. ``dismiss`` is :func:`_dismiss` and needs no
+    orphan; the rest of this applies to the two orphan actions.
 
     The worker session key is resolved HERE, from the store, and never leaves: it
     is not accepted from the body and not returned, which is what lets the page
@@ -714,6 +925,12 @@ async def api_work_ledger_board_action(request: web.Request) -> web.Response:
             resources=f"conductor={key} item={item_id}:item_not_found",
         )
         return _refuse("item_not_found", "no such item on this conductor's ledger", 404)
+
+    if action == "dismiss":
+        report_id = str(body.get("report_id") or "").strip()
+        if not report_id:
+            return _refuse("missing_report_id", "a dismiss names the report it sets aside", 400)
+        return await _dismiss(state, caller, key, item_id, report_id)
 
     # Read after the item is known to exist, so the two refusals cannot be told
     # apart by timing on a guessed id any more than by their bodies.

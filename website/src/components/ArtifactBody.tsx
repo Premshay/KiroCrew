@@ -7,6 +7,7 @@ import { useSilentLoadWatch } from '../hooks/useSilentLoadWatch'
 import { useScrollMemory } from '../hooks/useScrollMemory'
 import { useCommentBridge, type IframeSelection } from '../hooks/useCommentBridge'
 import { useFrameLinkBridge } from '../hooks/useFrameLinkBridge'
+import { useFrameFragmentScroll } from '../hooks/useFrameFragmentScroll'
 import { InlineCommentOverlay } from './InlineCommentOverlay'
 import { Btn } from './ui'
 import ErrorNotice from './ErrorNotice'
@@ -19,6 +20,7 @@ import {
 import { ContentRenderer, langFor, wrapCode } from './ContentRenderer'
 import type { FileType } from './FileRenderers'
 import type { Artifact, ArtifactComment } from '../types'
+import type { PierreEditorHandle } from '../pierre'
 import MarkdownOutlineRail from './MarkdownToc'
 
 import { i18nT } from '../i18n/t'
@@ -117,7 +119,7 @@ export function isEditableKind(kind: Artifact['kind']): boolean {
  * the detail page / side panel can attach selection-to-comment handlers
  * above it. */
 export const ArtifactBodyNative = memo(function ArtifactBodyNative({
-  kind, content, editing, onChange, previewRef,
+  kind, content, editing, onChange, previewRef, editorRef,
   comments, activeCommentId, scrollNonce, onActivateComment, unreadRootIds,
   heightStyle, flush, scrollMemoryKey, headingRail = false,
 }: {
@@ -126,6 +128,8 @@ export const ArtifactBodyNative = memo(function ArtifactBodyNative({
   editing: boolean
   onChange: (v: string) => void
   previewRef: React.RefObject<HTMLDivElement | null>
+  /** The editor's focus handle, live while `editing`. */
+  editorRef?: React.Ref<PierreEditorHandle>
   comments?: ArtifactComment[]
   activeCommentId?: string | null
   scrollNonce?: number
@@ -195,6 +199,7 @@ export const ArtifactBodyNative = memo(function ArtifactBodyNative({
           wordWrap={true}
           onChange={onChange}
           previewRef={previewRef}
+          editorRef={editorRef}
           displayContent={displayContent}
           isMarkdown={isMarkdown}
           flush={flush}
@@ -385,6 +390,9 @@ export const ArtifactBodyIframe = memo(function ArtifactBodyIframe({
   // Links in the page open through the host after a real click in this frame
   // (the frame itself grants no popups), or through the button it returns.
   const linkChip = useFrameLinkBridge([iframeRef])
+  // A frame sized to its document cannot scroll to its own `#section` links, so
+  // the page around it does. A side panel's fixed-height frame scrolls itself.
+  useFrameFragmentScroll(iframeRef, !heightStyle)
   return (
     // The side panel's heightStyle still wins outright — that surface fits a
     // fixed pane and scrolls inside it. On the full page the wrapper takes no
@@ -460,9 +468,17 @@ export const ArtifactBodyIframe = memo(function ArtifactBodyIframe({
               design-system button), not a raw `btn btn-sm` button: that class
               has no CSS behind it, and this control is the only recovery
               affordance the reader has — it must look pressable. */}
+          {/* aria-disabled + aria-busy, not native disabled: a disabled button
+              leaves the tab order, so a keyboard press of this recovery control
+              would drop focus to the page while the re-mint runs. The guard
+              ignores a second press; the class repeats the default disabled look
+              (opacity-30) so busy looks unchanged. The click is still
+              acknowledged by the busy state, per the note above. */}
           <Btn
-            disabled={pending}
-            onClick={retry}
+            aria-disabled={pending || undefined}
+            aria-busy={pending || undefined}
+            className="aria-disabled:opacity-30 aria-disabled:cursor-not-allowed aria-disabled:active:scale-100"
+            onClick={() => { if (!pending) retry() }}
           >
             {failed ? <RotateCw className="lucide-inline" /> : <Eye className="lucide-inline" />}
             {i18nT(failed

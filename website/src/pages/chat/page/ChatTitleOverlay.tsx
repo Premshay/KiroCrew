@@ -22,7 +22,7 @@ import Clickable from '../../../components/Clickable'
 import { useLabelTip } from '../../../components/InstantTip'
 import { i18nT } from '../../../i18n/t'
 import { uiLocation } from '../../../uiLocations/uiLocation'
-import { crewRootOf } from '../../../lib/crewMode'
+import { crewRootOf, hiddenMateRootOf } from '../../../lib/crewMode'
 
 interface ChatTitleOverlayProps {
   embedMode?: 'chat' | 'sessions'
@@ -69,6 +69,8 @@ interface ChatTitleOverlayProps {
   sidePanelWantsMount: boolean
   mobileNewSessionItem: { label: string; disabled: boolean; onSelect: () => void; }
   mobileSessionsToggle: JSX.Element
+  onPromote: () => void
+  promoting: boolean
 }
 
 /**
@@ -100,9 +102,13 @@ export default function ChatTitleOverlay({
   embedMode, popout, activeSlot, dispatch, filteredSlots, isMobile, titleInTopbar, activityOpen, setActionError, showActionError, onPinCollapsedHeight, pinCardRef, pinExpanded, pinFoldRef, pinned,
   scrollToPinnedPrompt, scrollTranscriptBy, setPinExpanded, activePoppedOut, focusActivePopout, openActivePopout, returnSelfToMain, splitFeatureEnabled, currentSlot, headerColorStyle, effectiveMode, title,
   activeIsSplitAnchor, editingTitle, enterSplit, setEditingTitleSlot, setSidebarPinned, sidebarAutoHidden, sidebarPinned, sidePanelDock, splitAnchorForActive, toggleAct, openSidebar, sidebarOnScreen,
-  sidebarOpen, sidePanelWantsMount, mobileNewSessionItem, mobileSessionsToggle,
+  sidebarOpen, sidePanelWantsMount, mobileNewSessionItem, mobileSessionsToggle, onPromote, promoting,
 }: ChatTitleOverlayProps) {
   const currentCrewRoot = crewRootOf(currentSlot)
+  // A crewmate's session the mate sessions preview keeps out of the person's
+  // lists, opened from History, search or a link: the same breadcrumb, back to the mate.
+  const currentMateRoot = currentCrewRoot ? '' : hiddenMateRootOf(currentSlot)
+  const breadcrumbRoot = currentCrewRoot || currentMateRoot
   return (
     <>
       {/* Claude-style title row — absolute overlay, solid top fading to transparent.
@@ -132,10 +138,10 @@ export default function ChatTitleOverlay({
         {/* A Crew Mode worker in the main pane: the breadcrumb replaces the title
             row on every width (on a phone it sits under the shell bar), so whose
             worker this is and the way back are always on screen. */}
-        {currentCrewRoot && currentSlot && (
+        {breadcrumbRoot && currentSlot && (
           <div className={`relative pr-4 ${!isMobile && embedMode !== 'chat' && filteredSlots.length > 0 && !sidebarOpen ? 'pl-[60px]' : 'pl-4'} pt-[9px] pb-2 flex items-center bg-bg border-b border-border`} data-testid="crew-worker-header">
             {/* Keyed by member: a reopen-failed notice belongs to the member it was about. */}
-            <CrewWorkerBreadcrumb key={currentSlot.key} root={currentCrewRoot} worker={currentSlot} />
+            <CrewWorkerBreadcrumb key={currentSlot.key} root={breadcrumbRoot} worker={currentSlot} mate={!!currentMateRoot} />
             {/* The panel's open control, which the title row carries and the
                 breadcrumb replaces: with the panel closed, one click brings the
                 Workers list back beside the worker. */}
@@ -151,7 +157,7 @@ export default function ChatTitleOverlay({
             )}
           </div>
         )}
-        {!titleInTopbar && !currentCrewRoot && (
+        {!titleInTopbar && !breadcrumbRoot && (
         <div style={headerColorStyle} className={`@container/chathead relative pr-1.5 pt-[9px] pb-2 flex items-center gap-2 bg-bg pointer-events-none ${headerColorStyle ? 'chat-header-colored' : ''} transition-[padding-left] duration-[240ms] [transition-timing-function:cubic-bezier(.32,.72,0,1)] ${!isMobile && embedMode !== 'chat' && filteredSlots.length > 0 && !sidebarOpen ? 'pl-[60px]' : isMobile ? (embedMode === 'chat' ? 'pl-4' : 'pl-3') : 'pl-5'}`}>
           {/* Divider between toggle and title — ALWAYS mounted and
               absolute (zero width, no flex-gap participation) so it can
@@ -186,6 +192,9 @@ export default function ChatTitleOverlay({
             onRename={activeSlot ? () => setEditingTitleSlot(activeSlot) : undefined}
             mode={effectiveMode}
             sidebarOnScreen={sidebarOnScreen}
+            memoryMode={currentSlot?.memory_mode}
+            onPromote={onPromote}
+            promoting={promoting}
             newSessionHere={embedMode !== 'chat' && isMobile ? mobileNewSessionItem : undefined}
             onSplitDown={!embedMode && splitFeatureEnabled && activeSlot && !(splitAnchorForActive && !activeIsSplitAnchor) ? () => enterSplit(activeSlot, 'down') : undefined}
           />

@@ -119,9 +119,12 @@ class AcpError(Exception):
             self.rejected_model: str | None = None
         if not hasattr(self, "advertised"):
             self.advertised: list[str] = []
-        # Sign-in failure tag, set by :func:`_raise_acp_error` when the raw frame
-        # is a session-expiry / rejected-credential answer, so the dashboard's
-        # error row can offer the Kiro sign-in card instead of a retry.
+        # Sign-in failure tags, set by :func:`_raise_acp_error` when the raw frame
+        # is a session-expiry / rejected-credential answer. ``sign_in_needed`` is
+        # set for every harness, so the task queue fails the row as auth without
+        # reading the prose; ``auth_required`` only for a harness that signs in
+        # through Crew, so the dashboard's error row offers the Kiro sign-in card.
+        self.sign_in_needed: bool = False
         self.auth_required: bool = False
         # Spent-allowance tag, set by :func:`_raise_acp_error` when the raw
         # frame is a usage-limit answer ("The monthly usage limit has been
@@ -180,12 +183,19 @@ class AcpError(Exception):
         # ``connection_failure``. The interactive ladder waits longer for it and
         # rewinds the failed prompt before re-sending. ``None`` means unclassified.
         self.throttle: bool | None = None
+        # A TRANSIENT capacity/rollout refusal (raw frame); its card offers the picker.
+        self.model_unavailable: bool = False
         # Set by :func:`_raise_acp_error` when the frame's ``data`` names
         # ``errorKind: cloud_credential_error``: the process cached credentials
         # it cannot reload, so the remedy is a fresh process, not a retry.
         # ``llm_helpers.acp_error_is_session_not_found`` routes it down the
         # reset-and-reload-once path a dropped session takes.
         self.credential_reload: bool = False
+        # The AWS exception name of a credential rejection (``ExpiredTokenException``),
+        # set by :func:`_raise_acp_error` from the raw frame, so a caller compares a code.
+        self.auth_error_code: str = ""
+        # Redacted harness frame behind curated wording; see error_frames.raw_error_detail.
+        self.raw_detail: str = ""
 
 
 class AcpTimeoutError(AcpError):
@@ -315,10 +325,18 @@ class AcpDelegateLaunchFailed(AcpError):  # noqa: N818
     :class:`AcpSandboxInitFailed` is not: that tag renders the start-failure
     card, whose Resume and repeat-start "restart the gateway" affordances cannot
     fix an install and would contradict the repair this message names.
+
+    The message is one of the curated texts :func:`delegate_launch_failure_message`
+    picks from the child's stderr: the install repair by default, or the update
+    remedy when the CLI rejected the ``--auth-method`` option because it is too
+    old (:data:`KIRO_CLI_TOO_OLD_MESSAGE`, or :data:`KIRO_CLI_TOO_OLD_TERMINAL_MESSAGE`
+    where no dashboard latched the Kiro CLI check). Never the child's own text.
     """
 
-    def __init__(self) -> None:
-        super().__init__(DELEGATE_LAUNCH_FAILURE_MESSAGE, transient=False, user_worded=True)
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(
+            message or DELEGATE_LAUNCH_FAILURE_MESSAGE, transient=False, user_worded=True
+        )
 
 
 class AcpRegistrationRateLimited(AcpProcessDied):  # noqa: N818

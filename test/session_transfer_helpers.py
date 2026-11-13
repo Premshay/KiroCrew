@@ -81,8 +81,7 @@ class _PostedBody:
 
 
 @pytest.fixture(autouse=True)
-# nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- pre-existing autouse fixture moved verbatim; no module of this family calls monkeypatch.undo()
-def _isolate_import_tmp(tmp_path_factory, monkeypatch):
+def _isolate_import_tmp(tmp_path_factory, _floor_monkeypatch):
     """Point the arrival temp dir at a per-test, auto-cleaned directory.
 
     Arriving bodies stream to disk before they are parsed; without this they would
@@ -91,9 +90,9 @@ def _isolate_import_tmp(tmp_path_factory, monkeypatch):
     from kiro_crew.dashboard import session_transfer as st
 
     d = tmp_path_factory.mktemp("kc-import")
-    monkeypatch.setattr(st, "_import_tmp_dir", lambda: d)
+    _floor_monkeypatch.setattr(st, "_import_tmp_dir", lambda: d)
     out = tmp_path_factory.mktemp("kc-export")
-    monkeypatch.setattr(st, "_egress_tmp_dir", lambda: out)
+    _floor_monkeypatch.setattr(st, "_egress_tmp_dir", lambda: out)
 
 
 class _PersistentLine:
@@ -229,7 +228,7 @@ def _size_refusing_peer(refusal_code: str):
 
         def _respond(self, _url, json=None, headers=None):
             seen.append(dict(json))
-            if "layer_b" in json:
+            if "layer_b" in json or "layer_b_kas" in json:
                 return _Resp(400, {"code": refusal_code})
             return _Resp(200, {"key": "remote-1", "resume_mode": "prefix"})
 

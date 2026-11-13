@@ -12,8 +12,10 @@ warning a scan logs when every spec it read failed.
 from __future__ import annotations
 
 import errno
+import hashlib
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
@@ -103,9 +105,12 @@ def _read_spec_bytes(real: Path, *, fence: Callable[[Path], bool] | None = None)
     cap = hooks.MAX_FILE_BYTES
 
     def read_once() -> bytes:
+        # Local import: a module-level name would be served by this module's facade.
+        from kiro_crew.bounded_read import bounded_read
+
         fd = open_fenced_for_read(real, fence=refused, refusal=_SpecReadRefused)
         with os.fdopen(fd, "rb") as fh:
-            return fh.read(cap + 1)
+            return bounded_read(fh, cap + 1)
 
     # On Windows a read that lands while a writer replaces the spec (the
     # dashboard's MCP enable, disable and remove paths rewrite kirocrew.json)
@@ -129,6 +134,35 @@ _KIRO_AGENTS_DIR: Path | None = None
 def _kiro_agents_dir() -> Path:
     """The kiro-cli agents directory, resolved against the live data home."""
     return _KIRO_AGENTS_DIR if _KIRO_AGENTS_DIR is not None else kiro_agents_dir()
+
+
+#: The prefix ``pinned_fs_primitives.open_fenced_for_read`` gives its link-count refusal.
+_HARDLINK_REFUSAL = "refusing to read a hardlinked file"
+
+# Digests of the resolved paths whose hardlink refusal this process has logged at
+# WARNING: a fixed 32 bytes each, at most _HARDLINK_WARNED_MAX of them. Past the cap
+# one WARNING says so and every later refusal logs at DEBUG.
+_HARDLINK_WARNED_MAX = 1024
+_HARDLINK_WARNED: set[bytes] = set()
+_HARDLINK_WARNED_LOCK = threading.Lock()
+
+
+def _first_hardlink_refusal(real: Path) -> bool:
+    """Whether this is the process's first hardlink refusal of *real*; records it."""
+    key = hashlib.sha256(os.fsencode(real)).digest()
+    with _HARDLINK_WARNED_LOCK:
+        if key in _HARDLINK_WARNED or len(_HARDLINK_WARNED) > _HARDLINK_WARNED_MAX:
+            return False
+        if len(_HARDLINK_WARNED) == _HARDLINK_WARNED_MAX:
+            # One sentinel entry past the cap marks the overflow as reported.
+            _HARDLINK_WARNED.add(b"")
+            logger.warning(
+                "More than %d hardlinked agent configs refused; later refusals log at DEBUG",
+                _HARDLINK_WARNED_MAX,
+            )
+            return False
+        _HARDLINK_WARNED.add(key)
+        return True
 
 
 def _audit_denied(*, operation: str, source: str, resources: str, error: str) -> None:
@@ -316,7 +350,12 @@ def _read_agent_spec(
         # Both values come from an untrusted filename (the refusal message
         # quotes the spelling), so they are rendered with ``%r``: a newline in
         # the name is escaped instead of starting a forged log record.
-        logger.warning("Skipping agent config %r: %r", path, exc)
+        level = logging.WARNING
+        if str(exc).startswith(_HARDLINK_REFUSAL) and not _first_hardlink_refusal(real):
+            # A hard-linked install tree is refused on every read; one WARNING
+            # per path says so, and the repeats would bury every other line.
+            level = logging.DEBUG
+        logger.log(level, "Skipping agent config %r: %r", path, exc)
         return None
     except PermissionError:
         if platform_compat.IS_WINDOWS:
@@ -688,29 +727,18 @@ def spec_by_declared_name(
     backend runs, so the question the caller asks (this agent's policy, this
     agent's projection) has one answer and that answer is returned, with a
     warning naming each file so the operator can tidy the directory. A package
-    installer that flattens dependencies writes exactly such twins for an agent
-    two packages vend; refusing them denied the agent its policy and its KAS
-    session with no lasting repair. Equality is of the whole parse, not of the
-    fields one caller reads: a pair that agrees on ``managedToolPolicy`` but
-    differs elsewhere is still two agents, and stays refused. Propagates
-    ``OSError`` from the directory walk itself; the per-file reads never raise.
+    installer that flattens dependencies writes such twins. Equality is of the
+    whole parse: a pair that agrees on ``managedToolPolicy`` but differs
+    elsewhere is still two agents, and stays refused. Propagates ``OSError``
+    from the directory walk itself; the per-file reads never raise.
 
-    Only the first matching spec is held; a later match is compared with it,
-    keeps its path, and its parse is dropped when the loop moves on. The reader
-    caps each file, so the parsed-spec memory this scan holds at its peak is a
-    constant few capped parses (the first match, the loop's last parse and the
-    one being read), not one per same-name file; the paths themselves, one per
-    candidate, are what the refusal message and the warning need and are all
-    the scan keeps of the rest.
+    Only the first match's parse is held, so peak memory is a few capped parses,
+    not one per same-name file; later matches keep only their paths.
 
-    This is a fresh walk rather than a filter over :func:`parsed_agent_specs`,
-    and the difference is the labels, not the loop. That cache serves catalog
-    readers of one directory, so its SEL labels are first-reader-wins for the
-    life of a snapshot; a denial met here would then be attributed to whichever
-    listing warmed the cache instead of to the projection or the policy read
-    that asked, which is the attribution the call-site ratchet exists to keep.
-    The cache also hands out its own rows to be treated as read-only, where
-    this returns a parse the caller owns.
+    A fresh walk rather than a filter over :func:`parsed_agent_specs`: that
+    cache's SEL labels are first-reader-wins, so a denial here would be
+    attributed to whichever listing warmed it. This also returns a parse the
+    caller owns, not a shared read-only row.
     """
     entry = declared_spec_entry(agents_dir, agent_id, operation=operation, source=source, pins=pins)
     return None if entry is None else entry[1]

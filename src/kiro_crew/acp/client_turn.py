@@ -2,30 +2,30 @@
 
 The kiro prompt loop, ``send_message`` and ``send_message_stream``, ``stream_events`` and
 ``stream_unsolicited``, the frame classifier and dispatcher, the prompt response reader, the
-opencode shell-permission deferral, the liveness consult and the redaction of a Claude native
-child's events, with the flush of their held text for a turn cut short.
-
+opencode and MiMo Code shell-permission deferrals, the liveness consult and the redaction of a
+Claude native child's events, with the flush of their held text for a turn cut short.
 Each function here whose first parameter is ``self`` is an ``AcpClient`` method: the
 class binds it by name, so it reads and writes the session's own state on the instance,
 and a patch of the method on the class or on an instance reaches every caller.
 
 Instance fields written: ``_active_run_id``, ``_active_tool_calls``, ``_between_turn_credits``,
 ``_cancelled``, ``_claude_compaction_pending``, ``_claude_dispatch_depth``,
-``_claude_folded_message_break``, ``_codex_compaction_pending``, ``_compaction_failed_at``,
-``_compaction_failed_turn``, ``_last_stop_reason``, ``_native_child_redactors``,
-``_oauth_emitted_servers``, ``_observed_tool_calls``, ``_permission_options``,
-``_prompt_capabilities``, ``_prompt_capability_stale``, ``_prompt_or_tool_seen``,
-``_skill_reads``, ``_stale_eligible``, ``_steers_awaiting_echo``, ``_tool_call_diff_path``,
-``_tool_call_harness_tool_name``, ``_tool_call_identity_unreadable``,
-``_tool_call_input_redacted``, ``_tool_call_inputs``, ``_tool_call_is_shell``,
-``_tool_call_mcp_server``, ``_tool_call_params``, ``_tool_call_tool_name``,
-``_tool_call_unclassified``, ``_tool_dispatched``, ``_turn_done``, ``last_prompt_stats``.
+``_claude_folded_message_break``, ``_claude_native_compaction_id``, ``_codex_compaction_pending``,
+``_compaction_failed_at``, ``_compaction_failed_turn``, ``_last_stop_reason``,
+``_native_child_redactors``, ``_oauth_emitted_servers``, ``_observed_tool_calls``,
+``_permission_options``, ``_prompt_capabilities``, ``_prompt_capability_stale``,
+``_prompt_or_tool_seen``, ``_sent_images_req``, ``_sent_images_staged``, ``_skill_reads``,
+``_stale_eligible``, ``_steers_awaiting_echo``, ``_tool_call_diff_path``,
+``_tool_call_harness_tool_name``, ``_tool_call_identity_unreadable``, ``_tool_call_input_redacted``,
+``_tool_call_inputs``, ``_tool_call_is_shell``, ``_tool_call_mcp_server``, ``_tool_call_params``,
+``_tool_call_tool_name``, ``_tool_call_unclassified``, ``_tool_dispatched``, ``_turn_done``,
+``last_prompt_stats``.
 
 Instance fields read: ``_batch_window``, ``_buffer``, ``_claude_idle_handler``,
 ``_copilot_ambiguous_mcp_calls``, ``_copilot_unmatched_titles``, ``_engine_fallback``,
 ``_last_activity``, ``_liveness_oracle``, ``_permission_gate_events``, ``_pid``, ``_process``,
-``_sel_settled_tool_calls``, ``_session_id``, ``_session_notices``, ``_steer_turn``,
-``_turn_lock``.
+``_sel_settled_tool_calls``, ``_sent_images``, ``_session_id``, ``_session_key``,
+``_session_notices``, ``_steer_turn``, ``_turn_lock``.
 """
 
 from __future__ import annotations
@@ -34,9 +34,15 @@ import asyncio
 import logging
 import time
 from contextlib import aclosing
-from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Callable
 
-from kiro_crew.acp import disposed_session, launch_tuning, pi_steer_turn
+from kiro_crew.acp import (
+    batch_guard,
+    claude_background_calls,
+    disposed_session,
+    launch_tuning,
+    pi_steer_turn,
+)
 from kiro_crew.acp._dispatch import (
     DRAIN_YIELD_AFTER_S,
     MAX_ACTIVE_TOOL_CALLS,
@@ -47,7 +53,9 @@ from kiro_crew.acp._dispatch import (
 )
 from kiro_crew.acp.client_timeouts import (
     _COMPACTION_FAILED_TURN_BUDGET,
+    _EOF_EXIT_GRACE_SECS,
     _MAX_CONSECUTIVE_EMPTY,
+    _MIMOCODE_PERMISSION_REFINEMENT_TIMEOUT,
     _OPENCODE_PERMISSION_REFINEMENT_TIMEOUT,
     _READ_TIMEOUT,
     _STALE_TURN_TIMEOUT,
@@ -55,12 +63,17 @@ from kiro_crew.acp.client_timeouts import (
     _effective_prompt_timeout_async,
 )
 from kiro_crew.acp.client_transport import _AGENT_STARTED_REQUEST_ID, _is_safe_oauth_url
-from kiro_crew.acp.client_turn_control import format_command_result
+from kiro_crew.acp.client_turn_control import format_command_result, parse_slash_command
 from kiro_crew.acp.elicitation import is_elicitation_request
 from kiro_crew.acp.engine_fallback import is_v2_model_fallback, normalize_kiro_v2
 from kiro_crew.acp.liveness import EVIDENCE_SAMPLING, VERDICT_WORKING, consult_offloaded
 from kiro_crew.acp.oauth_offline import with_google_offline_access
-from kiro_crew.acp.prompt_blocks import build_prompt_blocks
+from kiro_crew.acp.prompt_blocks import (
+    SentImageLedger,
+    StagedImages,
+    build_prompt_blocks,
+    command_drops_pictures,
+)
 from kiro_crew.acp.transport_errors import (
     AcpError,
     AcpProcessDied,
@@ -70,6 +83,7 @@ from kiro_crew.acp.transport_errors import (
     registration_rate_limited_error,
 )
 from kiro_crew.acp.types import (
+    ACP_BACKEND_MIMOCODE,
     ACP_BACKEND_OPENCODE,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
@@ -105,11 +119,14 @@ from kiro_crew.acp.types import (
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_FORBIDDEN_MODES,
     ACP_BACKEND_PROMPT_COMMAND_ALLOWLIST,
+    ACP_BACKENDS_INLINE_COMPACTION,
     ACP_BACKENDS_RELOAD_DISPOSED_SESSION,
     prompt_command_issue,
 )
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.security import StreamRedactor, redact_credentials, redact_exfiltration_urls
+from kiro_crew.tracing import turn_anomalies
+from kiro_crew.tracing import turns as trace_turns
 
 if TYPE_CHECKING:
     from kiro_crew.acp.client import AcpClient
@@ -321,6 +338,90 @@ async def _defer_opencode_shell_permission(
     return True
 
 
+#: The permission categories MiMo Code's shell tool asks under with NO metadata,
+#: so their request carries no command: ``tool/bash.ts:399-413`` on 0.1.15 asks
+#: ``external_directory`` and then ``bash`` with ``metadata: {}``, and the ACP layer
+#: forwards a request's metadata as its ``rawInput`` and its category as its
+#: ``title`` (``acp/agent.ts:198-205``). ``bash_delete`` is not one of them: it asks
+#: with ``{command, deletes}`` (``:424-432``), and only after ``bash`` was answered.
+_MIMOCODE_COMMANDLESS_SHELL_ASKS = frozenset({"bash", "external_directory"})
+
+
+def _is_mimocode_running_input(
+    update_frame: JsonRpcMessage, session_id: object, call_id: str
+) -> bool:
+    """Whether *update_frame* is MiMo Code's running-state update carrying the command.
+
+    MiMo Code sends one ``tool_call_update`` per state of a tool part, and the
+    running one carries the parsed input as ``rawInput`` and no output yet
+    (``acp/agent.ts:284-336`` on 0.1.15).
+    """
+    frame_params = update_frame.params if isinstance(update_frame.params, dict) else {}
+    update = frame_params.get("update")
+    update = update if isinstance(update, dict) else {}
+    raw_input = update.get("rawInput")
+    command = raw_input.get("command") if isinstance(raw_input, dict) else None
+    return (
+        update_frame.is_method(METHOD_SESSION_UPDATE)
+        and isinstance(session_id, str)
+        and frame_params.get("sessionId") == session_id
+        and update.get("sessionUpdate") == "tool_call_update"
+        and update.get("toolCallId") == call_id
+        and update.get("status") == "in_progress"
+        and isinstance(command, str)
+        and bool(command)
+        and not update.get("content")
+        and not update.get("rawOutput")
+    )
+
+
+async def _defer_mimocode_shell_permission(
+    self: AcpClient, msg: JsonRpcMessage, remaining: float
+) -> bool:
+    """Let MiMo Code's running shell update reach the cache before its permission.
+
+    On MiMo Code a shell permission NEVER carries the command: the categories in
+    :data:`_MIMOCODE_COMMANDLESS_SHELL_ASKS` ask with empty metadata, so the only
+    trusted source of the command is the part's running update, and the two are
+    published on separate bus events with no order between them. 0.1.15 delivered
+    them adjacent but in either order (``test/fixtures/acp_frames/mimocode/
+    session-live.jsonl``: update first on the first turn, request first on the
+    second). So when a command-less shell request arrives first, the next frame is
+    read, and if it is that update both are re-queued update first.
+
+    Keyed on MiMo Code's own request shape, not only on the tool being a shell: a
+    request of another category, or one for a call whose command is already
+    cached, goes straight to the dispatcher. ``external_directory`` and ``bash``
+    can both ask for one call; the first one reorders, and the second finds the
+    command cached. The request's own ``rawInput`` never fills the trusted cache.
+    """
+    params = msg.params if isinstance(msg.params, dict) else {}
+    tool_call = params.get("toolCall")
+    tool_call = tool_call if isinstance(tool_call, dict) else {}
+    call_id = tool_call.get("toolCallId")
+    if tool_call.get("title") not in _MIMOCODE_COMMANDLESS_SHELL_ASKS:
+        return False
+    if not isinstance(call_id, str) or self._tool_call_is_shell.get(call_id) is not True:
+        return False
+    cached = self._tool_call_params.get(call_id, {})
+    if isinstance(cached, dict) and cached.get("command"):
+        return False
+    following = await self._read_message(
+        timeout=min(_MIMOCODE_PERMISSION_REFINEMENT_TIMEOUT, remaining)
+    )
+    if following is None:
+        return False
+    room = self._buffer.maxlen is None or len(self._buffer) <= self._buffer.maxlen - 2
+    if not (room and _is_mimocode_running_input(following, params.get("sessionId"), call_id)):
+        # Not the update: hand it back untouched, ahead of everything still queued.
+        self._buffer.appendleft(following)
+        return False
+    # Update first, so the dispatcher caches the command before it builds the permission.
+    self._buffer.appendleft(msg)
+    self._buffer.appendleft(following)
+    return True
+
+
 async def _prompt_loop(
     self: AcpClient,
     req_id: int,
@@ -365,6 +466,7 @@ async def _prompt_loop(
         self._compaction_failed_at = None
         self._compaction_failed_turn = False
         self._claude_compaction_pending = False
+        self._claude_native_compaction_id = None
         self._codex_compaction_pending = False
         deadline = time.monotonic() + timeout
         consecutive_empty = 0
@@ -554,9 +656,10 @@ async def _prompt_loop(
                             )
                         else:
                             logger.warning(
-                                "Stale turn detected for req %d — no data for %.0fs after text was streamed "
-                                "(liveness=%s: %s). Treating as complete.",
+                                "Stale turn detected for req %d on session %s — no data for %.0fs "
+                                "after text was streamed (liveness=%s: %s). Treating as complete.",
                                 req_id,
+                                self._session_key,
                                 _idle_secs,
                                 verdict,
                                 evidence,
@@ -597,7 +700,13 @@ async def _prompt_loop(
                         req_id,
                         _stall_idle,
                     )
-                    await self._kill_process(force=True)
+                    # A stalled TOOL leaves the agent itself able to read the
+                    # stdin close, so kiro-cli gets the same bounded chance to
+                    # exit on it that a shutdown gives.
+                    if self._is_kiro:
+                        await self._kill_process(force=True, exit_grace=_EOF_EXIT_GRACE_SECS)
+                    else:
+                        await self._kill_process(force=True)
                     raise AcpProcessDied(
                         f"tool stalled — no data for {_stall_idle:.0f}s; agent killed to recover"
                     )
@@ -623,13 +732,36 @@ async def _prompt_loop(
                 continue
 
             action = self._process_message(msg, req_id)
-            if (
-                action == "permission"
-                and self.backend == ACP_BACKEND_OPENCODE
-                and await self._defer_opencode_shell_permission(msg, remaining)
+            if self.backend == ACP_BACKEND_MIMOCODE:
+                # A grant ``approve_tool`` refused under an ``mcp`` control installed
+                # mid-session: stopped here, where the turn can carry the remedy.
+                await self._tripwire_mimocode_governed_mcp(msg)
+            if action == "permission" and (
+                (
+                    self.backend == ACP_BACKEND_OPENCODE
+                    and await self._defer_opencode_shell_permission(msg, remaining)
+                )
+                or (
+                    self.backend == ACP_BACKEND_MIMOCODE
+                    and await self._defer_mimocode_shell_permission(msg, remaining)
+                )
             ):
                 self.last_prompt_stats.event_count -= 1
                 continue
+            # A Claude turn whose only unfinished calls are background agents' ends
+            # as the finished turn it is (see claude_background_calls).
+            if (
+                action == "error"
+                and self._is_claude
+                and (ended := await claude_background_calls.settle_background_only(self, msg))
+            ):
+                action, msg = "complete", ended
+            if action == "complete" and req_id == getattr(self, "_sent_images_req", None):
+                # The backend answered the prompt whose pictures were staged,
+                # so its conversation now holds them.
+                staged: StagedImages | None = getattr(self, "_sent_images_staged", None)
+                if staged is not None:
+                    staged.commit()
             # A harness that disposed this session's backend (see disposed_session):
             # a cancelled turn ends as cancelled, any other raises, and an approval
             # asked after the cancel is answered here rather than put to a person.
@@ -858,22 +990,29 @@ async def stream_events(
     timeout: float | None = None,
     *,
     allow_image: bool = True,
+    prompt_gate: Callable[[], None] | None = None,
 ) -> AsyncIterator[AcpEvent]:
     """Send a prompt and yield AcpEvent objects (text, tool_call, permission, complete).
 
     ``allow_image=False`` sends *message* as text only: no path in it is
-    read or inlined.
+    read or inlined. ``prompt_gate`` is called under the write lock, right
+    before the prompt is written; whatever it raises ends the turn with nothing
+    sent.
     """
     timeout = await _effective_prompt_timeout_async(timeout)
     self._cancelled = False
     self._turn_done.clear()
     async with launch_tuning.switch_barrier(self):
         await self.ensure_ready()
-    req_id = await self._send_prompt(message, allow_image=allow_image)
+    req_id = await self._send_prompt(message, allow_image=allow_image, prompt_gate=prompt_gate)
     # aclosing(): a consumer that closes this stream early must close the
     # dispatcher too, so its finally records the turn's unanswered steers
     # as orphans before the next _send_prompt settles them.
-    async with aclosing(self._dispatch_prompt_events(req_id, timeout)) as events:
+    async with aclosing(
+        turn_anomalies.watched(
+            self, trace_turns.traced(self, self._dispatch_prompt_events(req_id, timeout))
+        )
+    ) as events:
         async for event in events:
             yield event
 
@@ -973,9 +1112,11 @@ async def _dispatch_events(
     got_complete = False
     saw_agent_switch = False
     # A prompt turn takes ``_session/steering`` steers; a command turn and a
-    # turn the agent started do not. Steers accepted into an earlier turn were
-    # settled or dropped there.
+    # turn the agent started do not. Steers accepted into or held for an
+    # earlier turn were settled or dropped there.
     self._steers_accepted = []
+    self._steers_held = []
+    self._held_steers_unanswered = set()
     self._steering_turn_req = (
         None if extract_agent_from_result or req_id == _AGENT_STARTED_REQUEST_ID else req_id
     )
@@ -1091,6 +1232,9 @@ async def _dispatch_events(
                 if msg.id is not None:
                     await self._send_error(msg.id, -32600, "invalid request id")
                 continue
+            if self.backend == ACP_BACKEND_MIMOCODE:
+                # An ``mcp`` control installed since the start: refused and stopped.
+                await self._tripwire_mimocode_governed_mcp(msg, permission_event)
             # Three refusals before the consumer's gate sees the request: a
             # zero-tool spec, a switched-off tool, and a harness identity that is
             # absent or names an unmounted server. The third matters HERE as much
@@ -1265,6 +1409,8 @@ async def _dispatch_events(
                     self._active_tool_calls.discard(tool_result_event.tool_call_id or "")
                     self._tool_dispatched = self._active_tool_calls.possibly_open
                     self._stale_eligible = not self._active_tool_calls.possibly_open
+                    # A steer held while a call ran goes out once none is open.
+                    self._release_held_steers()
                 # Fire the PostToolUse HOOK ENGINE now that the tool RESULT
                 # (and its output) exists — the Pre-vs-Post split is required
                 # because fire_tool_hooks above is PreToolUse-only. No-op
@@ -1304,6 +1450,9 @@ async def _dispatch_events(
                 summary = compaction_failure_detail(params)
             yield AcpEvent(kind=EVENT_COMPACTION_STATUS, text=status_type, title=summary)
         elif action == "clear":
+            # The cleared conversation holds none of the pictures it was
+            # sent, so the next prompt naming one must send it again.
+            self._forget_sent_images()
             yield AcpEvent(kind=EVENT_CLEAR_STATUS)
         elif action == "subagent_list":
             params = msg.params or {}
@@ -1500,14 +1649,43 @@ async def _dispatch_events(
 # ── Private Helpers ──
 
 
-async def _send_prompt(self: AcpClient, message: str, *, allow_image: bool = True) -> int:
+def _forget_sent_images(self: AcpClient) -> None:
+    """The conversation has dropped the pictures it was sent (a completed
+    compaction summarized it, a clear wiped it, or the session is gone): a
+    later prompt naming one inlines it again."""
+    sent_images: SentImageLedger | None = getattr(self, "_sent_images", None)
+    if sent_images is not None:
+        sent_images.forget()
+
+
+async def _send_prompt(
+    self: AcpClient,
+    message: str,
+    *,
+    allow_image: bool = True,
+    prompt_gate: Callable[[], None] | None = None,
+) -> int:
     await self._settle_orphan_steers()
+    sent_images: SentImageLedger | None = getattr(self, "_sent_images", None)
+    if message.lstrip().startswith("/") and command_drops_pictures(
+        parse_slash_command(message)[0],
+        compacts_inline=self.backend in ACP_BACKENDS_INLINE_COMPACTION,
+    ):
+        # This backend compacts inside the turn, often with no status
+        # frame to say so, and drops the pictures: forget them before the turn.
+        self._forget_sent_images()
+    # This prompt's own staging, so a build abandoned on its worker thread can
+    # write only to a staging nothing commits.
+    staged = sent_images.staging() if sent_images is not None else None
+    # Shared with AcpSessionHandle.prompt via prompt_blocks so the two paths
+    # cannot drift.
     agent_accepts_image = self.supports_image_prompt is not False
     blocks = await asyncio.to_thread(
         build_prompt_blocks,
         message,
         allow_image=allow_image,
         agent_accepts_image=agent_accepts_image,
+        sent_images=staged,
     )
     # A harness whose prompt parser runs ``/<name>`` as its own command can be told,
     # by prompt text alone, to stop asking before tools run. Refused before the wire,
@@ -1534,26 +1712,47 @@ async def _send_prompt(self: AcpClient, message: str, *, allow_image: bool = Tru
             # waits on the turn ending before it raises.
             self._turn_done.set()
             raise AcpError(issue, transient=False, user_worded=True)
+    # What the model is told is seen by the batch guard (``acp.batch_guard``),
+    # which reads its setting off the event loop first.
+    await batch_guard.refresh_feeding(getattr(self, "_batch_window", None))
+    batch_guard.note_prompt(getattr(self, "_batch_window", None), blocks)
+    params = {
+        "sessionId": self._session_id,
+        # Offloaded: see the note in session_handle_turn.prompt -- image
+        # reads and base64 encoding must not block the event loop.
+        "prompt": blocks,
+    }
+
+    async def _send_blocks(prompt_blocks: list) -> int:
+        params["prompt"] = prompt_blocks
+        if prompt_gate is None:
+            return await self._send_request(METHOD_PROMPT, params)
+
+        def _gate_under_lock() -> None:
+            try:
+                prompt_gate()
+            except BaseException:
+                self._turn_done.set()
+                raise
+
+        return await self._send_request(METHOD_PROMPT, params, before_write=_gate_under_lock)
+
     try:
-        return await self._send_request(
-            METHOD_PROMPT,
-            {"sessionId": self._session_id, "prompt": blocks},
-        )
+        req_id = await _send_blocks(blocks)
     except Exception as exc:
         if not allow_image or not _blocks_carry_an_image(blocks) or not _is_image_refusal(str(exc)):
             raise
         self._prompt_capabilities = {"image": False}
         self._prompt_capability_stale = False
         logger.info("acp: image prompt refused by this connection; resending as text")
-        return await self._send_request(
-            METHOD_PROMPT,
-            {
-                "sessionId": self._session_id,
-                "prompt": await asyncio.to_thread(
-                    build_prompt_blocks, message, allow_image=False, agent_accepts_image=False
-                ),
-            },
+        staged = None
+        blocks = await asyncio.to_thread(
+            build_prompt_blocks, message, allow_image=False, agent_accepts_image=False
         )
+        req_id = await _send_blocks(blocks)
+    self._sent_images_req = req_id
+    self._sent_images_staged = staged
+    return req_id
 
 
 async def _read_prompt_response(self: AcpClient, req_id: int, timeout: float) -> str:

@@ -180,10 +180,11 @@ export default function CommandPalette({
   // corpus. Apps sits next to Pages because both are pure navigation targets.
   //
   // Folders are deliberately ABSENT. Reaching a session folder by name is a
-  // Command Bar feature, and it lives in that app (`apps/command-bar/`) the way
+  // Command Bar feature, and it lives there (`components/commandBar/`) the way
   // session and artifact search reach their corpora there: one row you enter,
   // then a list that narrows. Registering a second folder surface here would make
-  // the host own a copy of a feature the app already owns, and the two would drift.
+  // the palette own a copy of a feature the Command Bar already owns, and the two
+  // would drift.
   const tabs = useMemo<ResourceProvider[]>(
     () => [all, sessions, knowledge, skills, prompts, artifacts, apps, pages, actions, settings],
     [all, sessions, knowledge, skills, prompts, artifacts, apps, pages, actions, settings],
@@ -398,7 +399,7 @@ export default function CommandPalette({
   // flag, so a tab opening or closing must re-run their search too.
   const openTabsKey = activeProvider.id === 'sessions' || activeProvider.id === 'all' ? openSessionsKey : ''
   const { data: results = [], isLoading: loading, isError, refetch } = useQuery({
-    queryKey: ['palette', 'search', activeProvider.id, debouncedQuery, liveFingerprint, openTabsKey],
+    queryKey: ['palette', 'search', activeProvider.id, debouncedQuery, liveFingerprint, openTabsKey, activeProvider.scope ?? ''],
     queryFn: () => Promise.resolve(activeProvider.search(debouncedQuery)),
     enabled: open,
     placeholderData: (prev) => prev ?? [],
@@ -594,7 +595,8 @@ export default function CommandPalette({
       role="dialog"
       aria-modal="true"
       aria-label={i18nT('components.commandPalette.search_everywhere')}
-      onMouseDown={onClose}
+      // The press's own default action would clear the focus this close gives back.
+      onMouseDown={e => { e.preventDefault(); onClose() }}
     >
       {/* Containment only: the panel's handlers perform no action. onMouseDown
           keeps a press inside the panel from reaching the backdrop's dismiss;

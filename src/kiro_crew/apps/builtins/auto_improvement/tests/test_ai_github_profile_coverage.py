@@ -162,7 +162,7 @@ def test_repo_root_returns_the_tree_when_nothing_exists(tmp_path):
     assert gh._repo_root(missing) == missing
 
 
-# ── _write_protected_targets ─────────────────────────────────────────────────
+# ── write_protected_targets ──────────────────────────────────────────────────
 
 
 def test_write_protected_targets_masks_existing_parent_dirs(tmp_path, monkeypatch):

@@ -42,11 +42,13 @@ const {
 const {
   windowsGatewayExecutablePaths,
   windowsProcessCommand,
+  windowsTaskkill,
 } = require("./windows-port");
 const {
   gatewayWaitTimeoutMs,
   waitForGateway,
-  tailLines,
+  readLogTail,
+  rotateLaunchLog,
   isPortInUse,
 } = require("./gateway-wait");
 const { readBakedEdition } = require("./edition");
@@ -64,6 +66,7 @@ const {
 const { capturePySpyDump } = require("./pyspy-dump");
 const { getRemoteHostConfig } = require("./host-config");
 const { createTunnelKeeper } = require("./tunnel-keeper");
+const { loadDashboardWithToken } = require("./token-retry");
 const {
   remoteCrewAction,
   remoteCrewDraft,
@@ -88,6 +91,7 @@ const { createShutdown } = require("./runtime/gateway/shutdown");
 const { createReconnect } = require("./runtime/gateway/reconnect");
 const { createRemoteSwitch } = require("./runtime/gateway/remote-switch");
 const { createRespawnOwner, RESPAWN_SUPERSEDED } = require("./runtime/gateway/respawn-owner");
+const { createUserRestart } = require("./runtime/gateway/user-restart");
 
 const DEFAULT_THEME_ACCENT = "#8E48FF";
 const THEME_ACCENT_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
@@ -150,6 +154,9 @@ function createGatewaySupervisor({
   // prune that removed the bundled backend can have removed this app's own
   // files, and only the caller decides what to do about that.
   onStaleBundleRespawn = () => {},
+  // The active theme pack's splash art as a file: URL, "" for none
+  // (themeSplashUrl in theme-splash.js); every loading.html paint carries it.
+  currentThemeSplash = () => "",
   fsMod = defaultFs,
   osMod = defaultOs,
   pathMod = defaultPath,
@@ -239,6 +246,9 @@ function createGatewaySupervisor({
   // Set while first-run setup's switch to a remote crew stops the gateway this
   // app started, for the same reason: that exit is intended, not a crash.
   let switchingToRemote = false;
+  // Set while Settings' Restart gateway stops the child it is about to respawn
+  // (runtime/gateway/user-restart.js): that exit is intended too.
+  let restartingGateway = false;
   // Re-resolves spent on the current stale-bundle incident (see
   // shouldReresolveBackend). Reset whenever a fresh gateway is asked for,
   // whenever one reaches handoff, and whenever a monitored backend answers
@@ -288,7 +298,7 @@ function createGatewaySupervisor({
     lsofHoldsFile,
     psCommand,
     psPpid,
-    launchdJobPids,
+    isLaunchdJob,
     snapshotGatewayPortPids,
     unverifiedIncumbent,
     waitForIncumbentExit,
@@ -309,6 +319,7 @@ function createGatewaySupervisor({
     holdsHomeGatewayLock,
     sameHomeGatewayPid,
     runGatewayStop,
+    runPortStop,
     probeLockHolderPid,
   } = createHomeLock({
     fs, path, execFile, app, processObj, home: KIROCREW_HOME, port: PORT, isWindows: IS_WIN, log: glog,
@@ -348,7 +359,18 @@ function createGatewaySupervisor({
    * on retrying behind that dialog, so Retry works once the crew is back.
    */
   async function ensureManagedTunnel() {
-    if (!tunnelKeeper.start()) return;
+    if (!tunnelKeeper.start()) {
+      // A client-only crew that did not opt in still needs a forward when
+      // nothing else carries its port (tunnel-keeper.js startForUnansweredPort).
+      if (runLocalGateway || !getRemoteHostConfig(store, PORT)?.host) return;
+      try { await checkBackend(); return; }
+      catch { /* nothing answers the port */ }
+      // No HTTP answer is not a free port: the user's own forward can hold it
+      // while its far end is down. Only a port nothing listens on is taken.
+      if ((await probeGatewayPortBinding(PORT)) !== "free") return;
+      if (!tunnelKeeper.startForUnansweredPort()) return;
+      glog(`tunnel: nothing answers :${PORT}; keeping a forward to the crew for this launch`);
+    }
     sendStatus("Opening the tunnel to your crew…");
     // Counted in polls rather than read off the clock, so the injected timer
     // fully decides how long this waits.
@@ -371,7 +393,7 @@ function createGatewaySupervisor({
     waitForPortFree,
     waitForIncumbentExit,
   });
-  const { fetchRemoteToken, mintLocalToken } = createTokenSources({
+  const { fetchRemoteToken, mintLocalToken, ownsLocalListener } = createTokenSources({
     store,
     port: PORT,
     backendUrl: BACKEND_URL,
@@ -423,10 +445,14 @@ function createGatewaySupervisor({
   } = createHolderDecision({
     app, store, dialog, fs, path, processObj, port: PORT, isWindows: IS_WIN, log: glog, setTimeoutFn,
     quitting, mainWindow, sendStatus, checkBackend, waitForPortFree, probeGatewayPortBinding,
-    probeGatewayPortOwner, snapshotGatewayPortPids, psCommand, unverifiedIncumbent, waitForIncumbentExit,
-    sameHomeGatewayPid, runGatewayStop, probeLockHolderPid, fetchHealthInfo, fetchGatewayReadiness,
+    probeGatewayPortOwner, snapshotGatewayPortPids, psCommand, psPpid, unverifiedIncumbent, waitForIncumbentExit,
+    sameHomeGatewayPid, runGatewayStop, runPortStop, probeLockHolderPid, fetchHealthInfo, fetchGatewayReadiness,
     resolveFamilyConflict, getRunLocalGateway, setGatewayOwnership,
-    launchdJobPids: IS_MAC ? launchdJobPids : null,
+    isLaunchdJob: IS_MAC ? isLaunchdJob : null,
+    windowsCommand: IS_WIN ? (pid) => windowsProcessCommand(pid, { execFileFn: execFile }) : null,
+    windowsStopPid: IS_WIN
+      ? (pid, isTrustedCommand) => windowsTaskkill(pid, { execFileFn: execFile, isTrustedCommand })
+      : null,
   });
   const {
     stopGatewayGracefully,
@@ -472,6 +498,19 @@ function createGatewaySupervisor({
     setRunLocalGateway: (value) => { runLocalGateway = value; },
     setGatewayStartFailure: (failure) => { gatewayStartFailure = failure; },
     stopGatewayGracefully, waitForPortFree, startGateway, showLoadingThenConnect,
+    applySavedTunnelChoice: () => tunnelKeeper.applySavedChoice(),
+  });
+  const { canRestartGateway, restartGateway } = createUserRestart({
+    backendUrl: BACKEND_URL, log: glog, mainWindow, quitting,
+    isInstallingUpdate: () => installingUpdate,
+    paintLoadingScreen, sendStatus,
+    getGatewayProcess: () => gatewayProcess,
+    getGatewayOwnership,
+    getLivenessMonitor: () => livenessMonitor,
+    setLivenessMonitor: (monitor) => { livenessMonitor = monitor; },
+    setRestartingGateway: (value) => { restartingGateway = value; },
+    setGatewayStartFailure: (failure) => { gatewayStartFailure = failure; },
+    stopGatewayGracefully, respawnGateway, respawnSuperseded: RESPAWN_SUPERSEDED, showLoadingThenConnect,
   });
 
   function sendStatus(message) {
@@ -497,25 +536,33 @@ function createGatewaySupervisor({
   function splashQuery(window, { reconnect = false, accent = "" } = {}) {
     const query = {};
     if (accent) query.accent = accent;
+    const splash = currentThemeSplash();
+    if (splash) query.splash = splash;
     if (reconnect) Object.assign(query, SPLASH_RECONNECT_QUERY);
     if (window === mainWindow()) Object.assign(query, SPLASH_PRIMARY_QUERY);
     return query;
   }
 
-  function probeGatewayPortOwner(probePort) {
+  // `holders`, when given, receives what a "foreign" verdict found (see
+  // classifyPortOwner).
+  function probeGatewayPortOwner(probePort, { holders = null } = {}) {
     if (IS_WIN) {
       return classifyPortOwner(probePort, {
         getListenPids: winListenPids,
         getCommand: (p) => windowsProcessCommand(p, { execFileFn: execFile }),
         isKirocrew: isTrustedWindowsGatewayCommand,
         log: glog,
+        holders,
       });
     }
     return classifyPortOwner(probePort, {
       getListenPids: lsofListenPids,
       getCommand: psCommand,
       getPpid: psPpid,
+      // A PID-1 holder launchd runs no job for is an orphan, not a service.
+      isLaunchdJob: IS_MAC ? isLaunchdJob : null,
       log: glog,
+      holders,
     });
   }
 
@@ -633,18 +680,35 @@ function createGatewaySupervisor({
         resolve(false);
       };
 
+      // A stop this launch ran left `pids` on the port: fail the start, naming
+      // them and how to end them by hand.
+      const failStop = (what, pids) => {
+        const pidHint = pids.length
+          ? ` Process ${pids.join(", ")} still holds it. To end it, run this in Terminal, then try again:\nkill -TERM ${pids.join(" ")}`
+          : " End the process that holds it, then try again.";
+        gatewayStartFailure = { error: `could not stop ${what} on port ${PORT}.${pidHint}` };
+        resolve(false);
+      };
+
       // A responder on the port goes through the identity and readiness
       // decision, whether it answered at once or inside the stuck-holder grace.
       const adoptOrSpawn = async () => {
         const outcome = await resolveGatewayConflict();
         if (outcome === "reuse") { resolve(true); return; }
-        if (outcome === "foreign-holder") {
+        if (outcome && outcome.stopFailed) {
+          failStop("the gateway left running by an app that quit", outcome.stopFailed);
+          return;
+        }
+        if (outcome?.foreignHolder) {
           // No `canStartHere`: the dialog decides the button from
           // canOfferLocalStart, and with no crew on this port that answer is
           // unconditional, so a copy of it here would be state nobody reads.
+          // `isWindows` picks the command the message gives for ending a holder.
           gatewayStartFailure = {
             port: PORT,
             localStartBlocked: "foreign-holder",
+            holders: outcome.foreignHolder,
+            isWindows: IS_WIN,
           };
           resolve(false);
           return;
@@ -683,13 +747,7 @@ function createGatewaySupervisor({
           return;
         }
         if (outcome && outcome.stopFailed) {
-          const pidHint = outcome.stopFailed.length
-            ? ` Process ${outcome.stopFailed.join(", ")} still holds it. To end it, run this in Terminal, then try again:\nkill -TERM ${outcome.stopFailed.join(" ")}`
-            : " End the process that holds it, then try again.";
-          gatewayStartFailure = {
-            error: `could not stop the gateway that is not responding on port ${PORT}.${pidHint}`,
-          };
-          resolve(false);
+          failStop("the gateway that is not responding", outcome.stopFailed);
           return;
         }
         spawnUnlessClientOnly();
@@ -816,9 +874,40 @@ function createGatewaySupervisor({
     // Write child stdout/stderr directly to a file descriptor. A JS pipe could
     // backpressure a long-running gateway; the descriptor also preserves Python
     // tracebacks which otherwise disappear on clean recipient machines.
+    //
+    // Windows is the exception: Node adds CREATE_NO_WINDOW to a windowsHide
+    // spawn only when no stdio entry inherits a descriptor, and without it the
+    // gateway gets a console of its own that can show and take the focus. There
+    // the child gets the log's path instead, and its entry point re-points its
+    // own stdout/stderr at that file (kiro_crew/desktop_stdio.py). Until it
+    // does, its stderr is a pipe this shell copies into the log: a pipe is not
+    // an inherited descriptor, and it carries the tracebacks of an interpreter
+    // that dies before the re-point (the incomplete-bundle check reads them).
+    // The re-point closes the pipe, so it never carries a running gateway.
+    // Bound gateway-launch.log's size before this fresh gateway opens its fd on
+    // it. The log only ever appends and has no cap, so a long-lived install
+    // grows it without limit; a size-gated one-generation rename keeps the file
+    // bounded. This sits in the fresh-spawn path, after resolveGatewayConflict
+    // has already returned "reuse" for a surviving gateway: a reused gateway is
+    // still writing to this file (off Windows through an inherited descriptor,
+    // on Windows through the path), so rotating under it would detach it from
+    // the log the dialogs read. Rotating only when we are about to spawn a new
+    // writer, before the fd below is opened, means no live writer holds the file.
+    rotateLaunchLog(gatewayLogPath(), { fs, log: glog });
+
     let childOut = "ignore";
-    try { childOut = fs.openSync(gatewayLogPath(), "a"); }
-    catch (error) { userWarn(`WARN could not open child log fd: ${error.message}`); }
+    let childErr = "ignore";
+    let childLogEnv = {};
+    const winLaunchLog = IS_WIN ? gatewayLogPath() : "";
+    if (IS_WIN) {
+      if (winLaunchLog) {
+        childErr = "pipe";
+        childLogEnv = { KIROCREW_DESKTOP_STDIO_LOG: winLaunchLog };
+      }
+    } else {
+      try { childOut = fs.openSync(gatewayLogPath(), "a"); }
+      catch (error) { userWarn(`WARN could not open child log fd: ${error.message}`); }
+    }
     glog(SPAWN_MARKER);
     gatewayStartFailure = null;
 
@@ -835,7 +924,7 @@ function createGatewaySupervisor({
     );
 
     const child = spawn(spawnBin, spawnArgs, {
-      stdio: ["ignore", childOut, childOut],
+      stdio: ["ignore", childOut, IS_WIN ? childErr : childOut],
       detached: false,
       windowsHide: true,
       env: buildGatewayEnvironment({
@@ -844,10 +933,12 @@ function createGatewaySupervisor({
         KIROCREW_PROJECT_DIR: IS_WIN
           ? resolveProjectDir()
           : path.resolve(dirname, ".."),
-        // Tells a signed-out enterprise gateway to exit with its refusal instead
+        // Tells a signed-out LTS gateway to exit with its refusal instead
         // of serving the browser sign-in screen, which this window cannot open
-        // yet (enterprise_signin_gateway.DESKTOP_GATEWAY_ENV).
+        // yet (lts_signin_gateway.DESKTOP_GATEWAY_ENV).
         KIROCREW_DESKTOP_GATEWAY: "1",
+        // Windows only: where the gateway sends its stdout/stderr (see above).
+        ...childLogEnv,
         // The kiro-cli staged into the app's resources at build time; spread
         // only when it shipped AND runs on this machine, so an unbundled build,
         // or a bundled copy this host cannot execute, keeps the user's own
@@ -881,6 +972,14 @@ function createGatewaySupervisor({
     if (typeof childOut === "number") {
       try { fs.closeSync(childOut); } catch { /* ignore */ }
     }
+    if (childErr === "pipe" && child.stderr) {
+      // Synchronous appends, so the text is on disk by the time the boot poll
+      // reads the log after an early exit.
+      child.stderr.on("data", (chunk) => {
+        try { fs.appendFileSync(winLaunchLog, chunk); } catch { /* best-effort */ }
+      });
+      child.stderr.on("error", () => { /* the child closed its end */ });
+    }
 
     // Bind handlers to this child, not the mutable slot. Recovery can replace a
     // child before its late error/exit event arrives; stale events must never
@@ -906,7 +1005,7 @@ function createGatewaySupervisor({
         spawnErrorCode,
         attempts: reresolveAttempts,
         quitting: quitting(),
-        installingUpdate: installingUpdate || switchingToRemote,
+        installingUpdate: installingUpdate || switchingToRemote || restartingGateway,
         relaunchTargetExists,
       });
       const cause = exitCode === null ? `spawn ${spawnErrorCode}` : `exit ${exitCode}`;
@@ -942,6 +1041,9 @@ function createGatewaySupervisor({
       spawnedExecutablePaths = [];
       const giveUp = () => {
         gatewayStartFailure = { error: error.message, bundled };
+        // A spawn that never ran emits no `exit`, so nothing else clears the slot,
+        // and a kept dead child makes every Retry read the gateway as running.
+        gatewayProcess = null;
         sendStatus(`Gateway failed: ${error.message}`);
         resolve(false);
       };
@@ -951,7 +1053,8 @@ function createGatewaySupervisor({
     child.on("exit", (code, signal) => {
       const exitMessage = `gateway child exited code=${code} signal=${signal}`;
       const currentChild = gatewayProcess === child;
-      const expectedExit = !currentChild || quitting() || installingUpdate || switchingToRemote;
+      const expectedExit = !currentChild || quitting() || installingUpdate || switchingToRemote
+        || restartingGateway;
       if (expectedExit) glog(exitMessage);
       else userError(exitMessage);
       // Node's Windows kill maps both signal names to TerminateProcess. The
@@ -1001,7 +1104,6 @@ function createGatewaySupervisor({
         catch { /* window gone */ }
       },
       maxWaitMs: gatewayWaitTimeoutMs({
-        platform: processObj.platform,
         watchSpawn: watchSpawn && gatewayOwnership === "spawned",
         edition: BAKED_EDITION,
       }),
@@ -1009,11 +1111,10 @@ function createGatewaySupervisor({
     });
   }
 
-  function dashboardEntryUrl(targetBackendUrl, initialPath = "", token = "") {
+  function dashboardEntryUrl(targetBackendUrl, initialPath = "") {
     const target = initialPath
       ? new URL(initialPath, targetBackendUrl)
       : new URL(targetBackendUrl);
-    if (token) target.searchParams.set("token", token);
     return target.toString();
   }
 
@@ -1201,7 +1302,8 @@ function createGatewaySupervisor({
         if (token) {
           await fadeLoadingScreen(webContents);
           if (window.isDestroyed()) return;
-          webContents.loadURL(dashboardEntryUrl(targetBackendUrl, initialPath, token));
+          await loadDashboardWithToken(webContents, dashboardEntryUrl(targetBackendUrl, initialPath), token);
+          if (window.isDestroyed()) return;
           if (targetBackendUrl === BACKEND_URL && window === mainWindow()) {
             startLivenessMonitor(window);
           }
@@ -1275,9 +1377,9 @@ function createGatewaySupervisor({
       if (window.isDestroyed()) return;
       const failedToStart = error && error.kind === "failed";
       const launchLogPath = gatewayLogPath();
-      let logTail = "";
-      try { logTail = tailLines(fs.readFileSync(launchLogPath, "utf8"), 60); }
-      catch { /* no log yet */ }
+      // Bounded tail read, as in failure-dialog.js: only the file's last 256 KiB
+      // are read, however large the launch log has grown.
+      const logTail = readLogTail(launchLogPath, { fs, lines: 60 });
 
       // A pre-spawn integrity refusal is already authoritative. Otherwise only
       // a bundled current-attempt stdlib crash may be relabelled as installation;
@@ -1371,6 +1473,9 @@ function createGatewaySupervisor({
           portConflict,
           port: PORT,
           localGatewayOff,
+          // This launch probed the port's holder and logged its pid and command,
+          // so the log is this launch's own evidence and is shown.
+          ...(failureRecord?.localStartBlocked === "foreign-holder" ? { showLog: true } : {}),
           // Withheld for the foreign-holder state: its message names freeing the
           // port or recording the crew, never this button, and pressing it only
           // flips a setting that is already on and re-enters the same refusal --
@@ -1447,7 +1552,7 @@ function createGatewaySupervisor({
           continue;
         }
         if (action === "configure-remote") {
-          let draft = remoteCrewDraft(getRemoteHostConfig(store, PORT) || {});
+          let draft = remoteCrewDraft(getRemoteHostConfig(store, PORT) || {}, { tunnelByDefault: !IS_WIN });
           let configured = false;
           for (;;) {
             const fields = await promptRemoteCrew(window, PORT, draft);
@@ -1459,6 +1564,9 @@ function createGatewaySupervisor({
             if (saved) {
               configured = true;
               glog(`remote crew for :${PORT} configured from the error dialog`);
+              // The saved choice stands for the rest of this launch, so the
+              // Retry below never reopens a forward the form left unticked.
+              tunnelKeeper.applySavedChoice();
               break;
             }
             // Reopen on what the user typed. A refused save writes nothing, so
@@ -1642,9 +1750,16 @@ function createGatewaySupervisor({
     start: startGateway,
     connect: showLoadingThenConnect,
     mintLocalToken,
+    ownsLocalListener,
     fetchRemoteToken,
     entryUrl: dashboardEntryUrl,
     probePrimaryPortOwner,
+    // Whether anything listens on the launch port, whoever it is: "bound", "free"
+    // or "unknown". The start-time apply defers on anything but "free".
+    probePrimaryPortBinding: () => probeGatewayPortBinding(PORT),
+    // Who holds the home gateway.lock, whatever the listener is doing: a booting or
+    // draining gateway holds it with the port free. Verdict "released" means nobody.
+    probePrimaryLockHolder: () => probeLockHolderPid(),
     isCurrentBundleGateway,
     stopForUpdate: stopGatewayForUpdate,
     stopOnQuit: stopGatewayOnQuit,
@@ -1652,11 +1767,19 @@ function createGatewaySupervisor({
     // wake rebuilds it at once instead of waiting out ssh's keepalive.
     reopenTunnel: () => tunnelKeeper.restart(),
     // A remote-crew edit re-applies the launch port's tunnel choice at once:
-    // start, replace (new host or port) or stop the forward to match it.
-    syncTunnel: () => tunnelKeeper.start(),
+    // start, replace (new host or port) or stop the forward to match it. The
+    // save states the choice again, so it also ends a launch-time fallback.
+    syncTunnel: () => tunnelKeeper.applySavedChoice(),
+    // The Remote Crew panes a window on the launch port shows, carried by the
+    // same managed forward (tunnel-keeper.js), and their release when it closes.
+    forwardPanePorts: (owner, ports) => tunnelKeeper.forwardPanePorts(owner, ports),
+    releasePaneForwards: (owner) => tunnelKeeper.releasePaneForwards(owner),
     // First-run setup's "only crews on other machines" exit (remote-switch.js).
     canSwitchToRemoteCrew,
     switchToRemoteCrew,
+    // Settings → About's Restart gateway (runtime/gateway/user-restart.js).
+    canRestartGateway,
+    restartGateway,
     onInstallDispatched,
     onInstallFailed,
     // Read-only view of the update handoff, for watchers that must stay quiet

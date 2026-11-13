@@ -82,6 +82,8 @@ async def test_slot_is_unreachable_until_construction_finishes(monkeypatch):
     acquirer such as delete, regenerate or rewind can reach it) but still under
     construction for the cap. Retracting is safe because import mints its own key.
     """
+    from kiro_crew import members
+    from kiro_crew.agent_sdk.backends import ACP_BACKEND_KIRO
     from kiro_crew.dashboard import session_transfer as st
 
     seen_registered: list[bool] = []
@@ -97,6 +99,8 @@ async def test_slot_is_unreachable_until_construction_finishes(monkeypatch):
 
     monkeypatch.setattr(st, "_write_layer_b_files", _probe)
     monkeypatch.setattr(st, "_join_layer_b", lambda *_a, **_k: True)
+    # A kiro-cli pair is written only for a slot that starts on kiro-cli.
+    monkeypatch.setattr(members, "select_provider_backend", lambda *_a, **_k: ACP_BACKEND_KIRO)
 
     resp = await st.api_chat_slot_import(
         _make_request(state, _valid(layer_b={"envelope": {}, "events": "e"}))
@@ -187,7 +191,7 @@ async def test_a_landed_import_refreshes_the_older_sessions_listing(monkeypatch)
     from kiro_crew.dashboard import chat_utils_slots
     from kiro_crew.dashboard import session_transfer as st
 
-    monkeypatch.setattr(chat_utils_slots, "set_dashboard_surfaced", lambda _keys: None)
+    monkeypatch.setattr(chat_utils_slots, "set_dashboard_surfaced", lambda _keys, _tabs=None: None)
 
     def _really_synced(save):
         state = _stub_state(st, monkeypatch, save=save)
@@ -247,7 +251,7 @@ async def test_slot_cap_is_rechecked_after_the_pre_creation_awaits(monkeypatch):
 
     resp = await st.api_chat_slot_import(_make_request(state, _valid(agent="some-agent")))
 
-    assert resp.status == 429
+    assert resp.status == 409
     assert json.loads(resp.body)["code"] == "transfer_slot_cap"
     # Nothing was allocated by the request that lost the race.
     assert "imported-1" not in state._slots
@@ -557,7 +561,7 @@ async def test_a_bundle_with_no_sender_is_filed_under_the_group(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_placement_is_resolved_after_the_slot_exists(monkeypatch):
-    """A 429 from the post-await cap re-check leaves no folder behind (RFC §5.2).
+    """A 409 from the post-await cap re-check leaves no folder behind (RFC §5.2).
 
     The cap bites only after the early check, as a real concurrent burst does.
     """
@@ -575,7 +579,7 @@ async def test_placement_is_resolved_after_the_slot_exists(monkeypatch):
     state.live_slot_count = _count
     resp = await st.api_chat_slot_import(_make_request(state, _valid(origin="mac")))
 
-    assert resp.status == 429, resp.body
+    assert resp.status == 409, resp.body
     assert json.loads(resp.body)["code"] == "transfer_slot_cap"
     assert state._folders == [], "a refused import must leave no folder behind"
 

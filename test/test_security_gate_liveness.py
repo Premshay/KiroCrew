@@ -522,7 +522,7 @@ def _url_payload_command(n: int) -> str:
 #: (owners, kits, revoked approvals, tool access, migration ledger), write-denied
 #: like the folder itself. Data, not rule logic: the matcher is unchanged.
 #:
-#: Raised by 3, from 32,613, for the enterprise install-tree write fence in
+#: Raised by 3, from 32,613, for the LTS install-tree write fence in
 #: ``paths``: one import and one ``or`` clause on the write gate, plus the blank line
 #: isort puts after the import. The matcher lives outside the package
 #: (``kiro_crew.edition_install_fence``).
@@ -681,7 +681,133 @@ def _url_payload_command(n: int) -> str:
 #: value in every saved copy, channel, log and model replay.
 #: Raised by one, from 34,522, for the TickTick consent host in ``exfil_oauth``'s
 #: ``_OAUTH_AUTHORIZATION_ENDPOINTS``: one allowlist entry, no new machinery. Re-measured.
-_PACKAGE_LINE_BUDGET = 34_523
+#: Raised by one, from 34,523, for the Railway consent host in the same set, likewise.
+#: Raised by 175 more, from 34,524, for here-documents in the shared reader
+#: (``shell_commands.read_commands(heredocs=True)``: each body handed to its command,
+#: the substitutions of an unquoted body read once) and the rm floor's use of it (a body
+#: a shell reads, a command after a heredoc, a ``\n`` escape in ``$'...'``). Deny-only:
+#: the default read is unchanged and nothing the floor refused is allowed now; the
+#: walk is bounded by ``rm_floor._WALK_BUDGET_CHARS``.
+#: Raised by 34, from 34,699, to the package's measured size on main: the 175 above
+#: were counted on a base without the security fixes that merged before it, so main
+#: landed over budget. No code changes; nothing is relaxed. Re-measured.
+#: Raised by 20, from 34,733, for the git publish check in ``argv_floor_git``: a git
+#: option word with an unquoted expansion (``git -C $d push ...``) can word-split into
+#: the subcommand and refspecs, so it is handed to the ``$`` check. Deny-only. Re-measured.
+#: Raised by 24, from 34,753, for ``rm_floor._carrier_home``: each ``$HOME`` the carrier
+#: command leaves live is read as home in a nested payload. Deny-only. Re-measured.
+#: Raised by 25, from 34,777, for the prior spellings of the two interpreter-payload
+#: rows in ``_LEGACY_RULE_ID_BY_PATTERN``, so a policy that pinned a row keeps pinning
+#: it, and the catalog comment on why their call names stand bare (both rows match
+#: exactly what they matched). Nothing is relaxed. Re-measured.
+#: Raised by 43, from 34,802, for ``redaction_switch.owner_may_disable``: the governance
+#: gate on the owner's Files-view redaction switch and the stored-OFF read that obeys it
+#: (55 lines; the rest fit in the headroom main had left). Re-measured.
+#: Raised by 10, from 34,845, to the package's measured size on main: the headroom the
+#: 55 above were counted against was spent by the linear-time credential scans that
+#: merged before them, so main landed over budget. No code changes; nothing is relaxed.
+#: Re-measured.
+#: Raised by 39, from 34,855, for pass 4's prefix snapshot: ``redact_credentials`` takes
+#: an optional ``token_param_prefixes`` that replaces pass 4's live read, the diagram scan
+#: (``_document_link_spans``, ``_plantuml_verdict``) hands it to its nested call, and
+#: ``_well_formed_token_param_prefixes`` is the one shape gate the live read and a
+#: snapshot share. No rule, pattern or pass changed. Re-measured.
+#: Raised by 107, from 34,894, for ``scan_history`` reading ``sessions/*.jsonl``
+#: (``memory_audit``): the transcript row shapes, the fold of one tool call's rows
+#: by ``tool_call_id``, the non-shell tool kinds, row-time merge across files and
+#: the unreadable-file finding, so ``security audit`` never reports an unread
+#: scan as clean. No check was relaxed.
+#: Raised by 4, from 35,001, for the two endorsed-copy leaves on the read+write floor in
+#: ``paths_lists`` (copies of leaves already there). Re-measured.
+#: Raised by 31, from 35,005, for ``text_redaction.ends_plain_sentence``:
+#: the dashboard's sentence-end check moved here unchanged so the Slack stream
+#: shares it; the dashboard copy was deleted. Re-measured.
+#: Raised by 4, from 35,036, for the Bearer branch's ``bearer_prefix`` group and pass
+#: 1's value-only span. Re-measured.
+#: Raised by 34, from 35,040, for ``readonly_bash``'s ``uniq`` operand walk (a bare
+#: ``-`` is an operand, every word after the first operand is one, and a glob in
+#: any word prompts) and the ``git blame --output`` write flag. Nothing is
+#: relaxed. Re-measured.
+#: Raised by 20, from 35,074, for the per-decision payload-walk memo in
+#: ``shell_normalizer._shell_payload_walk`` (one walk of each distinct text per
+#: ``is_denied``) and the paren walk's skip of its second, ``${...}``-aware
+#: pass when the span holds no ``{``. Same verdicts, less work. Re-measured.
+#: Raised by 49, from 35,094, for the ssh floor's glob-verb read: ``match_globs`` on
+#: ``_operand_targets_self`` and ``_host_is_self``, the ``_ssh_verb_basename`` helper
+#: and its facade row, so a glob operand after a bare glob verb (the ``* * * *`` of a
+#: cron schedule) is not read as this host; and ``helpers``' RLIMIT_AS key, now
+#: ``max_address_space_mb``. Re-measured.
+#: Raised by 3, from 35,143, for the ``crew-oauth-bridge`` leaf on the read-gate floor
+#: in ``paths_lists`` (Connection bridge snapshots, fenced from file tools). Re-measured.
+#: Raised by 14, from 35,146, for ``DeniedCommandRule.note``: the optional field and its
+#: docstring, and ``edition_denied_rules`` carrying an edition rule's note through. It
+#: changes only the refusal text; no rule, pattern or match changed. Re-measured.
+#: Raised by 67, from 35,160, for the Outlook ``webLink`` route
+#: (``/owa/?ItemID=<id>&exvsurl=1&...``) in ``redaction_entropy``, its use by
+#: the exfil gate and its five names in the ``redaction`` facade manifest, so
+#: Graph's own message and event links are not masked or blocked. Re-measured.
+#: Raised by 84, from 35,227, for the self-protection-kill refusal diagnostic: the
+#: ``self-protection-kill`` floor reports the matched kill TARGET's offsets instead of
+#: the whole command. ``_is_self_kill`` is a boolean wrapper over a span-returning
+#: ``_self_kill_span`` (one walk, so verdict and span cannot disagree) with a local
+#: ``_locate`` closure that anchors the span on the product NAME inside the matched
+#: token -- best-effort location, so it points at the name only in an unquoted,
+#: single-occurrence, at/after-verb command and returns the whole command otherwise;
+#: ``deny_gate`` forwards it behind a length-preserving guard. No matcher, rule,
+#: threshold or verdict moved -- the decision is byte-identical and the change is
+#: diagnostics-only. Re-measured.
+#: Raised by 62, from 35,311, for ``_quoted_assignment_scripts`` and ``_self_frames``:
+#: the self-protection floor, its ssh self-target floor included, walks a carrier's
+#: quoted script that opens with an assignment whole, so the assignment resolves
+#: inside it. Deny-only. Re-measured.
+#: Raised by 38, from 35,373, for ``shell_commands.pipelines`` and the rm floor reading
+#: each pipeline's ``echo`` / ``printf`` stages and shells in ``_command_tokens``. It only
+#: adds refusals. Re-measured.
+#: Raised by 122, from 35,411, to the package's measured size with the structured
+#: credential detectors' seam: ``redaction`` splits pass 1 from passes 2-4 so the
+#: detectors' hits can run in front of them, carries pass 4's prefix snapshot
+#: across that split, routes the plan by the internal switch, and names the
+#: whole-text fail-closed placeholder; ``text_redaction`` asks the detectors where
+#: to hold a stream buffer, lets only a unit they are still deciding lower the
+#: holdback floor, and drops a unit decided while still running, which does
+#: nothing while the switch is off. The detectors live in a subpackage this
+#: budget does not count. Re-measured.
+#: Raised by one, from 35,533, for the ``update_next_start.json`` entry on the
+#: file-tool write fence: the update armed for the next start, which the sandbox
+#: seals read-only too.
+#: Raised by 5, from 35,534, for the ``update-staging`` entry in the home fence: the
+#: self-update engine's wheel staging directory moved out of ``trust/`` to its own
+#: top-level masked leaf, and the file-tool gate covers it as it covered ``trust/``.
+#: Raised by 98, from 35,539, to 35,637, for the target-set build reading each folder
+#: once: ``_child_realpath.realpaths_sharing_folders`` (the batch walk the resolver
+#: child and the in-process build share), the build's shared path spellings in
+#: ``paths_targets._anchor_targets``, and the comment above the expiry saying what one
+#: build observes. Same set, less work. Re-measured.
+#: Raised by 75, from 35,637, to 35,712, for ``call_views``: the per-call memo
+#: ``is_denied`` opens, in a leaf module with ``once_per_call`` on the pure readers one
+#: judgement repeats (shell tokens, program basename, operand, self-program test, line
+#: fold, Python lexer, quoted scripts). Same verdicts, less work. Re-measured.
+#: Raised by 92 more, from 35,712, in ``paths_resolver``: the test that confines the
+#: cumulative wait allowance to a thread running an event loop, and
+#: ``bounded_judgment``, one shared budget of resolver wait that every off-loop
+#: request checks before it is sent and that clamps only candidate waits; and the
+#: three lines the ``paths`` facade's manifest lists for them. No check was relaxed.
+#: Raised by 20, from 35,804, to 35,824, for ``StreamRedactor.release_sentence_end`` in
+#: ``text_redaction``: a withheld run that is one plain word ending a sentence can be
+#: committed before the next chunk arrives. No pattern, pass or commit boundary moved.
+#: Raised by 77, from 35,824, to 35,901, for ``paths_targets._app_readonly_dir_rows``
+#: and its facade manifest rows: the write gate's listing of the apps'
+#: ``agentReadOnlyDirs`` rows runs on the ``mc-pathres`` threads within the anchor
+#: rebuild's budget for every caller and is reused for a second on the event loop, so
+#: no gate scans ``apps/`` on its own thread. A miss refuses, and refuses later callers
+#: at once while that listing is still in flight. Re-measured.
+#: Raised by 96, from 35,901, to 35,997, for the ``local-destructive-rm-rf-root``
+#: row's scratch view (``rm_floor.scratch_rm_view``): the words of a plain ``rm``
+#: whose every operand is a direct ``/tmp/<name>`` entry are blanked for the shipped
+#: row only, and ``is_denied`` judges that row on the view while its events keep the
+#: command as submitted. Every other row, an operator's copy, and the rm floor for
+#: ``/`` and ``~`` read the full text. Re-measured.
+_PACKAGE_LINE_BUDGET = 35_997
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second

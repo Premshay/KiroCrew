@@ -85,6 +85,28 @@ def test_a_trusted_workspace_tree_is_inherited_too(kiro_tree, monkeypatch):
     ]
 
 
+@pytest.mark.skipif(
+    not skill_trust.project_skill_traversal_supported(),
+    reason="no-follow project traversal is unsupported on this platform",
+)
+def test_a_trusted_workspace_reached_through_a_linked_ancestor_is_inherited(
+    kiro_tree, monkeypatch, tmp_path
+):
+    """Trust matches the real directory, so the tree is opened there too."""
+    home, _agents, project = kiro_tree
+    _trust(monkeypatch, project)
+    monkeypatch.setattr(
+        skill_trust, "is_project_trusted", lambda p: Path(p).resolve() == project.resolve()
+    )
+    link = tmp_path / "linked-parent"
+    link.symlink_to(project.parent, target_is_directory=True)
+    via_link = link / project.name
+    assert agent_discovery.inherited_skill_globs(via_link) == [
+        str(home / "skills" / "*" / "SKILL.md"),
+        str(via_link / ".kiro" / "skills" / "*" / "SKILL.md"),
+    ]
+
+
 def test_an_untrusted_workspace_tree_is_not_probed(kiro_tree, monkeypatch):
     """Trust is asked first, so a workspace-controlled path is never opened."""
     from kiro_crew import skills
@@ -287,7 +309,7 @@ def native_custom(kiro_tree, tmp_path, monkeypatch):
     monkeypatch.setattr(projection.platform_compat, "first_linked_ancestor", lambda path: None)
     monkeypatch.setattr(
         "kiro_crew.agent.managed_mcp_spec_entry",
-        lambda name: {"command": "test-core", "args": []},
+        lambda name, **_kw: {"command": "test-core", "args": []},
     )
     monkeypatch.setattr(
         projection,
@@ -393,7 +415,7 @@ def test_an_unmapped_worker_is_a_search_agent_like_the_default(native_custom, mo
 
 def test_inheriting_agent_keeps_its_view_when_search_cannot_be_wired(native_custom, monkeypatch):
     agents, project = native_custom
-    monkeypatch.setattr("kiro_crew.agent.managed_mcp_spec_entry", lambda name: None)
+    monkeypatch.setattr("kiro_crew.agent.managed_mcp_spec_entry", lambda name, **_kw: None)
     _write_agent(agents, {"name": "custom", "tools": ["read"]})
     prepared = projection.prepare_native_skill_projection(project)
     view = prepared.specs["custom"]
@@ -403,7 +425,7 @@ def test_inheriting_agent_keeps_its_view_when_search_cannot_be_wired(native_cust
 
 def test_mapped_agent_is_still_refused_when_search_cannot_be_wired(native_custom, monkeypatch):
     agents, project = native_custom
-    monkeypatch.setattr("kiro_crew.agent.managed_mcp_spec_entry", lambda name: None)
+    monkeypatch.setattr("kiro_crew.agent.managed_mcp_spec_entry", lambda name, **_kw: None)
     _write_agent(
         agents,
         {"name": "custom", "tools": ["read"], "resources": ["skill:///opt/s/one/SKILL.md"]},

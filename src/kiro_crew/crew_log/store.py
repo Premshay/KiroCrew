@@ -152,13 +152,14 @@ from kiro_crew.crew_log.store_retention import (  # noqa: F401
     _scan_whole_for_types,
     _spawned_child_slot,
     _still_expired,
+    _type_needle,
     find_last_tree_edge,
     find_spawned_entries,
     read_last_tree_edge,
     sweep_expired,
-    tree_edge_scan_identity,
 )
 from kiro_crew.crew_log.store_segment_reads import (  # noqa: F401
+    _SEEK_SPAN,
     _TAIL_WINDOW,
     _anchor_exists,
     _Bounded,
@@ -166,6 +167,7 @@ from kiro_crew.crew_log.store_segment_reads import (  # noqa: F401
     _has_content,
     _iter_entries,
     _iter_entries_located,
+    _offset_below,
     _parses_to_object,
     _read_first_entry_seq,
     _read_header_line,
@@ -175,11 +177,17 @@ from kiro_crew.crew_log.store_segment_reads import (  # noqa: F401
     read_head,
 )
 from kiro_crew.crew_log.store_segment_writes import (  # noqa: F401
+    _RESIDUE,
+    _RESIDUE_LOCK,
+    _RESIDUE_MAX,
     _append_line,
     _append_lines,
+    _note_residue,
     _rollback_append,
+    _settle_residue,
     _truncate,
     _truncate_now,
+    _undo_residue,
     _write_then_sync,
 )
 from kiro_crew.crew_log.store_tail_repair import (  # noqa: F401
@@ -196,6 +204,7 @@ from kiro_crew.crew_log.store_tail_repair import (  # noqa: F401
     _refuse_content_repair,
 )
 from kiro_crew.crew_log.store_units import (  # noqa: F401
+    _PROVED_ROWS,
     _RACY_WINDOW_NS,
     _SLOT_INDEX_TRUST,
     _any_now_provable,
@@ -215,6 +224,7 @@ from kiro_crew.crew_log.store_units import (  # noqa: F401
     unit_header_slot,
     unit_ids,
     unit_opened_previous,
+    unit_opening,
     unprovable_session_units,
 )
 

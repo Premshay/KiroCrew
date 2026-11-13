@@ -63,7 +63,7 @@ agent loads only the one it needs.
 | [taskrunner.md](taskrunner.md) | The execution engine that runs a task spec to completion. |
 | [workflows.md](workflows.md) | The dynamic-workflow engine: the frozen `ctx` contract, the event stream, budgets, and the named conformance gates with the test pinning each. |
 | [decisions.md](decisions.md) | The Jev decision seam: `decisions.enabled` as the only opt-in, session-key sampling through `decisions.bucket`, the scrub-before-send refusal, `skills.select` as the one integration that consumes an answer (with the word-overlap result as its fallback), and the basic call-metadata log. |
-| [crew-mode.md](crew-mode.md) | Crews: the config record, `select_crew` roster and binding, model and workspace resolution, the Crews UI, and the record of the retired `"crew"` slot mode (Crew Mode). |
+| [crew-mode.md](crew-mode.md) | Crews: the config record, `select_crew` roster and binding, model and workspace resolution, the Crews UI, and the record of the retired `"crew"` slot mode (the old Crew Mode). |
 | [pipeline-conductor.md](pipeline-conductor.md) | The `kirocrew-pipeline-conductor` agent and its skill: the generated spec's permission narrowing, the three deterministic scripts, the patrol cycle, and what the RFC leaves unbuilt. |
 | [persistent-agent-channels.md](persistent-agent-channels.md) | Long-lived channels for multi-agent collaboration. |
 | [channel-history.md](channel-history.md) | The channel history buffer. |
@@ -93,6 +93,7 @@ agent loads only the one it needs.
 |---|---|
 | [app-kit-platform.md](app-kit-platform.md) | App contracts: MCP scoping, agent JSON composition, permissions, and dependencies. |
 | [plugin-import.md](plugin-import.md) | Converting a manifest-declared plugin package into an installable app: manifest discovery, per-kind mapping, root containment, and what is reported instead of converted. |
+| [agent-plugins.md](agent-plugins.md) | Discovering and validating installed Agent Plugins (agent-plugins.org 1.0.0) from the shared `~/.kiro/powers` tree: states, manifest, skills and `mcp.json` rules; the converter; the owner's read-only list, and what is held until the rulings. |
 | [harness-plugin-mapping.md](harness-plugin-mapping.md) | Where other harnesses' plugin contribution kinds land -- an existing extension point, a converter, or nowhere -- and the reason per kind. |
 | [mcp-apps.md](mcp-apps.md) | Apps that surface as MCP servers. |
 | [mcp-shareability.md](mcp-shareability.md) | Predicting which MCP servers can share one backend, from local evidence. |
@@ -102,7 +103,7 @@ agent loads only the one it needs.
 | [app-notifications.md](app-notifications.md) | How an app publishes a notification to the local bus, and the two shipped producers. |
 | [artifacts.md](artifacts.md) | Artifact identity, versioning, and the companion chat panel. |
 | [dashboard-templates.md](dashboard-templates.md) | A dashboard page shipped with its own typed contract, provider and parity gate: the three invariants, the fold menu the numbers come from, and why a publisher writes sentences and never numbers. |
-| [dashboard-instances.md](dashboard-instances.md) | One mate's own copy of a template: the registry it adopts from, why a rollback moves the version forward, the four states and why two of them are not one, and the history that is a crew-log fold. |
+| [dashboard-instances.md](dashboard-instances.md) | One Bot's own copy of a template: the registry it adopts from, why a rollback moves the version forward, the four states and why two of them are not one, and the history that is a crew-log fold. |
 | [prompt-optimizer.md](prompt-optimizer.md) | Rewriting a draft prompt on demand, and the paste-forwarding surface. |
 | [steering-viewer.md](steering-viewer.md) | Reading, creating, editing and deleting the steering files a session loads, and the declared-`inclusion` reporting. |
 | [turn-stats-footer.md](turn-stats-footer.md) | The per-turn token and timing footer: capture, persistence, and the frontend render gates. |
@@ -118,7 +119,7 @@ agent loads only the one it needs.
 |---|---|
 | [papyrus.md](papyrus.md) | The Papyrus writing app. |
 | [aws-control.md](aws-control.md) | The AWS account portal and S3-backed cloud drive app: accounts, Drive/Library/Backup, consent and confirmation guards, sharing, the crew bundle builder, and the crew container runtime a remote crew runs as. |
-| [command-bar.md](command-bar.md) | The opt-in launcher that replaces quick-search: the overlay seam, the request-free root, ranking and scopes. |
+| [command-bar.md](command-bar.md) | The dashboard's quick-search launcher and its on/off setting: the request-free root, ranking, scopes, and the fold of the former Command Bar app. |
 | [pptx-maker.md](pptx-maker.md) | Deck generation. |
 | [meetings.md](meetings.md) | Meeting capture and summarization. |
 | [issue-radar.md](issue-radar.md) | Issue triage and grouping. |

@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from 'react'
 import { appPathname } from '@/lib/basePath'
 import { runLayoutFormChange } from '@/lib/layoutFormTransition'
+import { touchFirstForm } from '@/lib/touchLayoutForm'
 
 /* Exported for the top-bar rung-budget test: the <640px icon-only rung base in
    index.css needs the desktop readouts to be unreachable below the pill's
@@ -42,11 +43,40 @@ const listeners = new Set<() => void>()
 let committed: boolean | null = null
 let attachedMql: MediaQueryList | null = null
 
+// A touch-first device takes the form its browser asks for (touchLayoutForm);
+// every other device keeps the width breakpoint. The resize and orientation
+// listeners below re-read both, so a rotation or a desktop-site reload lands.
 function readLive() {
-  return currentMql()?.matches ?? false
+  if (viewportless()) return committed ?? touchFirstForm() ?? false
+  return touchFirstForm() ?? currentMql()?.matches ?? false
 }
 
+// A document with no viewport at all reports 0x0 and matches the narrow query:
+// an iframe whose element is display:none, which is how InstancesViewport keeps
+// every inactive remote pane warm. Nobody sees that width, so it never decides
+// the form: the pane keeps the form it last drew (desktop before any real
+// measurement) instead of redrawing as a phone while hidden.
+function viewportless(): boolean {
+  return typeof window !== 'undefined' && window.innerWidth === 0 && window.innerHeight === 0
+}
+
+// Whether the last signal found no viewport. A form change noticed as the frame
+// is shown again is not a resize the reader watched, so it swaps instantly.
+let wasViewportless = false
+
+/** The form on <html> as `data-layout-form`, for CSS: `md:` and up only
+ *  apply off the phone form (tailwind-theme.css), so a phone drawn past 768px
+ *  keeps its phone-only controls. Never `phone` in an embed frame, which is
+ *  always drawn desktop. */
+function markForm(phone: boolean) {
+  if (typeof document === 'undefined') return
+  const form = phone && !appPathname().startsWith('/embed/') ? 'phone' : 'desktop'
+  if (document.documentElement.dataset.layoutForm !== form) document.documentElement.dataset.layoutForm = form
+}
+markForm(readLive())
+
 function notifyAll() {
+  if (committed !== null) markForm(committed)
   for (const cb of [...listeners]) cb()
 }
 
@@ -58,9 +88,11 @@ function notifyAll() {
 let pending: boolean | null = null
 
 function onSignal(e?: Event) {
+  const revealed = wasViewportless
+  wasViewportless = viewportless()
   const next = readLive()
   if (next === pending) return
-  if (committed === null || next === committed) { pending = null; committed = next; notifyAll(); return }
+  if (committed === null || next === committed || revealed) { pending = null; committed = next; notifyAll(); return }
   pending = next
   // The update commits the form the viewport has WHEN it runs: a resize back
   // across the breakpoint before then leaves nothing to switch.
@@ -77,6 +109,7 @@ function attach() {
   // Closed over, so detaching reaches the SAME list this attached to even if
   // `window.matchMedia` is replaced while the subscription is live.
   attachedMql = currentMql()
+  wasViewportless = viewportless()
   attachedMql?.addEventListener('change', onSignal)
   if (typeof window !== 'undefined') {
     for (const type of WINDOW_RECHECK_EVENTS) window.addEventListener(type, onSignal)
@@ -97,6 +130,7 @@ function subscribe(cb: () => void) {
   if (listeners.size === 0) {
     attach()
     committed = readLive()
+    markForm(committed)
   } else if (currentMql() !== attachedMql) {
     // `window.matchMedia` was replaced under a live subscription: follow the new list.
     attachedMql?.removeEventListener('change', onSignal)

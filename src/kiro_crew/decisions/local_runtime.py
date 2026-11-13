@@ -74,7 +74,7 @@ WEIGHTS_SUBDIR = Path("decisions") / "models"
 #: Each preset's environment and server log. The sandboxed uv and the server write
 #: here, so the runtime's own spawns are handed this preset's directory as a
 #: writable carve-out (``extra_writable_dirs``) out of the ``run`` seal, the same
-#: shape the MCP probe's ``run/mcp-tmp/<probe>`` TMPDIR uses. It cannot live under
+#: shape the MCP probe's ``run/t/<probe>`` TMPDIR uses. It cannot live under
 #: ``models``: that leaf is READONLY in every sandbox mode and a private window
 #: opens only inside a HIDDEN tree, so uv and the server would meet EROFS there.
 #: The gateway writes into it only through :func:`_refuse_links` and exclusive,
@@ -870,8 +870,9 @@ def resume_configured() -> str:
     Called at gateway start, off the event loop. A preset whose download or
     install was interrupted resumes from where the receipt left it. Nothing runs
     when the fleet withdrew local models, by pinning either
-    ``capabilities.decisions`` or ``capabilities.decisions_local`` off; the preset
-    then stays configured and idle until the owner picks another model. The owner's
+    ``capabilities.decisions`` or ``capabilities.decisions_local`` off, or when the
+    ceiling's ``providers`` list does not allow this preset; the preset then stays
+    configured and idle until the owner picks another model. The owner's
     switch is deliberately not consulted: with it off nothing is sent anyway, and
     the preset must be running for the send path to read it as local at all.
     """
@@ -879,7 +880,7 @@ def resume_configured() -> str:
     endpoint = gate.configured_endpoint(cfg)
     provider = getattr(getattr(cfg, "decisions", None), "provider", None)
     m = local_models.get(local_models.active_id(endpoint, getattr(provider, "model", "")))
-    if m is None or capability.is_decisions_denied(local=True):
+    if m is None or capability.is_decisions_denied(local=True, provider=m.id):
         return ""
     port = urlsplit(endpoint).port
     if port is None:

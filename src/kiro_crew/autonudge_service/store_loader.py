@@ -28,6 +28,7 @@ from kiro_crew.autonudge_service.gate import _MAX_QUIET_STREAK
 from kiro_crew.autonudge_service.model import (
     _MAX_IDLE_SECS,
     _MIN_IDLE_SECS,
+    INTERRUPTED_CYCLE_REASON,
     LOOP_BOUND_FIELDS,
     SENTINEL_DROPPED_REASON,
     STRUCTURAL_TERMINAL_REASON,
@@ -579,10 +580,13 @@ def _load(self: AutoNudgeService) -> None:
                     inflight,
                 )
                 self._store.unreconciled_claim[loop.id] = inflight
-                loop.active = False
                 # A reason the UI can render: without it a routine restart mid-fire
                 # surfaced as an unexplained pause with only a log line behind it.
-                loop.stopped_reason = "interrupted_cycle"
+                # Stamped only on a row this load stops itself, so a pause saved
+                # during the fire (``manual`` or any other reason) keeps its own.
+                if loop.active or not loop.stopped_reason:
+                    loop.stopped_reason = INTERRUPTED_CYCLE_REASON
+                loop.active = False
                 self._store_dirty = True
             # TRUST BOUNDARY: the REST scrub exempts these fields, so a credential
             # placed in one reaches every client verbatim. REFUSED, never scrubbed.
@@ -858,7 +862,11 @@ def _load(self: AutoNudgeService) -> None:
                 loop.active = True
                 self._store_dirty = True
         except Exception:
-            logger.warning("AutoNudge: skipping malformed loop entry: %r", raw, exc_info=True)
+            logger.warning(
+                "AutoNudge: skipping malformed loop entry: %s",
+                redact_store_value(raw),
+                exc_info=True,
+            )
             # Without this, a sibling flagging the store dirty makes the rewrite delete
             # this row permanently -- the warning above is then its only other trace.
             self._store.unparsed_rows.append(raw)

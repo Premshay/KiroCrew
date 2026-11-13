@@ -497,6 +497,20 @@ async def test_unsupported_extension_is_rejected_before_any_write(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_iwork_document_refusal_names_the_export_remedy(tmp_path: Path, mock_sel) -> None:
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await _upload(
+            client, directory=str(tmp_path), content=b"PK\x03\x04", filename="deck.key"
+        )
+        assert resp.status == 400, await resp.text()
+        body = await resp.json()
+    assert body["code"] == "unsupported_file_type"
+    assert body["error"].startswith("Unsupported file type: .key.")
+    assert "File > Export To" in body["error"]
+    assert not any(tmp_path.iterdir())
+
+
+@pytest.mark.asyncio
 async def test_size_limit_is_enforced(tmp_path: Path, mock_sel, monkeypatch) -> None:
     monkeypatch.setattr("kiro_crew.dashboard.handlers.files.upload_max_bytes", lambda: 8)
     async with TestClient(TestServer(_make_app())) as client:
@@ -1175,3 +1189,18 @@ class TestWriteFailureIsACodedError:
         assert not (tmp_path / "notes.txt").exists()
         assert mock_sel.log_api_access.call_args.kwargs["outcome"] == "failure"
         assert mock_sel.log_api_access.call_args.kwargs["resources"] == str(tmp_path / "notes.txt")
+
+
+@pytest.mark.asyncio
+async def test_a_multipart_type_with_no_boundary_is_a_400(tmp_path: Path, mock_sel) -> None:
+    """``request.multipart()`` raises on a missing boundary; that is the client's
+    mistake, answered like the other upload routes answer it."""
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await client.post(
+            f"/api/directory-upload?dir={quote(str(tmp_path))}",
+            data=b"x",
+            headers={"Content-Type": "multipart/form-data"},
+        )
+        assert resp.status == 400, await resp.text()
+        assert (await resp.json())["code"] == "not_multipart"
+    assert list(tmp_path.iterdir()) == []

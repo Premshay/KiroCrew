@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
-from kiro_crew.acp.client import AcpClient, AcpError, AcpProcessDied
+from kiro_crew.acp.client import AcpProcessDied
 from kiro_crew.acp.runtime import AcpRuntimeDead
 from kiro_crew.acp.session_handle import WatchdogSettings
 from kiro_crew.acp.session_provider import AcpSessionProvider
@@ -153,16 +153,33 @@ class TestAcpSessionProviderLifecycle:
         assert handle.destroy.await_args_list == [call()]
         assert runtime.kill.call_count == 0
 
+    @staticmethod
+    def _real_handle(runtime: MagicMock, *, turn_active: bool):
+        """A real handle whose cancel runs; destroy is replaced so no transcript is unlinked."""
+        import asyncio
+
+        from kiro_crew.acp.session_handle import AcpSessionHandle
+
+        runtime.send_notification = AsyncMock()
+        handle = AcpSessionHandle("sA", asyncio.Queue(), runtime)
+        if turn_active:
+            handle._turn_done.clear()
+        cancelled_at_destroy: list[bool] = []
+        handle.destroy = AsyncMock(
+            side_effect=lambda: cancelled_at_destroy.append(handle._cancelled)
+        )
+        return handle, cancelled_at_destroy
+
     @pytest.mark.asyncio
     async def test_shutdown_idle_subagent_does_not_cancel(self):
         # No in-flight turn → nothing to cancel; just destroy the handle.
-        handle = _make_handle(is_turn_active=False)
         runtime = _make_runtime()
+        handle, cancelled_at_destroy = self._real_handle(runtime, turn_active=False)
         provider = AcpSessionProvider(handle, runtime, owns_runtime=False)
 
         await provider.shutdown()
-        assert handle.cancel.await_count == 0
-        assert handle.destroy.await_args_list == [call()]
+        assert handle._cancelled is False
+        assert cancelled_at_destroy == [False]
         assert runtime.kill.call_count == 0
 
     @pytest.mark.asyncio
@@ -170,15 +187,14 @@ class TestAcpSessionProviderLifecycle:
         # Reaping a session-sharing subagent mid-turn must CANCEL the turn (so
         # the abandoned prompt stops burning credits / wedging the shared
         # runtime) but must NOT kill the runtime (co-tenants keep running).
-        handle = _make_handle(is_turn_active=True)
         runtime = _make_runtime()
+        handle, cancelled_at_destroy = self._real_handle(runtime, turn_active=True)
         provider = AcpSessionProvider(handle, runtime, owns_runtime=False)
 
         await provider.shutdown()
-        assert [c for c in handle.mock_calls if c[0] in ("cancel", "destroy")] == [
-            call.cancel(),
-            call.destroy(),
-        ]
+        assert handle._cancelled is True
+        assert handle.is_turn_active is False
+        assert cancelled_at_destroy == [True]
         assert runtime.kill.call_count == 0
 
     @pytest.mark.asyncio
@@ -403,13 +419,20 @@ class TestAcpSessionProviderToolApproval:
 
     @pytest.mark.asyncio
     async def test_reject_tool(self):
-        handle = _make_handle()
-        runtime = _make_runtime()
+        import asyncio
+
+        from kiro_crew.acp.session_handle import AcpSessionHandle
+
+        # codex records a denial on the handle; an approve would not.
+        runtime = _make_runtime(acp_backend="codex")
+        runtime.send_response = AsyncMock()
+        handle = AcpSessionHandle("sA", asyncio.Queue(), runtime)
+        handle._permission_options["req-7"] = {"reject": "deny"}
         provider = AcpSessionProvider(handle, runtime)
 
         await provider.reject_tool("req-7")
-        assert handle.reject_tool.await_args_list == [call("req-7")]
-        assert handle.approve_tool.await_count == 0
+        assert "req-7" not in handle._permission_options
+        assert handle._turn_steering_denied is True
 
 
 class TestAcpSessionProviderCancel:
@@ -1150,7 +1173,12 @@ class TestNewConversation:
 
         # Fresh session/new on the SAME runtime (cwd+agent from the runtime).
         runtime.create_session.assert_awaited_once_with(
-            cwd="/tmp/ws", agent="kirocrew", memory_mode="persistent", session_key=""
+            cwd="/tmp/ws",
+            agent="kirocrew",
+            memory_mode="persistent",
+            session_key="",
+            member_session_key="",
+            channel_id="",
         )
         # Handle swapped to the fresh session → next prompt starts clean.
         assert provider._handle is new_handle
@@ -1183,6 +1211,20 @@ class TestNewConversation:
         assert runtime.create_session.await_args.kwargs["session_key"] == "slot:owner"
 
     @pytest.mark.asyncio
+    async def test_a_bot_or_channel_chat_keeps_its_mount_and_channel(self):
+        # A Bot DM's dispatch tools and a Slack chat's channel ride session/new on a
+        # cold start; a chat's fresh conversation must carry them too.
+        old = _make_handle(session_id="old-session-1")
+        runtime, _new_handle = self._runtime_with_new_session()
+        provider = AcpSessionProvider(old, runtime, session_key="member:bot")
+
+        await provider.new_conversation(member_session_key="member:bot", channel_id="C123")
+
+        kwargs = runtime.create_session.await_args.kwargs
+        assert kwargs["member_session_key"] == "member:bot"
+        assert kwargs["channel_id"] == "C123"
+
+    @pytest.mark.asyncio
     async def test_the_fresh_conversation_keeps_the_delete_delay(self):
         """A pooled worker sets the delay once; every later conversation inherits it."""
         old = _make_handle(session_id="old-session-1")
@@ -1193,6 +1235,25 @@ class TestNewConversation:
         await provider.new_conversation()
 
         assert new_handle.delete_delay_secs == 1800.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("routed", [True, False])
+    async def test_the_fresh_conversation_keeps_the_keepalive_routes_mark(self, routed):
+        """The registry ``/api/session-keepalive`` reads holds the provider, not the
+        handle: a fresh conversation still times its calls on Kiro Crew's servers
+        exactly when the old one did."""
+        old = _make_handle(session_id="old-session-1")
+        old.keepalive_routed = False
+        runtime, new_handle = self._runtime_with_new_session()
+        new_handle.keepalive_routed = False
+        provider = AcpSessionProvider(old, runtime)
+        if routed:
+            provider.mark_keepalive_routed()
+            assert old.keepalive_routed is True
+
+        await provider.new_conversation()
+
+        assert new_handle.keepalive_routed is routed
 
     def test_the_workflow_provider_passes_the_delete_delay_to_its_session(self):
         """A workflow worker holds an ``AcpProvider``; only its shared-runtime client
@@ -1254,6 +1315,34 @@ class TestNewConversation:
         # (never a window referencing a terminated one), and old was NOT destroyed.
         assert provider._handle is old
         old.destroy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_fresh_conversation_clears_the_resumed_observation(self):
+        # A session restored via session/load reads resumed=True, which tells the
+        # turn path the backend already holds the history. The fresh session/new
+        # holds none, so a stale True would run the next turn on an empty context.
+        old = _make_handle(session_id="old-session-1")
+        runtime, _new_handle = self._runtime_with_new_session()
+        provider = AcpSessionProvider(old, runtime)
+        provider.resumed = True
+
+        await provider.new_conversation()
+
+        assert provider.resumed is False
+
+    @pytest.mark.asyncio
+    async def test_failed_create_keeps_the_resumed_observation(self):
+        old = _make_handle(session_id="old-session-1")
+        runtime, _ = self._runtime_with_new_session()
+        runtime.create_session = AsyncMock(side_effect=RuntimeError("session/new boom"))
+        provider = AcpSessionProvider(old, runtime)
+        provider.resumed = True
+
+        with pytest.raises(RuntimeError):
+            await provider.new_conversation()
+
+        # Still on the restored session, so it still holds its history.
+        assert provider.resumed is True
 
     @pytest.mark.asyncio
     async def test_refuses_a_backend_that_does_not_evict_before_creating_anything(self):
@@ -1377,6 +1466,22 @@ class TestNewConversation:
         assert provider._handle is new_handle
 
     @pytest.mark.asyncio
+    async def test_an_inherited_model_is_reapplied_as_inherited(self):
+        """An unpinned KAS session on kiro-cli's chat.defaultModel keeps it across a
+        fresh conversation, still as an inherited model, not a pin."""
+        old = _make_handle(session_id="old-session-1")
+        old.model = ""
+        old.inherited_model = "claude-opus-5.5"
+        runtime, new_handle = self._runtime_with_new_session()
+        new_handle.set_model = AsyncMock()
+        provider = AcpSessionProvider(old, runtime)
+
+        await provider.new_conversation()
+
+        assert new_handle.set_model.await_args_list == [call("claude-opus-5.5", inherit=True)]
+        assert provider._handle is new_handle
+
+    @pytest.mark.asyncio
     async def test_model_reapply_failure_tears_down_and_raises(self):
         """A set_model failure on the fresh session must NOT commit a wrong-model
         handle: the fresh session is torn down and the call raises so the caller
@@ -1401,79 +1506,6 @@ class TestNewConversation:
     @pytest.fixture(autouse=True)
     def _isolate_home(self, tmp_path, monkeypatch):
         monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
-
-    def _make_warm_client(self, tmp_path):
-        client = AcpClient(work_dir=tmp_path)
-        proc = MagicMock()
-        proc.returncode = None
-        client._process = proc
-        client._session_id = "sess-old"
-        client._turn_done.set()
-        return client
-
-    @pytest.mark.asyncio
-    async def test_swaps_session_and_reconfigures(self, tmp_path):
-        client = self._make_warm_client(tmp_path)
-        sent: list[tuple[str, dict]] = []
-
-        async def fake_send(method, params):
-            sent.append((method, params))
-            return len(sent)
-
-        client._send_request = fake_send
-        client._wait_for_response = AsyncMock(return_value={"sessionId": "sess-new"})
-        client._apply_startup_model = AsyncMock()
-
-        await client.new_conversation()
-
-        assert client._session_id == "sess-new"
-        assert sent[0][0] == "session/new"
-        assert (
-            next(params for method, params in sent if method == "session/set_mode")["sessionId"]
-            == "sess-new"
-        )
-        client._apply_startup_model.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_missing_or_unusable_session_keeps_prior_session(self, tmp_path):
-        client = self._make_warm_client(tmp_path)
-        client._send_request = AsyncMock(return_value=1)
-        client._wait_for_response = AsyncMock(return_value={})
-
-        with pytest.raises(AcpError, match="no sessionId"):
-            await client.new_conversation()
-
-        assert client._session_id == "sess-old"
-
-    @pytest.mark.asyncio
-    async def test_configuration_failure_restores_prior_session(self, tmp_path):
-        client = self._make_warm_client(tmp_path)
-
-        async def fake_send(method, params):
-            if method == "session/set_mode":
-                raise AcpError("mode rejected")
-            return 1
-
-        client._send_request = fake_send
-        client._wait_for_response = AsyncMock(return_value={"sessionId": "sess-new"})
-
-        with pytest.raises(AcpError, match="mode rejected"):
-            await client.new_conversation()
-
-        assert client._session_id == "sess-old"
-
-    @pytest.mark.asyncio
-    async def test_refuses_active_turn_and_dead_process(self, tmp_path):
-        client = self._make_warm_client(tmp_path)
-        client.has_active_turn = lambda: True
-
-        with pytest.raises(AcpError, match="turn is in flight"):
-            await client.new_conversation()
-
-        client.has_active_turn = lambda: False
-        client._process = None
-        with pytest.raises(AcpProcessDied):
-            await client.new_conversation()
 
 
 class TestLivePathModelEntitlement:

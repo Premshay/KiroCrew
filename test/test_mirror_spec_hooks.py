@@ -32,6 +32,7 @@ from kiro_crew.agent_sdk import spec_hooks
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_COPILOT,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_OPENCODE,
     ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS,
@@ -185,7 +186,7 @@ def test_a_live_shell_permission_request_carries_the_harness_tool(backend):
 @pytest.mark.parametrize("backend", _MIRRORS)
 def test_a_backend_with_no_table_gets_no_harness_tool_id(backend):
     # The same frames on a backend with no name table build the event as before.
-    assert _permission_event(backend, as_backend=ACP_BACKEND_CLAUDE).harness_tool_id == ""
+    assert _permission_event(backend, as_backend=ACP_BACKEND_COPILOT).harness_tool_id == ""
 
 
 def test_opencodes_later_titles_name_the_command_not_the_tool():
@@ -228,8 +229,8 @@ def test_a_pre_tool_use_spec_hook_blocks_the_live_shell_call(
             harness_tool_id=event.harness_tool_id,
         )
     )
-    # The hook ran, told the call is kiro-cli's execute_bash, and its exit 2 blocked.
-    assert ran == [(HOOK_EVENT_PRE_TOOL_USE, "deny.sh", "execute_bash", "/w")]
+    # The hook ran, told the call is kiro-cli's shell, and its exit 2 blocked.
+    assert ran == [(HOOK_EVENT_PRE_TOOL_USE, "deny.sh", "shell", "/w")]
     assert reason is not None
 
 
@@ -530,13 +531,19 @@ def test_the_direct_client_splits_by_the_servers_it_placed():
     assert client._placed_mcp_server_names() == ()
 
 
-def test_the_direct_client_uses_the_mcp_roster_sent_for_this_session():
-    client = _bare_client(ACP_BACKEND_OPENCODE)
+def test_the_direct_client_uses_the_mcp_roster_sent_for_this_session(tmp_path):
+    from kiro_crew.acp.client import AcpClient
+
+    client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_OPENCODE)
     client._session_mcp_cache = [{"name": "spec-server"}]
-    client._mcp_mount_servers = [{"name": "profile-core"}, {"name": 3}]
+    assert client._placed_mcp_server_names() == ("spec-server",)
+    client._begin_session_report([{"name": "profile-core"}, {"name": 3}])
     assert client._placed_mcp_server_names() == ("profile-core",)
-    client._mcp_mount_servers = []
+    client._begin_session_report([])
     assert client._placed_mcp_server_names() == ()
+    client._reset_state()
+    client._session_mcp_cache = [{"name": "next-projection"}]
+    assert client._placed_mcp_server_names() == ("next-projection",)
 
 
 def test_the_direct_client_permission_event_carries_the_mcp_split():
@@ -617,7 +624,10 @@ def test_a_rewritten_server_from_opencodes_own_config_meets_its_exact_deny(tmp_p
     # spawn's read-back named. The fused "docs_server_lookup" splits back to the
     # exact name, so a deny written mcp__docs.server__lookup still blocks.
     client = _bare_client(ACP_BACKEND_OPENCODE)
-    client._opencode_config_mcp_servers = ("docs.server",)
+    from kiro_crew.acp.harness import process_adapter_for
+
+    client._process_adapter = process_adapter_for(ACP_BACKEND_OPENCODE)
+    client._harness_read_back().config_mcp_servers = ("docs.server",)
     event = _direct_permission_event(client, "docs_server_lookup")
     assert event is not None
     assert event.harness_tool_id.split("|")[0] == "opencode#@docs.server/lookup"

@@ -1,20 +1,9 @@
 """The pod-scenario matrix must track which platforms actually have a pod backend.
 
-That tier's platform coverage is decided by exactly ONE fact -- whether
-``runtime.require_backend()`` finds a service manager on the host -- because no
-scenario body and no job carries a platform branch. The matrix is therefore a pure
-consequence of which backends exist, which is also why a comment saying a platform
-is "deferred until a backend lands" cannot be trusted: the day one lands, the
-comment is false and nothing notices.
-
-So the deferral is expressed HERE, as an assertion, instead of in prose. Every
-platform whose backend exists must either be in the matrix or be named in
-:data:`PENDING_VALIDATION` with the reason it is not, and that reason is what a
-reviewer reads instead of trusting a comment to still be true.
-
-Deliberately a plain unit test rather than part of the E2E tier: it reads YAML and
-imports nothing that needs a host with pods, so it runs on every shard, including
-the ones that cannot run a scenario at all.
+Coverage depends only on whether ``runtime.require_backend()`` finds a service
+manager. Every platform with a backend is in the matrix or named in
+:data:`PENDING_VALIDATION` with a reason. A plain unit test that reads YAML, so it
+runs on every shard.
 """
 
 from __future__ import annotations
@@ -80,8 +69,7 @@ def _backend_exists(module: str | None) -> bool:
 def test_a_platform_with_a_backend_is_either_covered_or_explicitly_pending(runner: str) -> None:
     """No third option. A backend with neither a matrix entry nor a stated reason is
     a platform everyone believes is covered and nothing runs."""
-    if not _backend_exists(BACKEND_FOR_RUNNER[runner]):
-        pytest.skip(f"{runner} has no pod backend yet, so the matrix owes it nothing")
+    assert _backend_exists(BACKEND_FOR_RUNNER[runner]), f"{runner} names a missing pod backend"
 
     assert runner in _matrix_runners() or runner in PENDING_VALIDATION, (
         f"{runner} has a pod backend, so require_backend() succeeds there and the "
@@ -137,11 +125,8 @@ def test_the_nightly_runs_the_full_suite_on_all_three_backends() -> None:
 def test_the_per_pr_windows_job_is_boot_only_by_default() -> None:
     """Unlabelled, `pod-boot-windows` boots a pod and nothing more.
 
-    The steps that run without the opt-in are the original canary: install the
-    control plane, build the payload venv, place the one-file SPA stand-in, run
-    the 3-test Task Scheduler module and pin its count. None of them installs
-    Node, builds the SPA or touches the scenario suite: that coverage is
-    nightly.yml's pod-scenarios leg, or a PR that carried the label.
+    No Node, SPA build or scenario suite: that coverage is nightly.yml's
+    pod-scenarios leg, or a labelled PR.
     """
     default_steps = [s for s in _pod_boot_steps() if str(s.get("if", "")) != OPT_IN_IF]
     run = _steps_run_text(default_steps)

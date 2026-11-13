@@ -34,6 +34,27 @@ logger = logging.getLogger("kiro_crew.config.loader")
 #: not this host.
 KAS_BUNDLE_DEFAULT_URL = "https://kas.crew.kiro.dev"
 
+#: ``agent.kas_refuse_plain_http_mcp_headers`` help text, kept here so the
+#: ``agent`` section DTO stays under its line budget.
+KAS_REFUSE_PLAIN_HTTP_MCP_HEADERS_HELP = (
+    "When true, the 'kas' backend no longer relays an MCP server's headers to a "
+    "plain http:// url on another host, so they are never sent unencrypted; the "
+    "server does not run and the session notice names it. When false (the "
+    "default), Kiro Crew's local bridge sends the headers to that url as before. "
+    "Only a JSON true turns it on. Read when a session starts."
+)
+
+#: ``agent.kas_fail_closed_web_fetch_blocked`` help text, kept here for the same
+#: line budget.
+KAS_FAIL_CLOSED_WEB_FETCH_BLOCKED_HELP = (
+    "When true, on the 'kas' backend a toolsSettings.web_fetch.blocked entry KAS "
+    "cannot apply (one naming a scheme or path, other regex syntax, or one too long) "
+    "makes that agent refuse every web fetch until the entry is fixed, and the "
+    "session notice says so. When false (the default), such an entry is named in the "
+    "notice and refuses nothing. Only a JSON true turns it on. Read when a session "
+    "starts."
+)
+
 
 def coerce_subagent_max_per_parent_by_agent(raw: object) -> dict[str, int]:
     """Normalize per-agent child-run caps from operator-owned configuration.

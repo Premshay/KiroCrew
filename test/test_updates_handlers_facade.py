@@ -21,7 +21,6 @@ from __future__ import annotations
 import ast
 import dis
 import functools
-import importlib
 import inspect
 import os
 import subprocess
@@ -51,7 +50,7 @@ _THIS_FILE = Path(__file__).resolve()
 
 #: Names the test trees are known to patch through the facade, one of each seam the
 #: handlers have: the release feed fetch the suite-wide floor refuses, the running version,
-#: the update provider and install layout, the governance gate, the restart, the auto-update
+#: the update provider and install layout, the restart, the auto-update
 #: effect and the check task state, the changelog cache and the log ring's installed flag.
 #: The scan below must find all of them, so a scanner that stops matching goes red instead
 #: of passing over nothing.
@@ -61,7 +60,6 @@ _KNOWN_SEAMS = frozenset(
         "_local_version",
         "resolve_provider",
         "detect_install_layout",
-        "update_blocked_reason",
         "_restart_gateway",
         "_auto_effect",
         "_check_task",
@@ -296,14 +294,6 @@ def test_the_family_logs_under_the_facade_name() -> None:
         m.__name__ for m in _family() if vars(m).get("logger", updates.logger) is not updates.logger
     ]
     assert others == []
-
-
-def test_the_moved_exception_keeps_the_facade_module() -> None:
-    """``_PolicyApplyStopped`` is named in tracebacks by the path callers import it from,
-    and that path still resolves it."""
-    cls = updates._PolicyApplyStopped
-    assert cls.__module__ == FACADE
-    assert getattr(importlib.import_module(cls.__module__), cls.__qualname__) is cls
 
 
 def test_the_facade_runs_as_a_module(tmp_path: Path) -> None:

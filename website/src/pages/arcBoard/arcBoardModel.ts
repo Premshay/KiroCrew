@@ -6,6 +6,7 @@
 
 import type { ChatSlot } from '../../types'
 import type { ArcBoardEntry, ArcBoardLane } from '../../api/client/arcBoard'
+import { compareText } from '../../i18n/format'
 
 /** An entry's `link` is free evidence text ("https://… — note", a branch name,
  *  a path). Only a leading http(s) URL becomes a clickable href; everything
@@ -78,7 +79,7 @@ export function pickerSessions(slots: ChatSlot[], members: Iterable<string>): Re
     })
   }
   for (const g of Object.keys(out) as SessionGroup[]) {
-    out[g].sort((a, b) => a.name.localeCompare(b.name))
+    out[g].sort((a, b) => compareText(a.name, b.name))
   }
   return out
 }
@@ -177,6 +178,6 @@ export function pickerAgents(
       role: suggestedRole({ key: a.name, agent: a.name, agent_kind: kind, title: a.display_name }),
     })
   }
-  for (const g of Object.keys(out) as SessionGroup[]) out[g].sort((x, y) => x.label.localeCompare(y.label))
+  for (const g of Object.keys(out) as SessionGroup[]) out[g].sort((x, y) => compareText(x.label, y.label))
   return out
 }

@@ -1,24 +1,33 @@
-"""Where a kirocrew-core tool's gateway call goes.
+"""Where a kirocrew-core tool's gateway call goes, and the verbs that send it.
 
 The gateway's port, base URL and unix socket and the caches that pin them, one
 request's target resolution, the refused-target replay and re-verification, the
-internal secret, the identity headers every verb sends, and the retry schedule,
-failure text and error body ``mcp_core._send`` uses.
+internal secret, the identity headers every verb sends, the retry schedule,
+failure text and error body, and the verbs themselves: ``_send`` and the
+``_get``, ``_post``, ``_patch``, ``_put`` and ``_delete`` helpers built on it.
 
-:mod:`kiro_crew.mcp_core` stays the import path and the patch surface; see
-:mod:`kiro_crew.mcp_core_parts`.
+The verbs live here, not in :mod:`kiro_crew.mcp_core`, so the other own servers
+(``mcp_guide``, ``mcp_mate``, ``mcp_cron``) can call the gateway without loading
+the whole core server: importing ``mcp_core`` pulls in agent discovery, the
+conversation store and knowledge search, about 950 ms and 650 modules a server
+never uses. :mod:`kiro_crew.mcp_core` stays the import path and the patch surface;
+see :mod:`kiro_crew.mcp_core_parts`.
 """
 
 from __future__ import annotations
 
 import json
 import re as _re
+import socket
+import time
+import urllib.error
 import urllib.request
 
 from kiro_crew.config.loader import read_local_secret
 from kiro_crew.dashboard.origin import dashboard_socket_path
 from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.mcp_caller import current_caller
+from kiro_crew.mcp_core_parts.identity import _resolve_session_key
 from kiro_crew.mcp_shared import internal_caller
 from kiro_crew.port_resolution import port_is_gateway_owned, resolve_client_port_src
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -27,18 +36,13 @@ from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 def _resolve_api_port() -> tuple[int, str]:
     """Resolve the gateway API port a callback should aim at.
 
-    Delegates to :func:`kiro_crew.port_resolution.resolve_client_port_src`, the
-    same precedence every client CLI command applies: ``KIROCREW_PORT``, then a
-    port **explicitly written** in ``dashboard.url``, then the sole
-    gateway-owned run-marker, then the documented default. The marker step is
-    what keeps a portless ``dashboard.url`` from collapsing to the default
-    port while a live gateway is bound elsewhere — ``parse_dashboard_url``
-    substitutes the default for the *server's* benefit (it must bind
-    something), which is exactly the wrong guess for a client callback.
+    Same precedence as every client CLI command
+    (:func:`kiro_crew.port_resolution.resolve_client_port_src`). The marker step
+    keeps a portless ``dashboard.url`` from collapsing to the default port while
+    a live gateway is bound elsewhere.
 
-    Returns ``(port, source)`` — the source string names the chain step that
-    produced the port (``"env"`` / ``"bound"`` / ``"config"`` / ``"marker"`` /
-    ``"default"``), because the caching rule below differs by source.
+    Returns ``(port, source)``; the source (``"env"`` / ``"bound"`` /
+    ``"config"`` / ``"marker"`` / ``"default"``) decides whether it may be cached.
     """
     return resolve_client_port_src(None)
 
@@ -52,16 +56,11 @@ def _resolve_api_port() -> tuple[int, str]:
 _STABLE_PORT_SOURCES = frozenset({"cli", "env", "bound", "config"})
 
 
-# Lazily-resolved caches for the gateway API port, base URL, and unix-socket
-# path. ``None`` means "not resolved yet"; the getters below fill them on
-# first use (tests may pre-seed any of them with a concrete value).
-# Deliberately NOT computed at import: resolution reads config and the
-# gateway's live run-marker, both of which can change between process start
-# and the first gateway call — an import-time snapshot froze a wrong guess
-# for the whole process lifetime. A REQUEST derives its URL and socket path
-# from one resolution (``_resolve_api_target``), so the two transports of an
-# attempt can never name different gateways; these caches hold that pair only
-# for the stable sources that are safe to pin.
+# Lazy caches for the gateway port, base URL and unix-socket path; ``None`` means
+# not resolved yet (tests may pre-seed them). Not computed at import: config and
+# the run-marker can change before the first gateway call. They hold a pair only
+# for stable sources; a request derives both from one resolution
+# (``_resolve_api_target``) so its two transports never name different gateways.
 _API_PORT: int | None = None
 
 
@@ -184,15 +183,9 @@ def _resolve_api_target() -> tuple[str, str]:
     """
     global _API, _API_UNIX_SOCKET
     if _API is not None and _API_UNIX_SOCKET is not None:
-        # Both memos populated: hand back exactly what the standalone getters
-        # would answer. The condition is deliberately NOT also `_API_PORT is not
-        # None`. `_api_base` / `_api_unix_socket` return a populated memo
-        # whatever the port cache holds, and tests pre-seed these two directly
-        # (the cache comment above documents that) -- requiring the port here
-        # made this resolver discard a seeded pair and re-resolve, which is the
-        # very drift between `_send` and the getters this function exists to
-        # remove. In production the two are written together and
-        # `_invalidate_api_base` clears them together, so they stay consistent.
+        # Answer exactly what the standalone getters would. Do not also require
+        # `_API_PORT`: the getters return a populated memo whatever the port cache
+        # holds, and tests pre-seed these two directly.
         return _API, _API_UNIX_SOCKET
     port = _api_port()
     base = f"http://127.0.0.1:{port}"
@@ -217,6 +210,14 @@ def _api_urlopen(
     socket belonging to THAT resolution (see :func:`_resolve_api_target`); the
     default keeps the standalone behavior for callers holding only a base.
     """
+    # A process holding an agent-socket capability sends every request there, with
+    # the capability in place of the secret, and nowhere else (agent_ipc_client).
+    # Imported here so the facade serves no name from outside its family.
+    from kiro_crew.agent_ipc_client import current_capability, open_with_capability
+
+    capability, agent_socket = current_capability(_api_port)
+    if capability:
+        return open_with_capability(req, timeout, capability=capability, socket_path=agent_socket)
     if unix_socket_path is None:
         unix_socket_path = _api_unix_socket()
     return loopback_urlopen(req, timeout=timeout, unix_socket_path=unix_socket_path or None)
@@ -475,27 +476,18 @@ def _transport_failure(message: str, mark: bool) -> dict:
     return out
 
 
-# Extra attempts a REFUSED target gets, and the pause before each.
-#
-# A refusal is the one failure where nothing reached the gateway, so re-dialling
-# the identical request cannot double-execute a verb — that invariant is what
-# makes this retry legal (see ``_retry_refused`` inside :func:`_send`). Two extra
-# dials, pausing ~250ms then ~500ms, cover the sub-second window in which a
-# restarting gateway is rebinding its port, without making a genuinely-down
-# gateway feel hung.
+# Pause before each extra attempt a REFUSED target gets. A refusal means nothing
+# reached the gateway, so re-dialling cannot double-execute a verb (see
+# ``_retry_refused`` in :func:`_send`). The pauses cover a restarting gateway
+# rebinding its port without making a down gateway feel hung.
 _REFUSED_RETRY_BACKOFFS: tuple[float, ...] = (0.25, 0.5)
 
 
 def _refused_message(refused_base: str, exc: BaseException) -> str:
     """Actionable text for a base that refused every attempt.
 
-    A bare ``<urlopen error [Errno 61] Connection refused>`` tells the caller
-    nothing it can act on, so name the address that was dialled and the likely
-    reason (the gateway is down, or restarting) together with the advice that
-    follows from it. The raw error is appended so the original diagnostic
-    survives for a bug report.
-
-    The address comes from the base that was actually refused; re-resolving here
+    Names the dialled address and the likely reason, and appends the raw error
+    for bug reports. The address comes from the refused base; re-resolving here
     would name a port nobody dialled.
     """
     host = refused_base.split("//", 1)[-1].rstrip("/") or refused_base
@@ -526,15 +518,14 @@ def _http_error_body(exc: urllib.error.HTTPError) -> dict:
     message = raw or str(exc)
     counted = False
     code = ""
+    hints: dict[str, str] = {}
     if raw:
         try:
             parsed = json.loads(raw)
             if isinstance(parsed, dict) and "error" in parsed:
                 message = str(parsed["error"])
-                # Preserve api_spawn's "this rejection was already counted"
-                # marker (wave-liveness reconcile) — it must survive the
-                # error-body flattening or spawn_run would double-reconcile
-                # in-process rejections and close waves early.
+                # Keep api_spawn's "already counted" marker, or spawn_run
+                # double-reconciles in-process rejections and closes waves early.
                 counted = bool(parsed.get("counted"))
                 # Preserve the backend's machine-readable error code (e.g.
                 # ``unknown_session`` from DELETE /api/lessons) so callers can
@@ -545,6 +536,13 @@ def _http_error_body(exc: urllib.error.HTTPError) -> dict:
                 raw_code = parsed.get("code")
                 if isinstance(raw_code, str) and _re.fullmatch(r"[a-z0-9_.-]{1,64}", raw_code):
                     code = raw_code
+                # The how-to-retry text a refusal carries next to its sentence
+                # (deploy's "use ttl_hours=0" and the command to run). Redacted
+                # below with the message, since it is the same untrusted body.
+                for key in ("details", "remediation"):
+                    value = parsed.get(key)
+                    if isinstance(value, str) and value:
+                        hints[key] = value
         except Exception:
             pass
     message, _ = redact_exfiltration_urls(message)
@@ -574,6 +572,13 @@ def _http_error_body(exc: urllib.error.HTTPError) -> dict:
             "second-gateway mix-up. The gateway's security event log marks "
             "these denials as received=absent."
         )
+    elif code in ("ipc_capability_invalid", "ipc_session_unbound", "ipc_session_mismatch"):
+        # The agent-socket capability this server holds does not admit it: the
+        # gateway that issued it is gone, or so is the session it names.
+        message = (
+            "this tool server's connection to the gateway does not admit it for this "
+            "session. Start a new session and retry."
+        )
     elif code == "caller_record_missing":
         message = (
             "this session's cron or subagent record no longer exists; start a new "
@@ -596,4 +601,326 @@ def _http_error_body(exc: urllib.error.HTTPError) -> dict:
         out["counted"] = True
     if code:
         out["code"] = code
+    for key, value in hints.items():
+        value, _ = redact_exfiltration_urls(value)
+        value, _ = redact_credentials(value)
+        out[key] = value
     return out
+
+
+def _send(
+    path: str,
+    *,
+    data: bytes | None = None,
+    headers: dict[str, str],
+    method: str = "GET",
+    timeout: float = 30,
+    mark_transport_error: bool = False,
+) -> dict:
+    """Send one gateway request, recovering from a refused connection.
+
+    Two layers, in order. A refused connection may mean the resolved base is
+    stale: the gateway came up, or moved to another port, after this tool server
+    booted, and that port is recorded only in the run marker — so the base is
+    re-resolved and the request replayed once, but only when re-resolution
+    actually produced a different base (the rule lives in
+    :func:`_replay_target`). When there is no moved gateway to chase, the base
+    that refused is the only candidate, and a gateway RESTARTING on its own port
+    lands there: it gets a short bounded retry of the same target
+    (``_retry_refused``) before the caller is told, actionably, that the gateway
+    is unreachable.
+
+    Every verb goes through here. Keeping both layers in one place is what stops
+    PATCH-shaped calls from staying pinned to a base that POST already learned
+    was wrong.
+    """
+
+    def _once(target: tuple[str, str], hdrs: dict[str, str] | None = None) -> dict:
+        base, socket_path = target
+        req = urllib.request.Request(
+            f"{base}{path}", data=data, headers=hdrs if hdrs is not None else headers, method=method
+        )
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- URL is the loopback gateway (_resolve_api_target(): 127.0.0.1 plus a port from config/env or a run-marker whose ownership is re-verified per request) + a fixed internal path; never user-controlled  # noqa: E501
+        with _api_urlopen(req, timeout=timeout, unix_socket_path=socket_path) as resp:
+            return json.loads(resp.read())
+
+    def _refreshed_headers(base: str) -> dict[str, str]:
+        """*headers* with the credential re-read for *base*, caller's dict intact.
+
+        A copy, never an in-place edit: ``headers`` belongs to the caller and is
+        reused for its own error reporting. An unreadable secret leaves the
+        original value rather than sending an empty one, so a transient read
+        failure cannot turn a retry into a guaranteed 403.
+        """
+        fresh = dict(headers)
+        secret = _secret_for_base(base)
+        if secret:
+            fresh["X-Internal-Secret"] = secret
+        return fresh
+
+    def _retry_refused(refused: tuple[str, str], refusal: urllib.error.URLError) -> dict:
+        """Re-dial the SAME refused target a few times, then report it actionably.
+
+        A refusal is the one failure that is safe to replay: the connect itself
+        never completed, so nothing was handed to the gateway and the request
+        cannot have been executed — an identical retry therefore cannot
+        double-execute a verb. That invariant is why this loop retries ONLY
+        ``ConnectionRefusedError`` / ``socket.gaierror``; every other failure
+        keeps its existing route, because an ``HTTPError`` carries a real
+        response and any post-connect failure leaves acceptance undetermined,
+        and spawn_run's reconcile depends on that ambiguity being reported
+        rather than retried.
+
+        The window this covers is a gateway restarting on its own port, which
+        :func:`_replay_target` deliberately declines to chase — there is no
+        moved base to find, so before this the caller got the raw errno with no
+        retry at all. On exhaustion it gets the port and the restart hypothesis
+        instead, with the raw error appended.
+
+        Sleeping does NOT let the target go unproven. The ownership proof is per
+        ATTEMPT, so every re-dial re-resolves through
+        :func:`_reverify_refused_target` and proceeds only while positive
+        evidence still names this same base — otherwise the port could have been
+        taken by another local process during the backoff, and the retry would
+        hand it the internal secret.
+
+        A check that cannot prove the target consumes one step of the budget
+        rather than ending it. "Not proven" is the EXPECTED reading mid-restart:
+        between the old process releasing the port and the new one binding it
+        nothing is listening, so no ownership can be shown — and that is the very
+        window this retry exists to cover. Abandoning the schedule on the first
+        such reading would have limited recovery to a gateway that rebinds inside
+        the FIRST backoff, discarding the longer half of the budget for the case
+        it was sized for. The schedule stays the bound: when the last step is
+        still unproven, the caller gets the same actionable message as a
+        dialled-and-refused exhaustion.
+        """
+        for backoff in _REFUSED_RETRY_BACKOFFS:
+            time.sleep(backoff)
+            # Re-prove ownership AFTER the sleep, never before it: the whole
+            # point is that the gateway may have gone during the pause.
+            proven = _reverify_refused_target(refused[0])
+            if proven is None:
+                # Spend the next step rather than the whole schedule: a gateway
+                # part-way through rebinding is unprovable but about to be back.
+                continue
+            # The target was re-proven; the CREDENTIAL has to be re-read for it
+            # too. A gateway that restarted on this port is a new generation with
+            # a new per-listener secret, so replaying the header this request was
+            # built with would earn a 403 instead of the retry this exists for.
+            try:
+                return _once(proven, _refreshed_headers(proven[0]))
+            except urllib.error.HTTPError as exc:
+                return _http_error_body(exc)
+            except urllib.error.URLError as exc:
+                if not isinstance(exc.reason, (ConnectionRefusedError, socket.gaierror)):
+                    return _transport_failure(str(exc), mark_transport_error)
+                refusal = exc
+            except Exception as exc:
+                return _transport_failure(str(exc), mark_transport_error)
+        # ``refused`` is the one failure that proves nothing reached a gateway,
+        # so a caller may fall back to a local path without risking a replay.
+        return {"error": _refused_message(refused[0], refusal), "refused": True}
+
+    # ONE resolution for this attempt; both transports derive from it.
+    target = _resolve_api_target()
+    base = target[0]
+    try:
+        return _once(target)
+    except urllib.error.HTTPError as e:
+        # urlopen raises HTTPError on 4xx/5xx; str(e) is only "HTTP Error 400:
+        # Bad Request" — the structured {"error": ...} body lives in e.read().
+        # Surface it so callers can act on the backend's actual error (e.g.
+        # the learn_add "unknown session" mapping) instead of an opaque code.
+        return _http_error_body(e)
+    except urllib.error.URLError as e:
+        if not isinstance(e.reason, (ConnectionRefusedError, socket.gaierror)):
+            return _transport_failure(str(e), mark_transport_error)
+        # THE replay rule lives in _replay_target, shared with
+        # mcp_computer._invoke: None means "do not replay" (no evidence, or the
+        # re-resolution named the same dead base). Nothing was handed to a live
+        # gateway in either case, so no refusal below carries transport
+        # ambiguity — the outcome is a definite rejection once the retry window
+        # for the refused target is spent.
+        retry_target = _replay_target(base)
+        if retry_target is None:
+            # No moved gateway to chase, so the base that refused is the only
+            # candidate — the same-port restart case. Give it the short retry
+            # window rather than surfacing a bare errno.
+            return _retry_refused(target, e)
+        try:
+            return _once(retry_target)
+        except urllib.error.HTTPError as retry_exc:
+            return _http_error_body(retry_exc)
+        except urllib.error.URLError as retry_exc:
+            if isinstance(retry_exc.reason, (ConnectionRefusedError, socket.gaierror)):
+                # Both bases refused. The re-resolved one is the fresher
+                # evidence of where the gateway lives, so the retry window
+                # applies to it.
+                return _retry_refused(retry_target, retry_exc)
+            return _transport_failure(str(retry_exc), mark_transport_error)
+        except Exception as retry_exc:
+            # The replay reached the gateway and failed afterwards (a read timeout
+            # after a spawn was accepted, say). Acceptance is undetermined, so this
+            # must carry the same ambiguity flag as a first-attempt post-connect
+            # failure — otherwise spawn_run reconciles a still-running member down
+            # and orphans it.
+            return _transport_failure(str(retry_exc), mark_transport_error)
+    except Exception as e:
+        # The request may have reached the gateway before the response failed
+        # (for example, a read timeout after spawn acceptance). Callers must
+        # not present this as a definite rejection or retry automatically.
+        return _transport_failure(str(e), mark_transport_error)
+
+
+def _post(
+    path: str,
+    body: dict | None = None,
+    *,
+    timeout: float = 30,
+    session_key: str | None = None,
+) -> dict:
+    """POST a gateway endpoint.
+
+    ``session_key``: as in :func:`_patch`, and it matters for the same reason.
+    The default resolution is :func:`_resolve_session_key`, which includes the
+    ``/proc`` ancestor walk, so a caller that already gated itself on
+    :func:`_resolve_session_key_strict` and then let this helper re-resolve
+    would CHECK one identity and WRITE under another — the walk can land on an
+    ancestor slot, which for an app-owned session means the write arrives
+    looking like the unconfined person. Such a caller must pass the key it
+    verified. It is still validated by ``_session_key_header_error``.
+    """
+    data = json.dumps(body or {}).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "X-Internal-Secret": _internal_secret(),
+        **_caller_header(),
+        **_session_token_header(),
+    }
+    sk = _resolve_session_key() if session_key is None else session_key
+    _sk_err = _session_key_header_error(sk)
+    if _sk_err:
+        return {"error": _sk_err}
+    if sk:
+        headers["X-Session-Key"] = sk
+    # ``transport_error`` means acceptance is unknown. A caller that reads it
+    # (spawn_run's batch reconcile, the cron tool proxy, learn_add) must not
+    # report a definite failure; other _post callers treat the payload as a
+    # normal error.
+    return _send(
+        path,
+        data=data,
+        headers=headers,
+        method="POST",
+        timeout=timeout,
+        mark_transport_error=True,
+    )
+
+
+def _get(path: str, session_key: str | None = None, *, timeout: float = 10) -> dict:
+    """GET a loopback gateway path with the internal-secret handshake.
+
+    ``session_key`` exists so a caller that has ALREADY verified its identity can
+    send the key it verified, instead of having this helper resolve one again. The
+    default resolution is :func:`_resolve_session_key`, which includes the ``/proc``
+    ancestor walk — fine for read-only telemetry, but for a caller gated on
+    :func:`_resolve_session_key_strict` re-resolving here is a check-then-use
+    split: the gate proves a strict identity exists, and this then attaches
+    whatever the lenient walk answers at request time, which need not be the same
+    session. Passing the verified key makes the value that was checked the value
+    that is used. It is still validated by ``_session_key_header_error``.
+
+    ``timeout`` defaults to the 10s a telemetry read needs. A route that does real
+    work behind the GET raises it — the Dev Fleet pod reads spawn a
+    ``python -m kiro_crew pod`` subprocess in the gateway, so they pay a cold
+    interpreter start that 10s cannot cover on a loaded host.
+    """
+    headers = {
+        "X-Internal-Secret": _internal_secret(),
+        **_caller_header(),
+        **_session_token_header(),
+    }
+    sk = _resolve_session_key() if session_key is None else session_key
+    _sk_err = _session_key_header_error(sk)
+    if _sk_err:
+        return {"error": _sk_err}
+    if sk:
+        headers["X-Session-Key"] = sk
+    return _send(path, headers=headers, timeout=timeout)
+
+
+def _patch(path: str, body: dict | None = None, *, session_key: str | None = None) -> dict:
+    """PATCH a loopback gateway path with the internal-secret handshake.
+
+    ``session_key``: as in :func:`_put`. A caller gated on
+    :func:`_resolve_session_key_strict` must send the key it verified —
+    re-resolving through the lenient walk here would let the request carry a
+    different session's authority than the one the gate approved.
+    """
+    data = json.dumps(body or {}).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "X-Internal-Secret": _internal_secret(),
+        **_caller_header(),
+        **_session_token_header(),
+    }
+    sk = _resolve_session_key() if session_key is None else session_key
+    _sk_err = _session_key_header_error(sk)
+    if _sk_err:
+        return {"error": _sk_err}
+    if sk:
+        headers["X-Session-Key"] = sk
+    return _send(path, data=data, headers=headers, method="PATCH")
+
+
+def _put(path: str, body: dict | None = None, session_key: str | None = None) -> dict:
+    """PUT to a loopback gateway path with the internal-secret handshake.
+
+    Same trust model as :func:`_post` / :func:`_patch` — the target path must be
+    listed in ``dashboard.server._MIXED_INTERNAL_API_PATHS`` (or the strict set)
+    or the gateway answers 403 ``Token required``.
+
+    ``session_key``: as in :func:`_get`, and it matters more here because this is
+    the WRITE. A caller gated on :func:`_resolve_session_key_strict` must send the
+    key it verified; re-resolving through the lenient walk would let the request
+    carry a different session's authority than the one the gate approved, which on
+    this path means writing another crew's work item and public ledger.
+    """
+    data = json.dumps(body or {}).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "X-Internal-Secret": _internal_secret(),
+        **_caller_header(),
+        **_session_token_header(),
+    }
+    sk = _resolve_session_key() if session_key is None else session_key
+    _sk_err = _session_key_header_error(sk)
+    if _sk_err:
+        return {"error": _sk_err}
+    if sk:
+        headers["X-Session-Key"] = sk
+    return _send(path, data=data, headers=headers, method="PUT")
+
+
+def _delete(path: str, body: dict | None = None, *, session_key: str | None = None) -> dict:
+    """DELETE a loopback gateway path with the internal-secret handshake.
+
+    ``session_key``: as in :func:`_patch`. A caller gated on
+    :func:`_resolve_session_key_strict` must send the key it verified.
+    """
+    data = json.dumps(body or {}).encode() if body else None
+    headers = {
+        "X-Internal-Secret": _internal_secret(),
+        **_caller_header(),
+        **_session_token_header(),
+    }
+    sk = _resolve_session_key() if session_key is None else session_key
+    _sk_err = _session_key_header_error(sk)
+    if _sk_err:
+        return {"error": _sk_err}
+    if sk:
+        headers["X-Session-Key"] = sk
+    if data:
+        headers["Content-Type"] = "application/json"
+    return _send(path, data=data, headers=headers, method="DELETE", timeout=10)

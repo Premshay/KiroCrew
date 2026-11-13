@@ -234,7 +234,12 @@ async def api_skills(request: web.Request) -> web.Response:
     """
     state: DashboardState = request.app["state"]
     session_key = _read_session_key(request)
-    denied = _deny_foreign_app_skill_slot(request, state, session_key, "skills_list")
+    # Projectless owned slots pass: ``project_dir`` below is the strict
+    # per-slot resolver, so such a slot reads no project rows, never a
+    # neighbour's checkout.
+    denied = _deny_foreign_app_skill_slot(
+        request, state, session_key, "skills_list", allow_projectless=True
+    )
     if denied is not None:
         return denied
     skills = _get_skills(state)
@@ -655,7 +660,7 @@ async def api_skill_tree(request: web.Request) -> web.Response:
             outcome="not_found",
             metadata={"name": name},
         )
-        return web.json_response({"error": "not found"}, status=404)
+        return web.json_response({"error": "not found", "code": "skill_not_found"}, status=404)
     # Sanitize the absolute path — never expose the server's real home to the
     # client.  ``root`` is already resolved (symlinks followed), so compare
     # against the *resolved* home too; otherwise a symlinked home (e.g. macOS
@@ -720,7 +725,7 @@ async def api_skill_file(request: web.Request) -> web.Response:
     )
     if root is None:
         _audit("not_found")
-        return web.json_response({"error": "not found"}, status=404)
+        return web.json_response({"error": "not found", "code": "skill_not_found"}, status=404)
     if err:
         if err == "access denied":
             _audit("blocked")

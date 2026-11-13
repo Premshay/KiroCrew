@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Awaitable, Callable, Type
 from kiro_crew import kiro_sandbox_conflict
 from kiro_crew.acp import transport_framing
 from kiro_crew.acp._dispatch import _loggable_request_id
-from kiro_crew.acp._frame_record import record_frame
+from kiro_crew.acp._frame_record import record_frame, record_sent_frame
 from kiro_crew.acp.client_claude_reader import _CLAUDE_SDK_MESSAGE_METHOD
 from kiro_crew.acp.client_spawn_env import _exit_origin
 from kiro_crew.acp.client_timeouts import (
@@ -81,7 +81,11 @@ from kiro_crew.acp.types import (
     JsonRpcMessage,
     JsonRpcRequest,
 )
-from kiro_crew.agent_sdk.backends import ACP_BACKEND_CLAUDE, ACP_BACKEND_FORBIDDEN_MODES
+from kiro_crew.agent_sdk.backends import (
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_FORBIDDEN_MODES,
+    ACP_BACKENDS_HARNESS_OWNED_SLASH_COMMANDS,
+)
 from kiro_crew.json_line import parse_json_object_line
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -220,12 +224,15 @@ async def _send_request(
     params: dict,
     *,
     on_id: Callable[[int], None] | None = None,
+    before_write: Callable[[], None] | None = None,
 ) -> int:
     """Write one request frame and return its id.
 
     ``on_id`` is called with the id before the frame is written, so a caller
     that waits for the answer can register for it before the write's drain
     can suspend and the turn's read loop can read that answer.
+    ``before_write`` runs under the write lock right before the frame is
+    written; whatever it raises aborts the write with nothing written.
     """
     if not self._process or not self._process.stdin:
         raise AcpError("ACP process not running")
@@ -252,7 +259,10 @@ async def _send_request(
         # co-tenant waits behind the lock, but a single session can self-wedge
         # too). A stall raises AcpProcessDied, the same recovery a closed pipe
         # already gets.
-        await self._write_request_bounded(data, req_id, method)
+        if before_write is None:
+            await self._write_request_bounded(data, req_id, method)
+        else:
+            await self._write_request_bounded(data, req_id, method, before_write=before_write)
     except (BrokenPipeError, ConnectionResetError) as exc:
         raise AcpProcessDied(f"ACP process pipe broken: {exc}") from exc
     self._last_activity = time.monotonic()
@@ -260,7 +270,12 @@ async def _send_request(
 
 
 async def _write_request_bounded(
-    self: AcpClient, data: bytes, request_id: int, method: str
+    self: AcpClient,
+    data: bytes,
+    request_id: int,
+    method: str,
+    *,
+    before_write: Callable[[], None] | None = None,
 ) -> None:
     """Write a REQUEST frame under the write lock and the same no-progress bound.
 
@@ -296,6 +311,8 @@ async def _write_request_bounded(
         self._stdin_write_lock(),
         data,
         bound_secs=transport_framing._RESPONSE_WRITE_BOUND_SECS,
+        before_write=before_write,
+        on_written=self._record_sent,
     )
     if result is RequestWriteResult.OK:
         return
@@ -321,6 +338,12 @@ async def _write_request_bounded(
         f"sending request req={safe_id}",
         ambiguous_delivery=result is RequestWriteResult.DRAIN_STALL,
     )
+
+
+def _record_sent(self: AcpClient, data: bytes) -> None:
+    """Feed a written request or notification to the frame recorder, gated like the read side."""
+    if self.memory_mode == "persistent":
+        record_sent_frame(self.backend, data)
 
 
 def _stdin_write_lock(self: AcpClient) -> asyncio.Lock:
@@ -746,6 +769,43 @@ async def _read_message(
     return await self._read_message_from_stdout(timeout)
 
 
+def _note_advertised_commands(self: AcpClient, msg: JsonRpcMessage) -> None:
+    """Keep the newest command list the agent advertised, with the session it names.
+
+    Each ``available_commands_update`` replaces the whole list. The session id rides
+    along because ``new_conversation`` swaps the session on this same process. Both
+    strings go to the dashboard, so they get the same scrub as every other string the
+    harness reports back (``_scrub_observed``).
+    """
+    kind, update = _session_update_kind(msg)
+    commands = update.get("availableCommands")
+    if kind != UPDATE_AVAILABLE_COMMANDS or not isinstance(commands, list):
+        return
+    rows = []
+    for command in commands:
+        name = command.get("name") if isinstance(command, dict) else None
+        if isinstance(name, str) and name:
+            description = command.get("description")
+            text = description if isinstance(description, str) else ""
+            rows.append(
+                {
+                    "name": str(self._scrub_observed(name)),
+                    "description": str(self._scrub_observed(text)),
+                }
+            )
+    self._advertised_commands = (str(msg.params.get("sessionId") or ""), tuple(rows))
+
+
+def advertised_commands(self: AcpClient) -> list[dict[str, str]]:
+    """The commands this session last advertised: name and description, scrubbed.
+
+    Empty before the first ``available_commands_update``, and when the list names a
+    session other than the one this process runs.
+    """
+    session_id, rows = self._advertised_commands
+    return list(rows) if session_id and session_id == self._session_id else []
+
+
 async def _wait_for_response(
     self: AcpClient,
     req_id: int,
@@ -876,7 +936,7 @@ async def _drain_notifications(
             # here. Stated rather than defaulted so a transport that gains
             # tenants has to answer the question instead of inheriting a
             # yes.
-            self._mcp_report.record_frame(msg, owned=True)
+            self._mcp_report.fold_frame(msg)
         name = ""
         if isinstance(msg.params, dict):
             name = msg.params.get("name") or msg.params.get("serverName") or ""
@@ -924,7 +984,7 @@ async def _drain_notifications(
             _capture_agent_switched(read_msg)
             _capture_available_commands(read_msg)
             _capture_notice(read_msg)
-            self._mcp_report.record_frame(read_msg, owned=True)
+            self._mcp_report.fold_frame(read_msg)
             if "mcp" in (read_msg.method or ""):
                 name = ""
                 if isinstance(read_msg.params, dict):
@@ -1047,6 +1107,9 @@ async def _wait_for_response_inner(
         # Notification (has method, no id) — buffer for drain.
         if msg.method and msg.id is None:
             self._mcp_notifications.append(msg)
+            # No turn reads this buffer, and the frame may be the one that
+            # dropped the conversation's pictures (a late compaction or clear).
+            self._forget_sent_images()
             logger.debug("Buffered notification: %s (req=%d)", msg.method, req_id)
             continue
         # Server→client request (method AND id) or a foreign-id response
@@ -1180,13 +1243,16 @@ async def _read_message_from_stdout(
     projection = getattr(self, "_native_skill_projection", None)
     if projection is not None:
         data = projection.frame(data)
-    return JsonRpcMessage(
+    msg = JsonRpcMessage(
         id=data.get("id"),
         method=data.get("method"),
         result=data.get("result"),
         error=data.get("error"),
         params=data.get("params"),
     )
+    if self.backend in ACP_BACKENDS_HARNESS_OWNED_SLASH_COMMANDS:
+        self._note_advertised_commands(msg)
+    return msg
 
 
 def _handle_available_commands_update(self: AcpClient, msg: JsonRpcMessage) -> None:

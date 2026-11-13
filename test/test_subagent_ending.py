@@ -98,6 +98,7 @@ def test_the_reap_ending_names_the_reaper_only_when_it_writes_the_error(monkeypa
 
 def _coordinator(calls: list[str]) -> SimpleNamespace:
     coordinator = SimpleNamespace(
+        _fire_session_ended=lambda _info: None,
         _record_crew_log_terminal=lambda info: calls.append(f"record done={info.done}"),
         _record_terminal_metric=lambda info: calls.append(f"metric done={info.done}"),
         _manager=SimpleNamespace(

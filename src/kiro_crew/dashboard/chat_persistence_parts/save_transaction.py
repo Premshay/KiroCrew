@@ -42,11 +42,18 @@ if TYPE_CHECKING:
         queue_persist_signature,
         register_guarded_history_write,
         slot_history_key,
+        transcript_lock_stems,
     )
 
 
 def save_all_slots_to_history(state: DashboardState) -> None:
     """Save all active slots to history. Called on gateway shutdown."""
+    # Which chats hold an approval mode, for the next boot's notice that the
+    # restart ended it. First, because it is one small file and the per-slot
+    # saves below can use up the caller's shutdown deadline.
+    from kiro_crew.dashboard import chat_trust_restart
+
+    chat_trust_restart.record(state)
     for key in list(state._slots.keys()):
         # Re-fetch the occupant at each turn: this sequential pass takes real
         # disk time per slot while the loop can still recreate keys, and the
@@ -162,6 +169,8 @@ def _save_slot_to_history(
     after_commit_under_lock: Callable[[], None] | None = None,
     refuse_stale_empty_merge: bool = False,
     turn_timeout_override: tuple[int | None] | None = None,
+    autocompact_override: tuple[float | None] | None = None,
+    after_commit_on_transcript: Callable[[], None] | None = None,
     retired_rows: list[dict] | None = None,
     takeover_basis: TakeoverBasis | None = None,
 ) -> bool:
@@ -299,7 +308,7 @@ def _save_slot_to_history(
     if snapshot is None:
         return False
     window, queue_snapshot, queue_candidates, disk_older = snapshot
-    note_auth_key, history_key = _write_guards.routing_snapshot(slot)
+    note_auth_key, history_key, routed_binding = _write_guards.routing_snapshot(slot)
     if expected_history_key is not None and history_key != expected_history_key:
         # The caller authorized a write against a specific transcript and the
         # slot's routing moved before this snapshot (a rebind on the event
@@ -377,6 +386,9 @@ def _save_slot_to_history(
                 muted_override=muted_override,
                 after_commit_under_lock=after_commit_under_lock,
                 turn_timeout_override=turn_timeout_override,
+                autocompact_override=autocompact_override,
+                after_commit_on_transcript=after_commit_on_transcript,
+                routed_binding=routed_binding,
             )
             if refusal is not None:
                 logger.warning("Slot %s empty-window save refused: %s", slot.key, refusal)
@@ -402,6 +414,24 @@ def _save_slot_to_history(
         and not rewrite
     ):
         return True
+    observed_history_key = str(getattr(slot, "_disk_meta_key", "") or "")
+    if observed_history_key and not _write_guards._same_transcript(
+        observed_history_key, history_key
+    ):
+        # A drifted save verifies the observed source A before committing target B.
+        # Hold both physical lock sets across that whole check-then-write span so
+        # delete_session(A) cannot unlink A after verification and let its rows be
+        # published into B. locked_stems deduplicates and sorts the union, matching
+        # every transcript writer's order and avoiding cross-key deadlock.
+        save_lock = state.conversation_log.locked_stems(
+            (
+                *transcript_lock_stems(observed_history_key),
+                *transcript_lock_stems(history_key),
+            )
+        )
+    else:
+        # Keep the ordinary one-transcript path on its existing lock.
+        save_lock = state.conversation_log._locked(history_key)
     try:
         # Hold the SAME per-session cross-process lock that ``append`` /
         # ``append_off_loop`` / rotate / rewrite / metadata mutations take, across
@@ -411,11 +441,11 @@ def _save_slot_to_history(
         # result appended to the originating dashboard session) can land between
         # this save's snapshot of the file and its ``atomic_write`` — the save
         # then replaces the file with meta+frozen+window and silently deletes the
-        # acknowledged append. ``_locked`` serializes the two so neither is lost.
-        # On the event loop ``_locked`` makes ONE non-blocking acquire and raises
-        # ``HistoryLockTimeout`` under contention (never blocking the loop); the
-        # ``save_slot_off_loop`` helper routes on-loop callers to a worker thread
-        # so they take the patient acquire path instead of dropping the save.
+        # acknowledged append. The selected lock serializes the writers so neither
+        # is lost. On the event loop it makes ONE non-blocking acquire per stem and
+        # raises ``HistoryLockTimeout`` under contention (never blocking the loop);
+        # ``save_slot_off_loop`` routes on-loop callers to a worker thread so they
+        # take the patient acquire path instead of dropping the save.
         #
         # The claim scope opens BEFORE the lock and closes after it: the lock
         # serializes writers on the transcript, while the claim orders this
@@ -433,7 +463,7 @@ def _save_slot_to_history(
                 expected_slot_name=expected_slot_name,
                 takeover_basis=takeover_basis,
             ) as _claim,
-            state.conversation_log._locked(history_key),
+            save_lock,
         ):
             # ── Swap-won guard ──────────────────────────────────────────────
             # A save copies the window before it waits for this lock, and a
@@ -484,6 +514,7 @@ def _save_slot_to_history(
                 meta_readable=_meta_readable,
                 line_corrupt=_line_corrupt,
                 history_key=history_key,
+                conv_log=state.conversation_log,
             ):
                 return False
             # ── Recreate-won guard ──────────────────────────────────────────
@@ -531,7 +562,12 @@ def _save_slot_to_history(
                     rows_only=rows_only,
                     mutes_opened_override=mutes_opened_override,
                     muted_override=muted_override,
-                    turn_timeout_override=turn_timeout_override,
+                    turn_timeout_override=_metadata_line.turn_timeout_fold(
+                        slot, turn_timeout_override, existing_meta, routed_binding, history_key
+                    ),
+                    autocompact_override=_metadata_line.autocompact_fold(
+                        slot, autocompact_override, routed_binding, history_key
+                    ),
                 )
             )
             meta_str = json.dumps(meta_line) + "\n"
@@ -578,20 +614,49 @@ def _save_slot_to_history(
                 )
                 return False
 
-            payload, frozen_prefix, foreign_lines = _transcript_merge.compose_payload(
-                state,
+            # Digested before any row is built, so a row mutated after this
+            # point reads as changed on the next save rather than as written.
+            digests = _transcript_merge.row_digests(window)
+            tail = _transcript_merge.appendable_tail(
                 slot,
                 path,
                 history_key,
                 window,
+                digests,
                 disk_older,
                 meta_str,
                 rewrite=rewrite,
                 retired_rows=retired_rows,
             )
+            # Text from a rewrite; on an append, the cache's entry, possibly a range.
+            frozen_prefix: str | tuple[int, int] | None
+            if tail is None:
+                payload, frozen_prefix, foreign_lines, drop_archives = (
+                    _transcript_merge.compose_payload(
+                        state,
+                        slot,
+                        path,
+                        history_key,
+                        window,
+                        disk_older,
+                        meta_str,
+                        rewrite=rewrite,
+                        retired_rows=retired_rows,
+                        digests=digests,
+                    )
+                )
+            else:
+                # The file already holds everything but the new rows.
+                # The prefix cache stays valid only while its ``disk_older`` does.
+                _cache = slot._frozen_prefix_cache
+                frozen_prefix = _cache[3] if _cache and _cache[2] == disk_older else None
+                payload, foreign_lines, drop_archives = "".join(tail), [], lambda: None
 
             _preserve_mtime: float | None = None
-            if closed and (slot.linked_session_key or is_channel_session_key(history_key)):
+            # A save that keeps this slot's own close is not channel activity either.
+            if (closed or _metadata_line.keeps_own_close(slot, closed, existing_meta)) and (
+                slot.linked_session_key or is_channel_session_key(history_key)
+            ):
                 # This slot shares its transcript with a channel, and the
                 # reconciler decides whether a close still stands by comparing
                 # the file's mtime against ``closed_at``: activity newer than the
@@ -621,16 +686,21 @@ def _save_slot_to_history(
                 # count-based retry's short window. Off the event loop (the slot
                 # save offloads) the budget is spent; on the loop the retry
                 # re-raises at once and never sleeps.
-                atomic_write(
-                    path,
-                    payload,
-                    fsync=True,
-                    replace_budget_s=TRANSCRIPT_REPLACE_BUDGET_SECONDS,
-                )
+                if tail is not None:
+                    _transcript_merge.append_tail(path, tail)
+                else:
+                    atomic_write(
+                        path,
+                        payload,
+                        fsync=True,
+                        replace_budget_s=TRANSCRIPT_REPLACE_BUDGET_SECONDS,
+                    )
             except BaseException:
                 # A failed save keeps nothing staged: its rows stay unjudged and
-                # the next save offers them again.
+                # the next save offers them again. Nor does it keep an archive of
+                # rows the unchanged transcript still holds.
                 _display_verdicts.take_pending()
+                drop_archives()
                 raise
             # The rows just written are judged for display once, now, on the
             # verdict worker (display_verdicts); a cheap hand-off, not the work.
@@ -640,9 +710,13 @@ def _save_slot_to_history(
             # flush -- which needs this same lock to serialize the slot -- cannot
             # observe the still-prior flag and overwrite the committed value.
             # This is the full-save twin of the empty-window merge's
-            # ``after_commit_under_lock`` hook; one or the other runs, never both.
+            # ``after_commit_under_lock`` hook; one save path or the other runs,
+            # never both. Both hooks run on every commit here; only the merge
+            # skips the first for a rebound slot (see ``merge_empty_window``).
             if after_commit_under_lock is not None:
                 after_commit_under_lock()
+            if after_commit_on_transcript is not None:
+                after_commit_on_transcript()
             _record_pending_memory_mode(pending_mode_target, _mode)
             # The write committed: the deferred-note drop records it retired
             # are now safe to consume (see ``build_full_line``). Discard is
@@ -673,19 +747,46 @@ def _save_slot_to_history(
             # foreign-append fast path. The foreign lines just preserved are cached
             # too: they now sit in the window region, and a bare frozen+window
             # rebuild would delete them.
-            _post_write_cache: tuple[float, int, int, str, list[str]] | None
+            #
+            # The prefix is cached as where it sits in this file, not as its
+            # text: a slot that stays open would otherwise hold a second copy of
+            # its whole older history for as long as it lives.
+            _post_write_cache: tuple[float, int, int, str | tuple[int, int], list[str]] | None
             try:
                 _st = path.stat()
             except OSError:
                 _post_write_cache = None
             else:
                 _post_write_cache = (
-                    _st.st_mtime,
-                    _st.st_size,
-                    disk_older,
-                    frozen_prefix,
-                    foreign_lines,
+                    None
+                    if frozen_prefix is None
+                    else (
+                        _st.st_mtime,
+                        _st.st_size,
+                        disk_older,
+                        (
+                            frozen_prefix
+                            if not isinstance(frozen_prefix, str)
+                            else _transcript_merge.prefix_range(meta_str, frozen_prefix)
+                        ),
+                        foreign_lines,
+                    )
                 )
+            # What the next save needs to append instead of rewriting: only when
+            # the file holds exactly meta + prefix + this window, so no foreign line.
+            _identity = _transcript_merge.file_identity(path)
+            _post_write_basis = (
+                (
+                    str(path),
+                    _identity,
+                    disk_older,
+                    meta_str,
+                    digests,
+                    _transcript_merge.first_file_change_row(window),
+                )
+                if _identity is not None and not foreign_lines
+                else None
+            )
             # The disk identity this save just wrote (carried forward from
             # ``existing_meta`` when present), so the delete-won guard can
             # recognize a file recreated by another writer after a permanent
@@ -704,7 +805,14 @@ def _save_slot_to_history(
                 # writes — even when the carried-forward metadata is legacy and
                 # has no ``created_at`` for the identity string above.
                 slot._disk_meta_observed = True
+                # The key this identity was observed under is the target just
+                # written — this block is already gated on
+                # ``slot_history_key(slot) == history_key``. The delete
+                # witnesses compare it against the live target to tell a routing
+                # drift apart from a delete-recreate.
+                slot._disk_meta_key = history_key
                 slot._frozen_prefix_cache = _post_write_cache
+                slot._append_basis = _post_write_basis
                 if queue_line_is_ours:
                     # The queued prompts are now on disk, so the flush's drift
                     # check stops reporting them as owed until the queue moves
@@ -744,6 +852,8 @@ async def save_slot_off_loop(
     muted_override: bool | None = None,
     after_commit_under_lock: Callable[[], None] | None = None,
     turn_timeout_override: tuple[int | None] | None = None,
+    autocompact_override: tuple[float | None] | None = None,
+    after_commit_on_transcript: Callable[[], None] | None = None,
     retired_rows: list[dict] | None = None,
     takeover_basis: TakeoverBasis | None = None,
     verdict_source: str | None = None,
@@ -918,6 +1028,8 @@ async def save_slot_off_loop(
             muted_override=muted_override,
             after_commit_under_lock=after_commit_under_lock,
             turn_timeout_override=turn_timeout_override,
+            autocompact_override=autocompact_override,
+            after_commit_on_transcript=after_commit_on_transcript,
             retired_rows=retired_rows,
             takeover_basis=_basis,
         )

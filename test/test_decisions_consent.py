@@ -77,9 +77,7 @@ def configured(monkeypatch):
     return _set
 
 
-# ---------------------------------------------------------------------------
 # Fences
-# ---------------------------------------------------------------------------
 
 
 class TestTheLogIsSealedToo:
@@ -176,9 +174,7 @@ class TestTheLeafIsAKeystone:
         assert "decisions.enabled" not in _EDITABLE_CONFIG
 
 
-# ---------------------------------------------------------------------------
 # Reads fail soft; only a literal true consents
-# ---------------------------------------------------------------------------
 
 
 class TestRead:
@@ -280,9 +276,7 @@ class TestRead:
             keystone.chmod(0o600)
 
 
-# ---------------------------------------------------------------------------
 # The writer
-# ---------------------------------------------------------------------------
 
 
 class TestWrite:
@@ -398,17 +392,12 @@ class TestWrite:
     def test_a_lowering_survives_an_enable_running_beside_it(self, keystone, monkeypatch):
         """Two owner PUTs on two threads, and the LOWER ceiling is the one left.
 
-        The handler hands ``save_enabled`` to a thread, so the switch PUT (which
-        omits the field and therefore keeps) and a PUT lowering the ceiling to 0
-        really do overlap. Resolving the sentinel inside the function narrows the
-        window but cannot order two reads against one write: the keeper reads 2000,
-        the lowerer writes 0, and the keeper writes 2000 back -- an egress limit
-        raised by losing a race.
+        The handler runs ``save_enabled`` on a thread, so a keep-the-ceiling switch PUT
+        and a lower-to-0 PUT overlap: without a lock the keeper reads 2000, the lowerer
+        writes 0, and the keeper writes 2000 back.
 
-        The interleaving is forced rather than raced for: the keeper's write is held
-        open long enough for the lowerer to finish inside it. Under the lock the
-        lowerer cannot start until the keeper is done, so the last write is its 0;
-        without the lock the keeper's delayed 2000 lands last.
+        The interleaving is forced, not raced for: the keeper's write is held open
+        while the lowerer runs, so only the lock makes 0 the last write.
         """
         import threading
         import time
@@ -416,14 +405,14 @@ class TestWrite:
         from kiro_crew.decisions import consent as module
 
         consent.save_enabled(True, endpoint=DEFAULT_ENDPOINT, history_budget_chars=2000)
-        real_write = module.atomic_write
+        real_write = module.rewrite_in_place
 
         def _slow_keeper_write(path, text, **kwargs):
             if '"history_budget_chars": 2000' in text:
                 time.sleep(0.3)
             return real_write(path, text, **kwargs)
 
-        monkeypatch.setattr(module, "atomic_write", _slow_keeper_write)
+        monkeypatch.setattr(module, "rewrite_in_place", _slow_keeper_write)
         errors: list[BaseException] = []
 
         def _keep():
@@ -458,7 +447,7 @@ class TestWrite:
         """The read and the write are inside the same acquisition, not two."""
         held: list[bool] = []
         real_read = consent.read_state_strict
-        real_write = consent.atomic_write
+        real_write = consent.rewrite_in_place
 
         def _read_under_the_lock():
             held.append(consent._SAVE_LOCK.locked())
@@ -470,16 +459,14 @@ class TestWrite:
 
         with (
             patch.object(consent, "read_state_strict", _read_under_the_lock),
-            patch.object(consent, "atomic_write", _write_under_the_lock),
+            patch.object(consent, "rewrite_in_place", _write_under_the_lock),
         ):
             consent.save_enabled(True, endpoint=DEFAULT_ENDPOINT, history_budget_chars=2000)
 
         assert held == [True, True]
 
 
-# ---------------------------------------------------------------------------
 # The dashboard handler
-# ---------------------------------------------------------------------------
 
 
 def _stream(data: bytes):
@@ -561,6 +548,9 @@ class TestHandler:
             "endpoint": "",
             "configured_endpoint": DEFAULT_ENDPOINT,
             "permits": False,
+            # No policy refuses the configured model: ``permits`` is false for want
+            # of consent, not because the administrator withdrew it.
+            "withdrawn": False,
             "history_budget_chars": 0,
             # Reported so the card draws the scope actually recorded rather than
             # inferring it from ``enabled``; absent on this keystone reads false.
@@ -585,6 +575,7 @@ class TestHandler:
         configured(CUSTOM)
         body = json.loads((await api_decisions_consent_get(_request())).text)
         assert body["enabled"] is True and body["permits"] is False
+        assert body["withdrawn"] is False, "a moved address is not a refusal"
         assert body["endpoint"] == DEFAULT_ENDPOINT and body["configured_endpoint"] == CUSTOM
         # Every successful read is audited too, with the address it reported.
         assert [(r["operation"], r["outcome"]) for r in audit] == [
@@ -775,13 +766,9 @@ class TestHandler:
     ):
         """An enable PUT that never mentions the ceiling must not lower it.
 
-        The consent card sends ``enabled`` and ``endpoint`` only, so defaulting the
-        missing field to 0 makes an ordinary switch flip erase a ceiling recorded
-        through this same route -- a security decision lowered by a request that
-        said nothing about it, and silently, since the route answers 200.
-
-        Driven through the handler, because the default that did the erasing lives
-        on the route and a test of ``save_enabled`` leaves it unexercised.
+        The consent card sends ``enabled`` and ``endpoint`` only, so a missing field
+        must keep the recorded ceiling, not default to 0. Driven through the handler,
+        where that default lives.
         """
         from kiro_crew.dashboard.handlers.decisions import api_decisions_consent_put
 
@@ -997,9 +984,7 @@ class TestHandler:
         assert routes is not None
 
 
-# ---------------------------------------------------------------------------
 # The fleet's ceiling above the owner's switch: ``capabilities.decisions``
-# ---------------------------------------------------------------------------
 
 
 #: A ceiling that pins the seam off.
@@ -1343,14 +1328,11 @@ class TestCapabilityCeiling:
     ):
         """A budget-only PUT carries no ``enabled`` and no scope, and still grants.
 
-        The number bounds how much prior conversation the seam may carry, so recording a
-        bigger one under the pin books an egress allowance for the moment the pin lifts
-        -- and the pin is exactly when it is cheapest to book, because nothing sends
-        while it holds. The write must be refused and the recorded ceiling untouched.
+        A bigger ceiling recorded under the pin is an egress allowance for when the pin
+        lifts, so the write is refused and the recorded ceiling untouched.
 
-        The scope rides along at its REVOKING value, because the route refuses a body
-        naming neither the switch nor a scope. So whatever this asserts can only have
-        come from the ceiling.
+        The scope rides along at its REVOKING value (the route refuses a body naming
+        neither switch nor scope), so the refusal can only come from the ceiling.
         """
         from kiro_crew.dashboard.handlers.decisions import api_decisions_consent_put
 

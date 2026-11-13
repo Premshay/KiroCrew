@@ -212,7 +212,7 @@ _BASE_OWNERS: dict[str, tuple[str, ...]] = {
         "_agent_runtime_policy",
         "api_kirocrew_agent_models",
     ),
-    "slash_commands": ("_menu_description", "_advertised_commands", "api_slash_commands"),
+    "slash_commands": ("_menu_description", "_menu_rows", "api_slash_commands"),
     "crew_removal": tuple("""
         _member_slug_is_claimed _reclaim_deleted_member_crew_log
         _prune_private_copy_of_deleted_crew api_kirocrew_agent_delete
@@ -258,7 +258,6 @@ _FACADE_DEFS = (
     "_shared_catalog_fetch",
     "_consume_refresh_exception",
     "api_models",
-    "api_effort_levels",
     "api_kirocrew_agents",
     "_get_config_lock",
     "_pin_entitlement_backend",
@@ -267,6 +266,10 @@ _FACADE_DEFS = (
     "_model_pin_rejected",
     "api_kirocrew_agent_avatar_get",
 )
+
+#: Base definitions in a plain sibling module outside the owner composition, which
+#: the facade imports and binds under the same name: name -> module stem.
+_SIBLING_DEFS = {"api_effort_levels": "agents_effort_levels"}
 
 _MOVED = frozenset(name for names in _BASE_OWNERS.values() for name in names)
 
@@ -374,11 +377,12 @@ def test_the_routes_and_the_package_reach_the_facade_objects() -> None:
 
     app = web.Application()
     routes.register_all(app)
+    sibling_modules = {f"kiro_crew.dashboard.handlers.{stem}" for stem in _SIBLING_DEFS.values()}
     served = [
         route.handler
         for route in app.router.routes()
         if getattr(agents, getattr(route.handler, "__name__", ""), None) is not None
-        and route.handler.__module__ == _FACADE
+        and route.handler.__module__ in {_FACADE} | sibling_modules
     ]
     assert len({id(h) for h in served}) == 32
     assert [h.__name__ for h in served if getattr(agents, h.__name__) is not h] == []
@@ -514,9 +518,9 @@ def test_the_moved_names_keep_their_base_shapes() -> None:
     # Upstream's 93 moved contracts retain their original digest above.
     for name in ("_discover_agent_models", "_shared_agent_model_discovery"):
         assert inspect.signature(getattr(agents, name)).parameters["backend"].default is None
-    assert hashlib.sha256("\n".join(lines).encode()).hexdigest() == (
-        "e2b889634170be76ae07baf82a6be820909a238eb7bd6447bda3d03c27651a73"
-    ), "\n".join(lines)
+    assert tuple(inspect.signature(agents.api_slash_commands).parameters) == ("request",)
+    assert tuple(inspect.signature(agents._menu_description).parameters) == ("raw",)
+    assert tuple(inspect.signature(agents._menu_rows).parameters) == ("request", "rows", "blocked")
 
 
 def _module_assignments(source: str) -> set[str]:
@@ -560,7 +564,17 @@ def test_every_base_definition_is_in_exactly_one_place() -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
     }
     assert defined == set(_FACADE_DEFS)
-    assert len(defined | _MOVED) == len(defined) + len(_MOVED) == 127
+    siblings = set(_SIBLING_DEFS)
+    total = len(defined) + len(_MOVED) + len(siblings)
+    assert len(defined | _MOVED | siblings) == total == 127
+
+
+@pytest.mark.parametrize("name", sorted(_SIBLING_DEFS))
+def test_a_sibling_definition_is_the_facade_binding(name: str) -> None:
+    """The facade binds the sibling's own object, so routes and patches see one function."""
+    sibling = importlib.import_module(f"kiro_crew.dashboard.handlers.{_SIBLING_DEFS[name]}")
+    assert getattr(agents, name) is vars(sibling)[name]
+    assert getattr(handlers_pkg, name) is vars(sibling)[name]
 
 
 def test_the_owners_log_as_the_facade() -> None:

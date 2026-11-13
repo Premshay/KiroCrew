@@ -54,7 +54,7 @@ from kiro_crew.cron_script import (
 )
 from kiro_crew.cron_trigger import _JOB_ID_RE, trigger_cron_job
 from kiro_crew.mcp_caller import current_caller
-from kiro_crew.mcp_core import (
+from kiro_crew.mcp_core_parts.identity import (
     _resolve_session_key,
     require_strict_session_key,
     strict_identity_diagnosis,
@@ -64,7 +64,7 @@ from kiro_crew.mcp_cron_list_render import (
     _render_cron_list_full,
     _render_cron_list_json,
 )
-from kiro_crew.mcp_cron_tool_list import _list_tools
+from kiro_crew.mcp_cron_tool_list import SERVER, _list_tools
 from kiro_crew.mcp_cron_vet import (
     _command_cron_platform_refusal,
     _log_cron_denial,
@@ -73,7 +73,6 @@ from kiro_crew.mcp_cron_vet import (
     _vet_script_file,
     _vet_shell_command,
 )
-from kiro_crew.mcp_instructions import CRON as _INSTRUCTIONS
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.port_resolution import resolve_serving_port
@@ -151,7 +150,7 @@ def _call_tool(name: str, raw_args: dict[str, Any]) -> str:
     if current_caller() is not None or _resolve_session_key():
         # The gateway authenticates the request and resolves its captured session
         # execution before opening the cron store.
-        from kiro_crew.mcp_core import _post
+        from kiro_crew.mcp_core_parts.gateway import _post
 
         session_key, refusal = require_strict_session_key(
             "Cannot identify this cron caller. Reopen the conversation.",
@@ -750,7 +749,10 @@ def _owned_by(jobs: list[CronJob], session_key: str) -> list[CronJob]:
 _AUTO_APPROVAL_OWNER_ONLY = (
     "Error: approval_mode 'auto' can only be turned on by the owner. "
     "Create or update the job without it, then ask the user to turn on "
-    "auto-approve for this job on the Schedule page."
+    "auto-approve for this job: on the Schedule page, open the job, set its "
+    "Approval field to Auto-approve and save; or run "
+    "`kirocrew cron update <job-id> --approval-mode auto`. A later tool edit to "
+    "the job's message, agent, model, schedule, channel or thread turns it off again."
 )
 
 
@@ -762,7 +764,8 @@ _AUTO_RESETTING_FIELDS = frozenset(
 
 _AUTO_APPROVAL_RESET_NOTE = (
     " Auto-approve was turned off because the job changed; ask the user to turn it "
-    "back on for this job on the Schedule page."
+    "back on: on the Schedule page, open the job, set its Approval field to "
+    "Auto-approve and save; or run `kirocrew cron update {job_id} --approval-mode auto`."
 )
 
 
@@ -978,6 +981,10 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             # does `kirocrew cron add`, which reaches the store directly.
             return _unidentified_caller_refusal("cron_add")
         persistent_session = args.get("persistent_session")
+        new_chat_per_run = args.get("new_chat_per_run") is True
+        if not isinstance(persistent_session, bool):
+            # A new chat per run is a fresh session per run.
+            persistent_session = not new_chat_per_run
         minimal_context = args.get("minimal_context")
         hide_in_chat = args.get("hide_in_chat")
         strict_schedule = args.get("strict_schedule")
@@ -1008,7 +1015,8 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
                 at_ts=at_ts,
                 channel=channel,
                 thread_ts=thread_ts,
-                delete_after_run=bool(at_ts),
+                # build_job prefers cron_expr/every over at_ts: one-shot only if neither.
+                delete_after_run=bool(at_ts) and not every and not cron_expr,
                 timezone=tz,
                 skip_dates=skip_dates,
                 agent_id=_agent_id,
@@ -1018,18 +1026,18 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
                 silent=bool(silent),
                 strict_schedule=strict_schedule if isinstance(strict_schedule, bool) else False,
                 hide_in_chat=hide_in_chat if isinstance(hide_in_chat, bool) else False,
+                new_chat_per_run=new_chat_per_run,
                 folder_id=folder_id,
                 command=command or "",
                 script=script or "",
-                persistent_session=(
-                    persistent_session if isinstance(persistent_session, bool) else True
-                ),
+                persistent_session=persistent_session,
                 session_key=session_key,
                 minimal_context=minimal_context if isinstance(minimal_context, bool) else False,
                 timeout=timeout_val or 0,
                 timeout_secs=timeout_secs_val or 0,
                 auto_pause_after_failures=auto_pause_val,
                 alert_after_failures=alert_after_val,
+                person_owner=getattr(current_caller(), "person_tab", False),
             )
         except CronStoreBusy:
             return "Error: cron store busy, please retry"
@@ -1058,13 +1066,15 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         # the caveat to the whole returned object. ``args`` also keeps the answer
         # correct by construction if the argument is ever added to the schema.
         caveats = _owner_unusable_caveat(svc, session_key, job.id) + _ephemeral_authority_caveat(
-            persistent_session if isinstance(persistent_session, bool) else True,
+            persistent_session,
             not (command or script),
             list(args.get("agent_sequence") or []),
         )
+        ignored = at_ts and (every or cron_expr)
         return (
             f"Added job: {job.id} ({job.name}) [{sched_str}]. "
             f"Tell the user: scheduled for {sched_str}.{caveats}"
+            + (" Note: at/delay/at_time is not used; the job repeats." if ignored else "")
             + _sub_floor_timeout_note(timeout_secs_val)
             + _never_fires_note(job)
         )
@@ -1130,6 +1140,10 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             kwargs["folder_id"] = fid
         if "persistent_session" in args:
             kwargs["persistent_session"] = args["persistent_session"]
+        if isinstance(args.get("new_chat_per_run"), bool):
+            kwargs["new_chat_per_run"] = args["new_chat_per_run"]
+            if args["new_chat_per_run"] and "persistent_session" not in args:
+                kwargs["persistent_session"] = False
         if "minimal_context" in args:
             mc = args["minimal_context"]
             if isinstance(mc, bool):
@@ -1206,7 +1220,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         )
         note = _sub_floor_timeout_note(args["timeout_secs"]) if "timeout_secs" in args else ""
         if was_auto:
-            note += _AUTO_APPROVAL_RESET_NOTE
+            note += _AUTO_APPROVAL_RESET_NOTE.format(job_id=updated.id)
         note += _never_fires_note(updated)
         return f"Updated job: {updated.id} ({updated.name}) [{sched_str}]{caveat}{note}"
 
@@ -1433,19 +1447,13 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
 #: readable without executing :func:`run_mcp_server`, and so
 #: ``test/test_mcp_managed_caller_identity.py`` can assert it against the argument
 #: actually handed to the shim.
-ADVERTISE_CALLER_IDENTITY = True
+ADVERTISE_CALLER_IDENTITY = SERVER.advertise_caller_identity
 
 
 def run_mcp_server() -> None:
     """Run MCP stdio server — reads JSON-RPC from stdin, writes to stdout."""
     run_mcp_stdio_loop(
-        "kirocrew-cron",
-        "1.0.0",
-        _list_tools,
-        _call_tool,
-        advertise_caller_identity=ADVERTISE_CALLER_IDENTITY,
-        error_prefix_is_error=True,
-        instructions=_INSTRUCTIONS,
+        SERVER.name, SERVER.version, _list_tools, _call_tool, **SERVER.loop_options()
     )
 
 
@@ -1494,6 +1502,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _fold_runs,
         _format_next_run,
         _job_kind,
+        _json_folder,
         _normalize_summary,
         _sanitize,
     )
@@ -1550,6 +1559,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _CRON_FOLDER_ID_RE,
         _audit_fire_time_decision,
         _audit_governance_deny,
+        _resolve_cron_folder_via,
         _vet_app_owner_enabled,
         _vet_command_governance,
         _vet_script_contents,
@@ -1562,6 +1572,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     )
     from kiro_crew.cron import (  # noqa: F401
         compute_next_run_ts,
+        load_cron_folders,
         lookup_cron_folder_id,
     )
     from kiro_crew.cron_service.model import (  # noqa: F401
@@ -1571,6 +1582,10 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     )
     from kiro_crew.loopback_http import (  # noqa: F401
         loopback_urlopen,
+    )
+    from kiro_crew.mcp_instructions import CRON as _INSTRUCTIONS  # noqa: F401
+    from kiro_crew.mcp_shared_listing import (  # noqa: F401
+        StdioServer,
     )
     from kiro_crew.mcp_tool_titles import (  # noqa: F401
         with_titles,

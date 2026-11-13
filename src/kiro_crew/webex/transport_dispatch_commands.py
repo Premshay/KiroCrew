@@ -159,6 +159,13 @@ async def _apply_model(
     if not live:
         return deferred
     if not await self.sessions.try_acquire(session_key):
+        # The acquire's Kiro account check retires a session that holds
+        # another account, and then nothing is live: the next message starts
+        # a fresh one. A session the check only flagged (an idle parent it
+        # spared for its running sub-agents) stays registered but is refused
+        # the same way, and the next message's claim retires it.
+        if not self.sessions.has_session(session_key) or self.sessions.is_retiring(session_key):
+            return deferred
         return (
             f"✅ Model set to **{label}**, but a reply is still running — this "
             f"conversation keeps its current model; the switch applies to your "
@@ -238,7 +245,7 @@ async def _handle_sessions(self: WebexDispatcher, inbound: "WebexInbound") -> No
     try:
         rows = [
             row
-            for row in await asyncio.to_thread(self.conv_log.list_sessions)
+            for row in await asyncio.to_thread(self.conv_log.list_sessions_indexed)
             # The bucket itself (generation 0) or one of its generations. The
             # separator is required so a bucket cannot match a longer route
             # that merely starts with the same characters.

@@ -7,6 +7,7 @@ the ``mcp-<pkg>`` refusal and the config key's validation.
 from __future__ import annotations
 
 import ast
+import codecs
 import json
 import sys
 import types
@@ -554,6 +555,80 @@ def test_no_row_for_an_unrelated_or_shadowing_record(wheel, monkeypatch, tmp_pat
     assert "adoption" not in manager.get_app(NAME)
 
 
+_MARKER = {
+    "state": "adopted",
+    "repository": REPOSITORY,
+    "commit": COMMIT,
+    "addedName": True,
+    "setRepository": True,
+    "removedLocal": False,
+}
+_NAV = {"route": f"/{NAME}", "icon": "Box"}
+
+
+def test_an_unpinned_adopted_row_keeps_the_legacy_nav_recorded_at_adoption(
+    wheel, monkeypatch, tmp_path
+):
+    from builtin_adoption_helpers import seed_agent
+
+    _adopt_record()
+    seed_agent(
+        manager.config_dir(),
+        {"apps_builtin_adoption": {NAME: _MARKER}, "apps_builtin_adoption_nav": {NAME: _NAV}},
+    )
+    _unpin(monkeypatch, tmp_path)
+    assert manager.get_app(NAME)["adoption"] == {"state": "adopted", "legacyNav": _NAV}
+    listed = [row for row in manager.list_apps() if row["name"] == NAME]
+    assert listed[0]["adoption"] == {"state": "adopted", "legacyNav": _NAV}
+
+
+@pytest.mark.parametrize(
+    "agent",
+    [
+        {"apps_builtin_adoption": {NAME: _MARKER}},
+        {"apps_builtin_adoption": {NAME: _MARKER}, "apps_builtin_adoption_nav": {NAME: "x"}},
+    ],
+    ids=["none-recorded", "malformed"],
+)
+def test_an_unpinned_adopted_row_without_a_recorded_nav_has_none(
+    wheel, monkeypatch, tmp_path, agent
+):
+    from builtin_adoption_helpers import seed_agent
+
+    _adopt_record()
+    seed_agent(manager.config_dir(), agent)
+    _unpin(monkeypatch, tmp_path)
+    assert manager.get_app(NAME)["adoption"] == {"state": "adopted"}
+
+
+def test_a_recorded_nav_never_reaches_a_record_from_another_repository(
+    wheel, monkeypatch, tmp_path
+):
+    from builtin_adoption_helpers import seed_agent
+
+    _adopt_record(sourceUrl="https://github.com/other/fork")
+    seed_agent(
+        manager.config_dir(),
+        {"apps_builtin_adoption": {NAME: _MARKER}, "apps_builtin_adoption_nav": {NAME: _NAV}},
+    )
+    _unpin(monkeypatch, tmp_path)
+    assert "adoption" not in manager.get_app(NAME)
+
+
+def test_the_pin_wins_over_a_recorded_nav(wheel):
+    from builtin_adoption_helpers import seed_agent
+
+    _adopt_record()
+    seed_agent(
+        manager.config_dir(),
+        {
+            "apps_builtin_adoption": {NAME: _MARKER},
+            "apps_builtin_adoption_nav": {NAME: {"route": "/elsewhere", "icon": "Other"}},
+        },
+    )
+    assert manager.get_app(NAME)["adoption"]["legacyNav"] == _NAV
+
+
 # --------------------------------------------------------------------------- #
 # The config key
 # --------------------------------------------------------------------------- #
@@ -634,11 +709,25 @@ def test_a_tree_that_needs_a_build_step_is_refused(tmp_path, build_input):
     assert pinned_tree_refusal(pin, manifest, tree) == "tree_requires_build"
 
 
-def test_a_name_a_core_table_keys_on_is_refused(tmp_path):
-    from kiro_crew.apps.builtin_adoption_checks import core_named_apps, pinned_tree_refusal
-    from kiro_crew.mcp_tools.apps import TOOL_APPS
+def test_a_marked_manifest_declaring_default_enabled_is_still_refused(tmp_path):
+    # The raw read must accept a byte-order-marked app.json like the parse does, or
+    # its `defaultEnabled` reads as absent.
+    from kiro_crew.apps.builtin_adoption_checks import pinned_tree_refusal
+    from kiro_crew.apps.manifest import AppManifest
 
-    keyed = sorted(set(TOOL_APPS.values()))[0]
+    pin, _, tree = _pin_and_manifest(tmp_path, defaultEnabled=True)
+    path = tree / "app.json"
+    path.write_bytes(codecs.BOM_UTF8 + path.read_bytes())
+    manifest = AppManifest.from_json_file(path)
+    assert pinned_tree_refusal(pin, manifest, tree) == "pinned_feature_unsupported"
+
+
+def test_a_name_a_core_table_keys_on_is_refused(tmp_path):
+    from kiro_crew import webhook_sources
+    from kiro_crew.apps.builtin_adoption_checks import core_named_apps, pinned_tree_refusal
+
+    # The webhook source ids are a core table that still keys a capability on an app.
+    keyed = webhook_sources.SOURCE_OPS_MISSION_CONTROL
     assert keyed in core_named_apps()
     pin, manifest, tree = _pin_and_manifest(tmp_path, name=keyed)
     assert pinned_tree_refusal(pin, manifest, tree) == "pinned_feature_unsupported"
@@ -680,3 +769,30 @@ def test_no_shipped_pin_adopts_on_a_host_without_the_seams():
     has_seams = hasattr(route_registry, "_route_fields")
     for pin in pins.values():
         assert (pin.min_app_sdk_level <= APP_SDK_LEVEL) is has_seams, pin.name
+
+
+def test_the_nav_key_drops_every_malformed_entry_and_is_capped():
+    from kiro_crew.apps.builtin_adoption_markers import MAX_MARKERS, coerce_adoption_nav
+    from kiro_crew.config.loader_builders import _builtin_adoption_nav
+
+    raw = {
+        NAME: _NAV,
+        "Bad Name": _NAV,
+        "extra-key": {**_NAV, "x": 1},
+        "two-segments": {**_NAV, "route": "/a/b"},
+        "no-slash": {**_NAV, "route": NAME},
+        "lower-icon": {**_NAV, "icon": "box"},
+        "not-a-dict": "/x",
+    }
+    assert _builtin_adoption_nav(raw) == {NAME: _NAV}
+    assert _builtin_adoption_nav([_NAV]) == {}
+    many = {f"app-{i}": _NAV for i in range(MAX_MARKERS + 5)}
+    assert len(coerce_adoption_nav(many)) == MAX_MARKERS
+
+
+def test_a_marker_never_carries_the_nav():
+    """A build that knows only the six marker keys must keep reading every marker."""
+    from kiro_crew.apps.builtin_adoption_markers import marker_is_valid
+
+    assert marker_is_valid(_MARKER)
+    assert not marker_is_valid({**_MARKER, "legacyNav": _NAV})

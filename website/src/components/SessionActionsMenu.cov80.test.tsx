@@ -40,6 +40,7 @@ vi.mock('./SendToInstanceSubmenu', () => ({ default: () => <div>zzq-send</div> }
 vi.mock('./SessionColorSwatches', () => ({ default: () => <div>zzq-colors</div> }))
 vi.mock('./LinkedSurfacesSection', () => ({ default: () => <div>zzq-links</div> }))
 vi.mock('./SessionTurnLimitMenu', () => ({ SessionTurnLimitSubmenu: () => <div>zzq-turn-limit</div> }))
+vi.mock('./SessionAccountMenu', () => ({ SessionAccountSubmenu: () => <div>zzq-account</div> }))
 
 const actions = vi.hoisted(() => ({
   toggleRead: vi.fn(),
@@ -92,12 +93,13 @@ describe('SessionActionsMenu', () => {
     Object.values(popouts).forEach(fn => fn.mockReset())
     popouts.isPoppedOut.mockReturnValue(false)
     popouts.isSelfPopout.mockReturnValue(false)
+    actions.copyLink.mockResolvedValue(true)
     openTagPopover.mockReset()
     chatFolders.mockReset()
     chatFolders.mockResolvedValue([] as never)
   })
 
-  it('wires the tab-modifier actions to the slot', () => {
+  it('wires the tab-modifier actions to the slot', async () => {
     setup()
     fireEvent.click(btn('Mark as unread'))
     expect(actions.toggleRead).toHaveBeenCalledWith('zzq-slot')
@@ -107,6 +109,8 @@ describe('SessionActionsMenu', () => {
     expect(openTagPopover).toHaveBeenCalledWith('zzq-slot')
     fireEvent.click(btn('Copy link'))
     expect(actions.copyLink).toHaveBeenCalledWith('zzq-slot')
+    // The resolved boolean is read: a landed copy flips the item to "Copied".
+    expect(await screen.findByText('Copied')).toBeTruthy()
     fireEvent.click(btn('Close session'))
     expect(actions.close).toHaveBeenCalledWith('zzq-slot')
   })

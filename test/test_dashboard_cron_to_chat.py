@@ -201,7 +201,8 @@ class TestInjectCronResultToDashboard:
         slot = state.get_or_create_slot(name=f"cron-{job.id}")
         assert slot.linked_session_key == f"cron:{job.id}"
 
-    def test_delivery_preserves_the_agent_workspace_of_a_precreated_tab(self):
+    @pytest.mark.parametrize("resolved_workspace", ["", "research"])
+    def test_delivery_preserves_the_agent_workspace_of_a_precreated_tab(self, resolved_workspace):
         from kiro_crew.dashboard.state import SlotOrigin
 
         state = _make_state()
@@ -210,7 +211,10 @@ class TestInjectCronResultToDashboard:
             name=f"cron-{job.id}", origin=SlotOrigin.CRON, workspace="research"
         )
 
-        _inject(state, job, "result")
+        with patch(
+            "kiro_crew.dashboard.cron_inject.cron_tab_workspace", return_value=resolved_workspace
+        ):
+            _inject(state, job, "result")
 
         assert state.get_or_create_slot(name=f"cron-{job.id}") is slot
         assert slot.workspace == "research"

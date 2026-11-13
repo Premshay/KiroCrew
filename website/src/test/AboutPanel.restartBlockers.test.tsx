@@ -1,24 +1,12 @@
-//
-// Contract under test — Settings > About answers a refused update/restart with
-// the SAME named blocker panel the sessions-reset button raises.
-//
-// The gateway refuses a coordinated reset while any live ACP session still owns
-// a turn, and every endpoint that drains sessions says so the same way: 409 with
-// `code: "restart_ack_required"`. `/api/update` is one of them, and this panel
-// used to collapse that refusal into the generic ApiError branch — a red
-// sentence naming nobody, offering nothing, and indistinguishable from a dirty
-// working tree. The blocker panel names each channel worker and carries the one
-// safe action over it.
-//
-// Two properties this file exists to pin, because both failed silently before:
-// the ack refusal is tested BEFORE the generic 409 branch that would swallow it,
-// and an ordinary 409 still reads as an error with no blocker read at all.
+// Settings > About keeps named blockers when a server refuses an action.
+// An ordinary 409 stays an error without reading blockers. A successful update
+// request arms the next start and sends no gateway restart request.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 import { store } from '../store'
-import { setUpdateProgress, sseStatus } from '../store/dashboardSlice'
+import { sseStatus } from '../store/dashboardSlice'
 import { MemoryRouter } from 'react-router-dom'
 import { AboutPanel } from '../pages/settings/AboutPanel'
 
@@ -51,7 +39,7 @@ const BLOCKER_REPORT = {
 }
 
 /** Route every request the panel makes; `applyStatus`/`applyBody` decide how
- *  the update apply is refused. `reads` records GET urls so a test can assert
+ *  the update apply is refused. `reads` records methods and URLs so a test can assert
  *  the blocker endpoint was (or was not) consulted. */
 function stubFetch(opts: { applyStatus: number; applyBody: unknown }) {
   const reads: string[] = []
@@ -64,11 +52,11 @@ function stubFetch(opts: { applyStatus: number; applyBody: unknown }) {
   })
   vi.stubGlobal('fetch', vi.fn(async (input: unknown, init?: RequestInit) => {
     const url = String(input)
+    reads.push(`${init?.method ?? 'GET'} ${url}`)
     if (init?.method === 'POST') {
       if (url.includes('/api/update')) return json(opts.applyBody, opts.applyStatus)
       return json({ ok: true })
     }
-    reads.push(url)
     if (url.includes('/api/sessions/restart-blockers')) return json(BLOCKER_REPORT)
     if (url.includes('/api/update/check')) {
       return json({ update_available: true, can_apply: true, check_status: 'succeeded', changes: '' })
@@ -94,9 +82,9 @@ function mountWeb() {
 
 /** Open the confirm modal and press its apply. Returns the dialog. */
 async function applyUpdate() {
-  fireEvent.click(screen.getByRole('button', { name: /update now/i }))
+  fireEvent.click(screen.getByRole('button', { name: /update when i restart/i }))
   const dialog = await screen.findByRole('dialog')
-  const apply = await within(dialog).findByRole('button', { name: /update now/i })
+  const apply = await within(dialog).findByRole('button', { name: /update when i restart/i })
   await waitFor(() => expect(apply).not.toBeDisabled())
   fireEvent.click(apply)
   return dialog
@@ -158,25 +146,16 @@ describe('AboutPanel maintenance blockers', () => {
     expect(await screen.findByTestId('restart-blockers')).toBeInTheDocument()
   })
 
-  it('leaves updating and shows blockers when a late barrier event arrives', async () => {
-    // The apply request succeeded long ago, then a session started while the
-    // update was building. The restart's only remaining reply path is the
-    // structured update-progress event, not the original HTTP response.
-    stubFetch({ applyStatus: 200, applyBody: { ok: true, status: 'updating' } })
+  it('arms the update without restarting the gateway', async () => {
+    const requests = stubFetch({ applyStatus: 200, applyBody: { ok: true, status: 'armed' } })
     mountWeb()
 
-    const dialog = await applyUpdate()
-    await within(dialog).findByText('Updating — gateway restarting…')
+    await applyUpdate()
 
-    store.dispatch(setUpdateProgress({
-      step: 'blocked',
-      detail: 'restart waiting',
-      maintenance: ACK_BODY.maintenance,
-    }))
-
-    expect(await within(dialog).findByTestId('restart-blockers')).toBeInTheDocument()
-    await waitFor(() => expect(within(dialog).queryByText('Updating — gateway restarting…')).not.toBeInTheDocument())
-    expect(within(dialog).getByRole('button', { name: /update now/i })).not.toBeDisabled()
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    expect(requests.some(url => url.startsWith('POST ') && url.includes('/api/update'))).toBe(true)
+    expect(requests.some(url => url.includes('/api/restart'))).toBe(false)
+    expect(screen.queryByTestId('restart-blockers')).not.toBeInTheDocument()
   })
 
   it('drops the panel when the operator starts a fresh restart', async () => {

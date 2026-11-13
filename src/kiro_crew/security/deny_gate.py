@@ -375,6 +375,7 @@ def _deny_segment_views(segment: str, emit_self: bool = True) -> tuple[str, ...]
 # ``print('<name>'); log('<verb>')``, which mints nothing.
 _INTERP_BINDING_RE = re.compile(r"\b([a-z_]\w*)\s*=\s*('[^']*'|\"[^\"]*\")")
 _INTERP_IDENT_RE = re.compile(r"\b[a-z_]\w*\b")
+_INTERP_ROW_NEEDS = "crew"  # every alternative of both rows needs it: without it, no copy is built
 
 
 # ``"<name> %s" % "<verb>"`` -- printf-style formatting is the same evasion as adjacent
@@ -564,6 +565,7 @@ def is_denied(
         *,
         rule: str = "",
         component: str = "",
+        span: "tuple[int, int] | None" = None,
     ) -> str:
         """Refusal text for *matched* -- see :func:`_deny_reason`, the shared producer.
 
@@ -576,11 +578,16 @@ def is_denied(
         denial's first line already names the pattern that matched the input, so a
         diagnostic would repeat it on every ordinary refusal, while a floor denial
         reports a pattern the input provably cannot match and is the refusal an
-        agent cannot diagnose at all. The span is the whole subject because a floor
-        decides on the argv's SHAPE rather than at an offset.
+        agent cannot diagnose at all.
+
+        *span* points the diagnostic at the offsets a floor read as the cause (the
+        kill floor names its target); omitted, it is the whole subject -- the
+        honest reading for a shape-level floor or an unlocatable match.
         """
         diagnostic = (
-            _diag.refusal_diagnostic(rule, component, tool_name) if rule and component else None
+            _diag.refusal_diagnostic(rule, component, tool_name, span)
+            if rule and component
+            else None
         )
         return _rules._deny_reason(
             matched, reason_notes, note_override=note_override, diagnostic=diagnostic
@@ -604,7 +611,7 @@ def is_denied(
     # under backtracking and are already enforced by the ``_is_git_publish`` floor
     # below (see ``_GIT_PUBLISH_RULE_PATTERNS``).
     regex_patterns = [p for p in regex_patterns if p not in _rules._GIT_PUBLISH_RULE_PATTERNS]
-    # The chmod/chown rows are matched on argv (``argv_rules``), not as regexes: run
+    # The chmod/chown and dd rows are matched on argv (``argv_rules``), not as regexes: run
     # across a whole compound command, their text matched words of OTHER commands
     # (``chmod +x a && ls /usr/lib`` read as a chmod on /usr). Same capture-then-strip
     # as git-publish, so a disabled row stays disabled.
@@ -630,9 +637,8 @@ def is_denied(
     # therefore also matched against a copy with those joins collapsed.  Scoped to those
     # two patterns on purpose: collapsing text for all the other rules would change
     # inputs they were never measured against.
-    joined = _inline_interpreter_bindings(
-        _collapse_percent_format(_rules._LITERAL_CONCAT_RE.sub("", lower))
-    )
+    collapsed = _collapse_percent_format(_rules._LITERAL_CONCAT_RE.sub("", lower))
+    joined = _inline_interpreter_bindings(collapsed) if _INTERP_ROW_NEEDS in collapsed else lower
     if joined != lower:
         for interpreter_pattern in regex_patterns:
             if interpreter_pattern not in _rules._INTERPRETER_RULE_PATTERNS:
@@ -774,7 +780,7 @@ def is_denied(
         ("credential-exfil-kirocrew-token", _argv._is_credential_mint),
         ("self-protection-kill", _argv._is_self_kill),
         ("self-protection-dev-mode-out-of-root-confirm", _argv._is_dev_mode_out_of_root_confirm),
-        ("sandbox-escape-ssh-self", _argv._is_ssh_to_self),
+        ("sandbox-escape-ssh-self", _argv._reaches_self_over_ssh),
     ):
         pattern = _rules._SELF_PROTECTION_FLOOR_BY_ID.get(rule_id)
         if pattern is None or pattern not in floor_enabled:
@@ -782,11 +788,26 @@ def is_denied(
         # The mint predicate also gets the command AS SUBMITTED: it decodes base64
         # literals to read the name they hide, and base64 does not survive the
         # lower-casing every other predicate reads.
-        hit = (
-            _argv._is_credential_mint(lower, raw_text=tool_name)
-            if predicate is _argv._is_credential_mint
-            else predicate(lower)
-        )
+        #
+        # The kill floor derives its matched target's offsets in the same walk that
+        # decides the verdict (``_self_kill_span``), so the diagnostic points at the
+        # token not the whole command. The verdict is unchanged -- a self-kill
+        # always yields a span, so ``hit`` is exactly ``_is_self_kill``; other
+        # floors report no offsets and span the whole subject.
+        span: "tuple[int, int] | None" = None
+        if predicate is _argv._is_credential_mint:
+            hit = _argv._is_credential_mint(lower, raw_text=tool_name)
+        elif predicate is _argv._is_self_kill:
+            span = _argv._self_kill_span(lower)
+            hit = span is not None
+            # Offsets index ``lower``; the diagnostic renders ``tool_name``. They
+            # align only while ``str.lower`` kept the length -- a width-changing
+            # lowercase (``İ`` U+0130 -> two) would land them on the wrong raw
+            # bytes, so drop to the whole-command span.
+            if span is not None and len(lower) != len(tool_name):
+                span = None
+        else:
+            hit = predicate(lower)
         if hit:  # never waived: a self-guard rule (``_DenyWaiver``)
             # Report the rule's own pattern, exactly as the regex tier does, so
             # the denial reason and the SEL event still map back to the rule id —
@@ -799,6 +820,7 @@ def is_denied(
                 _rules._SELF_PROTECTION_FLOOR_NOTES.get(rule_id, ""),
                 rule=rule_id,
                 component="argv-floor",
+                span=span,
             )
     # The self-management SUBCOMMAND floors have no catalog row (their
     # product-name-anywhere regex rows were deleted, see
@@ -824,7 +846,34 @@ def is_denied(
             )
 
     # ── Pattern passes (shared with the synthesized tier's ``segments=True``) ──
-    pattern_denial = _deny_pattern_passes(tool_name, lower, all_patterns, _reason, shipped, waive)
+    # The shipped ``rm -rf /.*`` row matches every absolute path. It reads a view where
+    # each plain ``rm`` of scratch entries only (``rm -rf /tmp/build``) is blanked, so it
+    # still judges every other rm and every other mention of the text. An operator's
+    # own copy of the pattern is not shipped-only and keeps reading the full text.
+    _rm = _submodule("rm_floor")
+    rm_root = (_rm._RM_FLOOR_BY_KIND.get("root", ("", ""))[1], True)
+    scratch_view = (
+        _rm.scratch_rm_view(tool_name)
+        if rm_root in all_patterns and rm_root[0] in shipped
+        else None
+    )
+    if scratch_view is None:
+        pattern_denial = _deny_pattern_passes(
+            tool_name, lower, all_patterns, _reason, shipped, waive
+        )
+    else:
+        # Matched on the view; every event still records the command as submitted.
+        pattern_denial = _deny_pattern_passes(
+            tool_name,
+            scratch_view.lower(),
+            [rm_root],
+            _reason,
+            shipped,
+            waive,
+            match_text=scratch_view,
+        ) or _deny_pattern_passes(
+            tool_name, lower, [p for p in all_patterns if p != rm_root], _reason, shipped, waive
+        )
     if pattern_denial is not None:
         return pattern_denial
     # ── Recursive-force rm floor (argv-structural, UNION with the regex) ──
@@ -833,7 +882,6 @@ def is_denied(
     # for recursive + force in any spelling against the root or home dir itself,
     # only for a row still in the effective set, and only when the text could
     # hold an rm at all, so a command with none is never refused by it.
-    _rm = _submodule("rm_floor")
     rm_enabled = {
         kind: rule for kind, rule in _rm._RM_FLOOR_BY_KIND.items() if rule[1] in regex_patterns
     }
@@ -854,7 +902,7 @@ def is_denied(
             # The raw input, not ``lower``: see the audit note below.
             _emit_deny_event(tool_name, pattern, tool_name)
             return _reason(pattern, note, rule=rule_id, component="argv-floor")
-    # ── Argv rules (chmod/chown: mode 777, system dirs) ──
+    # ── Argv rules (chmod/chown: mode 777, system dirs; dd: raw disk output) ──
     # Read from the raw input: paths and modes are case-sensitive.
     # A waived row leaves the set and the rest are asked again, so a second row the
     # command also breaks still refuses; each pass removes one row, so this ends.
@@ -899,16 +947,21 @@ def _deny_pattern_passes(
     reason: "Callable[[str], str]",
     shipped: frozenset[str] = frozenset(),
     waive: "Callable[[str], bool] | None" = None,
+    *,
+    match_text: "str | None" = None,
 ) -> str | None:
     """Run :func:`is_denied`'s whole-string and per-segment passes over *all_patterns*.
 
     Exceptions and the s3 download narrowing apply as there; no floor runs here.
     *shipped* gates the s3 download narrowing to shipped-only patterns. *waive* is
     the caller's :class:`_DenyWaiver`: a pattern it answers True for is skipped
-    where it would refuse, and every other pattern is still judged.
+    where it would refuse, and every other pattern is still judged. *match_text*, when
+    given, is the text the segments are cut from (*lower* is its lowercase); every
+    event still records *tool_name*, the command as submitted.
     """
     _rules = _submodule("denied_rules")
     _shell = _submodule("shell_normalizer")
+    text = tool_name if match_text is None else match_text
 
     # Memoizes the s3 download reading per command: the same command is asked
     # about once per matching segment.
@@ -979,7 +1032,7 @@ def _deny_pattern_passes(
     # ``bash -c 'r\`` and ``m -rf /'`` and the ``-c`` script is never seen.
     # Emitting no view for the command itself is what keeps
     # this from fabricating one across its separators.
-    folded = _shell._fold_line_continuations(tool_name)
+    folded = _shell._fold_line_continuations(text)
     segments = [seg.strip() for seg in _split_segments(folded)]
     segments = [seg for seg in segments if seg]
     work: list[tuple[str, tuple[str, ...]]] = []
@@ -990,7 +1043,7 @@ def _deny_pattern_passes(
     # not already produce.  Measured: skipping the duplicate halves the cost on a
     # command padded with thousands of interpreter tokens (a stall risk).
     if len(segments) != 1 or segments[0] != folded.strip():
-        work.append(("", _deny_segment_views(tool_name, False)))
+        work.append(("", _deny_segment_views(text, False)))
     for seg_raw in segments:
         work.append((seg_raw.lower(), _deny_segment_views(seg_raw)))
     for seg_lower, segment_views in work:

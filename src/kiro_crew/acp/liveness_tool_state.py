@@ -9,6 +9,7 @@ re-exports every name here.
 
 from __future__ import annotations
 
+import string
 from dataclasses import dataclass
 
 from kiro_crew.acp.liveness_command import (
@@ -64,9 +65,16 @@ class ToolCallState:
             self.tool_name = self.tool_name[:MAX_RETAINED_NAME_CHARS]
         if len(self.mcp_server_name) > MAX_RETAINED_NAME_CHARS:
             self.mcp_server_name = self.mcp_server_name[:MAX_RETAINED_NAME_CHARS]
+        if len(self.silence_server) > MAX_RETAINED_NAME_CHARS:
+            self.silence_server = self.silence_server[:MAX_RETAINED_NAME_CHARS]
 
     dispatch_ts: float = 0.0  # time.monotonic() at EVENT_TOOL_CALL
     is_shell: bool = False
+    # Sticky denial of process-cleanup authority for this call. Liveness may
+    # still track a likely child, but a shared runtime, a program-only match,
+    # or overlap with another shell call can never later become safe merely
+    # because an oracle generation was retired or a sibling exited.
+    shell_cleanup_disqualified: bool = False
     # ``boottime_now()`` at EVENT_TOOL_CALL — the SAME clock /proc dates process
     # start times against, so a child's start can be compared to its dispatch
     # without mixing clocks (see :func:`boottime_now`). Separate from
@@ -99,7 +107,9 @@ class ToolCallState:
     tool_name: str = ""
     # Trusted MCP server from the adapter identity channel, set only when the
     # tool_call frame's identity is provenance-verified
-    # (``AcpEvent.mcp_identity_trusted``); empty otherwise (fail-closed). Read by
+    # (``AcpEvent.mcp_identity_trusted``) or is KAS's half-identity for a
+    # ``kirocrew-core`` call (:meth:`identity_of`); empty otherwise
+    # (fail-closed). Read by
     # :meth:`is_trusted_wait`, and by the ``remote_flat`` scan, which reads only
     # the subtree of the server this names.
     mcp_server_name: str = ""
@@ -110,13 +120,106 @@ class ToolCallState:
     # classification see the same value the dispatch computed, and so a
     # detached consult never re-derives it from a different command string.
     interactive_risk: str = INTERACTIVE_NONE
+    # The per-call silence timer (``acp.tool_silence``). ``silence_class`` is the
+    # bound this call gets, "" for none (a shell call keeps the oracle's rules).
+    # ``silence_server`` is the MCP server the harness's frame named, kept only so
+    # Kiro Crew's own keepalive can be matched to a call it served; it is never an
+    # identity anything trusts. ``last_activity_ts`` is when a frame attributable
+    # to this call last arrived (monotonic; the dispatch instant until one does),
+    # and ``activity_parked`` is the turn's consumer park banked at that moment,
+    # so the timer subtracts only parks that came after it.
+    silence_class: str = ""
+    silence_server: str = ""
+    last_activity_ts: float = 0.0
+    activity_parked: float = 0.0
+
+    @staticmethod
+    def identity_of(event: object) -> tuple[str, str]:
+        """``(mcp_server_name, tool_name)`` a state retains for a dispatch *event*.
+
+        A provenance-verified pair (``mcp_identity_trusted``) is kept as it is.
+        Otherwise the server is dropped, except for one shape: KAS names the
+        server on a ``tool_call`` frame (``_meta.kiro.serverName``) but stamps
+        no tool name there, so a Trust-mode call, which gets no permission
+        request, never carries the tool half. For the ``kirocrew-core`` server
+        alone, and only when the frame's server half names it, the tool half is
+        then read from what KAS itself wrote about the call it runs: the Tool
+        Search envelope's ``tool_id`` (``kirocrew-core::<tool>``, the id the
+        engine dispatches on) or the wire title KAS stamps as
+        ``@kirocrew-core/<tool>``. The display ``title`` is never read.
+        """
+        server = getattr(event, "mcp_server_name", "") or ""
+        tool = getattr(event, "tool_name", "") or ""
+        server = server if isinstance(server, str) else ""
+        tool = tool if isinstance(tool, str) else ""
+        if getattr(event, "mcp_identity_trusted", False) is True:
+            return server, tool
+        if tool or getattr(event, "is_shell", False) or server not in ("", CORE_MCP_SERVER):
+            return "", tool
+        named = ToolCallState._kas_core_tool_name(event, server_named=server == CORE_MCP_SERVER)
+        return (CORE_MCP_SERVER, named) if named else ("", "")
+
+    #: A bare MCP tool name as KAS spells it in a ``tool_id`` or a wire title.
+    _CORE_TOOL_NAME_CHARS = frozenset(string.ascii_letters + string.digits + "_-")
+    _CORE_TOOL_NAME_MAX = 128
+
+    @staticmethod
+    def _is_core_tool_name(name: str) -> bool:
+        """True when *name* is 1-128 characters, each a letter, digit, ``_`` or ``-``."""
+        return 1 <= len(name) <= ToolCallState._CORE_TOOL_NAME_MAX and all(
+            c in ToolCallState._CORE_TOOL_NAME_CHARS for c in name
+        )
+
+    #: Backend-authored prefix on a kiro-cli / KAS wire title.
+    _RUNNING_PREFIX = "Running: "
+
+    @staticmethod
+    def _kas_core_tool_name(event: object, *, server_named: bool) -> str:
+        """The ``kirocrew-core`` tool a KAS frame names, or "" (see
+        :meth:`ToolCallState.identity_of`).
+
+        The envelope is read only when it is exactly ``{tool_id, arguments}`` (plus
+        ``_meta``), the shape ``session_directive.event_input_digest`` unwraps; an
+        input naming a ``tool_id`` in any other shape names nothing. Both are
+        read only when the frame's own server half already says
+        ``kirocrew-core``, so neither the input nor a title alone names a core
+        tool.
+        """
+        if not server_named:
+            # The input is the model's; only the harness's own server half
+            # says the call went to kirocrew-core at all.
+            return ""
+        raw = getattr(event, "raw_tool_params", None)
+        if isinstance(raw, dict) and "tool_id" in raw:
+            # Any other input naming a ``tool_id`` is no envelope KAS writes, so it
+            # names nothing (``permission_requests._workspace_call_arguments``).
+            if set(raw) - {"_meta"} != {"tool_id", "arguments"} or not isinstance(
+                raw.get("arguments"), dict
+            ):
+                return ""
+            tool_id = raw.get("tool_id")
+            prefix = f"{CORE_MCP_SERVER}::"
+            if isinstance(tool_id, str) and tool_id.startswith(prefix):
+                name = tool_id[len(prefix) :]
+                return name if ToolCallState._is_core_tool_name(name) else ""
+            return ""
+        title = getattr(event, "wire_title", "")
+        if not isinstance(title, str):
+            return ""
+        if title.startswith(ToolCallState._RUNNING_PREFIX):
+            title = title[len(ToolCallState._RUNNING_PREFIX) :]
+        prefix = f"@{CORE_MCP_SERVER}/"
+        if not title.startswith(prefix):
+            return ""
+        name = title[len(prefix) :]
+        return name if ToolCallState._is_core_tool_name(name) else ""
 
     def is_trusted_wait(self) -> bool:
         """True when the adapter-authored identity names the kirocrew-core ``wait``.
 
         Keys on ``mcp_server_name`` + ``tool_name``, never on ``title``, which is
-        model-authored prose. ``mcp_server_name`` is set only from a
-        provenance-verified identity channel, so an unverified call fails closed.
+        model-authored prose. ``mcp_server_name`` is set only by
+        :meth:`identity_of`, so an unverified call fails closed.
         A server-qualified ``tool_name`` resolves to its last segment, the same
         normalization ``session_directive.match_tool`` applies to this field; the
         server itself is still authenticated by ``mcp_server_name`` alone.
@@ -265,6 +368,17 @@ class InFlightToolTracker:
         """
         return self._evicted_count
 
+    def states(self) -> list[tuple[str, ToolCallState]]:
+        """Every call still open as ``(toolCallId, state)``, in dispatch order.
+
+        The id-less judged call is included under ``""``: a per-call timer has to
+        see it too, and it is the one call ``active_calls`` leaves out.
+        """
+        out = [(call_id, state) for call_id, (state, _aux) in self._calls.items()]
+        if self._idless is not None:
+            out.append(("", self._idless[0]))
+        return out
+
     @property
     def active_calls(self) -> dict[str, tuple[ToolCallState, object]]:
         """The live ``{toolCallId: (state, aux)}`` map, read-only by convention.
@@ -277,14 +391,33 @@ class InFlightToolTracker:
         """
         return self._calls
 
+    @staticmethod
+    def _may_run_shell(state: object) -> bool:
+        """Whether *state* may be a shell call; one that cannot say counts as one."""
+        return getattr(state, "is_shell", True) is not False
+
     def dispatch(self, call_id: str, state: ToolCallState, aux: object = None) -> bool:
         """Record *state* under *call_id* and make it the judged call.
 
         A falsy *call_id* is judged but not stored (see the class docstring):
         it takes the id-less slot, which the next dispatch overwrites and which
-        never appears in ``active_calls``. Returns True — a dispatch always
+        never appears in ``active_calls``. Calls that overlap and may each run a
+        shell lose cleanup authority: the latch is set on every one of them that
+        carries ``shell_cleanup_disqualified``. Returns True — a dispatch always
         changes the judged call.
         """
+        if self._may_run_shell(state):
+            active_shells = [
+                existing
+                for existing_id, (existing, _aux) in self._calls.items()
+                if existing_id != (call_id or "") and self._may_run_shell(existing)
+            ]
+            if self._idless is not None and self._may_run_shell(self._idless[0]):
+                active_shells.append(self._idless[0])
+            if active_shells:
+                for shell in (state, *active_shells):
+                    if hasattr(shell, "shell_cleanup_disqualified"):
+                        shell.shell_cleanup_disqualified = True
         self._current_id = call_id or ""
         if call_id:
             self._idless = None

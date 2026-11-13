@@ -6,7 +6,7 @@ import { sendTurn, SEND_ABORT_MS, type SendReceipt } from '../../chat-core/trans
 import { sendFailureCopy, deliveryUnconfirmedCopy } from '../../chat-core/transport/receiptCopy'
 import { sideTurnWire } from './sideTurnWire'
 import { useAppSelector, useAppDispatch, useAppStore } from '../../store'
-import { beginSideQueueEdit, finishSideQueueEdit, forgetSideSteerSubmittedText, readSideSteerSubmittedText, recordSideSteerSubmittedText, setSideQueueEditDraft, sideClose, sideOptimisticAccepted, sideOptimisticAppend, sideOptimisticRollback, restoreSideConversation, awaitSideRestore, sseSideQueue, sideReleaseConsumed, sideSendStatus, queueEditBroadcastAt, stageToMainComposer, takeSideQueueDroppedByClose, takeSideQueueDroppedByResyncThenClose, takeSideSteerDroppedByClose, transcriptTsMs, type SideStandingNotice } from '../../store/chatSlice'
+import { beginSideQueueEdit, finishSideQueueEdit, forgetSideSteerSubmittedText, noteSideQueueCancelWaiting, readSideSteerSubmittedText, recordSideSteerSubmittedText, setSideQueueEditDraft, sideClose, sideOptimisticAccepted, sideOptimisticAppend, sideOptimisticRollback, restoreSideConversation, awaitSideRestore, sseSideQueue, sideReleaseConsumed, sideSendStatus, queueEditBroadcastAt, stageToMainComposer, takeSideQueueDroppedByClose, takeSideQueueDroppedByResyncThenClose, takeSideSteerDroppedByClose, transcriptTsMs, type SideStandingNotice } from '../../store/chatSlice'
 import QueueStack from '../../components/QueueStack'
 import ChatMessageList from '../../app-sdk/ChatMessageList'
 import FollowUpBar from '../../components/FollowUpBar'
@@ -90,7 +90,7 @@ function handBack(vars: SideSubmit): Pick<SendRecovery, 'text' | 'pastes'> {
  *  lazy-loading (the Lexical editor) before it gives up on placing the caret. */
 const SEED_FOCUS_WAIT_MS = 5000
 
-export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
+export default function SideChat({ slot, onFileOpen, onFolderOpen, onArtifactOpen }: {
   slot: string
   /** Open a path named in a side reply as a Files tab of the panel this chat
    *  sits in — the same opener the host hands the main transcript. Capability
@@ -98,6 +98,9 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
    *  OS reveal (a clipboard copy on a remote dashboard), a path link stays a
    *  plain link. */
   onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
+  /** Open a folder named in a side reply as a folder tab of the same panel;
+   *  absent, the folder chip takes the same OS-reveal fallback. */
+  onFolderOpen?: (path: string) => void
   /** Open an artifact link as an artifact tab of the same panel; absent, the
    *  link navigates away from the chat. */
   onArtifactOpen?: (slug: string) => void
@@ -651,7 +654,10 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
   const cancelQueued = useMutation({
     mutationFn: ({ queueId, slot: target }: { queueId: string; slot: string }) =>
       api.sideQueueCancel(target, queueId),
-    onMutate: ({ queueId }: { queueId: string; slot: string }) => { markQueuePending(queueId, true) },
+    onMutate: ({ queueId, slot: target }: { queueId: string; slot: string }) => {
+      markQueuePending(queueId, true)
+      noteSideQueueCancelWaiting(target, queueId, true)
+    },
     onSuccess: (res, { queueId, slot: target }) => {
       // The reducer stashes the released text and the effect above drains it, so
       // on an open slot this path and the WS frame share ONE release — restoring
@@ -697,7 +703,10 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
     onError: () => {
       setLocalError(i18nT('pages.chat.sideChat.queue_cancel_failed'))
     },
-    onSettled: (_d, _e, { queueId }) => { markQueuePending(queueId, false) },
+    onSettled: (_d, _e, { queueId, slot: target }) => {
+      markQueuePending(queueId, false)
+      noteSideQueueCancelWaiting(target, queueId, false)
+    },
   })
 
   const editQueued = useMutation({
@@ -945,7 +954,7 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
       {showBanner && (
         <div className={`flex items-center justify-between px-3 py-1.5 text-[12px] border-b border-border shrink-0 ${isStale ? 'bg-warn/10 text-warn-text' : 'bg-bg-hover/50 text-muted'}`}>
           <span className="italic">
-            {i18nT('pages.chat.sideChat.context_from')} {i18nT('pages.chat.sideChat.turn', { count: turnsBehind })} {i18nT('pages.chat.sideChat.ago')}{age ? ` · ${age}` : ''}
+            {i18nT('pages.chat.sideChat.context_from_turns_ago', { count: turnsBehind })}{age ? ` · ${age}` : ''}
           </span>
           <span className="flex items-center gap-1 shrink-0">
             <button
@@ -981,6 +990,7 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
         // The host's own openers, so a path or artifact named in a side reply
         // opens where the main transcript opens it: a tab of this panel.
         onFileOpen={onFileOpen}
+        onFolderOpen={onFolderOpen}
         onArtifactOpen={onArtifactOpen}
         transcript={{
           sessionId: `side:${slot}`,

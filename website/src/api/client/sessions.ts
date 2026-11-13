@@ -5,24 +5,13 @@
  */
 
 import type { ClientTransport } from './transport'
+import type { RestartMaintenance } from '../../types'
+export type { RestartMaintenance } from '../../types'
 import { CONFIRM_IRREVERSIBLE_HEADER } from '../sharedCrewInvites'
 import type { CrewBoardAction, CrewBoardActionResult, WorkBoardResponse } from '../crewBoard'
 
 export const SEARCH_MIN_CHARS = 2  // backend session search threshold (must match kiro_crew.history.SEARCH_MIN_CHARS)
 
-/** The coordinated-reset barrier as the maintenance surface reads it.
- *
- *  `pending` names dashboard slots that must acknowledge for THEMSELVES —
- *  nothing here can acknowledge on their behalf. `unmanaged_busy` is the raw
- *  key list the barrier blocks on; the named breakdown of it arrives as
- *  `channel_blockers` / `other_blockers`. */
-export interface RestartMaintenance {
-  active: boolean
-  ready: boolean
-  required: string[]
-  pending: string[]
-  unmanaged_busy: string[]
-}
 /** A channel-owned worker holding up a reset, named by who it is rather than
  *  by its session key. */
 export interface RestartChannelBlocker {
@@ -126,6 +115,8 @@ export function createSessionsEndpoints({ get, post, del, j, jfetch: fetch, send
         session_key?: string
         rss_mb: number; peak_rss_mb: number; cpu_cores: number
         procs: number | null; mcp: number | null
+        /** Credits the live run has burned so far; null while none. Absent from an older gateway. */
+        credits?: number | null
         started_at: number; shared: boolean; pid: number | null; sampled: boolean
       }[]
       totals: {
@@ -140,6 +131,28 @@ export function createSessionsEndpoints({ get, post, del, j, jfetch: fetch, send
          */
         lineage_over_cap: boolean
         lineage_cap: number
+        /**
+         * Everything the product runs on this host, by part, so the page's total
+         * is comparable with the OS's own figure for the app. `rss_mb` above
+         * stays the sessions' own total. Null when the breakdown could not be
+         * taken; absent from an older gateway.
+         */
+        breakdown?: {
+          total_mb: number
+          host_pct: number | null
+          /** True when some part could not be measured, so the total leaves it out. */
+          partial: boolean
+          categories: {
+            /** `sessions`, `warm_pool`, `other_agents`, `mcp_gateway`, `gateway`, `gateway_helpers`, `desktop`. */
+            id: string
+            /** null when this part cannot be measured on this host. */
+            mb: number | null
+            /** null when processes cannot be counted on this host. */
+            procs: number | null
+            /** The largest executables in this part, by base name. */
+            top: { name: string; procs: number; mb: number }[]
+          }[]
+        } | null
       }
       history: { t: number; mb: number }[]
     }>,
@@ -208,10 +221,11 @@ export function createSessionsEndpoints({ get, post, del, j, jfetch: fetch, send
      * returned: the server resolves it from the store, which is what lets this call
      * stop a session the masked read deliberately does not name. A non-orphaned
      * item answers 409, so a click made from a stale poll is refused rather than
-     * quietly doing nothing.
+     * quietly doing nothing. A `dismiss` names the report it sets aside
+     * (`reportId`), so a newer ask filed since the last poll is refused, not hidden.
      */
-    crewBoardAction: (conductor: string, itemId: string, action: CrewBoardAction) =>
-      post('/api/crew-board/action', { conductor, item_id: itemId, action })
+    crewBoardAction: (conductor: string, itemId: string, action: CrewBoardAction, reportId?: string) =>
+      post('/api/crew-board/action', { conductor, item_id: itemId, action, ...(reportId ? { report_id: reportId } : {}) })
         .then(j) as Promise<CrewBoardActionResult>,
   }
 

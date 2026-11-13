@@ -10,7 +10,6 @@ and the builders other test files import from here are re-exported below.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import threading
 import time
@@ -42,7 +41,7 @@ from kiro_crew.monitoring.models import (
 )
 from kiro_crew.slack import gateway as gw
 from kiro_crew.slack.gateway import _EPOCH_WINDOW_SECS, GatewayOrchestrator, _result_hash
-from kiro_crew.testing.wait import async_wait_until, await_until
+from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS, async_wait_until, await_until
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tests: __init__ and constructor
@@ -520,17 +519,15 @@ class TestInteractiveApproval:
             tool_purpose="review changes",
             slot="parent-slot",
             is_background=False,
+            on_host_decision=None,
         )
 
     @pytest.mark.asyncio
     async def test_all_slots_trusted_does_not_auto_approve(self):
         """All slots trusted, no resolver → still PROMPTS (no implicit trust).
 
-        Session trust speaks for a chat session, not for an unattended job, and
-        with one trusted chat open the `all()` test is trivially satisfied.
-        Asserting the return value alone would pass vacuously, because the
-        mocked `request_approval` also returns True -- so assert the prompt was
-        actually raised.
+        Session trust speaks for a chat session, not an unattended job. The mocked
+        `request_approval` also returns True, so the test asserts the prompt was raised.
         """
         orch = _make_orchestrator(slack_enabled=False)
         ds = _mock_dashboard_state()
@@ -760,11 +757,8 @@ class TestShutdown:
     def test_autonudge_service_has_a_declared_default(self):
         """`_init_autonudge` returns before assigning when the flag is off.
 
-        `KIROCREW_AUTONUDGE=0` makes `_init_autonudge` return at its feature-flag
-        guard, before its only `self.autonudge_svc = ...`. Without a declaration
-        the attribute does not exist, and the seven `if self.autonudge_svc:`
-        sites in the loop-CRUD handlers raise AttributeError instead of reading
-        a default -- unlike `cron_svc` and `heartbeat_svc`, which are declared.
+        With `KIROCREW_AUTONUDGE=0` and no declared default, every
+        `if self.autonudge_svc:` in the loop-CRUD handlers raises AttributeError.
         """
         orch = _make_orchestrator()
         assert orch.autonudge_svc is None
@@ -1035,8 +1029,12 @@ class TestShutdown:
     async def test_a_wedged_autonudge_drain_is_cut_so_the_teardown_still_runs(self, monkeypatch):
         """A drain whose write never settles is cut on its own budget. Its window
         closes inside the graceful bound, and the teardown after it runs in full
-        instead of being cancelled before its first step."""
-        monkeypatch.setattr(gw, "GRACEFUL_SHUTDOWN_SECS", 1.0)
+        instead of being cancelled before its first step.
+
+        The graceful bound is a safety net, never a race: the wedged drain never
+        settles, so only this method's own cut lets ``_shutdown`` return, and a
+        regression that drops the cut still reaches the bound and fails."""
+        monkeypatch.setattr(gw, "GRACEFUL_SHUTDOWN_SECS", FALLBACK_TIMEOUT_SECS)
         # Absent before the drain had a budget of its own; set so a regression
         # reaches the graceful bound below instead of failing on the attribute.
         monkeypatch.setattr(gw, "PERSISTENCE_DRAIN_GRACE_SECS", 0.05, raising=False)
@@ -1159,28 +1157,75 @@ class TestShutdown:
     ):
         """The wait after the cut is bounded by the graceful deadline, whether that
         deadline is ``_shutdown``'s own or the bound ``_shutdown_and_exit`` applies,
-        and the write it leaves is named at WARNING."""
+        and the write it leaves is named at WARNING.
+
+        The outer bound is applied as the cancellation it delivers at expiry, once
+        the wait after the cut has started. A timer racing the drain cut would land
+        before that wait on a loaded runner and test a different path."""
         orch, service, add_task, release, finished = await self._cut_drain_over_a_slow_write(
-            tmp_path, monkeypatch, graceful_secs=0.3
+            tmp_path, monkeypatch, graceful_secs=_LOST_RUN_SECS if under_graceful_bound else 0.3
         )
-        # Replace teardown with a no-op so ``settle_admitted_writes`` is always
-        # reached before the graceful deadline, regardless of shard load.  Once
-        # reached, the warning fires unconditionally (via deadline or via the
-        # CancelledError path in settle_admitted_writes), making the assertion
-        # deterministic.  The real teardown is not under test here.
+        # The real teardown is not under test here.
         orch._stop_services_and_sessions = AsyncMock(return_value=None)
+        settle_entered = asyncio.Event()
+        real_settle = service.settle_admitted_writes
+
+        async def recording_settle(deadline):
+            settle_entered.set()
+            return await real_settle(deadline)
+
+        monkeypatch.setattr(service, "settle_admitted_writes", recording_settle)
         caplog.set_level("WARNING", logger="kiro_crew.autonudge")
         try:
-            shutdown = orch._shutdown()
             if under_graceful_bound:
-                shutdown = asyncio.wait_for(shutdown, timeout=gw.GRACEFUL_SHUTDOWN_SECS)
-            with contextlib.suppress(asyncio.TimeoutError):
-                await _within_lost_run(shutdown, "shutdown over a wedged AutoNudge write")
+                shutdown = asyncio.create_task(orch._shutdown())
+                await _within_lost_run(settle_entered.wait(), "the wait after the drain cut")
+                shutdown.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await _within_lost_run(shutdown, "shutdown cut by the graceful bound")
+            else:
+                await _within_lost_run(orch._shutdown(), "shutdown over a wedged AutoNudge write")
+            assert settle_entered.is_set()
             assert not finished.is_set()
             assert any(
                 "at the graceful shutdown deadline" in record.getMessage()
                 for record in caplog.records
             ), "shutdown ended without naming the admitted write it left pending"
+        finally:
+            release.set()
+            await _within_lost_run(
+                asyncio.gather(add_task, return_exceptions=True), "the wedged add cleanup"
+            )
+            service.stop()
+
+    @pytest.mark.asyncio
+    async def test_a_cancel_during_the_teardown_still_names_the_wedged_write(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The graceful bound can land while the teardown is still running; the
+        write the drain cut left pending is named at WARNING all the same."""
+        orch, service, add_task, release, finished = await self._cut_drain_over_a_slow_write(
+            tmp_path, monkeypatch, graceful_secs=0
+        )
+        teardown_entered = asyncio.Event()
+
+        async def endless_teardown(**_kwargs):
+            teardown_entered.set()
+            await asyncio.Event().wait()
+
+        orch._stop_services_and_sessions = endless_teardown
+        caplog.set_level("WARNING", logger="kiro_crew.autonudge")
+        try:
+            shutdown = asyncio.create_task(orch._shutdown())
+            await _within_lost_run(teardown_entered.wait(), "the teardown after the drain cut")
+            shutdown.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await _within_lost_run(shutdown, "shutdown cancelled in its teardown")
+            assert not finished.is_set()
+            assert any(
+                "at the graceful shutdown deadline" in record.getMessage()
+                for record in caplog.records
+            ), "a cancelled teardown skipped naming the admitted write it left pending"
         finally:
             release.set()
             await _within_lost_run(
@@ -1299,12 +1344,9 @@ class TestShutdown:
     async def test_shutdown_releases_the_subagent_task_store(self):
         """Shutdown closes the manager's durable store, and only after cancel_all.
 
-        ``SubagentManager.__init__`` opens a SQLite connection plus a writer thread
-        for the durable task queue; ``cancel_all`` stops the runs but leaves that
-        store open, so a gateway that never calls ``close`` holds the descriptors
-        and the executor for the life of the process. The ORDER is the other half
-        of the contract: ``cancel_all`` is what stops the runs still writing to the
-        store, so closing first would pull the connection out from under them.
+        ``cancel_all`` leaves the SQLite store and its writer thread open, and it is
+        what stops runs still writing to it, so closing first would pull the
+        connection out from under them.
         """
         order: list[str] = []
         orch = _make_orchestrator()
@@ -1554,3 +1596,30 @@ class TestShutdown:
         assert order[0] == "watchdog_stop"
         assert "heartbeat_cancel" in order[:2]
         assert order.index("watchdog_stop") < order.index("reap")
+
+    @pytest.mark.asyncio
+    async def test_shutdown_leaves_the_clean_exit_mark_to_the_exit_path(self):
+        # The teardown after the disarm can still wedge and be killed, so the mark
+        # waits for the exit path's last step, and _shutdown() never writes it.
+        from kiro_crew.dashboard import crash_dump_store
+
+        order: list[str] = []
+        orch = _make_orchestrator()
+        orch.cron_svc = None
+        orch.heartbeat_svc = None
+        orch.secretary_svc = None
+        orch.subagent_mgr = None
+        orch.sessions = _mock_sessions()
+        orch.sessions.close_all = AsyncMock(side_effect=lambda: order.append("reap"))
+        ds = _mock_dashboard_state()
+        ds._loop_watchdog = MagicMock()
+        ds._loop_watchdog.stop = MagicMock(side_effect=lambda: order.append("watchdog_stop"))
+        orch.dashboard_state = ds
+        orch._dashboard_runner = MagicMock()
+        orch._dashboard_runner.cleanup = AsyncMock()
+        with patch.object(
+            crash_dump_store, "record_clean_exit", side_effect=lambda *_: order.append("marked")
+        ):
+            await orch._shutdown()
+        assert "watchdog_stop" in order and "reap" in order
+        assert "marked" not in order

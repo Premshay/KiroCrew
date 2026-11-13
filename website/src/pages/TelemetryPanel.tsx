@@ -8,6 +8,7 @@ import { api } from '../api/client'
 import ErrorNotice from '../components/ErrorNotice'
 import InfoTip from '../components/InfoTip'
 import SegmentedControl from '../components/SegmentedControl'
+import TruncatedText from '../components/TruncatedText'
 import { SettingRef } from '../components/settingRef/SettingRef'
 import { Card, CardTitle, EmptyState, Input } from '../components/ui'
 import { usePersistedString } from '../hooks/usePersistedString'
@@ -86,7 +87,7 @@ function Notice({ children }: { children: React.ReactNode }) {
 // counter beside it.
 function GenNote({ shown, total, compact }: { shown?: number; total?: number; compact?: boolean }) {
   if (shown == null || total == null || total <= shown) return null
-  const text = i18nT('pages.telemetryPanel.showing_partial_window', { shown, total })
+  const text = i18nT('pages.telemetryPanel.showing_partial_window', { shown: fmtNumber(shown), total: fmtNumber(total) })
   // A fixed-width cell cannot hold the sentence: rendered inline it wraps to a
   // nine-line sliver and pushes the row to ten times its height. The marker keeps
   // the caveat visible and discoverable while the sentence moves to the tooltip.
@@ -205,6 +206,15 @@ function DailyTrend({ rows }: { rows: { date: string; count: number; cold_p50_ms
       {rows.map(r => {
         const cold = r.cold_p50_ms > 0 ? (r.cold_p50_ms / peak) * 100 : 0
         const warm = r.warm_p50_ms > 0 ? (r.warm_p50_ms / peak) * 100 : 0
+        // The same absence the empty column shows: the label says "—", not "0 ms",
+        // which would read as an instant start.
+        const point = i18nT('pages.telemetryPanel.daily_trend_point', {
+          date: r.date,
+          cold: fmtMs(r.cold_p50_ms > 0 ? r.cold_p50_ms : null),
+          warm: fmtMs(r.warm_p50_ms > 0 ? r.warm_p50_ms : null),
+          count: r.count,
+          n: fmtNumber(r.count),
+        })
         return (
           <div
             key={r.date}
@@ -212,20 +222,8 @@ function DailyTrend({ rows }: { rows: { date: string; count: number; cold_p50_ms
             // The numbers exist nowhere else, so the column has to carry them for
             // anyone not using a pointer.
             role="img"
-            aria-label={i18nT('pages.telemetryPanel.daily_trend_point', {
-              date: r.date,
-              cold: fmtMs(r.cold_p50_ms),
-              warm: fmtMs(r.warm_p50_ms),
-              count: r.count,
-              n: fmtNumber(r.count),
-            })}
-            title={i18nT('pages.telemetryPanel.daily_trend_point', {
-              date: r.date,
-              cold: fmtMs(r.cold_p50_ms),
-              warm: fmtMs(r.warm_p50_ms),
-              count: r.count,
-              n: fmtNumber(r.count),
-            })}
+            aria-label={point}
+            title={point}
           >
             <span className="block w-full rounded-t-sm" style={{ height: `${cold}%`, background: 'var(--accent)' }} />
             <span className="block w-full rounded-t-sm" style={{ height: `${warm}%`, background: 'var(--muted-strong)' }} />
@@ -329,9 +327,7 @@ function LatencyTab({ other }: { other: Other[] }) {
               const r = histRow(o)
               return (
               <div key={o.name} className="flex items-center gap-3 text-[11.5px]">
-                <span className="w-[260px] shrink-0 truncate font-mono text-[11px]" title={o.name}>
-                  {o.name}
-                </span>
+                <TruncatedText full={o.name} className="w-[260px] shrink-0 font-mono text-[11px]" />
                 {/* The endpoints flank the bar so each row is visibly its own
                     scale, rather than a position on a shared axis it never had. */}
                 <span className="w-14 shrink-0 text-right font-mono tabular-nums text-muted">
@@ -373,9 +369,7 @@ function LatencyTab({ other }: { other: Other[] }) {
               <div className="flex flex-col gap-1">
                 {counters.map(o => (
                   <div key={o.name} className="flex items-center gap-3 text-[11.5px]">
-                    <span className="min-w-0 flex-1 truncate font-mono text-[11px]" title={o.name}>
-                      {o.name}
-                    </span>
+                    <TruncatedText full={o.name} className="min-w-0 flex-1 font-mono text-[11px]" />
                     <span className="shrink-0 font-mono tabular-nums">
                       {fmtNumber(o.count ?? o.total ?? 0)}
                     </span>
@@ -400,9 +394,7 @@ function LatencyTab({ other }: { other: Other[] }) {
                 {gauges.map(o => (
                   <div key={o.name}>
                     <div className="flex items-center gap-3 text-[11.5px]">
-                      <span className="min-w-0 flex-1 truncate font-mono text-[11px]" title={o.name}>
-                        {o.name}
-                      </span>
+                      <TruncatedText full={o.name} className="min-w-0 flex-1 font-mono text-[11px]" />
                       <span
                         className="shrink-0 font-mono tabular-nums"
                         title={String(o.latest ?? 0)}
@@ -417,9 +409,7 @@ function LatencyTab({ other }: { other: Other[] }) {
                       <div className="ml-4 flex flex-col gap-0.5">
                         {Object.entries(o.by_attr).map(([sig, v]) => (
                           <div key={sig} className="flex items-center gap-3 text-[10.5px] text-muted">
-                            <span className="min-w-0 flex-1 truncate font-mono text-[10px]" title={sig}>
-                              {sig}
-                            </span>
+                            <TruncatedText full={sig} className="min-w-0 flex-1 font-mono text-[10px]" />
                             <span className="shrink-0 font-mono tabular-nums" title={String(v)}>
                               {fmtGaugeValue(o.name, v)}
                             </span>

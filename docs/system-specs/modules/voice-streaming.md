@@ -14,8 +14,8 @@ small WAV chunks, sends built-in-engine output as one WAV chunk, and streams
 Polly sentences as MP3; the browser queues either form for sequential playback.
 Every synthesis has a request identity so the browser can reject audio from a
 stopped request. Polly auto-speak starts as soon as the first sentence finishes
-streaming; Pocket starts a manual replay from the first progressively encoded
-Ogg Opus bytes. Sending a new message interrupts playback immediately.
+streaming. The Pocket replay endpoint streams progressively encoded Ogg Opus.
+Sending a new message interrupts playback immediately.
 
 Replaying a stored reply uses the same cancellation boundary: active audio,
 queued chunks and synthesis requests stop before the replay starts. A replaced
@@ -145,12 +145,12 @@ Telegram and dashboard paths. Three rules:
 
 ### Registered providers
 
-A composed edition can add TTS providers through the `speech` slot on `PlatformContext` (`SpeechProviderRegistry.tts_providers()`; see `platform-context.md`). The default registry adds none, so a standalone install has exactly `VALID_PROVIDERS`. `voice_reply.valid_providers()` is the built-ins plus the registered names.
+A composed edition can add TTS providers through the `speech` slot on `PlatformContext` (`SpeechProviderRegistry.tts_providers()`; see `platform-context.md`). The default registry adds none, so a standalone install has exactly `VALID_PROVIDERS`. The built-in sets (`VALID_PROVIDERS`, `REMOVED_PROVIDERS`, `DEFAULT_PROVIDER`) are defined in `speech_providers` and served by `voice_reply`, so boot validates a registry against them without loading the synthesis code. `voice_reply.valid_providers()` is the built-ins plus the registered names.
 
-- **Collision rule.** A registered name may not be a built-in (`polly`, `system`) or a removed provider (`piper`), may not be blank and may not repeat. `speech_providers.validate_speech_registry` refuses any of these at boot with `PlatformCompositionError`, so an edition can add a provider but never replace one.
-- **Default precedence.** A stored provider always wins. Only an absent, null or empty value takes `voice_reply.default_provider()`: the edition's `default_tts()` when it names a selectable provider, else `DEFAULT_PROVIDER`. An invalid stored value still falls back to `DEFAULT_PROVIDER`, never to the edition default, for the same reason it never falls back to Polly.
+- **Collision rule.** A registered name may not be a built-in (`polly`, `system`, `piper`, `pocket`) or a removed provider, may not be blank and may not repeat. `speech_providers.validate_speech_registry` refuses any of these at boot with `PlatformCompositionError`, so an edition can add a provider but never replace one.
+- **Default precedence.** A stored provider always wins. Only an absent, null or empty value without a Piper model takes `voice_reply.default_provider()`: the edition's `default_tts()` when it names a selectable provider, else `DEFAULT_PROVIDER`. An invalid stored value still falls back to `DEFAULT_PROVIDER`, never to the edition default, for the same reason it never falls back to Polly.
 
-`GET /api/voice/config` serves the same `providers` list the STT config does (`stt-streaming.md` § "The capability `providers` list"): a built-in row is `{name, builtin: true}` with no probe, a registered row carries `name`, `label`, `builtin`, `available`, `reason`, `action`, `error`; built-ins first in `system`, `polly` order. The Settings picker (`VoicePanel`) renders its options from it and falls back to its own `PROVIDER_OPTIONS` when the list is absent. A registered provider shows none of the built-in field sets; when it cannot run, `SpeechProviderNotice` shows its `reason` under the picker: through `ErrorNotice`, with the agent hand-off, when `error` says its check timed out or raised, and otherwise as status text with any sign-in hint.
+`GET /api/voice/config` serves the same `providers` list the STT config does (`stt-streaming.md` § "The capability `providers` list"): a built-in row is `{name, builtin: true}` with no probe, a registered row carries `name`, `label`, `builtin`, `available`, `reason`, `action`, `error`; built-ins first in `system`, `polly`, `piper`, `pocket` order. The Settings picker (`VoicePanel`) renders its options from it and falls back to its own `PROVIDER_OPTIONS` when the list is absent. A registered provider shows none of the built-in field sets; when it cannot run, `SpeechProviderNotice` shows its `reason` under the picker: through `ErrorNotice`, with the agent hand-off, when `error` says its check timed out or raised, and otherwise as status text with any sign-in hint.
 
 ## Components
 
@@ -166,9 +166,8 @@ A composed edition can add TTS providers through the `speech` slot on `PlatformC
 | Turn-taking hold | `website/src/hooks/useHandsFreeLoop.ts`, `website/src/pages/chat/page/composerHost.ts` and `website/src/pages/ChatPage.tsx` | The main composer opts into hands-free conversation mode: spoken turns preserve keyboard drafts, and the mic stays closed while a turn runs or reply audio is busy, with barge-in on a mic tap. |
 | Turn latency marks | `website/src/utils/voiceTurnMetrics.ts` | Debug-level per-turn spans: end-of-speech to first token and to first audio. |
 | Settings | `website/src/pages/settings/VoicePanel.tsx` | Updates auto-speak, provider, and the selected provider's settings (Polly, Pocket, Piper, built-in engine); fetches each provider's voice catalogue only while that provider is selected. |
-| Slack reply | `slack.handler.handle_message()` and `_safe_voice_reply()` | Starts a background provider-aware voice reply when thread, global, or voice-input settings allow it. |
-| Settings | `website/src/pages/settings/VoicePanel.tsx` | Updates auto-speak, provider, and the selected provider's settings; fetches each provider's voice catalogue only while that provider is selected. |
-| Slack reply | `slack.handler.handle_message()`, through `_reply_by_voice()` and `_safe_voice_reply()` (`slack/handler_runtime/voice.py`) | Starts a background provider-aware voice reply when thread, global, or voice-input settings allow it. |
+| Slack reply | `slack.transport_dispatch.handle_message_transport()` (the default `messaging.use_transport` path, through `slack.transport_voice.speak_finished_turn()`) and the native `slack.handler.handle_message()`, both through `_reply_by_voice()` and `_safe_voice_reply()` (`slack/handler_runtime/voice.py`) | Starts a background provider-aware voice reply when thread, global, or voice-input settings allow it. |
+| WhatsApp reply | `whatsapp.transport_dispatch.WhatsAppDispatcher._speak_reply()` | Answers an inbound voice note with a push-to-talk note after the text when `whatsapp.auto_reply_to_voice` is on. Polly only: it passes `ogg_opus=True` through `synthesize_and_deliver()`, so Polly writes Ogg/Opus (`.ogg`), the container a WhatsApp voice note plays; the built-in engine's WAV is skipped rather than sent. |
 
 ## Dashboard auto-speak
 
@@ -233,11 +232,16 @@ after a newer response starts.
 
 For Polly, `api_voice_synthesize()` iterates
 `voice_reply.streaming_voice_reply()`, broadcasts each `voice_chunk`, then
-uses `stitch_mp3s()` to broadcast `voice_complete`.
+uses `stitch_mp3s()` to broadcast `voice_complete`. `stitch_mp3s()` hands
+ffmpeg's concat demuxer a list file, so the command line stays one length for
+any chunk count (Windows refuses one over 32,767 characters). When the stitch
+fails (no ffmpeg, a non-zero exit, a timeout), every chunk has still been sent, so
+`voice_complete` is broadcast without `audio` or `audioMime`, a WARNING is
+logged, and the HTTP response is unchanged.
 The built-in engine broadcasts its completed WAV. Only the explicit Polly
 provider reaches the Polly branch; a future provider cannot silently reach a
-paid AWS service. Both event types include `audioMime` and echo the synthesis `request_id`.
-`voice_complete` also updates the Redux
+paid AWS service. Both event types echo the synthesis `request_id`, and carry
+`audioMime` with their audio. A `voice_complete` with audio also updates the Redux
 `voiceAudio` field; `UseWebSocketCoverage.voice.test.tsx` covers that state update.
 
 `VoicePcmPlayer` decodes WAV chunks in order and schedules their sources on one
@@ -344,11 +348,9 @@ audio rather than only silencing what already has.
 
 ## Manual replay
 
-The Speak button appears on hover over assistant messages of at least 50
-characters. It first asks `api.voiceReplay(slot, content)` for a provider-aware
-playback path: Pocket returns a one-time Ogg Opus URL the browser plays as it
-grows, while Piper and Polly fall back to `api.voiceSynthesize(slot, content)`.
-Manual replay works independently of auto-speak.
+The replay endpoint can return a one-time Pocket Ogg Opus URL or select the
+legacy synthesis path. The dashboard has no caller for `api.voiceReplay` yet;
+the endpoint alone does not establish progressive Pocket playback.
 
 While muted, `voice_chunk` frames are discarded and the `chat_segment`/
 `chat_done` tail paths do not synthesize more text. A new assistant message
@@ -371,13 +373,13 @@ synthesis so simultaneous local requests cannot load unbounded models.
 
 ## Hands-free conversation turn-taking
 
-With hands-free dictation armed AND auto-speak on, the loop runs fast
+With hands-free dictation armed, the loop enables speech and runs fast
 turn-taking (half-duplex — never listening while speaking):
 
 - **Hold.** `chat.voiceBusy` is true while the TTS pipeline is active
   end-to-end: a synthesis POST in flight (`synthInFlightRef`), chunks queued, or
-  audio playing. `ChatPage` passes `hold = autoSpeak && (slotRunning ||
-  voiceBusy)` into `useHandsFreeLoop`, whose re-arm cycle will not open the mic
+  audio playing. The composer passes the turn and playback hold into
+  `useHandsFreeLoop`, whose re-arm cycle will not open the mic
   while held. A capture already in progress is never interrupted by a hold
   arriving mid-utterance. `voiceBusy` (not `voicePlaying`) is the hold signal
   because playing goes false in the gap between requesting a sentence's
@@ -396,7 +398,8 @@ turn-taking (half-duplex — never listening while speaking):
   first audio `play()` log debug-level `end-of-speech → first token / first
   audio` spans. Marks expire after 30 s; dead-end auto-sends clear them.
 
-With auto-speak off, hands-free keeps its dictate-anytime behavior — no hold.
+Disarming hands-free releases its speech request; the configured auto-speak
+preference remains independent.
 
 ## Configuration and API
 
@@ -510,9 +513,21 @@ region, so `voice_polly_rejected` is a client-fallback code alongside
 payloads carry `speakable`, and a manual Read aloud that allowed the fallback
 speaks the reply on the client instead of showing the notice.
 
+A stream that ends with no audio is probed the way the built-in engine's
+single-file path is: `voice_unavailable` only when `resolve_polly_cli()` finds no
+AWS CLI, and otherwise `voice_synthesis_failed`. An access or credential error
+that skipped every sentence therefore reaches the generic notice instead of being
+masked by browser speech.
+
+Every Polly `aws` child gets its environment through `sandbox.without_python_env`:
+the catalogue's `describe-voices`, the consent gate's probes and synthesis.
+aws-cli v1 is a Python program, so this keeps the gateway's `PYTHONPATH` /
+`PYTHONHOME` from making it import the gateway's packages, with or without a
+sandbox backend. Nothing else is dropped by it. The consent probes get it at
+`cloud.aws.run_aws`.
+
 Local Piper/Pocket binary discovery and model-file checks run off the event loop.
 `_synthesize_polly()` and Pocket's replay stream run their commands through
-
 `wrap_argv_async(..., _prepare=wrap_argv)`. `_synthesize_system()` instead delegates
 to `_run_tts_subprocess()`, which uses `sandboxed_spawn_argv_async()` and the
 credential-scrubbed child environment. Those chokepoints catch
@@ -560,19 +575,28 @@ surface can show:
   Polly host, which is the defect itself rather than a cosmetic difference.
 - `synthesize_and_deliver()` has no channel for prose, so it still reports "no
   audio" and catches the refusal explicitly so it cannot escape as an unhandled
-  error on a voice reply. Both callers drop that signal — Slack's
-  `_safe_voice_reply` discards the returned bool and Telegram only logs it — so a
-  refusal is silent on those surfaces; the gap is in those callers, not in this
-  function.
+  error on a voice reply. Every caller drops that signal — Slack's
+  `_safe_voice_reply` discards the returned bool, and Telegram and WhatsApp only
+  log it — so a refusal is silent on those surfaces; the gap is in those callers,
+  not in this function.
 
 ## Slack voice replies
 
 `slack.handler` accepts `!voice` thread commands (`_bang_voice`,
 `slack/handler_runtime/commands.py`) for enabling and disabling a
 thread, toggling global replies, and choosing a voice, engine, speed, or pitch.
-`handle_message()` calls `_reply_by_voice()` (`slack/handler_runtime/voice.py`),
-which starts `_safe_voice_reply()` as a background task when a
-thread or global setting enables replies, or when voice-input reply settings
-allow a transcribed voice message to receive audio. `_safe_voice_reply()` calls
-the provider-aware `voice_reply.voice_reply()` path, so Slack replies follow
-the selected provider rather than assuming Polly.
+Both Slack turn paths call `_reply_by_voice()` (`slack/handler_runtime/voice.py`)
+once the answer is out: the default transport path
+(`transport_dispatch.handle_message_transport()`, `messaging.use_transport`) and
+the native `handle_message()` (review-mode channels and
+`messaging.use_transport=false`). It starts `_safe_voice_reply()` as a background
+task when a thread or global setting enables replies, or when voice-input reply
+settings allow a transcribed voice message to receive audio. The transport path
+speaks `SlackRenderer.delivered_text`, the answer as Slack showed it (OPTIONS,
+control tags and thinking removed, redacted), into the conversation the answer
+was posted to, and skips an unfinished or cancelled turn; a failure there is
+logged and never re-records the turn. `_route_message` hands the voice-memo
+signal (`had_voice_input`) to whichever path it picks, and the busy-session
+queues carry it to `_dispatch_queued`, so a queued voice memo is answered in kind
+too. `_safe_voice_reply()` calls the provider-aware `voice_reply.voice_reply()`
+path, so Slack replies follow the selected provider rather than assuming Polly.

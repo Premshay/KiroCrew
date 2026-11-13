@@ -142,8 +142,14 @@ export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
   'SecurityPanelRedaction.tsx': 'security',
   'SecurityPanelLayers.tsx': 'security',
   'SecurityPanelGovernance.tsx': 'security',
-  'ConnectionsPanel.tsx': 'connections',
+  // The review cards for settings files edited outside the dashboard, which
+  // SecurityPanel.tsx mounts as its banner. No extractable primitive; mapped so
+  // the hand-written `security.config-pending` entry stays anchored to its source.
+  'SecurityPanelConfigPending.tsx': 'security',
+  'OAuthAppPanel.tsx': 'connections',
   'SecretsPanel.tsx': 'secrets',
+  // Draws the tab while the Secrets vault redesign preview is off.
+  'SecretsPanelLegacy.tsx': 'secrets',
   'NotificationsPanel.tsx': 'notifications',
   'ShortcutsPanel.tsx': 'shortcuts',
   // Added upstream (auto-skill generation) without a mapping here, so its two
@@ -180,7 +186,14 @@ export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
     { tab: 'channels', params: { channel: 'discord' }, labelSuffix: 'Discord' },
     { tab: 'channels', params: { channel: 'telegram' }, labelSuffix: 'Telegram' },
     { tab: 'channels', params: { channel: 'wecom' }, labelSuffix: 'WeCom' },
+    { tab: 'channels', params: { channel: 'feishu' }, labelSuffix: 'Feishu' },
   ],
+  // These channels' spec files render no primitive, but they carry the literal labels of
+  // the credential fields BotChannelPanel draws, which settingsManual indexes.
+  'DiscordPanel.tsx': { tab: 'channels', params: { channel: 'discord' }, labelSuffix: 'Discord' },
+  'TelegramPanel.tsx': { tab: 'channels', params: { channel: 'telegram' }, labelSuffix: 'Telegram' },
+  'WeComPanel.tsx': { tab: 'channels', params: { channel: 'wecom' }, labelSuffix: 'WeCom' },
+  'FeishuPanel.tsx': { tab: 'channels', params: { channel: 'feishu' }, labelSuffix: 'Feishu' },
   'DeveloperPanel.tsx': 'developer',
   // The Feature Previews cards DeveloperPanel mounts on its Feature Previews
   // page. Indexed on purpose: a control visible on a Settings pane that
@@ -189,11 +202,13 @@ export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
   'FeaturePreviewsSection.tsx': DEVELOPER_PREVIEWS,
   // The URL is offered only while its preview is enabled (settingsSearchCore).
   'SessionEnvironmentsCard.tsx': 'session-environments',
-  // The Crewmates section DeveloperPanel mounts under Feature Previews: the
-  // server-side crewmate switches (reply threads today). Same tab, so a
-  // SettingRef to `dashboard.crewmate_threads` deep-links to the row.
-  'CrewmatesSection.tsx': DEVELOPER_PREVIEWS,
-  // The Decisions (Jev) card, which FeaturePreviewsSection mounts. Its own file
+  // The Reply threads row FeaturePreviewsSection mounts in its Crew and bots
+  // group (`dashboard.crewmate_threads`). Same tab, so a SettingRef to that
+  // key deep-links to the row.
+  'ReplyThreadsRow.tsx': DEVELOPER_PREVIEWS,
+  // The default agent's opt-in MCP sets, mounted below the preview groups.
+  'DefaultMcpGrantsSection.tsx': DEVELOPER_PREVIEWS,
+  // The Decision models card, which FeaturePreviewsSection mounts. Its own file
   // because it is a list and a detail rather than one row, and mapped here for the
   // reason the section above is: a control on a Settings pane that search cannot
   // find is the coverage gap this map exists to close.
@@ -210,20 +225,29 @@ export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
   // control added to it belongs to the same deep link, and leaving it unmapped
   // would mean the extractor never looks at the file at all.
   'DecisionsPointPanel.tsx': DEVELOPER_PREVIEWS,
+  // The hosted provider's API key, drawn inside that provider's entry of the
+  // decision model picker. Governed like the card it belongs to.
+  'DecisionsHostedKeyField.tsx': DEVELOPER_PREVIEWS,
   'AboutPanel.tsx': 'about',
   // AboutPanel.tsx's owners (the in-app update step-up and request card; a gateway
-  // install's Updates card body). Mapped with it so a control either one gains stays
-  // indexed on the About tab.
+  // install's Updates card body; the desktop app's Restart gateway row; the two
+  // auto-update switches; the upcoming update notice). Mapped
+  // with it so a control any of them gains stays indexed on the About tab.
   'AboutPanelUpdateFlow.tsx': 'about',
   'AboutPanelGatewayUpdate.tsx': 'about',
+  'AboutPanelUpdateSwitches.tsx': 'about',
+  'AboutPanelUpcomingUpdate.tsx': 'about',
+  'DesktopGatewayRestartRow.tsx': 'about',
   'SttSettings.tsx': 'voice',
   // The `instances` tab mounts RemoteCrewPanel (SettingsPage.tsx), which also
   // renders InstancesPanel.tsx's AddInstanceForm — both files map to the same
   // tab so a primitive added to either lands on the right deep link.
   'RemoteCrewPanel.tsx': 'instances',
-  // RemoteCrewPanel.tsx's component owners (the setup tab's cards, one crew row).
+  // RemoteCrewPanel.tsx's component owners (the setup tab's cards, one crew row,
+  // the not-active-yet banner).
   'RemoteCrewPanelLaunch.tsx': 'instances',
   'RemoteCrewPanelCrewRow.tsx': 'instances',
+  'RemoteCrewPanelRestartBanner.tsx': 'instances',
   // Mounted from outside pages/settings, so each is also a root in panelRoots:
   // ImportPanel mounts PortabilityTab, FeaturePreviewsSection the gateway-wide
   // automatic-cards switch.
@@ -239,6 +263,9 @@ export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
   // The conductor remote-dispatch card FeaturePreviewsSection mounts: its
   // `work_ledger.remote_dispatch` switch is a Developer-tab row.
   'RemoteDispatchCard.tsx': DEVELOPER_PREVIEWS,
+  // The edition rows FeaturePreviewsSection mounts. It only places
+  // edition-registered components, so it has no extractable primitive.
+  'EditionPreviewRows.tsx': DEVELOPER_PREVIEWS,
   // The per-app model rows ChatPanel's Model page mounts. Each row is labelled
   // with the app's own name, a dynamic label the extractor skips, so the file
   // yields no entry today; mapped so a static control added to it lands on the
@@ -250,8 +277,18 @@ export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
   'ChatPanelLinkPatternsEditor.tsx': { tab: 'chat', params: { sub: 'transcript' } },
   // The default-folder picker ChatPanel's Sessions page mounts.
   'DefaultSessionFolderSetting.tsx': { tab: 'chat', params: { sub: 'sessions' } },
+  // The per-creator session limit ChatPanel's Sessions page mounts.
+  'SessionsPerCreatorSetting.tsx': { tab: 'chat', params: { sub: 'sessions' } },
+  // The per-app session mutes NotificationsPanel's Sources page mounts. Each row
+  // is labelled with the app's own name, a dynamic label the extractor skips;
+  // mapped so a static control added to it lands on the Sources deep link.
+  'AppSessionMuteSection.tsx': { tab: 'notifications', params: { sub: 'sources' } },
   // The Web Push toggle NotificationsPanel's Desktop alerts page mounts.
   'NotificationsPushSection.tsx': { tab: 'notifications', params: { sub: 'alerts' } },
+  // The per-channel "Deliver to" route NotificationsPanel's Sources page mounts on
+  // each runtime-fetched channel row; mapped so a static control added to it lands
+  // on the Sources deep link.
+  'NotificationsBridgeRoute.tsx': { tab: 'notifications', params: { sub: 'sources' } },
 }
 
 /** Panels whose controls sit in `case '<sub>':` pages of a SettingsSubNav;
@@ -340,8 +377,13 @@ function extractStringProp(source: string, propName: string): string | undefined
   // duplicates DEFAULT_PRODUCT_NAME in `src/i18n/index.ts`: importing that
   // module here would drag i18next and every catalog into a build-time
   // script for one constant.
-  if (tMatch) return getEnCatalog()[tMatch[1]]?.replaceAll('{{productName}}', 'Kiro Crew')
+  if (tMatch) return withStockProductName(getEnCatalog()[tMatch[1]])
   return undefined
+}
+
+/** A catalog string with `{{productName}}` resolved to its stock default, for the reason above. */
+function withStockProductName(text: string | undefined): string | undefined {
+  return text?.replaceAll('{{productName}}', 'Kiro Crew')
 }
 
 /** Return the catalog key when a JSX prop is a supported translation call. */
@@ -502,6 +544,8 @@ export function panelRoots(srcDir: string): ExtractRoot[] {
     { dir: path.join(srcDir, 'pages', 'developer'), file: 'KasBundleCard.tsx' },
     { dir: path.join(srcDir, 'pages', 'developer'), file: 'KiroSignInCard.tsx' },
     { dir: path.join(srcDir, 'pages', 'chat', 'command-center'), file: 'AutomaticCardSetting.tsx' },
+    // A Connections card's OAuth app part, opened in place on Settings → Connections.
+    { dir: path.join(srcDir, 'pages', 'connections'), file: 'OAuthAppPanel.tsx' },
   ]
 }
 
@@ -590,8 +634,8 @@ export function mergeManualEntries(generated: SettingEntry[], manual: ManualSett
     const { descriptionKey, ...rest } = m
     resolved.push({
       ...rest,
-      label: cat[m.labelKey],
-      ...(descriptionKey ? { description: cat[descriptionKey] } : {}),
+      label: withStockProductName(cat[m.labelKey]) as string,
+      ...(descriptionKey ? { description: withStockProductName(cat[descriptionKey]) } : {}),
     })
   }
   const byId = new Map(resolved.map(m => [m.id, m]))

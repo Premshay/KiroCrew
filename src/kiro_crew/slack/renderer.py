@@ -63,6 +63,7 @@ from kiro_crew.messaging.renderer import (
 from kiro_crew.messaging.split import repaired_for_delivery, split_markdown_safe
 from kiro_crew.messaging.transport import TransportCapabilities
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.slack.approval_card import approval_detail_blocks, approval_header_text, bounded_scan
 from kiro_crew.slack.approval_tokens import (  # noqa: F401 -- re-exported
     _APPROVAL_TOKEN_SEP,
     _approval_registry_key,
@@ -93,7 +94,7 @@ from kiro_crew.slack.handler import (
     build_timing_footer,
 )
 from kiro_crew.slack.outbound import PostedOptions
-from kiro_crew.slack.renderer_session_status import ApprovalSessionStatus
+from kiro_crew.slack.renderer_session_status import _STATUS_WORKING, ApprovalSessionStatus
 from kiro_crew.slack.reply_pieces import (  # noqa: F401 -- re-exported
     _NARRATION_MAX_CHARS,
     _SPLIT_HEADROOM,
@@ -114,9 +115,6 @@ TOOL_DENY_ACTION_PREFIX = "mc_tool_deny_"
 #: "Trust" auto-approves all subsequent tools for THIS session only (not
 #: global). Mirrors the native path's per-session trust_tool button.
 TOOL_TRUST_ACTION_PREFIX = "mc_tool_trust_"
-
-#: Thread-status text shown while the turn is in flight (mirrors handler).
-_STATUS_WORKING = "is working on your request"
 
 
 def _redact_all(text: str) -> str:
@@ -147,9 +145,19 @@ def _display_safe(text: str) -> str:
 
 
 def build_approval_blocks(
-    title: str, request_id: str | int, session_key: str = "", nonce: str = ""
+    title: str,
+    request_id: str | int,
+    session_key: str = "",
+    nonce: str = "",
+    *,
+    purpose: str = "",
+    tool_input: str = "",
+    mcp_identity: tuple[str, str] = ("", ""),
 ) -> list[dict[str, Any]]:
     """Build Block Kit approve/deny buttons for a tool-permission request.
+
+    Above them, the tool, the trusted *mcp_identity* server it runs on, its *purpose*
+    and *tool_input*, drawn by :mod:`kiro_crew.slack.approval_card` for the approver.
 
     The ``action_id``s and ``value`` encode a session-namespaced approval token
     (``session_key:request_id``) so the interaction handler correlates a click
@@ -173,10 +181,8 @@ def build_approval_blocks(
     key = _approval_registry_key(session_key, request_id)
     token = build_approval_token(session_key, request_id, nonce)
     return [
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"🔧 Approve tool *{title}*?"},
-        },
+        {"type": "section", "text": {"type": "mrkdwn", "text": approval_header_text(title)}},
+        *approval_detail_blocks(purpose, tool_input, mcp_identity),
         {
             "type": "actions",
             "elements": [
@@ -1620,6 +1626,11 @@ class SlackRenderer(ApprovalSessionStatus, Renderer):
             self._narration_previewed = pending[0]
             shown = self._last_segment.rstrip()
             await self._finish_pending_step(pending, f"{shown}…" if shown.strip() else "")
+        # The display-form scan every egress here takes, over what the card shows: the
+        # driver's byte-level pass reads ``AKIA**...**`` as no key; Slack shows it whole.
+        title, purpose, detail = (
+            bounded_scan(text, _display_safe) for text in (title, tool_purpose, tool_input)
+        )
         # Namespace the approval buttons by this turn's session so a click can
         # only resolve THIS session's pending tool (kiro-cli rids restart at 1
         # per session — a bare id would collide across concurrent threads).
@@ -1634,7 +1645,15 @@ class SlackRenderer(ApprovalSessionStatus, Renderer):
         try:
             await self.slack.post_blocks(
                 self.channel,
-                build_approval_blocks(title, request_id, session_key, nonce),
+                build_approval_blocks(
+                    title,
+                    request_id,
+                    session_key,
+                    nonce,
+                    purpose=purpose,
+                    tool_input=detail,
+                    mcp_identity=self.prompt_mcp_identity,
+                ),
                 "Tool approval requested",
                 self.thread_ts,
             )

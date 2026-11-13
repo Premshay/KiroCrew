@@ -23,6 +23,7 @@ from dashboard_handlers_core_coverage_helpers import _json_req, _req, _seed_stt
 from kiro_crew import transcribe as transcribe_mod
 from kiro_crew.dashboard.handlers import core as core_mod
 from kiro_crew.stt import models as stt_models
+from kiro_crew.testing.wait import finished
 
 # ── STT status / prepare / prewarm ──────────────────────────────────────
 
@@ -730,6 +731,23 @@ class TestSttTranscribe:
         assert body["error"] == "STT not available"
 
     @pytest.mark.asyncio
+    async def test_a_body_that_is_not_multipart_is_400(self) -> None:
+        req = _req()
+        req.content_type = "application/json"
+        resp = await core_mod.api_stt_transcribe(req)
+        assert resp.status == 400
+        assert json.loads(resp.body)["code"] == "not_multipart"
+
+    @pytest.mark.asyncio
+    async def test_a_multipart_type_with_no_boundary_is_400(self) -> None:
+        req = _req()
+        req.content_type = "multipart/form-data"
+        req.multipart = AsyncMock(side_effect=ValueError("boundary missing"))
+        resp = await core_mod.api_stt_transcribe(req)
+        assert resp.status == 400
+        assert json.loads(resp.body)["code"] == "not_multipart"
+
+    @pytest.mark.asyncio
     async def test_missing_audio_field_is_400(self) -> None:
         resp = await core_mod.api_stt_transcribe(_multipart_req(None))
         assert resp.status == 400
@@ -908,3 +926,29 @@ class TestSttTranscribe:
         assert body["error"] == "transcription failed"
         assert body["code"] == "stt_transcription_failed"
         assert "recogniser exploded" not in json.dumps(body)
+
+    @pytest.mark.asyncio
+    async def test_a_departed_uploader_cancels_the_decode(self, monkeypatch) -> None:
+        """An aborted upload stops the recogniser instead of decoding to the end."""
+        cancelled = asyncio.Event()
+
+        async def _decode_forever(_path, _cfg):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        monkeypatch.setattr("kiro_crew.transcribe.transcribe_audio", _decode_forever)
+        field = SimpleNamespace(
+            name="audio",
+            filename="recording.webm",
+            read_chunk=AsyncMock(side_effect=[b"x", b""]),
+        )
+        req = _multipart_req(field)
+        req.transport = SimpleNamespace(is_closing=lambda: True)
+        resp = await finished(
+            core_mod.api_stt_transcribe(req), "the transcribe handler after its client left"
+        )
+        assert cancelled.is_set()
+        assert resp.status == 400

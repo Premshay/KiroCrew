@@ -569,6 +569,26 @@ async def test_route_record_marks_a_reporting_workers_milestone(_open_route, mon
 
 
 @pytest.mark.asyncio
+async def test_route_get_sends_the_event_tail_once(_open_route):
+    routes = _open_route
+    _unit(slot=sl.ledger_key("chat-r-1"))
+    for n in range(sl._MAX_EVENT_TAIL + 5):
+        req = _mk_request(
+            "POST",
+            "/api/session-ledger/record",
+            body={"event": f"step {n}", "event_kind": "progress"},
+        )
+        assert (await routes.api_session_ledger_record(req)).status == 200
+    assert_drained()
+    resp = await routes.api_session_ledger_get(_mk_request("GET", "/api/session-ledger"))
+    data = json.loads(resp.text)
+    assert "events" not in data["state"]
+    assert [event["text"] for event in data["events"]] == [
+        f"step {n}" for n in range(5, sl._MAX_EVENT_TAIL + 5)
+    ]
+
+
+@pytest.mark.asyncio
 async def test_route_phase_without_event_is_400(_open_route):
     routes = _open_route
     _unit(slot=sl.ledger_key("chat-r-1"))
@@ -1117,6 +1137,23 @@ def test_mcp_tools_pass_the_verified_key_to_transport(monkeypatch):
         mcp_core, "_get", lambda _path, *, session_key, timeout: {"state": {}, "events": []}
     )
     assert tools.session_ledger_read("x", {}).startswith("This session has no work ledger yet.")
+
+
+def test_mcp_read_returns_an_events_only_record(monkeypatch):
+    """A record holding only events is a ledger: the read returns its event tail
+    instead of the start-one hint."""
+    from kiro_crew import mcp_core
+    from kiro_crew.mcp_tools import ledger as tools
+
+    event = {"ts": "2026-11-01T00:00:00Z", "kind": "progress", "text": "checked CI"}
+    state = {"goal": "", "phase": "", "next": "", "tried": [], "artifacts": {}, "events": [event]}
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "chat-v-1")
+    monkeypatch.setattr(
+        mcp_core, "_get", lambda _path, *, session_key, timeout: {"state": state, "events": [event]}
+    )
+    read = tools.session_ledger_read("x", {})
+    assert not read.startswith("This session has no work ledger yet.")
+    assert json.loads(read)["events"] == [event]
 
 
 # ── MCP read budget ───────────────────────────────────────────────────────

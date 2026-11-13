@@ -1082,7 +1082,7 @@ class TestStopCardTeardownRace:
         assert slot._stop_event_id == stop_id
 
         await _make_stop_resolver(state, slot, "hard", stop_id)()
-        assert _card_state(slot, stop_id) == "stop_failed_reset"
+        assert _card_state(slot, stop_id) == "force_stopped"
 
     @pytest.mark.asyncio
     async def test_teardown_does_not_erase_hard_kill_precedence(self):
@@ -1110,7 +1110,7 @@ class TestStopCardTeardownRace:
         assert slot._stop_event_id == stop_id
 
         await _make_stop_resolver(state, slot, "hard", stop_id)()
-        assert _card_state(slot, stop_id) == "stop_failed_reset"
+        assert _card_state(slot, stop_id) == "force_stopped"
         assert slot._stop_escalated_card_id is None
 
     def test_stopping_setter_leaves_the_escalation_marker_alone(self):
@@ -1216,6 +1216,20 @@ class TestStopCardTeardownRace:
         assert _card_state(slot, new_id) == "stopped"
         assert slot._stop_event_id is None
         assert slot._stop_state == "idle"
+
+    @pytest.mark.asyncio
+    async def test_a_stale_escalation_marker_does_not_label_a_later_kill_forced(self):
+        """Only the escalated card reads force_stopped: a later card's timeout still failed."""
+        from kiro_crew.dashboard.chat_handlers import _make_stop_resolver
+
+        slot = _FakeSlot()
+        state = _FakeState(slot)
+        slot._stop_escalated_card_id = "stop-old"  # left behind by a swept, escalated card
+        new_id = _seed_stop_card(slot, stop_id="stop-new")
+
+        await _make_stop_resolver(state, slot, "hard", new_id)()
+
+        assert _card_state(slot, new_id) == "stop_failed_reset"
 
     @pytest.mark.asyncio
     async def test_cardless_hard_kill_still_releases_the_stop_posture(self):
@@ -1488,7 +1502,7 @@ class TestStopReusesOrphanedCard:
         for a ``role == "inject"`` row carrying ``meta.injectKind ==
         "synthesis"`` — the row ``_run_pending_synthesis`` appends when a
         sub-agent wave completes. An orphan above one is cross-turn even
-        though plain inject rows (cron/recovery notes) are passive.
+        though a plain inject note is passive.
         """
         slot = _FakeSlot()
         state = _FakeState(slot)
@@ -1510,6 +1524,59 @@ class TestStopReusesOrphanedCard:
         states = {r["id"]: r["state"] for r in rows}
         assert states["stop-prev-turn"] == "stopped"
         assert slot._stop_event_id != "stop-prev-turn"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("inject_kind", ["cron", "mcp_app", "automation_notice"])
+    async def test_turn_dispatching_inject_bounds_the_reuse(self, inject_kind):
+        """A cron delivery, an app message and an automation notice open a turn.
+
+        ``opensDisplayTurn`` (groupDisplayItems.ts) starts a new turn at each
+        of them, so an orphan stop card above one sits in an earlier turn and
+        must not be re-armed.
+        """
+        slot = _FakeSlot()
+        state = _FakeState(slot)
+        state.sessions.stop_turn = AsyncMock(return_value="soft")
+        _seed_stop_card(slot, stop_id="stop-prev-turn")
+        slot.messages.append(
+            {
+                "role": "inject",
+                "content": f"{inject_kind} prompt",
+                "cls": "msg msg-inject",
+                "meta": {"injectKind": inject_kind},
+            }
+        )
+
+        await self._press(state, slot)
+
+        rows = self._stop_event_rows(slot)
+        assert len(rows) == 2
+        states = {r["id"]: r["state"] for r in rows}
+        assert states["stop-prev-turn"] == "stopped"
+        assert slot._stop_event_id != "stop-prev-turn"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("inject_kind", ["recovery", "user_replay"])
+    async def test_turn_continuing_inject_is_walked_past(self, inject_kind):
+        """A recovery or a replayed prompt continues the turn above it."""
+        slot = _FakeSlot()
+        state = _FakeState(slot)
+        state.sessions.stop_turn = AsyncMock(return_value="soft")
+        _seed_stop_card(slot, stop_id="stop-orphan")
+        slot.messages.append(
+            {
+                "role": "inject",
+                "content": f"{inject_kind} prompt",
+                "cls": "msg msg-inject",
+                "meta": {"injectKind": inject_kind},
+            }
+        )
+
+        await self._press(state, slot)
+
+        rows = self._stop_event_rows(slot)
+        assert len(rows) == 1
+        assert rows[0]["id"] == "stop-orphan"
 
     @pytest.mark.asyncio
     async def test_plain_inject_rows_are_walked_past(self):

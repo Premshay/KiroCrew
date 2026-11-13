@@ -143,3 +143,18 @@ for _owner in _OWNERS:
 _EXPORTS: dict[str, str] = {}
 _EXPORTS.update(_facade_mirror.install(_sys.modules[__name__], _OWNERS, excluded=()).served)
 _sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
+
+
+async def delegate_launch_failed(message: str | None) -> AcpDelegateLaunchFailed:
+    """Build the delegate-launch error and latch an outdated Kiro CLI."""
+    from kiro_crew.acp.delegate_launch_signatures import (
+        KIRO_CLI_TOO_OLD_MESSAGE,
+        KIRO_CLI_TOO_OLD_TERMINAL_MESSAGE,
+    )
+
+    if message == KIRO_CLI_TOO_OLD_MESSAGE:
+        from kiro_crew.kiro_prerequisite import mark_registered_cli_too_old
+
+        if not await mark_registered_cli_too_old():
+            message = KIRO_CLI_TOO_OLD_TERMINAL_MESSAGE
+    return AcpDelegateLaunchFailed(message)
