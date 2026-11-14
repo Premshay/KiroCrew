@@ -116,15 +116,29 @@ function approvalRouting(ctx) {
 /**
  * The tool presentation the tools service COMPOSED, read off the service itself.
  *
- * Kiro Crew's patch pins `tools.mode: native`, and the pin holds because a
- * `--patch` overlay is applied after the operator layer -- an ordering observed at
+ * Kiro Crew's patch enables the stock native executor and disables PTC. The
+ * tools config is empty because current dsh rejects the removed `mode` field.
+ * The `--patch` overlay is applied after the operator layer -- an ordering observed at
  * one harness version. This reads what the service actually resolved
- * (`defaultMode`, the process-global presentation the `mode` row selects), so a
+ * (the selected executor on current dsh, `defaultMode` on older versions), so a
  * release that reorders the layers, or a plugin that rewrites the mode after
  * composition, is refused by Kiro Crew rather than trusted to precedence. A
  * per-agent `presentAs()` scope cannot exist yet at load and is not visible here.
  */
 function toolsSnapshot(ctx) {
+  if (ctx.tools && "selectExecutor" in ctx.tools) {
+    try {
+      const executor = ctx.tools.selectExecutor();
+      const owner = approvalOwner({ ctx: executor?.pipeline?.ctx });
+      const native = executor?.constructor?.name === "NativeToolExecutor" &&
+        owner.entry === "include:tool-executor-native" &&
+        owner.module === "@deepseek-ai/dsh-tool-executor-native" &&
+        owner.plugin === "native-tool-executor";
+      return { mode: native ? "native" : null };
+    } catch {
+      return { mode: null };
+    }
+  }
   const mode = ctx.tools?.defaultMode;
   return { mode: typeof mode === "string" ? mode : null };
 }

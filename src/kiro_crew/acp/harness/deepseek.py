@@ -103,7 +103,7 @@ _DSH_GATE_MARKER_MAX_BYTES = 64 * 1024
 # Same seal, same reason, for the DeepSeek Harness gate plugin. Pinned by
 # ``test_acp_deepseek_backend``, so editing the plugin is a deliberate two-file
 # edit.
-DEEPSEEK_GATE_EXTENSION_SHA256 = "6a9ac9cf23ed7478ec61125840a8aa278690a7021a3b18f29c53681f6cd71ce7"
+DEEPSEEK_GATE_EXTENSION_SHA256 = "151c8e679a6b8d99a06c85fe4494b0d95804e31668637bf5e859237f0dd8439e"
 
 # ── deepseek (ACP_BACKEND_DEEPSEEK) ──
 # DeepSeek Harness is a plugin host, and ACP is one of the profiles it boots. So the
@@ -236,15 +236,15 @@ def _seal_deepseek_gate_extension() -> str:
 def _write_deepseek_gate_patch(sealed_extension: str) -> str:
     """Write the per-launch patch that composes *sealed_extension*, and return its path.
 
-    Four rows in the same owner-only gate artifact directory the sealed plugin lives
+    Rows in the same owner-only gate artifact directory the sealed plugin lives
     in. The first is one ``insert`` naming the plugin by absolute path, which is the
     composition channel the harness's own launcher documents (its ``boot/cmdline``
     package, and its own plugin-development guide). Emitted per process rather than
     shipped as package data because it has to name the SEALED copy, whose path
     carries this process's pid.
 
-    The second pins the harness's tool presentation to ``native``, and it is a
-    SECURITY row rather than a preference. Under ``ptc`` or ``both`` the harness
+    The tool rows pin the harness's tool presentation to ``native``, and this is a
+    security requirement rather than a preference. Under ``ptc`` the harness
     exposes a reserved ``run_code`` transport instead of native tool schemas, and a
     program running inside it reaches Node's own APIs directly -- filesystem,
     network, subprocess -- which are not tool calls and therefore never traverse
@@ -270,7 +270,11 @@ def _write_deepseek_gate_patch(sealed_extension: str) -> str:
     artifact_dir = pi_mod._pi_gate_artifact_dir()
     body = (
         f"- insert:\n    - id: kiro-crew-tool-gate\n      name: {json.dumps(sealed_extension)}\n"
-        "- id: tools\n  config:\n    mode: native\n"
+        "- id: tools\n  config: {}\n"
+        "- id: tool-executor-native\n"
+        "  name: '@deepseek-ai/dsh-tool-executor-native'\n"
+        "  disabled: false\n"
+        "- id: tool-executor-ptc\n  disabled: true\n"
         "- id: approval\n"
         "  name: '@deepseek-ai/dsh-user-approval'\n"
         "  disabled: false\n"
@@ -590,12 +594,14 @@ def _verify_deepseek_gate(
             acp_tool_gate.remediation_for(backend),
         )
     published = False
+    early_exit: int | None = None
     try:
         while time.monotonic() < deadline:
             if os.path.lexists(marker_path):
                 published = True
                 break
-            if process.poll() is not None:
+            early_exit = process.poll()
+            if early_exit is not None:
                 # The harness ended on its own before publishing: nothing more is
                 # coming, and the read below judges whatever it left.
                 break
@@ -617,6 +623,12 @@ def _verify_deepseek_gate(
             acp_tool_gate.remediation_for(backend),
         )
     if not published and not os.path.lexists(marker_path):
+        if early_exit is not None:
+            return (
+                f"the harness exited with status {early_exit} before publishing "
+                "the gate's load marker; check the harness startup diagnostics",
+                acp_tool_gate.remediation_for(backend),
+            )
         return (
             "the gate's load marker was not written within "
             f"{_DSH_GATE_READBACK_TIMEOUT_S:.0f}s of booting the harness, so Kiro "

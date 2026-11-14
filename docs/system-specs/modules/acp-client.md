@@ -2,6 +2,12 @@
 
 ## Overview
 
+DeepSeek launch overlays clear the removed `tools.mode` setting, enable the
+stock native executor and disable PTC. The gate verifies the selected executor's
+owning loader entry, module and plugin before reporting native tool routing.
+Older registries without executor selection retain their `defaultMode` read-back.
+An early probe exit reports its status rather than the load-marker timeout.
+
 KAS refuses project prompt symlink loops on supported Python versions.
 Missing prompt files keep their existing startup notice.
 

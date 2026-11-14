@@ -308,6 +308,14 @@ def _deepseek_gate_verifier(tmp_path, monkeypatch, marker_writer, *, names: tupl
     return verify, marker_path, probe_process
 
 
+def test_an_early_harness_exit_is_not_reported_as_a_timeout(tmp_path, monkeypatch):
+    verify, _, _ = _deepseek_gate_verifier(tmp_path, monkeypatch, lambda path: None)
+    monkeypatch.setattr(_FakeProbeProcess, "poll", lambda self: 1)
+    issue, _ = verify()
+    assert "exited with status 1" in issue
+    assert "within" not in issue
+
+
 def test_the_probe_discards_output_and_a_good_bounded_marker_is_admitted(
     tmp_path, monkeypatch
 ) -> None:
@@ -925,7 +933,11 @@ def test_the_patch_pins_the_tool_presentation_to_native() -> None:
     sealed = client_module._seal_deepseek_gate_extension()
     body = open(client_module._write_deepseek_gate_patch(sealed), encoding="utf-8").read()
     assert "id: tools" in body
-    assert "mode: native" in body
+    assert "config: {}" in body
+    assert "mode: native" not in body
+    assert "id: tool-executor-native" in body
+    assert "name: '@deepseek-ai/dsh-tool-executor-native'" in body
+    assert "id: tool-executor-ptc\n  disabled: true" in body
 
 
 def test_the_patch_reasserts_the_approval_service_and_acp_bridge() -> None:
