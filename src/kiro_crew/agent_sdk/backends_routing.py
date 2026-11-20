@@ -385,6 +385,17 @@ ACP_BACKENDS_CREW_LOADS_SPEC_STEERING: FrozenSet[str] = frozenset(
     {ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX}
 )
 
+#: Provider labels of harnesses that are NOT ACP backends but are served through
+#: the companion's own provider seam, and that read no agent ``resources`` either.
+#: Same meaning as :data:`ACP_BACKENDS_CREW_LOADS_SPEC_STEERING`, asked by the same
+#: label (``drivers.acp.crew_loads_spec_steering``). It is a separate set because
+#: the backend set is closed over ``ACP_BACKENDS_KNOWN`` (every id there needs a
+#: label row, a card, a host-auth entry): ``antigravity`` has no backend id.
+#: Its provider reports ``context_provider_type == "antigravity"``; agy takes its
+#: ``--agent`` from the engine row, never from the KiroCrew spec, so Crew's prompt
+#: text is the only way a spec's documents reach it.
+PROVIDER_LABELS_CREW_LOADS_SPEC_STEERING: FrozenSet[str] = frozenset({"antigravity"})
+
 #: Backends that read the project's ``AGENTS.md`` themselves from the session's
 #: working directory, so Crew's steering load leaves that file out
 #: (``agent_sdk.drivers.acp.reads_project_agents_md``). codex is the member: Crew

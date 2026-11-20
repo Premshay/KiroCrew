@@ -1324,7 +1324,7 @@ def _skills_injection_plan(
     hand-copied second gate is exactly what let the re-injection path ship
     without scoping, handing a mapped agent the catalog its mapping excludes.
     """
-    inherit = provider_type == PROVIDER_ACP
+    inherit = acp_driver.lends_inherited_skills(provider_type)
     pinned = pinned_skill_globs(session_key, project_dir=project_dir, inherit_defaults=inherit)
     if pinned is not None:
         globs = pinned

@@ -43,7 +43,10 @@ _GUIDE_RULE = "SEAT_DELEGATION_GUIDE_K9"
 _TREE_RULE = "PROJECT_TREE_RULE_P4"
 _START = "[Steering resources]"
 _REINJECTED = "[REINJECTED AFTER COMPACTION — steering resources]".translate(_MULTIBYTE_TABLE)
-_SEAT_HARNESSES = [PROVIDER_CLAUDE_CODE, PROVIDER_LABEL_CODEX]
+# "antigravity" is the label the companion's AntigravityHeadlessProvider reports; it is no
+# ACP backend (PROVIDER_LABELS_CREW_LOADS_SPEC_STEERING), and agy reads no spec resources.
+_PROVIDER_LABEL_ANTIGRAVITY = "antigravity"
+_SEAT_HARNESSES = [PROVIDER_CLAUDE_CODE, PROVIDER_LABEL_CODEX, _PROVIDER_LABEL_ANTIGRAVITY]
 
 
 @pytest.fixture(autouse=True)
@@ -296,3 +299,46 @@ def test_the_notice_still_names_absolute_entries_where_nothing_loads_them(home, 
 def test_no_notice_when_every_entry_is_loaded(home, guide):
     _write_seat(home, [f"file://{guide}"])
     assert _notice(home, ACP_BACKEND_CLAUDE) == []
+
+
+# --- antigravity: a companion provider label, not an ACP backend ----------------
+
+
+def test_antigravity_is_loaded_by_crew_but_reads_agents_md_through_crew_too():
+    from kiro_crew.agent_sdk.drivers import acp as acp_driver
+
+    assert acp_driver.crew_loads_spec_steering(_PROVIDER_LABEL_ANTIGRAVITY)
+    # Not shown to read AGENTS.md from its cwd: Crew's load keeps it (a duplicate at worst).
+    assert not acp_driver.reads_project_agents_md(_PROVIDER_LABEL_ANTIGRAVITY)
+    assert not acp_driver.crew_loads_spec_steering("")
+    assert not acp_driver.crew_loads_spec_steering(None)
+
+
+def test_antigravity_keeps_the_project_agents_md_in_a_seat_load(home, project):
+    (project / "AGENTS.md").write_text("AGENTS_MD_RULE\n", encoding="utf-8")
+    _write_seat(home, [f"file://{project / 'AGENTS.md'}"])
+    assert "AGENTS_MD_RULE" in _part(
+        project=str(project), provider_type=_PROVIDER_LABEL_ANTIGRAVITY
+    )
+
+
+def test_antigravity_is_no_longer_read_as_kiro_cli_by_the_folder_dedup(home, project):
+    """Under "acp" the project trees counted as delivered natively; agy never gets them."""
+    from kiro_crew import context as ctx
+
+    with patch.object(ctx.acp_driver, "inherits_default_resources", return_value=True):
+        assert ctx._project_steering_delivered(PROVIDER_ACP, False, str(project), agent=_SEAT)
+        assert not ctx._project_steering_delivered(
+            _PROVIDER_LABEL_ANTIGRAVITY, False, str(project), agent=_SEAT
+        )
+
+
+def test_antigravity_keeps_the_inherited_skill_trees_it_had_under_the_acp_label():
+    """Relabelling must not strip skills: agy has no skill trees of its own to read."""
+    from kiro_crew.agent_sdk.drivers import acp as acp_driver
+
+    assert acp_driver.lends_inherited_skills(PROVIDER_ACP)
+    assert acp_driver.lends_inherited_skills(_PROVIDER_LABEL_ANTIGRAVITY)
+    assert not acp_driver.lends_inherited_skills(PROVIDER_CLAUDE_CODE)
+    assert not acp_driver.lends_inherited_skills(PROVIDER_LABEL_CODEX)
+    assert not acp_driver.lends_inherited_skills(None)
