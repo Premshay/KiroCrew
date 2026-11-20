@@ -244,3 +244,45 @@ async def test_the_usage_route_carries_the_reading(
     assert response.status == 200
     assert data["codex"]["five_hour"]["used_percent"] == 10
     assert data["codex"]["weekly"]["used_percent"] == 63
+
+
+def _limits_line(stamp: str, limits: dict) -> dict:
+    return {
+        "timestamp": stamp,
+        "type": "event_msg",
+        "payload": {"type": "token_count", "rate_limits": limits},
+    }
+
+
+def test_only_the_codex_limit_counts_and_a_weekly_primary_is_weekly(codex_home: Path) -> None:
+    # Codex as of 2026-11: one weekly window sent as ``primary``, then newer
+    # ``premium`` rows that carry no windows at all.
+    _rollout(
+        codex_home,
+        "2026/11/18",
+        "s",
+        [
+            _limits_line(
+                "2026-11-18T20:06:27Z",
+                {
+                    "limit_id": "codex",
+                    "primary": {"used_percent": 95.0, "window_minutes": 10080, "resets_at": _FUTURE},
+                    "secondary": None,
+                },
+            ),
+            _limits_line(
+                "2026-11-20T08:09:31Z",
+                {
+                    "limit_id": "premium",
+                    "primary": {"used_percent": 1.0, "window_minutes": 300, "resets_at": _FUTURE},
+                    "secondary": None,
+                },
+            ),
+        ],
+        3000,
+    )
+    reading = read_codex_rate_limits()
+    assert reading is not None
+    assert reading["five_hour"] is None
+    assert reading["weekly"]["used_percent"] == 95.0
+    assert reading["captured_at"] == "2026-11-18T20:06:27Z"

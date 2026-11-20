@@ -27,6 +27,10 @@ _MAX_ROLLOUTS = 5
 #: newest block sits in the tail and a long session costs no more than a short one.
 _TAIL_BYTES = 1 << 20
 _RATE_LIMITS_KEY = b'"rate_limits"'
+#: The ``rate_limits.limit_id`` of the plan's own windows.
+_PLAN_LIMIT_ID = "codex"
+#: A window this long or longer is the weekly one (a week is 10080 minutes).
+_WEEKLY_MINUTES_FLOOR = 24 * 60
 #: The newest reading found and the ``sessions`` directory it came from. It answers when a
 #: disposable session has deleted the only log that held a block.
 _last_reading: tuple[Path, dict[str, Any]] | None = None
@@ -114,8 +118,29 @@ def _reading(line: bytes, now: float) -> dict[str, Any] | None:
     limits = payload.get("rate_limits") if isinstance(payload, dict) else None
     if not isinstance(limits, dict):
         return None
-    five_hour = _window(limits.get("primary"), now)
-    weekly = _window(limits.get("secondary"), now)
+    # Codex writes one block per limit; only the ``codex`` limit is the plan's
+    # window (``premium`` rows are newer and carry none). A block with no id is
+    # the older single-limit shape.
+    limit_id = limits.get("limit_id")
+    if limit_id is not None and limit_id != _PLAN_LIMIT_ID:
+        return None
+    five_hour: dict[str, Any] | None = None
+    weekly: dict[str, Any] | None = None
+    for slot in ("primary", "secondary"):
+        window = _window(limits.get(slot), now)
+        if window is None:
+            continue
+        # Named by its length, not its slot: Codex dropped the 5-hour window and
+        # now sends the weekly one as ``primary``.
+        minutes = window.get("window_minutes")
+        if minutes is not None:
+            is_weekly = minutes >= _WEEKLY_MINUTES_FLOOR
+        else:
+            is_weekly = slot == "secondary"
+        if is_weekly and weekly is None:
+            weekly = window
+        elif not is_weekly and five_hour is None:
+            five_hour = window
     if five_hour is None and weekly is None:
         return None
     captured_at = record.get("timestamp")
@@ -163,8 +188,9 @@ def _newer(kept: dict[str, Any], found: dict[str, Any]) -> bool:
 def read_codex_rate_limits() -> dict[str, Any] | None:
     """The newest windows Codex recorded locally, or ``None`` when there is no reading.
 
-    ``five_hour`` is the block's ``primary`` window and ``weekly`` its ``secondary``; either
-    is ``None`` when the block lacks it. ``source_mtime`` is the log's modification time.
+    Only blocks with ``limit_id`` ``codex`` (or none) count. ``five_hour`` and ``weekly``
+    are named by each window's ``window_minutes`` (by slot when it has none); either is
+    ``None`` when the block lacks it. ``source_mtime`` is the log's modification time.
     A disposable Codex session deletes its rollout at teardown, so the last reading found for
     the same store is held in memory only. It is returned when none of the newest logs holds
     a block that was recorded after it.
