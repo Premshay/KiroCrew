@@ -673,6 +673,14 @@ async def _run_impl(self: RunEventCoordinator, info: SubagentInfo) -> None:
             else:
                 logger.exception("Subagent %s failed", info.id)
     finally:
+        # Fork: a run that failed on its vendor's quota marks the vendor out and,
+        # when routed, continues as a successor on the next vendor; pinned, it
+        # ends ``quota_exhausted``. Before the cap and the report, so both carry
+        # the outcome. Bounded and it never raises (``quota_switch``).
+        if not reap_owns_report:
+            from kiro_crew.subagent_manager.quota_switch import handle_run_end_guarded
+
+            await handle_run_end_guarded(self._manager, info)
         # Every ending but a claimed one leaves result.txt capped before its
         # report exists, so the parent reads a bounded file. Bounded, and it
         # never raises, so it cannot keep the report below from spawning.

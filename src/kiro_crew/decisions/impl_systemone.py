@@ -371,6 +371,10 @@ def _response_body(body: dict) -> dict:
     return result if isinstance(result, dict) else body
 
 
+#: Longest ``note`` an answer may carry: one line for a card, not a channel.
+MAX_NOTE_CHARS = 160
+
+
 def _answer_from_wire(q: Question, raw: dict) -> Answer:
     """Validate wire fields before constructing an answer, by question type."""
     if isinstance(q, Noul):
@@ -392,11 +396,14 @@ def _answer_from_wire(q: Question, raw: dict) -> Answer:
     )
     if probability is None or not 0.0 <= probability <= 1.0:
         raise ProviderProtocolError("answer has no valid chosen probability")
+    # Fork (spawn.route): the provider's one-line account, shown on the child's card.
+    note = raw.get("note")
     return Answer(
         id=q.id,
         value=chosen,
         p=probability,
         confidence=_as_float_or_none(raw.get("confidence")),
+        note=note[:MAX_NOTE_CHARS] if isinstance(note, str) else "",
     )
 
 

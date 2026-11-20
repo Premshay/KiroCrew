@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from kiro_crew.agent_capabilities import CapabilityError
 from kiro_crew.dashboard.chat_delivery import attachment_meta
+from kiro_crew.dashboard.chat_quota_out import mark_quota_out
 from kiro_crew.dashboard.chat_utils import MODEL_UNAVAILABLE_KIND, TRANSIENT_RETRY_KIND
 from kiro_crew.security import redact
 from kiro_crew.session_capabilities import CapabilityStartupError
@@ -222,6 +223,9 @@ async def _on_acp_error_card(turn: _ChatTurn, exc) -> None:
     session_key = turn.session_key
     slot = turn.slot
     state = turn.state
+    # Fork: a quota fault marks its vendor out for later spawns. Scheduled,
+    # never awaited, never raises; the chat's model is not touched.
+    mark_quota_out(turn, exc)
     await _persist_partial_reply(turn, "error: terminal")
     # ── Poisoned-conversation escalation ────────────────────────────
     # A transient-classified error that reaches this terminal branch
@@ -717,6 +721,7 @@ async def _on_error(turn: _ChatTurn, exc) -> None:
     # carries its steered wake, is that cycle.
     _wake_id, _wake_gen = turn._wake_cycle or ("", 0)
     slot = turn.slot
+    mark_quota_out(turn, exc)  # fork: as in _on_acp_error_card
     _record_terminal_timeline(slot, "error")
     state = turn.state
     _memory_preparation_admitted = turn._memory_preparation_admitted

@@ -309,6 +309,14 @@ def _write_tombstone_file(
     cleanup_identity = {
         key: state[key] for key in ("session_id", "provider", "cwd") if state.get(key)
     }
+    # Fork: the seat and model that actually served the run, so a scan of
+    # tombstones (``spawn_route.vendor_health``) attributes it to that vendor,
+    # not to the template seat in ``agent`` (2026-11-20 run 521d4974).
+    served_identity = {
+        key: state[key]
+        for key in ("runtime_agent", "resolved_model")
+        if isinstance(state.get(key), str) and state[key]
+    }
     live_cleanup_identities = _live_cleanup_identities(agent_id)
     latest_live_identity = live_cleanup_identities[-1] if live_cleanup_identities else {}
     generation_metadata: dict[str, object] = {}
@@ -358,6 +366,7 @@ def _write_tombstone_file(
         "result_available": _check_result_available(d / "result.txt"),
         "result_path": str(d / "result.txt"),
         **cleanup_identity,
+        **served_identity,
         **latest_live_identity,
         **generation_metadata,
         **carried,

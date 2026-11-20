@@ -385,6 +385,10 @@ def _handle_update(self: AcpSessionHandle, msg: JsonRpcMessage) -> list[AcpEvent
         cost = parse_usage_cost(update)
         if cost is not None:
             self.last_prompt_stats.apply_cost_cumulative(cost)
+        # Fork: Claude's plan window rides on usage ``_meta`` (spawn.route health).
+        from kiro_crew.vendor_limits import note_usage_meta
+
+        note_usage_meta(update)
         return []
 
     # config_option_update: ACP pushes updated configOptions (e.g. after

@@ -350,12 +350,44 @@ async def _run_inner_impl(
         info, child_aws_profile=await self._resolve_child_aws_profile(info)
     )
     eff_model = plan.eff_model
+    from kiro_crew.decisions.points import spawn_route as _spawn_route
+
+    if info.quota_routable is None:
+        # Decided once, before the route below writes a backend onto the run: a
+        # quota fall-through (``quota_switch``) moves only a start that named no
+        # model, backend, seat, crew or agent. A successor keeps its own value.
+        info.quota_routable = not (
+            info.model or _spawn_route.pins_vendor(info, own_worker=own_worker)
+        )
     if not info.model:
-        routed = await self._route_spawn_model(info, agent)
-        if routed:
+        # Fork (spawn.route v2): a spawn that did not pick its vendor may be
+        # routed to another one's backend; the route is dropped whole when that
+        # backend cannot carry the run, so the seat's default stands.
+        routed = await self._route_spawn_model(
+            info, agent, cross_vendor=not _spawn_route.pins_vendor(info, own_worker=own_worker)
+        )
+        if routed and await asyncio.to_thread(
+            _spawn_route.apply_route_backend, info, routed, captured_execution
+        ):
             plan = plan._replace(eff_model=routed["model"], shared=False)
             eff_model = plan.eff_model
             info.route_reason = routed["line"]
+            info.route_tier = str(routed.get("tier") or "")
+    # Fork: a start on a vendor (or Antigravity model group) a run already
+    # proved out fails now, before its session exists, instead of being sent
+    # and refused; the ending then switches or reports it (``quota_switch``).
+    from kiro_crew.subagent_manager import quota_switch as _quota_switch
+
+    _known_out = await asyncio.to_thread(_quota_switch.known_out, info, eff_model or "")
+    if _known_out is not None:
+        info.error_code = _quota_switch.QUOTA_ERROR_CODE
+        if _known_out.model:
+            # The ending reads the model back to find the mark it hit.
+            info.requested_model = _known_out.model
+        raise RuntimeError(
+            f"{_quota_switch.KNOWN_OUT_MARK} {_quota_switch.describe(_known_out)} "
+            "(known out before this start)"
+        )
     # Record the EFFECTIVE pin (per-spawn OR the role_models['subagent']
     # config pin, via ``_subagent_default_model()``) as the requested side of
     # the downgrade comparison — keying off the bare per-spawn ``model`` would
