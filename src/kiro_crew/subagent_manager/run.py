@@ -207,8 +207,14 @@ def _stop_in_progress(info: SubagentInfo) -> bool:
 
 
 class RunEventCoordinator(ManagerComponent):
-    async def _route_spawn_model(self, info: SubagentInfo, agent: str) -> dict | None:
-        """``spawn.route`` for a model-less spawn: ``{model, line}`` or ``None``.
+    async def _route_spawn_model(
+        self, info: SubagentInfo, agent: str, *, cross_vendor: bool = False
+    ) -> dict | None:
+        """``spawn.route`` for a model-less spawn: the routed answer plus ``line``, or ``None``.
+
+        With *cross_vendor* another vendor's candidate may come back with the
+        ``backend`` that runs it (``spawn_route.apply_route_backend`` puts it on
+        the run).
 
         Bounded by the seam's own timeout; every failure is ``None`` so the run
         keeps the seat's default exactly as before. The parent's served model is
@@ -232,6 +238,7 @@ class RunEventCoordinator(ManagerComponent):
                 agent=agent or "",
                 parent_model=parent_model,
                 session_key=info.parent_session_key or None,
+                cross_vendor=cross_vendor,
             )
         except asyncio.CancelledError:
             raise
@@ -246,9 +253,13 @@ class RunEventCoordinator(ManagerComponent):
             operation="subagent.spawn_route",
             outcome="ok",
             source="subagent",
-            resources=f"subagent_id={info.id},model={routed['model']},tier={routed.get('tier')},p={routed.get('p')}",
+            resources=(
+                f"subagent_id={info.id},model={routed['model']},tier={routed.get('tier')},"
+                f"vendor={routed.get('vendor')},backend={routed.get('backend') or ''},"
+                f"p={routed.get('p')}"
+            ),
         )
-        return {"model": routed["model"], "line": line}
+        return {**routed, "line": line}
 
     """Own run transitions while state remains facade-owned."""
 

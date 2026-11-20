@@ -351,8 +351,17 @@ async def _run_inner_impl(
     )
     eff_model = plan.eff_model
     if not info.model:
-        routed = await self._route_spawn_model(info, agent)
-        if routed:
+        # Fork (spawn.route v2): a spawn that did not pick its vendor may be
+        # routed to another one's backend; the route is dropped whole when that
+        # backend cannot carry the run, so the seat's default stands.
+        from kiro_crew.decisions.points import spawn_route as _spawn_route
+
+        routed = await self._route_spawn_model(
+            info, agent, cross_vendor=not _spawn_route.pins_vendor(info, own_worker=own_worker)
+        )
+        if routed and await asyncio.to_thread(
+            _spawn_route.apply_route_backend, info, routed, captured_execution
+        ):
             plan = plan._replace(eff_model=routed["model"], shared=False)
             eff_model = plan.eff_model
             info.route_reason = routed["line"]

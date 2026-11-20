@@ -68,7 +68,7 @@ _REPO_ROOT = _TEST_ROOT.parent
 _MEMBERS: dict[str, tuple[str, str, str]] = {
     "_route_spawn_model": (
         "coroutine",
-        "(self, info: 'SubagentInfo', agent: 'str') -> 'dict | None'",
+        "(self, info: 'SubagentInfo', agent: 'str', *, cross_vendor: 'bool' = False) -> 'dict | None'",
         "run",
     ),
     "_publish_identity": (
