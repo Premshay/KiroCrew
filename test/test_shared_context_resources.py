@@ -189,9 +189,7 @@ def test_a_subagent_whose_parent_withheld_project_gets_nothing(home, guide, conf
     configured(str(guide))
     groups = frozenset({inclusion.CONTEXT_GROUP_MEMORY})
     assert _RULE not in _start(home, provider_type=PROVIDER_CLAUDE_CODE, context_groups=groups)
-    assert _RULE not in _reinjected(
-        home, provider_type=PROVIDER_CLAUDE_CODE, context_groups=groups
-    )
+    assert _RULE not in _reinjected(home, provider_type=PROVIDER_CLAUDE_CODE, context_groups=groups)
 
 
 def test_a_member_chat_with_an_essentials_envelope_gets_the_block(home, guide, configured):
