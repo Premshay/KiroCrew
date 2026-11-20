@@ -36,6 +36,7 @@ from kiro_crew.dashboard.chat_utils import (
     tool_calls_are_read_only_preparation,
     with_bounded_redaction_records,
 )
+from kiro_crew.dashboard.chat_quota_out import mark_quota_out
 from kiro_crew.dashboard.recovery_replays import replays_of
 from kiro_crew.dashboard.state import chat_message_note, row_mid
 from kiro_crew.messaging.empty_turn_copy import EMPTY_TURN_NOTICE, EMPTY_TURN_NOTICE_AFTER_WORK
@@ -1287,6 +1288,10 @@ async def _turn_settle_answer(turn: _ChatTurn) -> None:
         # a recovered turn never reaches Crew's refusal card or retry, and the
         # engine-fallback notice is the only account of the walk.
         if _stop_reason == STOP_REASON_REFUSAL:
+            # Fork: a refusal that is the vendor's quota fault (Antigravity
+            # streams it as text) marks that vendor out for later spawns.
+            # Scheduled, never awaited; the chat's model is not touched.
+            mark_quota_out(turn, refusal=True)
             # The Kiro service's content filter STREAMS its canned
             # explanation as assistant text and then ends the turn, so the
             # refusal reaches this (answered) branch rather than the
@@ -1355,6 +1360,7 @@ async def _turn_settle_answer(turn: _ChatTurn) -> None:
                     )
                 turn.died_notice = "chat_stopped_refused"
     elif _stop_reason == STOP_REASON_REFUSAL:
+        mark_quota_out(turn, refusal=True)  # fork: see the answered branch
         # Model-side content refusal with no accompanying text: Anthropic's
         # bare `refusal` stop reason (passed through by every harness), or
         # the Kiro service's filter when kiro-cli surfaced only the

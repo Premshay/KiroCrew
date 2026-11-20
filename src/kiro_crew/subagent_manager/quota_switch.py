@@ -32,8 +32,9 @@ A start on a vendor already known out never waits for the vendor to say so
 again: :func:`known_out` fails it before its session is created, and the ending
 then takes the same path (a "stall bounded by a timeout" of zero).
 
-Dashboard chat sessions are out of scope: switching a live conversation's model
-re-prefills its history.
+Dashboard chat sessions are never switched: that re-prefills their history. A
+chat turn that fails on its quota only writes the mark (:func:`note_chat_quota`,
+called from ``dashboard.chat_quota_out``), so later spawns avoid that vendor.
 """
 
 from __future__ import annotations
@@ -63,7 +64,8 @@ SWITCH_TIMEOUT_S = 90.0
 #: A quota error that names no reset: the vendors' 5-hour rolling window.
 DEFAULT_WINDOW_S = 5 * 3600
 
-_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+#: Each vendor's own quota signals; ``spawn_route.limit_hit`` reads tombstones with them too.
+QUOTA_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
     "antigravity": (
         re.compile(r"Individual quota reached", re.I),
         re.compile(r"\bQUOTA_EXHAUSTED\b|\bRESOURCE_EXHAUSTED\b"),
@@ -76,7 +78,6 @@ _PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
         re.compile(r"\b429\b[^\n]{0,80}\b(?:quota|limit)", re.I),
     ),
 }
-_RESETS_IN = re.compile(r"Resets? in\s+(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s)?", re.I)
 # Claude Code: "Claude AI usage limit reached|1795180000" / "resets 5pm" / "resets 5:30pm"
 _EPOCH = re.compile(r"limit reached\|(\d{10})")
 _RESETS_AT = re.compile(r"resets\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)", re.I)
@@ -91,29 +92,21 @@ class QuotaHit:
 
 
 def run_vendor(info: Any, model: str = "") -> str:
-    """The vendor that actually served *info*: an execution seat, else the model, else the seat.
+    """The vendor that actually served *info* (``spawn_route.served_vendor``).
 
     The seat (``agent``) is the weakest witness: a ``crew-claude`` run moved to
     the Antigravity seat by ``runtime_agent`` was served by Antigravity
     (2026-11-20 run 521d4974 is exactly that, and its tombstone was read as Claude).
     """
-    from kiro_crew.decisions.points.spawn_route import vendor_of_seat
+    from kiro_crew.decisions.points.spawn_route import served_vendor
 
-    runtime_agent = str(getattr(info, "runtime_agent", "") or "")
-    if runtime_agent:
-        v = vendor_of_seat(runtime_agent)
-        if v:
-            return v
-    if model:
-        v = vendor_of_seat("", model)
-        if v:
-            return v
     backend = getattr(info, "backend", None)
-    if isinstance(backend, str) and backend:
-        v = vendor_of_seat(backend)
-        if v:
-            return v
-    return vendor_of_seat(str(getattr(info, "agent", "") or ""))
+    return served_vendor(
+        runtime_agent=str(getattr(info, "runtime_agent", "") or ""),
+        provider=backend if isinstance(backend, str) else "",
+        model=model,
+        agent=str(getattr(info, "agent", "") or ""),
+    )
 
 
 def run_model(info: Any) -> str:
@@ -125,10 +118,11 @@ def run_model(info: Any) -> str:
 
 
 def _reset_from(detail: str, vendor: str, now: float) -> float:
-    m = _RESETS_IN.search(detail)
-    if m and any(m.groups()):
-        h, mi, se = (int(x or 0) for x in m.groups())
-        return now + h * 3600 + mi * 60 + se
+    from kiro_crew.decisions.points.spawn_route import reset_time, resets_in
+
+    rel = resets_in(detail, now)
+    if rel is not None:
+        return rel
     m = _EPOCH.search(detail)
     if m:
         return float(m.group(1))
@@ -144,13 +138,16 @@ def _reset_from(detail: str, vendor: str, now: float) -> float:
             if t.timestamp() < now - 60:
                 t += _dt.timedelta(days=1)
             return t.timestamp()
-    from kiro_crew.decisions.points.spawn_route import reset_time
-
     return reset_time(detail, now, DEFAULT_WINDOW_S)
 
 
 def detect(
-    text: str, *, vendor: str, model: str = "", now: float | None = None
+    text: str,
+    *,
+    vendor: str,
+    model: str = "",
+    now: float | None = None,
+    use_health: bool = True,
 ) -> QuotaHit | None:
     """The quota hit *text* (a failed run's error and partial tail) proves, or ``None``.
 
@@ -158,6 +155,7 @@ def detect(
     vendor's error is not read as out. Claude's rejected ``rate_limit_event``
     (``vendor_limits``) is a hit even when the error text names none. A start
     refused as already known out (:data:`KNOWN_OUT_MARK`) keeps the mark it hit.
+    *use_health* off reads the text alone (a chat turn's error).
     """
     from kiro_crew import vendor_limits as vl
 
@@ -168,14 +166,14 @@ def detect(
         if mark:
             return QuotaHit(vendor, model, float(mark["until"]), str(mark.get("detail") or ""))
         return None
-    for rx in _PATTERNS.get(vendor, ()):
+    for rx in QUOTA_PATTERNS.get(vendor, ()):
         m = rx.search(text)
         if m:
             start = text.rfind("\n", 0, m.start()) + 1
             end = text.find("\n", m.end())
             line = text[start : end if end >= 0 else len(text)].strip()[:300]
             return QuotaHit(vendor, model, _reset_from(text, vendor, now), line)
-    if vendor == "claude":
+    if vendor == "claude" and use_health:
         state = vl.claude_health(now)
         if state.get("out") and state.get("resets_at"):
             return QuotaHit(
@@ -196,6 +194,45 @@ def known_out(info: Any, model: str = "", now: float | None = None) -> QuotaHit 
     if not mark:
         return None
     return QuotaHit(vendor, model, float(mark["until"]), str(mark.get("detail") or ""))
+
+
+def note_chat_quota(
+    text: str,
+    *,
+    runtime_agent: str = "",
+    agent: str = "",
+    provider: str = "",
+    model: str = "",
+    now: float | None = None,
+) -> QuotaHit | None:
+    """Mark the vendor out when a dashboard chat turn's error is its quota. Never raises.
+
+    The chat itself is not switched (that re-prefills its history); only the
+    mark is written, so every later spawn avoids that vendor (Antigravity: the
+    model's quota group) until the reset. 2026-11-20 11:19 IST chat-2069 hit
+    ``Individual quota reached`` on gemini-4-hydrogen-high and nothing learned
+    from it. Only the text counts: a chat failing for another reason while
+    Claude's ``rate_limit_event`` reads rejected marks nothing new.
+    """
+    try:
+        from kiro_crew import vendor_limits as vl
+        from kiro_crew.decisions.points.spawn_route import served_vendor
+
+        vendor = served_vendor(
+            runtime_agent=runtime_agent, provider=provider, model=model, agent=agent
+        )
+        if not vendor or not text:
+            return None
+        hit = detect(text, vendor=vendor, model=model, now=now, use_health=False)
+        if hit is None:
+            return None
+        vl.note_quota_out(vendor, until=hit.until, model=model, detail=hit.detail, now=now)
+        _forget_route_caches()
+        logger.warning("Chat turn hit its quota: %s (%s)", describe(hit, now), hit.detail)
+        return hit
+    except Exception:
+        logger.warning("Chat quota out-mark failed", exc_info=True)
+        return None
 
 
 def _clock(ts: float, now: float | None = None) -> str:

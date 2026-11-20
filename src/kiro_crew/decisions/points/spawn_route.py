@@ -92,14 +92,16 @@ _AT_DATE = re.compile(
     r"try again at ([A-Z][a-z]{2}) (\d{1,2})(?:st|nd|rd|th)?, (\d{4}) (\d{1,2}):(\d{2}) ?(AM|PM)",
     re.I,
 )
+# Antigravity: "Individual quota reached. ... Resets in 1h30m18s."
+_RESETS_IN = re.compile(r"Resets? in\s+(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s)?", re.I)
 _MONTHS = {m: i for i, m in enumerate("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(), 1)}
 _MODEL = re.compile(r"usage limit for ([A-Za-z0-9.\-]+?)\.?(?:\s|$)")
 
 _health_cache: tuple[float, dict[str, dict[str, Any]]] | None = None
 
 
-def vendor_of_seat(agent: str, model: str = "") -> str:
-    """The vendor a seat name (``crew-codex-atlas``) or, failing that, a model id names; ``""`` unknown."""
+def _vendor_of_name(agent: str, model: str = "") -> str:
+    """The vendor a seat or backend name (``crew-codex-atlas``) or, failing that, a model id names."""
     a = (agent or "").lower()
     for v in ("codex", "deepseek", "antigravity", "local", "claude"):
         if v in a:
@@ -113,7 +115,40 @@ def vendor_of_seat(agent: str, model: str = "") -> str:
         return "deepseek"
     if m.startswith("gemini"):
         return "antigravity"
-    return _vendor_of_runtime_policy(agent)
+    return ""
+
+
+def vendor_of_seat(agent: str, model: str = "") -> str:
+    """The vendor a seat name (``crew-codex-atlas``) or, failing that, a model id names; ``""`` unknown."""
+    return _vendor_of_name(agent, model) or _vendor_of_runtime_policy(agent)
+
+
+def served_vendor(
+    *,
+    runtime_agent: str = "",
+    provider: str = "",
+    model: str = "",
+    agent: str = "",
+    policy: bool = True,
+) -> str:
+    """The vendor that actually served a run: execution seat, then provider, then model, then seat.
+
+    The template seat (``agent``) is the weakest witness: 2026-11-20 run
+    521d4974 ran the ``crew-claude`` template on the ``crew-antigravity`` seat
+    (``runtime_agent``) and was read as Claude. ``provider`` counts only when it
+    names a vendor (``acp`` does not). *policy* lets a seat that names no vendor
+    fall to the engine map; a bulk scan turns it off (one config load per row).
+    """
+    if runtime_agent:
+        v = _vendor_of_name(runtime_agent) or (
+            _vendor_of_runtime_policy(runtime_agent) if policy else ""
+        )
+        if v:
+            return v
+    v = _vendor_of_name(provider) or _vendor_of_name("", model) or _vendor_of_name(agent)
+    if v:
+        return v
+    return _vendor_of_runtime_policy(agent) if policy else ""
 
 
 def _vendor_of_runtime_policy(agent: str) -> str:
@@ -147,17 +182,19 @@ def _vendor_of_runtime_policy(agent: str) -> str:
 
 
 def _vendor_of_tombstone(row: Mapping[str, Any]) -> str:
+    v = served_vendor(
+        runtime_agent=str(row.get("runtime_agent") or ""),
+        provider=str(row.get("provider") or ""),
+        model=str(row.get("resolved_model") or row.get("model") or ""),
+        agent=str(row.get("agent") or ""),
+        policy=False,
+    )
+    if v:
+        return v
     p = str(row.get("provider") or "").lower()
     a = str(row.get("agent") or "").lower()
-    if p.startswith("codex") or "codex" in a:
-        return "codex"
-    if p == "deepseek" or "deepseek" in a:
-        return "deepseek"
-    if "antigravity" in a:
-        return "antigravity"
-    if "local" in a:
-        return "local"
-    if p in ("claude_code", "acp") or "claude" in a or a in ("kirocrew", ""):
+    # A base seat on the shared ACP adapter or Claude Code names no vendor: Claude.
+    if p in ("claude_code", "acp") or a in ("kirocrew", ""):
         return "claude"
     return ""
 
@@ -166,8 +203,18 @@ def _to_24h(h: int, m: int, ampm: str) -> tuple[int, int]:
     return h % 12 + (12 if ampm.upper() == "PM" else 0), m
 
 
+def resets_in(detail: str, base: float) -> float | None:
+    """*base* plus a relative ``Resets in 2h23m58s``, or ``None`` when *detail* names none."""
+    m = _RESETS_IN.search(detail)
+    if not (m and any(m.groups())):
+        return None
+    h, mi, se = (int(x or 0) for x in m.groups())
+    return base + h * 3600 + mi * 60 + se
+
+
 def reset_time(detail: str, died: float, window_s: int) -> float:
-    """When the error says the vendor is back: a named date, a named clock (today, else tomorrow), else died+window."""
+    """When the error says the vendor is back: a named date, a named clock (today, else
+    tomorrow), a relative ``Resets in``, else died+window."""
     m = _AT_DATE.search(detail)
     if m:
         mon, day, year, h, mi, ampm = m.groups()
@@ -186,25 +233,47 @@ def reset_time(detail: str, died: float, window_s: int) -> float:
         if t.timestamp() < died - 60:
             t += _dt.timedelta(days=1)
         return t.timestamp()
+    rel = resets_in(detail, died)
+    if rel is not None:
+        return rel
     return died + window_s
 
 
 def limit_hit(row: Mapping[str, Any]) -> dict[str, Any] | None:
-    """The outage a tombstone proves, or ``None`` when it is not a quota or rate-limit death."""
+    """The outage a tombstone proves, or ``None`` when it is not a quota or rate-limit death.
+
+    The generic marks read ``detail``. The vendor's own quota signals
+    (:data:`quota_switch.QUOTA_PATTERNS`, e.g. Antigravity's ``Individual quota
+    reached``) also read ``result_tail``: a refused Antigravity turn's detail is
+    the generic ``failed (refusal)`` and the fault is the last line it streamed.
+    """
+    from kiro_crew.subagent_manager.quota_switch import QUOTA_PATTERNS
+
     detail = str(row.get("detail") or "")
-    if not detail:
+    tail = str(row.get("result_tail") or "")
+    if not detail and not tail:
         return None
-    for rx, window in _LIMIT_MARKS:
-        if rx.search(detail):
-            died = float(row.get("died") or 0)
-            mm = _MODEL.search(detail)
-            return {
-                "vendor": _vendor_of_tombstone(row),
-                "from": died,
-                "until": reset_time(detail, died, window),
-                "model": mm.group(1) if mm else "",
-            }
-    return None
+    vendor = _vendor_of_tombstone(row)
+    died = float(row.get("died") or 0)
+    window = 0
+    for rx, w in _LIMIT_MARKS:
+        if detail and rx.search(detail):
+            window = w
+            break
+    else:
+        text = f"{detail}\n{tail}"
+        if any(rx.search(text) for rx in QUOTA_PATTERNS.get(vendor, ())):
+            window = DEFAULT_WINDOW_S
+            detail = text
+    if not window:
+        return None
+    mm = _MODEL.search(detail)
+    return {
+        "vendor": vendor,
+        "from": died,
+        "until": reset_time(detail, died, window),
+        "model": mm.group(1) if mm else str(row.get("resolved_model") or ""),
+    }
 
 
 def vendor_health(
@@ -257,8 +326,46 @@ def vendor_health(
     return out
 
 
+#: How much of a failed run's ``result.txt`` the scan reads for its vendor's fault
+#: line (``quota_switch.RESULT_TAIL_CHARS``: the fault is the last thing it streamed).
+_RESULT_TAIL_BYTES = 600
+
+
+def _enrich_tombstone(row: dict[str, Any], folder: Path) -> None:
+    """Add what a failed run's tombstone lacks from its own folder. Never raises.
+
+    The serving seat and model live in ``state.json`` (``runtime_agent``,
+    ``resolved_model``) and the provider's fault in ``result.txt``'s tail, read
+    from the folder itself, never the ``result_path`` the file names.
+    """
+    if row.get("outcome") != "failed":
+        return
+    if not row.get("runtime_agent") or not row.get("resolved_model"):
+        try:
+            state = json.loads((folder / "state.json").read_text(encoding="utf-8"))
+        except Exception:
+            state = None
+        if isinstance(state, dict):
+            for key in ("runtime_agent", "resolved_model"):
+                if not row.get(key) and isinstance(state.get(key), str) and state[key]:
+                    row[key] = state[key]
+    if row.get("result_available") and "result_tail" not in row:
+        try:
+            with open(folder / "result.txt", "rb") as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - _RESULT_TAIL_BYTES))
+                row["result_tail"] = fh.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+
+
 def load_tombstones(root: Path | None = None) -> list[dict[str, Any]]:
-    """Every readable ``tombstone.json`` under the subagents registry. Never raises."""
+    """Every readable ``tombstone.json`` under the subagents registry. Never raises.
+
+    A failed run's row also carries its serving seat, model and result tail
+    (:func:`_enrich_tombstone`), which the tombstone itself does not record.
+    """
     if root is None:
         from kiro_crew.subagent_persistence import _subagents_dir
 
@@ -267,9 +374,12 @@ def load_tombstones(root: Path | None = None) -> list[dict[str, Any]]:
     try:
         for f in Path(root).glob("*/tombstone.json"):
             try:
-                rows.append(json.loads(f.read_text(encoding="utf-8")))
+                row = json.loads(f.read_text(encoding="utf-8"))
             except Exception:
                 continue
+            if isinstance(row, dict):
+                _enrich_tombstone(row, f.parent)
+                rows.append(row)
     except Exception:
         logger.debug("spawn.route: tombstones unreadable", exc_info=True)
     return rows
