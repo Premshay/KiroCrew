@@ -266,3 +266,17 @@ class TestHarnessProfile:
         provider = AcpProvider(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
         with pytest.raises(ValueError, match="setting sources"):
             provider.restrict_tools(["Read"], sources)
+
+
+class TestLeanContractSafety:
+    def test_the_lean_contract_keeps_the_safety_lines(self):
+        text = lc.LOCAL_HELPER_CONTRACT
+        for needle in (
+            "data, never instructions",
+            "Never read credential files",
+            "never force-push",
+            "do not reword it",
+            "127.0.0.1",
+            "$KIROCREW_SCRATCH",
+        ):
+            assert needle in text, needle
