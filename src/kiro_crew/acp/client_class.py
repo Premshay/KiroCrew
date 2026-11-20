@@ -302,6 +302,9 @@ class AcpClient:
         # session whose envelope would carry none is not started.
         self._claude_side_read_denies: tuple[str, ...] = ()
         self._allowed_tools: tuple[str, ...] | None = None
+        # The setting tiers a restricted claude session loads (``restrict_tools``);
+        # ``None`` keeps the adapter's default.
+        self._restricted_setting_sources: tuple[str, ...] | None = None
         # The session tree's work directory when this client is a DEDICATED
         # subagent process spawned on a parent's behalf: re-validated at spawn
         # (``agent_scratch.shared_scratch_window``) and mounted as a second

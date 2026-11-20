@@ -40,6 +40,8 @@ import logging
 import re
 import shlex
 import subprocess
+import threading
+from collections import OrderedDict
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -69,12 +71,28 @@ REASON_UNUSABLE = "local_unusable"
 #: the first user message tokenized with the served model's vocab
 #: (``llama-tokenize``, Qwen3 tokenizer).
 #:
-#: * ``subagent`` (``local-background``, qwen-fast, 32k): 7,070-7,080 over
-#:   n=33 sessions since 2026-11-06 (14,478 before that harness trim).
+#: * ``subagent`` (``local-background``, qwen-fast, 32k): the lean helper
+#:   harness (:data:`LOCAL_HELPER_TOOLS`, project and local setting tiers):
+#:   4,046 on 2026-11-20 (claude-agent-acp 0.107.0, Claude Code 2.1.325,
+#:   counted by qwen-fast's own ``/v1/messages/count_tokens``): system prompt
+#:   758, the four tool schemas 2,124, environment / model / CLAUDE.md / git /
+#:   date / attribution reminders 1,149 with a repo cwd that carries a
+#:   CLAUDE.md, rounded up. The full harness it replaces measured 15,153 on the
+#:   same run (12 tool schemas 8,602; MCP tool, agent, skill and MCP
+#:   instruction listings 4,123).
 #: * ``agent`` (``local-fleet``, qwen38-mtp on Noda, 128k): 24,895-24,982 on
 #:   2026-11-20 (n=2, repo cwd); 14,843-15,742 for n=8 earlier in November.
 #:   The latest, larger figure is used: an underestimate is the failure that costs.
-LOCAL_HARNESS_OVERHEAD_TOKENS: dict[str, int] = {"subagent": 7080, "agent": 24982}
+LOCAL_HARNESS_OVERHEAD_TOKENS: dict[str, int] = {"subagent": 4050, "agent": 24982}
+
+#: The first-turn prompt a local role is trimmed to, harness included: a token
+#: TARGET, not the window. The CPU lane prefills at ~100 tokens/s at 2k, 58 at
+#: 10k and 35 at 22.5k (qwen-fast, 2026-11-20), so a first turn sized to "fits
+#: the window" took 11+ minutes and the reaper killed it at 300 s; a run sized
+#: to this target starts answering in about 2-3 minutes. Raising the lane's
+#: window does not move it: at 64k everything "fit", and that switched the
+#: window-only trim off. The GPU role has no target and keeps fitting its window.
+LOCAL_FIRST_TURN_TARGET_TOKENS: dict[str, int] = {"subagent": 12000}
 
 #: The KiroCrew context a session injects ahead of the request (memory,
 #: lessons, project, skills index) when any include_* flag is on. Median of the
@@ -111,6 +129,12 @@ TRIM_ORDER: tuple[str, ...] = ("memory", "lessons")
 #: conduct, skills index, crew/seat spec and the project group.
 KEPT_CONTEXT_TOKENS = INJECTED_CONTEXT_TOKENS - sum(CONTEXT_GROUP_TOKENS.values())
 
+#: What the lean helper contract (:data:`LOCAL_HELPER_CONTRACT`) saves over the
+#: shipped Kiro Crew contract (``config/prompt.md``) in the ``[AGENT SYSTEM
+#: PROMPT]`` block: 7,152 tokens for the shipped contract's block on the
+#: 2026-11-20 helper run against 190 for this one (qwen-fast count).
+LEAN_CONTRACT_SAVED_TOKENS = 6962
+
 #: Output tokens each local seat reserves per request
 #: (``CLAUDE_CODE_MAX_OUTPUT_TOKENS`` on ``local-background`` and
 #: ``local-fleet`` in the engine map); the router admits input + reserve
@@ -124,10 +148,15 @@ LOCAL_CTX_FALLBACK: dict[str, int] = {"subagent": 32768, "agent": 131072}
 _ALL_GROUPS = frozenset({"memory", "lessons", "project"})
 
 
-def context_tokens(groups: frozenset[str] | None) -> int:
-    """The injected KiroCrew context for a run keeping *groups* (``None`` = every group)."""
+def context_tokens(groups: frozenset[str] | None, role: str = "") -> int:
+    """The injected KiroCrew context for a run keeping *groups* (``None`` = every group).
+
+    A *role* that runs the lean helper contract (:data:`LEAN_CONTRACT_ROLES`)
+    carries that contract in place of the shipped one.
+    """
     kept = _ALL_GROUPS if groups is None else groups
-    return KEPT_CONTEXT_TOKENS + sum(t for g, t in CONTEXT_GROUP_TOKENS.items() if g in kept)
+    base = KEPT_CONTEXT_TOKENS - (LEAN_CONTRACT_SAVED_TOKENS if role in LEAN_CONTRACT_ROLES else 0)
+    return base + sum(t for g, t in CONTEXT_GROUP_TOKENS.items() if g in kept)
 
 
 def estimate_tokens(
@@ -139,18 +168,30 @@ def estimate_tokens(
     group; without it the measured median whole is used, or nothing when
     *include_context* is false.
     """
-    if groups is not None:
-        ctx = context_tokens(groups)
-    else:
-        ctx = INJECTED_CONTEXT_TOKENS if include_context else 0
-    base = brief_tokens(brief) + ctx
-    return {role: base + over for role, over in LOCAL_HARNESS_OVERHEAD_TOKENS.items()}
+    out = {}
+    for role, over in LOCAL_HARNESS_OVERHEAD_TOKENS.items():
+        if groups is not None:
+            ctx = context_tokens(groups, role)
+        elif include_context:
+            ctx = INJECTED_CONTEXT_TOKENS - (
+                LEAN_CONTRACT_SAVED_TOKENS if role in LEAN_CONTRACT_ROLES else 0
+            )
+        else:
+            ctx = 0
+        out[role] = brief_tokens(brief) + ctx + over
+    return out
 
 
 def input_budget(role: str, ctx: int | None = None) -> int:
-    """What a local *role* can take as input: its window minus the output reserve."""
+    """What a local *role*'s first turn may take as input.
+
+    Its window minus the output reserve, capped by the role's first-turn
+    token target (:data:`LOCAL_FIRST_TURN_TARGET_TOKENS`) when it has one.
+    """
     window = ctx if isinstance(ctx, int) and ctx > 0 else LOCAL_CTX_FALLBACK.get(role, 0)
-    return max(0, window - LOCAL_OUTPUT_RESERVE_TOKENS)
+    budget = max(0, window - LOCAL_OUTPUT_RESERVE_TOKENS)
+    target = LOCAL_FIRST_TURN_TARGET_TOKENS.get(role)
+    return min(budget, target) if target else budget
 
 
 class LocalFit:
@@ -184,8 +225,9 @@ def fit_local(
 ) -> LocalFit:
     """Fit a run keeping *groups* to local *role*, trimming in :data:`TRIM_ORDER`.
 
-    Budget = (window - output reserve) - the seat's measured harness overhead -
-    the brief; the injected context must fit what is left. A group in *pinned*
+    Budget = min(window - output reserve, the role's first-turn target) - the
+    seat's measured harness overhead - the brief; the injected context must fit
+    what is left. A group in *pinned*
     (the caller set its ``include_*`` true explicitly) is never dropped. When
     the minimal set still does not fit, ``fits`` is false: the candidate is
     skipped as too big rather than sent to overflow.
@@ -194,14 +236,14 @@ def fit_local(
     room = budget - LOCAL_HARNESS_OVERHEAD_TOKENS.get(role, 0) - brief_tokens(brief)
     kept = set(_ALL_GROUPS if groups is None else groups)
     drop: list[str] = []
-    need = context_tokens(frozenset(kept))
+    need = context_tokens(frozenset(kept), role)
     for group in TRIM_ORDER:
         if need <= room:
             break
         if group in kept and group not in pinned:
             kept.discard(group)
             drop.append(group)
-            need = context_tokens(frozenset(kept))
+            need = context_tokens(frozenset(kept), role)
     fits = need <= room
     return LocalFit(role, fits, tuple(drop) if fits else (), budget, need)
 
@@ -268,6 +310,147 @@ def apply_trim(info: Any, drop: list[str] | tuple[str, ...]) -> None:
         delegation = dict(getattr(info, "delegation", None) or {})
         delegation[TRIMMED_KEY] = ",".join(sorted(trimmed_groups(info) | set(done)))
         info.delegation = delegation
+
+
+# ---------------------------------------------------------------------------
+# The lean helper profile (CPU-lane roles)
+# ---------------------------------------------------------------------------
+
+#: Local roles whose sub-agent runs take the lean helper profile: the shipped
+#: Kiro Crew contract is replaced by :data:`LOCAL_HELPER_CONTRACT`, the
+#: harness mounts only :data:`LOCAL_HELPER_TOOLS` and no MCP server, and the
+#: injected context is trimmed to :data:`LOCAL_FIRST_TURN_TARGET_TOKENS`.
+#: The GPU ``agent`` role is not one: it keeps the full contract and tools.
+LEAN_CONTRACT_ROLES: frozenset[str] = frozenset({"subagent"})
+
+#: The built-in tools a lean helper keeps: what a coding helper needs. Grep and
+#: Glob are left out on purpose (1,567 tokens of schema; Bash greps).
+LOCAL_HELPER_TOOLS: tuple[str, ...] = ("Bash", "Read", "Edit", "Write")
+
+#: The Claude Code setting tiers a lean helper loads: the project's, as every
+#: Crew session that binds MCP servers already does. The user tier stays out:
+#: on the local lane its ``modelOverrides`` make Claude Code read the role name
+#: as an older Claude model, which switches to that model's long system prompt
+#: and tool descriptions (+4,463 tokens measured 2026-11-20).
+LOCAL_HELPER_SETTING_SOURCES: tuple[str, ...] = ("project", "local")
+
+#: The ``[AGENT SYSTEM PROMPT]`` a lean helper runs under, in place of the
+#: shipped contract, whose sections teach Kiro Crew MCP tools, dashboard
+#: widgets, browsing and orchestration that a lean helper does not mount.
+LOCAL_HELPER_CONTRACT = """You are a Kiro Crew helper running on a local model. \
+The agent that started you reads your reply; no person is watching.
+
+- Do the task with the tools this session has (Read, Edit, Write, Bash). \
+Kiro Crew's MCP tools (spawning, scheduling, memory, dashboards) are not \
+mounted here: do not search for them or ask for them.
+- Work in your working directory. Prefer small, direct steps. When the task \
+names a check (tests, a build, a command), run it and fix failures before you finish.
+- Do not ask questions. If something the task needs is missing (a file, a \
+credential, context your parent withheld), say exactly what and stop rather than guess.
+- Finish with a short report: the files you changed (absolute paths), the \
+commands you ran and their results, and anything left undone."""
+
+_LEAN_SESSIONS: OrderedDict[str, None] = OrderedDict()
+_LEAN_SESSIONS_LOCK = threading.Lock()
+#: Sessions remembered as lean, so a compaction's re-injected contract is the
+#: one the session started with. Bounded: the oldest is forgotten first.
+_LEAN_SESSIONS_MAX = 2048
+
+
+def mark_lean_session(session_key: str) -> None:
+    """Record *session_key* as a lean helper session (its contract is :data:`LOCAL_HELPER_CONTRACT`)."""
+    if not session_key:
+        return
+    with _LEAN_SESSIONS_LOCK:
+        _LEAN_SESSIONS[session_key] = None
+        _LEAN_SESSIONS.move_to_end(session_key)
+        while len(_LEAN_SESSIONS) > _LEAN_SESSIONS_MAX:
+            _LEAN_SESSIONS.popitem(last=False)
+
+
+def is_lean_session(session_key: str | None) -> bool:
+    """Whether *session_key* runs the lean helper contract."""
+    if not session_key:
+        return False
+    with _LEAN_SESSIONS_LOCK:
+        return session_key in _LEAN_SESSIONS
+
+
+def local_role_of_run(info: Any) -> str:
+    """The local router role serving *info*, or ``""`` when the local fleet does not serve it.
+
+    A run routed to the fleet carries its role as ``route_tier``; a run started
+    on a companion execution seat (``spawn_run(backend="local-background")``)
+    is matched to the seat whose template alias it runs under. Blocking (reads
+    the config): call it off the event loop. Never raises.
+    """
+    if getattr(info, "route_vendor", "") == "local":
+        tier = str(getattr(info, "route_tier", "") or "")
+        return tier if tier in LOCAL_CTX_FALLBACK else ""
+    runtime_agent = str(getattr(info, "runtime_agent", "") or "")
+    if not runtime_agent:
+        return ""
+    try:
+        from kiro_crew.decisions.points.spawn_route import _local_role_of_seat, vendor_of_seat
+        from kiro_crew.execution_seats import declared_execution_seats
+
+        seats = declared_execution_seats()
+    except Exception:
+        logger.debug("local role: execution seats unreadable", exc_info=True)
+        return ""
+    for seat_id, seat in sorted(seats.items()):
+        if seat.get("runtime_agent") == runtime_agent and vendor_of_seat(seat_id) == "local":
+            return _local_role_of_seat(seat_id)
+    return ""
+
+
+def lean_helper_profile() -> dict[str, list[str]]:
+    """The ``local_helper_profile`` factory kwarg: the tools and setting tiers a lean helper keeps."""
+    return {
+        "tools": list(LOCAL_HELPER_TOOLS),
+        "setting_sources": list(LOCAL_HELPER_SETTING_SOURCES),
+    }
+
+
+def fit_seat_run(info: Any, role: str) -> LocalFit:
+    """Fit a run started on a local seat to *role*'s first-turn target, and trim it.
+
+    The routed path fits before it picks (``spawn_route.fit_local_candidates``);
+    a run that named its seat is fitted here instead. A group the caller asked
+    for explicitly is never dropped, and a run whose minimal set still does not
+    fit starts as it is: it chose its seat.
+    """
+    groups = frozenset(g for g, flag in _FLAG_OF.items() if getattr(info, flag, True))
+    task = getattr(info, "_raw_task", "") or getattr(info, "task", "") or ""
+    fit = fit_local(role, str(task), groups=groups, pinned=pinned_groups(info))
+    if fit.drop:
+        apply_trim(info, fit.drop)
+    return fit
+
+
+def prepare_lean_run(info: Any, session_key: str) -> dict[str, list[str]] | None:
+    """Put a run on the CPU lane onto the lean helper profile; ``None`` for any other run.
+
+    Fits a run that named its seat to the role's first-turn target (a routed
+    pick was fitted before it was picked), records *session_key* as lean so its
+    contract is :data:`LOCAL_HELPER_CONTRACT`, and returns the
+    ``local_helper_profile`` the provider factory takes. Blocking (reads the
+    config): call it off the event loop.
+    """
+    role = local_role_of_run(info)
+    if role not in LEAN_CONTRACT_ROLES:
+        return None
+    if getattr(info, "route_vendor", "") != "local":
+        fit = fit_seat_run(info, role)
+        logger.info(
+            "Subagent %s: lean %s helper, first turn fitted to %d tokens%s",
+            getattr(info, "id", "?"),
+            role,
+            fit.budget,
+            f" (trimmed {', '.join(fit.drop)})" if fit.drop else "",
+        )
+    mark_lean_session(session_key)
+    return lean_helper_profile()
 
 
 # ---------------------------------------------------------------------------

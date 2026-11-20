@@ -205,11 +205,15 @@ class LLMProvider(ABC):
         """
         return None
 
-    def restrict_tools(self, allowed_tools: list[str]) -> None:
+    def restrict_tools(
+        self, allowed_tools: list[str], setting_sources: list[str] | None = None
+    ) -> None:
         """Restrict tools before startup, or refuse if enforcement is unavailable.
 
         An empty list forbids every tool. This is an execution restriction,
         not an approval preference; permission events alone do not satisfy it.
+        *setting_sources* names the harness setting tiers the restricted session
+        loads, where the harness has tiers; ``None`` keeps its default.
         """
         raise NotImplementedError("This provider cannot enforce a tool whitelist before execution")
 

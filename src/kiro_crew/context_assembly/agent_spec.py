@@ -804,6 +804,19 @@ def _crewmate_worker_prompt(agent: str, base_prompt: str, session_key: str) -> s
     return f"{worker_base}\n\n{addition}" if addition else worker_base
 
 
+def _lean_helper_session(session_key: str | None) -> bool:
+    """Whether *session_key* is a lean local helper (``local_check.is_lean_session``)."""
+    from kiro_crew.subagent_manager.local_check import is_lean_session
+
+    return is_lean_session(session_key)
+
+
+def _lean_helper_contract() -> str:
+    from kiro_crew.subagent_manager.local_check import LOCAL_HELPER_CONTRACT
+
+    return LOCAL_HELPER_CONTRACT
+
+
 def _resolve_agent_prompt(
     self,
     agent: str | None,
@@ -826,7 +839,12 @@ def _resolve_agent_prompt(
     from kiro_crew.agent_files import is_kirocrew_default_agent
 
     is_custom = bool(agent) and not is_kirocrew_default_agent(agent)
+    lean = _lean_helper_session(session_key)
     agent_prompt: str
+    if lean and not is_custom:
+        # A lean CPU-lane helper (``local_check.LEAN_CONTRACT_ROLES``): the shipped
+        # contract teaches tools and surfaces its session does not mount.
+        return _lean_helper_contract()
     if is_cc and not is_custom:
         # CC gets the same Kiro Crew persona prompt as kiro — including
         # the Output Format rules (diff blocks, image embeds, OPTIONS)
@@ -849,6 +867,11 @@ def _resolve_agent_prompt(
             owner_template=(agent or "") if private_owner else "",
             spec_path=ctx.pinned_session_skill_spec(session_key),
         )
+        # A custom agent whose spec carries the managed contract resolves to the
+        # shipped contract file; a lean helper takes its own contract instead. A
+        # custom agent's own persona prompt is kept.
+        if lean and agent_prompt and agent_prompt == _read_prompt_file(ctx._prompt_path()):
+            return _lean_helper_contract()
     else:
         pp = ctx._prompt_path()
         logger.debug("Prompt selection: mode=%r → %s", mode, pp)

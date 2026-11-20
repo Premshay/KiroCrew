@@ -422,6 +422,17 @@ async def _run_inner_impl(
         extra_kwargs["bare"] = True
     if info.allowed_tools:
         extra_kwargs["allowed_tools"] = info.allowed_tools
+    # Fork (Nexus): a run on the CPU lane of the local fleet takes the lean helper
+    # profile (``local_check.LEAN_CONTRACT_ROLES``): the short contract, the
+    # coding tools alone, and its context trimmed to the role's first-turn token
+    # target. A dedicated process only: a shared runtime's session is not this
+    # run's to shape.
+    if not plan.shared:
+        from kiro_crew.subagent_manager import local_check as _local_check
+
+        _lean = await asyncio.to_thread(_local_check.prepare_lean_run, info, session_key)
+        if _lean is not None:
+            extra_kwargs["local_helper_profile"] = _lean
     if info.cwd:
         extra_kwargs["cwd"] = info.cwd
     # A run that withholds memory keeps the harness's own memory out too.

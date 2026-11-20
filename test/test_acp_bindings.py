@@ -74,7 +74,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_to_llm_event": ("staticmethod", False, "9400e81ecdfb", "acp_turns"),
     "_tool_search_settings": ("function", False, "da838953900b", "acp"),
     "acp_config_options": ("property", False, "7eb96c2fda05", "acp"),
-    "restrict_tools": ("function", False, "81433b0f7bda", "acp"),
+    "restrict_tools": ("function", False, "f0ff36b6341f", "acp"),
     "session_provider_label": ("property", False, "bb418bb7ece8", "acp"),
     "session_resumed": ("property", False, "a6632a57e602", "acp"),
     "set_resume_session_id": ("function", False, "c284282f8a1d", "acp"),

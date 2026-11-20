@@ -610,8 +610,13 @@ class AcpProvider(LLMProvider):
         """
         return str(getattr(self._client, "cwd", "") or self._client._work_dir)
 
-    def restrict_tools(self, allowed_tools: list[str]) -> None:
-        self._client.restrict_tools(allowed_tools)
+    def restrict_tools(
+        self, allowed_tools: list[str], setting_sources: list[str] | None = None
+    ) -> None:
+        if setting_sources is None:
+            self._client.restrict_tools(allowed_tools)
+        else:
+            self._client.restrict_tools(allowed_tools, setting_sources)
 
     @property
     def session_activity_at(self) -> float | None:

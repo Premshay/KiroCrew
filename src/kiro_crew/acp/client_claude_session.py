@@ -15,8 +15,8 @@ Instance fields written: ``_claude_inline_settings``,
 
 Instance fields read: ``_agent_version``, ``_agent_version_read``, ``_allowed_tools``,
 ``_claude_worker_builtin_tools``, ``_include_memory``,
-``_mcp_mount_servers``, ``_permission_mode``, ``_session_id``, ``_session_key``,
-``_session_mcp_excludes_local``, ``_session_mcp_inline_settings``, ``_side_read_only``,
+``_mcp_mount_servers``, ``_permission_mode``, ``_restricted_setting_sources``,
+``_session_id``, ``_session_key``, ``_session_mcp_excludes_local``, ``_session_mcp_inline_settings``, ``_side_read_only``,
 ``_spec_shell_allowlist``, ``_spec_write_allowlist``, ``_spec_zero_tools``, ``memory_mode``.
 """
 
@@ -519,6 +519,11 @@ def _claude_session_meta(self: AcpClient) -> dict[str, Any]:
     excluded = getattr(self, "_claude_local_settings_excluded", False) or getattr(
         self, "_session_mcp_excludes_local", False
     )
+    restricted_sources = self._restricted_setting_sources
+    if self._allowed_tools is not None and restricted_sources is not None and not excluded:
+        # A restricted session that names its tiers loads only those. Under the
+        # exclusion below the governed source wins.
+        options["settingSources"] = list(restricted_sources)
     if excluded:
         options["settingSources"] = list(_CLAUDE_CREW_GOVERNED_SETTING_SOURCES)
         options["allowDangerouslySkipPermissions"] = False

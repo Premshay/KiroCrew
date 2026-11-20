@@ -492,7 +492,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "effort_config_option_id": ("function", False, "f21e39ec5ffb", "client_class"),
     "has_background_work": ("property", False, "a6632a57e602", "client_class"),
     "note_model_changed": ("function", False, "b60c5fea256e", "client_class"),
-    "restrict_tools": ("function", False, "81433b0f7bda", "client_mcp_array"),
+    "restrict_tools": ("function", False, "f0ff36b6341f", "client_mcp_array"),
     "session_activity_at": ("property", False, "c2eec8a41739", "client_class"),
     "set_claude_autonomous_turn_handler": (
         "function",
