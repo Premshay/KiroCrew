@@ -476,7 +476,7 @@ async def handle_run_end(manager: Any, info: Any) -> str:
     info.error_code = reason
     if not info.quota_routable:
         info.local_check_line = (
-            f"local check FAIL -> not switched (pinned run)"
+            "local check FAIL -> not switched (pinned run)"
             if reason == REASON_CHECK_FAILED
             else "local run unusable -> not switched (pinned run)"
         )

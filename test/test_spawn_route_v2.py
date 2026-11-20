@@ -53,7 +53,8 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(sr, "load_tombstones", lambda root=None: [])
     consent = tmp_path / "decisions_consent.json"
     consent.write_text(
-        json.dumps({"enabled": True, "endpoint": DECISION_PROVIDER_ENDPOINT_DEFAULT}), encoding="utf-8"
+        json.dumps({"enabled": True, "endpoint": DECISION_PROVIDER_ENDPOINT_DEFAULT}),
+        encoding="utf-8",
     )
     monkeypatch.setattr("kiro_crew.config.loader.decisions_consent_path", lambda: consent)
     monkeypatch.setattr(log_mod, "log_dir", lambda: tmp_path / "decisions")
@@ -83,9 +84,10 @@ class TestClaudeRateLimit:
                 },
             }
         )
-        assert json.loads((tmp_path / vl.STORE_NAME).read_text())["claude"]["five_hour"][
-            "used_pct"
-        ] == 42.0
+        assert (
+            json.loads((tmp_path / vl.STORE_NAME).read_text())["claude"]["five_hour"]["used_pct"]
+            == 42.0
+        )
         vl._reset_for_tests()  # a restart: the store is read back from disk
         h = vl.claude_health(NOW)
         assert h["out"] is False and h["used_pct"] == 42.0 and h["window"] == "five_hour"
@@ -93,17 +95,32 @@ class TestClaudeRateLimit:
 
     def test_the_most_used_live_window_binds(self):
         vl.note_claude_rate_limit(
-            {"status": "allowed", "utilization": 0.2, "rateLimitType": "five_hour",
-             "resetsAt": NOW + 100}, now=NOW,
+            {
+                "status": "allowed",
+                "utilization": 0.2,
+                "rateLimitType": "five_hour",
+                "resetsAt": NOW + 100,
+            },
+            now=NOW,
         )
         vl.note_claude_rate_limit(
-            {"status": "allowed", "utilization": 0.7, "rateLimitType": "seven_day",
-             "resetsAt": NOW + 86400}, now=NOW,
+            {
+                "status": "allowed",
+                "utilization": 0.7,
+                "rateLimitType": "seven_day",
+                "resetsAt": NOW + 86400,
+            },
+            now=NOW,
         )
         # an expired window no longer counts
         vl.note_claude_rate_limit(
-            {"status": "allowed", "utilization": 0.99, "rateLimitType": "seven_day_opus",
-             "resetsAt": NOW - 1}, now=NOW,
+            {
+                "status": "allowed",
+                "utilization": 0.99,
+                "rateLimitType": "seven_day_opus",
+                "resetsAt": NOW - 1,
+            },
+            now=NOW,
         )
         h = vl.claude_health(NOW)
         assert (h["window"], h["used_pct"]) == ("seven_day", 70.0)
@@ -121,8 +138,13 @@ class TestClaudeRateLimit:
             {"status": "rejected", "rateLimitType": "five_hour", "resetsAt": NOW + 600}, now=NOW
         )
         vl.note_claude_rate_limit(
-            {"status": "allowed", "utilization": 0.1, "rateLimitType": "five_hour",
-             "resetsAt": NOW + 600}, now=NOW + 5,
+            {
+                "status": "allowed",
+                "utilization": 0.1,
+                "rateLimitType": "five_hour",
+                "resetsAt": NOW + 600,
+            },
+            now=NOW + 5,
         )
         assert vl.claude_health(NOW + 10)["out"] is False
 
@@ -179,17 +201,26 @@ class TestOtherVendors:
             }
         )
         assert (h["out"], h["used_pct"], h["window"], h["source"]) == (
-            False, 87.0, "weekly", "codex_rollout"
+            False,
+            87.0,
+            "weekly",
+            "codex_rollout",
         )
         assert h["resets_at"] == NOW + 3600 and h["as_of"] > 0
 
     def test_codex_full_window_is_out_and_stale_is_ignored(self):
-        assert vl.codex_health(
-            {"weekly": {"used_percent": 100.0, "resets_at": NOW + 1, "stale": False}}
-        )["out"] is True
-        assert vl.codex_health(
-            {"weekly": {"used_percent": 100.0, "resets_at": NOW - 1, "stale": True}}
-        ) == {}
+        assert (
+            vl.codex_health(
+                {"weekly": {"used_percent": 100.0, "resets_at": NOW + 1, "stale": False}}
+            )["out"]
+            is True
+        )
+        assert (
+            vl.codex_health(
+                {"weekly": {"used_percent": 100.0, "resets_at": NOW - 1, "stale": True}}
+            )
+            == {}
+        )
         assert vl.codex_health({}) == {}
 
     def test_antigravity_quota_file(self, tmp_path):
@@ -219,7 +250,10 @@ class TestOtherVendors:
         h = vl.antigravity_health(["gemini-4-hydrogen-medium"], now=NOW)
         assert h["per_model"] == {"gemini-4-hydrogen-medium": 30.0, "gemini-4-neon-medium": 100.0}
         assert (h["out"], h["used_pct"], h["window"], h["source"]) == (
-            False, 30.0, "per_model", "agy_quota"
+            False,
+            30.0,
+            "per_model",
+            "agy_quota",
         )
         both = vl.antigravity_health(["gemini-4-hydrogen-medium", "gemini-4-neon-medium"], now=NOW)
         assert both["out"] is False and both["used_pct"] == 100.0
@@ -319,24 +353,39 @@ class TestCandidates:
     def test_local_roles_are_offered_when_a_seat_carries_them(self, monkeypatch):
         monkeypatch.setattr(sr, "effective_tiers", _fake_tiers)
         backends = {
-            "local/subagent": {"backend": "local-background", "runtime_agent": "kirocrew-lite",
-                               "native": ""},
-            "local/agent": {"backend": "local-fleet", "runtime_agent": "crew-local",
-                            "native": ""},
+            "local/subagent": {
+                "backend": "local-background",
+                "runtime_agent": "kirocrew-lite",
+                "native": "",
+            },
+            "local/agent": {"backend": "local-fleet", "runtime_agent": "crew-local", "native": ""},
         }
-        cands = [c for c in sr.all_candidates("claude", backends=backends) if c["vendor"] == "local"]
+        cands = [
+            c for c in sr.all_candidates("claude", backends=backends) if c["vendor"] == "local"
+        ]
         assert cands == [
-            {"key": "local/subagent/0", "vendor": "local", "tier": "subagent",
-             "model": "subagent", "backend": "local-background"},
-            {"key": "local/agent/0", "vendor": "local", "tier": "agent",
-             "model": "agent", "backend": "local-fleet"},
+            {
+                "key": "local/subagent/0",
+                "vendor": "local",
+                "tier": "subagent",
+                "model": "subagent",
+                "backend": "local-background",
+            },
+            {
+                "key": "local/agent/0",
+                "vendor": "local",
+                "tier": "agent",
+                "model": "agent",
+                "backend": "local-fleet",
+            },
         ]
 
     def test_a_local_parent_gets_its_roles_on_its_own_seat(self, monkeypatch):
         monkeypatch.setattr(sr, "effective_tiers", _fake_tiers)
         cands = sr.all_candidates("local", cross_vendor=False)
         assert [(c["key"], c["backend"]) for c in cands] == [
-            ("local/subagent/0", ""), ("local/agent/0", "")
+            ("local/subagent/0", ""),
+            ("local/agent/0", ""),
         ]
 
     def test_a_pinned_vendor_is_offered_alone(self, monkeypatch):
@@ -351,17 +400,28 @@ class TestCandidates:
             es,
             "declared_execution_seats",
             lambda cfg=None: {
-                "antigravity": {"id": "antigravity", "runtime_agent": "crew-antigravity",
-                                "runtime": "Antigravity"},
-                "local-background": {"id": "local-background", "runtime_agent": "kirocrew-lite",
-                                     "runtime": "local"},
-                "local-fleet": {"id": "local-fleet", "runtime_agent": "crew-local",
-                                "runtime": "local"},
+                "antigravity": {
+                    "id": "antigravity",
+                    "runtime_agent": "crew-antigravity",
+                    "runtime": "Antigravity",
+                },
+                "local-background": {
+                    "id": "local-background",
+                    "runtime_agent": "kirocrew-lite",
+                    "runtime": "local",
+                },
+                "local-fleet": {
+                    "id": "local-fleet",
+                    "runtime_agent": "crew-local",
+                    "runtime": "local",
+                },
             },
         )
         b = sr.route_backends("claude")
         assert b["antigravity"] == {
-            "backend": "antigravity", "runtime_agent": "crew-antigravity", "native": ""
+            "backend": "antigravity",
+            "runtime_agent": "crew-antigravity",
+            "native": "",
         }
         assert b["local/subagent"]["backend"] == "local-background"
         assert b["local/agent"]["backend"] == "local-fleet"
@@ -393,10 +453,21 @@ class TestCandidates:
 def test_merged_health_keeps_unknown_absent():
     tombs = sr.vendor_health([], now=NOW)
     limits = {
-        "claude": {"out": False, "used_pct": 42.0, "window": "five_hour",
-                   "resets_at": NOW + 10, "source": "claude_rate_limit_event", "as_of": NOW},
-        "codex": {"out": True, "used_pct": 100.0, "window": "weekly", "resets_at": NOW + 99,
-                  "source": "codex_rollout"},
+        "claude": {
+            "out": False,
+            "used_pct": 42.0,
+            "window": "five_hour",
+            "resets_at": NOW + 10,
+            "source": "claude_rate_limit_event",
+            "as_of": NOW,
+        },
+        "codex": {
+            "out": True,
+            "used_pct": 100.0,
+            "window": "weekly",
+            "resets_at": NOW + 99,
+            "source": "codex_rollout",
+        },
     }
     h = sr.merged_health(tombs, limits)
     state = sr.build_state("b", vendor="claude", parent_model="", cands=[], health=h)["health"]
@@ -428,9 +499,19 @@ def routed_env(monkeypatch):
         sr,
         "limit_health",
         lambda models=(), now=None: {
-            "antigravity": {"out": False, "used_pct": 30.0, "window": "per_model",
-                            "per_model": {"gemini-4-hydrogen-medium": 30.0}, "source": "agy_quota"},
-            "codex": {"out": False, "used_pct": 87.0, "window": "weekly", "source": "codex_rollout"},
+            "antigravity": {
+                "out": False,
+                "used_pct": 30.0,
+                "window": "per_model",
+                "per_model": {"gemini-4-hydrogen-medium": 30.0},
+                "source": "agy_quota",
+            },
+            "codex": {
+                "out": False,
+                "used_pct": 87.0,
+                "window": "weekly",
+                "source": "codex_rollout",
+            },
         },
     )
 
@@ -445,12 +526,19 @@ class TestRoutedAcrossVendors:
     def test_another_vendor_comes_back_with_its_seat(self, routed_env):
         oracle = routed_env(_Oracle("antigravity/small/0"))
         got = asyncio.run(
-            sr.routed_spawn("READ-ONLY: trace callers.", agent="crew-claude-atlas",
-                            parent_model="claude-opus-5", session_key="s1")
+            sr.routed_spawn(
+                "READ-ONLY: trace callers.",
+                agent="crew-claude-atlas",
+                parent_model="claude-opus-5",
+                session_key="s1",
+            )
         )
         assert got is not None
         assert (got["vendor"], got["model"], got["backend"], got["runtime_agent"]) == (
-            "antigravity", "gemini-4-hydrogen-medium", "antigravity", "crew-antigravity"
+            "antigravity",
+            "gemini-4-hydrogen-medium",
+            "antigravity",
+            "crew-antigravity",
         )
         state = oracle.states[0]
         assert state["parent_vendor"] == "claude"
@@ -465,7 +553,11 @@ class TestRoutedAcrossVendors:
     def test_a_native_backend_route(self, routed_env):
         routed_env(_Oracle("codex/large/0", note="trace/complex"))
         got = asyncio.run(sr.routed_spawn("x", agent="crew-claude", session_key="s1"))
-        assert (got["backend"], got["native_backend"], got["runtime_agent"]) == ("codex", "codex", "")
+        assert (got["backend"], got["native_backend"], got["runtime_agent"]) == (
+            "codex",
+            "codex",
+            "",
+        )
         assert "87% of weekly" in sr.reason_line(got)
 
     def test_own_vendor_stays_on_its_seat(self, routed_env):
@@ -536,7 +628,9 @@ class TestApply:
         info = self._info(**pin)
         assert sr.pins_vendor(info) is True
         before = dict(vars(info))
-        assert sr.apply_route_backend(info, {"backend": "codex", "native_backend": "codex"}) is False
+        assert (
+            sr.apply_route_backend(info, {"backend": "codex", "native_backend": "codex"}) is False
+        )
         assert vars(info) == before
 
     def test_own_worker_pins(self):
@@ -556,10 +650,15 @@ class TestNexusCompanionSeats:
         "engines": {
             "claude-max": {"env": {}},
             "codex-sub": {"env": {"ACP_ENGINE": "codex", "CODEX_HOME": "/codex"}},
-            "local-fleet": {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8484",
-                                    "ANTHROPIC_MODEL": "agent"}},
-            "local-background": {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8484",
-                                         "ANTHROPIC_MODEL": "subagent"}},
+            "local-fleet": {
+                "env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8484", "ANTHROPIC_MODEL": "agent"}
+            },
+            "local-background": {
+                "env": {
+                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8484",
+                    "ANTHROPIC_MODEL": "subagent",
+                }
+            },
             "deepseek-flash": {"env": {"ACP_ENGINE": "deepseek"}},
         },
         "agents": {
@@ -581,9 +680,7 @@ class TestNexusCompanionSeats:
         path.write_text(json.dumps(self.ENGINES), encoding="utf-8")
         monkeypatch.setenv("KIROCREW_ENGINES", str(path))
         registry = companion.NexusProviderRegistry()
-        monkeypatch.setattr(
-            context, "current_context", lambda: SimpleNamespace(providers=registry)
-        )
+        monkeypatch.setattr(context, "current_context", lambda: SimpleNamespace(providers=registry))
         cfg = KiroCrewConfig()
         for alias in self.ENGINES["agents"]:
             cfg.agents[alias] = KiroCrewAgentConfig(kiro_agent=alias)

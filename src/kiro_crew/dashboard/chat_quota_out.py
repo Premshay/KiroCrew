@@ -42,9 +42,7 @@ def _turn_model(turn: Any) -> str:
         return ""
 
 
-def mark_quota_out(
-    turn: Any, *texts: object, refusal: bool = False
-) -> asyncio.Future[Any] | None:
+def mark_quota_out(turn: Any, *texts: object, refusal: bool = False) -> asyncio.Future[Any] | None:
     """Schedule the vendor's quota out-mark when *texts* carry a quota signal. Never raises.
 
     *texts* are errors (``str()`` is taken here); *refusal* adds the refused
@@ -57,9 +55,7 @@ def mark_quota_out(
         if refusal:
             texts = (*texts, *refusal_texts(turn))
         text = "\n".join(str(t)[-_TEXT_TAIL_CHARS:] for t in texts if t)
-        if not text or not any(
-            rx.search(text) for rxs in QUOTA_PATTERNS.values() for rx in rxs
-        ):
+        if not text or not any(rx.search(text) for rxs in QUOTA_PATTERNS.values() for rx in rxs):
             return None
         call = functools.partial(
             note_chat_quota,
