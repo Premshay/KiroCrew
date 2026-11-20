@@ -75,6 +75,14 @@ def no_advertised(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_host_limits(monkeypatch):
+    """No live headroom reads (rollouts, the fleet router, quota files) and no other vendor's backend."""
+    monkeypatch.setattr(sr, "_limits_cache", None)
+    monkeypatch.setattr(sr, "limit_health", lambda models=(), now=None: {})
+    monkeypatch.setattr(sr, "route_backends", lambda parent_vendor, cfg=None: {})
+
+
+@pytest.fixture(autouse=True)
 def no_tombstones(monkeypatch):
     """No registry read by default; a test that wants health installs its own rows."""
     monkeypatch.setattr(sr, "_health_cache", None)
@@ -109,10 +117,12 @@ class _Oracle:
 
 @pytest.fixture
 def install_oracle(monkeypatch):
-    import kiro_crew.decisions.impl_jev as impl_mod
+    # The gate builds its provider through ``gate._oracle`` (the registry since the
+    # System One rename); patching ``impl_jev.JevOracle`` no longer reaches it.
+    import kiro_crew.decisions.gate as gate_mod
 
     def _install(oracle):
-        monkeypatch.setattr(impl_mod, "JevOracle", lambda provider: oracle)
+        monkeypatch.setattr(gate_mod, "_oracle", lambda *a, **k: oracle)
         return oracle
 
     return _install
@@ -393,7 +403,7 @@ class TestRoutedSpawn:
 
 class TestNoteOnTheWire:
     def test_note_is_bounded_and_optional(self):
-        from kiro_crew.decisions.impl_jev import MAX_NOTE_CHARS, _answer_from_wire
+        from kiro_crew.decisions.impl_systemone import MAX_NOTE_CHARS, _answer_from_wire
         from kiro_crew.decisions.types import Choice
 
         q = Choice("spawn", "which", options=["a", "b"])
