@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.constants import reflow_and_label_glued_option_marker
+from kiro_crew.dashboard.chat_quota_out import mark_quota_out
 from kiro_crew.dashboard.chat_utils import (
     _ACTIVITY_NO_REPLY_CONTINUE_MSG,
     _COMPACTION_CONTINUE_MSG,
@@ -36,7 +37,6 @@ from kiro_crew.dashboard.chat_utils import (
     tool_calls_are_read_only_preparation,
     with_bounded_redaction_records,
 )
-from kiro_crew.dashboard.chat_quota_out import mark_quota_out
 from kiro_crew.dashboard.recovery_replays import replays_of
 from kiro_crew.dashboard.state import chat_message_note, row_mid
 from kiro_crew.messaging.empty_turn_copy import EMPTY_TURN_NOTICE, EMPTY_TURN_NOTICE_AFTER_WORK
