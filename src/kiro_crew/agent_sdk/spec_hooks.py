@@ -1430,7 +1430,8 @@ def spec_steering_read_nowhere(provider: object) -> bool:
 
     True where the backend's mirror rules ``resources`` ``withheld`` or
     ``no-channel``: the harness is handed no spec, and Crew's own steering load
-    serves only the default agent, on Claude Code and Codex
+    serves the default agent, and a custom agent's absolute entries only, on
+    Claude Code and Codex
     (``ACP_BACKENDS_CREW_LOADS_SPEC_STEERING``,
     ``providers.mirrors.base.RESOURCES_NO_READER``). False for a backend with no
     mirror (kiro-cli and KAS read ``resources`` themselves) and for one whose

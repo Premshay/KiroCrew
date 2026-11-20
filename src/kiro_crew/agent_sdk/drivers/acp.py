@@ -56,6 +56,7 @@ __all__ = [
     "catalog_row_would_drop",
     "context_provider_of",
     "crew_loads_spec_steering",
+    "lends_inherited_skills",
     "projected_session_mcp_servers",
     "agent_spec_mcp_refs",
     "claude_adapter_cached_negative",
@@ -373,11 +374,34 @@ def crew_loads_spec_steering(provider_type: str | None) -> bool:
 
     *provider_type* is the session's provider label, as context assembly receives
     it. True for a harness in ``ACP_BACKENDS_CREW_LOADS_SPEC_STEERING`` (claude and
-    codex), which is handed no spec and so reads none of its ``resources``.
+    codex), which is handed no spec and so reads none of its ``resources``, and for
+    a label in ``PROVIDER_LABELS_CREW_LOADS_SPEC_STEERING`` (antigravity, which is
+    no ACP backend).
     """
     from kiro_crew.agent_sdk.backends import ACP_BACKENDS_CREW_LOADS_SPEC_STEERING
+    from kiro_crew.agent_sdk.backends_routing import PROVIDER_LABELS_CREW_LOADS_SPEC_STEERING
 
-    return _label_names_a_member(provider_type, ACP_BACKENDS_CREW_LOADS_SPEC_STEERING)
+    return bool(provider_type) and (
+        provider_type in PROVIDER_LABELS_CREW_LOADS_SPEC_STEERING
+        or _label_names_a_member(provider_type, ACP_BACKENDS_CREW_LOADS_SPEC_STEERING)
+    )
+
+
+def lends_inherited_skills(provider_type: str | None) -> bool:
+    """Whether an unmapped custom agent on *provider_type* gets kiro-cli's default skill trees.
+
+    Crew supplies ``~/.kiro/skills`` and the workspace's ``.kiro/skills`` through its
+    bounded catalog (``agent_discovery.inherited_skill_globs``) to a session labelled
+    kiro-cli (``"acp"``), and to a companion-served harness in
+    ``PROVIDER_LABELS_CREW_LOADS_SPEC_STEERING`` (antigravity): it reported ``"acp"``
+    until it named itself, and it has no skill trees of its own to read them from.
+    """
+    from kiro_crew.acp.types import PROVIDER_LABEL_DEFAULT
+    from kiro_crew.agent_sdk.backends_routing import PROVIDER_LABELS_CREW_LOADS_SPEC_STEERING
+
+    return provider_type == PROVIDER_LABEL_DEFAULT or (
+        provider_type in PROVIDER_LABELS_CREW_LOADS_SPEC_STEERING
+    )
 
 
 def reads_project_agents_md(provider_type: str | None) -> bool:

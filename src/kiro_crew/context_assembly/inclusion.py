@@ -214,9 +214,12 @@ def steering_resources_part(
     compaction, so only a harness that does NOT read agent ``resources`` needs the
     explicit load: *provider_type*, the session's provider label, names one in
     ``ACP_BACKENDS_CREW_LOADS_SPEC_STEERING`` (Claude Code and Codex, a positive
-    membership). A custom agent loads its own prompt, a member chat (*essentials*
-    non-empty) carries its steering inside the essentials envelope, and the
-    ``project`` context group decides whether steering is in scope at all.
+    membership). A member chat (*essentials* non-empty) carries its steering
+    inside the essentials envelope, and the ``project`` context group decides
+    whether steering is in scope at all. A custom (non-default, non-member) agent
+    -- a seat such as ``crew-claude-atlas`` -- gets only its spec's own ABSOLUTE
+    ``file://`` documents (:func:`kiro_crew.context._load_seat_resources`): its
+    relative entries and the default trees stay out, as before.
     *project* is the session's project: relative entries anchor there, as
     kiro-cli anchors them at its working directory, and it adds the project's
     steering and ``AGENTS.md`` that kiro-cli inherits. A harness that reads that
@@ -228,10 +231,9 @@ def steering_resources_part(
 
     if essentials or not ctx.acp_driver.crew_loads_spec_steering(provider_type):
         return ""
-    if agent and not is_kirocrew_default_agent(agent):
-        return ""
     if not _group_included(context_groups, CONTEXT_GROUP_PROJECT):
         return ""
-    return ctx._load_steering_resources(
-        project, harness_reads_agents_md=ctx.acp_driver.reads_project_agents_md(provider_type)
-    )
+    reads_agents_md = ctx.acp_driver.reads_project_agents_md(provider_type)
+    if agent and not is_kirocrew_default_agent(agent):
+        return ctx._load_seat_resources(agent, project, harness_reads_agents_md=reads_agents_md)
+    return ctx._load_steering_resources(project, harness_reads_agents_md=reads_agents_md)
