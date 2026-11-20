@@ -4208,6 +4208,50 @@
       "defaultValue": true
     },
     {
+      "path": "context",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Context",
+      "help": "Session-context documents configured once for every agent session.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {
+        "shared_resources": []
+      }
+    },
+    {
+      "path": "context.shared_resources",
+      "kind": "core",
+      "type": "array",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Shared Resources",
+      "help": "Documents every agent session receives at session start, configured once instead of in each agent spec's resources: the default agent, custom agents and seats, crewmate chats and spawned subagents, on every harness, and again after a compaction. Each entry is an absolute path or a file:// URI naming one file. A file the session's agent spec already lists in its resources is not sent twice; a missing or unreadable file is logged and skipped. Withheld when the project context group is. Empty (the default) adds nothing.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": []
+    },
+    {
+      "path": "context.shared_resources.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
       "path": "session_summary",
       "kind": "core",
       "type": "object",

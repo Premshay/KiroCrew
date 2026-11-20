@@ -97,6 +97,7 @@ def post_compaction_parts(
     native_launch_sources: Collection[str],
     post_compaction_checkpoint: Mapping[str, object] | None = None,
     query_text: str = "",
+    member_template: str = "",
 ) -> list[str]:
     """What a turn re-injects after a confirmed compaction dropped session start.
 
@@ -104,9 +105,11 @@ def post_compaction_parts(
     glob restriction as session start), the learned-lessons block (same store,
     gates and budgets as session start, ranked against *query_text*, the user's
     own text for this turn), the CURRENT reply-style preferences, the Claude Code
-    backend's steering resources (same gate as session start) and the CURRENT
-    folder steering. The member section is re-injected by the caller, through the
-    member lifecycle chokepoint. Also starts the session's shown-lesson record
+    backend's steering resources (same gate as session start), the CURRENT
+    ``context.shared_resources`` documents (same gate as session start, on every
+    harness; *member_template* names a member chat's template for de-duplication)
+    and the CURRENT folder steering. The member section is re-injected by the
+    caller, through the member lifecycle chokepoint. Also starts the session's shown-lesson record
     again, from the lessons block re-sent here.
 
     A minimal-context turn (shared and guest channel turns, minimal crons) gets back
@@ -253,6 +256,23 @@ def post_compaction_parts(
         parts.append(
             "[REINJECTED AFTER COMPACTION — steering resources]\n"
             + ctx._neutralize_structural_markers(_steering_ctx)
+            + "\n[END REINJECTED]\n\n"
+        )
+    # The operator's shared documents were session-start prompt text on every
+    # harness (kiro-cli does not load them natively unless the spec lists them,
+    # and then the gate skips them), so the compaction dropped them everywhere.
+    # Re-read the CURRENT files; the payload is scrubbed, the wrapper kept outside.
+    _shared_ctx = _inclusion.shared_resources_part(
+        agent=agent,
+        provider_type=provider_type,
+        context_groups=context_groups,
+        project=project,
+        member_template=member_template if _essentials else "",
+    )
+    if _shared_ctx:
+        parts.append(
+            "[REINJECTED AFTER COMPACTION — shared resources]\n"
+            + ctx._neutralize_structural_markers(_shared_ctx)
             + "\n[END REINJECTED]\n\n"
         )
     # Folder steering is session-start context too, and unlike kiro's

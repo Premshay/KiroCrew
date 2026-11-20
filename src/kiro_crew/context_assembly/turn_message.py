@@ -617,6 +617,7 @@ def build_message(
                 context_provider=context_provider,
                 post_compaction_checkpoint=post_compaction_checkpoint,
                 native_launch_sources=native_launch_sources,
+                member_template=_private_template,
                 # The user's own text (or a transform hook's output), never a
                 # dispatcher prefix, ranks the lessons -- as on the per-message path.
                 query_text=(

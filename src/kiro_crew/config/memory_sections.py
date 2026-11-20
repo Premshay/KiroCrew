@@ -1,7 +1,7 @@
 """Sections for what Kiro Crew keeps and derives across sessions.
 
 Owns the DTOs, defaults and field coercion for ``memory``, ``knowledge``,
-``skills``, ``session_summary`` and the named ``memory_stores`` records, plus the
+``skills``, ``session_summary``, ``context`` and the named ``memory_stores`` records, plus the
 raw-dict merge a store override applies over the top-level ``memory`` section.
 ``config.sections`` re-exports every name; this module never imports it, the
 loader, schema or validation.
@@ -1259,6 +1259,55 @@ class SessionSummaryConfig:
                 self.assistant_excerpt_chars,
             )
             object.__setattr__(self, "assistant_excerpt_chars", 80)
+
+
+#: Most entries ``context.shared_resources`` keeps; the rest are dropped on load.
+SHARED_RESOURCES_MAX_ITEMS = 32
+
+
+@dataclass
+class ContextConfig:
+    """Session-context documents configured once for every agent session."""
+
+    shared_resources: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Shared Resources",
+            "Documents every agent session receives at session start, configured "
+            "once instead of in each agent spec's resources: the default agent, "
+            "custom agents and seats, crewmate chats and spawned subagents, on every "
+            "harness, and again after a compaction. Each entry is an absolute path or "
+            "a file:// URI naming one file. A file the session's agent spec already "
+            "lists in its resources is not sent twice; a missing or unreadable file "
+            "is logged and skipped. Withheld when the project context group is. "
+            "Empty (the default) adds nothing.",
+        ),
+    )
+
+    @classmethod
+    def from_raw(cls, section: object) -> ContextConfig:
+        """Build from a raw ``context`` dict; a malformed value reads as empty.
+
+        Only non-empty strings are kept, in order, at most
+        :data:`SHARED_RESOURCES_MAX_ITEMS`. Whether an entry names a readable file
+        is the loader's question, asked per session, not this parse's.
+        """
+        if not isinstance(section, dict):
+            return cls()
+        raw = section.get("shared_resources")
+        if not isinstance(raw, list):
+            if raw is not None:
+                logger.warning("context.shared_resources is not a list; ignoring it")
+            return cls()
+        kept = [e.strip() for e in raw if isinstance(e, str) and e.strip()]
+        if len(kept) > SHARED_RESOURCES_MAX_ITEMS:
+            logger.warning(
+                "context.shared_resources has %d entries; keeping the first %d",
+                len(kept),
+                SHARED_RESOURCES_MAX_ITEMS,
+            )
+            kept = kept[:SHARED_RESOURCES_MAX_ITEMS]
+        return cls(shared_resources=kept)
 
 
 def resolve_memory_store_config(

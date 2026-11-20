@@ -91,6 +91,7 @@ from kiro_crew.config.integration_sections import (  # noqa: F401
 )
 from kiro_crew.config.memory_sections import (  # noqa: F401
     DEFAULT_AUTO_INGEST_ARTIFACT_KINDS,
+    ContextConfig,
     KnowledgeConfig,
     MemoryConfig,
     MemoryStoreConfig,
