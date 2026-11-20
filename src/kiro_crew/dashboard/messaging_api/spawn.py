@@ -670,6 +670,9 @@ async def api_spawn(request: web.Request) -> web.Response:
     from kiro_crew.shared_crew.admission_entry import admitted_scope
 
     _card_seen = bool(parent_session) and card_turn_seen(request, parent_session)
+    # Imported here: this handler runs on the messaging facade's globals.
+    from kiro_crew.subagent_manager.local_check import spawn_delegation
+
     with admitted_scope(child_admission):
         info = await _spawn_on_loop(
             state,
@@ -688,11 +691,10 @@ async def api_spawn(request: web.Request) -> web.Response:
             label=str(cleaned.get("label") or ""),
             # Kept in ``delegation`` so it survives the queue, a restart and a
             # successor exactly as the rest of the delegation does.
-            **(
-                {"delegation": {"check": str(cleaned["check"]).strip()}}
-                if str(cleaned.get("check") or "").strip()
-                else {}
-            ),
+            # The check and the include_* groups the body pinned explicitly,
+            # kept in ``delegation`` so they survive the queue, a restart and a
+            # successor exactly as the rest of the delegation does.
+            **spawn_delegation(body, str(cleaned.get("check") or "")),
             approval_mode=approval_mode or None,
             silent=silent,
             batch_id=batch_id,

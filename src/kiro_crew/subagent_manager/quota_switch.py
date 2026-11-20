@@ -391,6 +391,7 @@ async def _fall_through(manager: Any, info: Any, hit: QuotaHit, now: float | Non
             session_key=info.parent_session_key or None,
             exclude_vendors=chain,
             tier=info.route_tier,
+            **_local_scope(info),
         )
         if not routed:
             info.error = (
@@ -426,6 +427,17 @@ async def _fall_through(manager: Any, info: Any, hit: QuotaHit, now: float | Non
         manager.settle_retry(info, successor.id if successor is not None else None)
 
 
+def _local_scope(info: Any) -> dict[str, Any]:
+    """The scope a fall-through fits a local candidate to: the caller's, before any trim."""
+    from kiro_crew.subagent_manager import local_check as _local_check
+    from kiro_crew.subagent import _context_groups_of
+
+    return {
+        "context_groups": _context_groups_of(info) | _local_check.trimmed_groups(info),
+        "pinned_groups": _local_check.pinned_groups(info),
+    }
+
+
 async def spawn_successor(
     manager: Any,
     info: Any,
@@ -451,6 +463,20 @@ async def spawn_successor(
 
         execution = await asyncio.to_thread(read_run_execution, info.id)
     native = routed.get("native_backend") or ""
+    # The successor starts from the scope the caller gave, not the one a local
+    # lane trimmed to fit; a successor routed to a local lane is fitted again.
+    from kiro_crew.subagent_manager import local_check as _local_check
+
+    restored = _local_check.trimmed_groups(info)
+    delegation = {k: v for k, v in dict(info.delegation).items() if k != _local_check.TRIMMED_KEY}
+    pinned = _local_check.pinned_groups(info)
+    trim = {g for g in routed.get("trim") or () if g not in pinned}
+    keep = {
+        g: (getattr(info, f"include_{g}") or g in restored) and g not in trim
+        for g in ("memory", "lessons", "project")
+    }
+    if trim:
+        delegation[_local_check.TRIMMED_KEY] = ",".join(sorted(trim))
     successor = await manager.spawn_async(
         brief,
         parent_session_key=info.parent_session_key,
@@ -462,10 +488,10 @@ async def spawn_successor(
         runtime_agent=routed.get("runtime_agent") or "",
         approval_mode=info.approval_mode or None,
         silent=info.silent,
-        delegation=dict(info.delegation),
-        include_memory=info.include_memory,
-        include_lessons=info.include_lessons,
-        include_project=info.include_project,
+        delegation=delegation,
+        include_memory=keep["memory"],
+        include_lessons=keep["lessons"],
+        include_project=keep["project"],
         memory_store=info.memory_store,
         crew=info.crew,
         label=info.label,

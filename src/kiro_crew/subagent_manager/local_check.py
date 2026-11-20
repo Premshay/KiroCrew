@@ -90,10 +90,184 @@ def brief_tokens(brief: str) -> int:
     return int(len(brief or "") / CHARS_PER_TOKEN) + 1
 
 
-def estimate_tokens(brief: str, *, include_context: bool = True) -> dict[str, int]:
-    """Per local router role, the first request a local seat would send for *brief*."""
-    base = brief_tokens(brief) + (INJECTED_CONTEXT_TOKENS if include_context else 0)
+#: What each switchable group that can be TRIMMED adds to the injected context.
+#: Measured 2026-11-20 on the same local-lane first messages (n=20 with a
+#: session context, ``~/.local/share/claude-local-lane/projects/*/*.jsonl``):
+#: each section tokenized with the Qwen3 vocab (``llama-tokenize``) and
+#: assigned to its group by its header -- memory = ``[Memory tools]``,
+#: stable profile, semantic, episodic, activity, conversation history;
+#: lessons = learned corrections, learned experience, user profile. Medians
+#: of the sessions that carried the group (memory n=15: 83-8,780; lessons
+#: n=18: 81-6,763). A median, not a high percentile: overstating what a drop
+#: saves is the failure that costs (a "fits" that overflows the lane).
+CONTEXT_GROUP_TOKENS: dict[str, int] = {"memory": 3867, "lessons": 5801}
+
+#: The order groups are dropped to fit a local lane (operator ruling
+#: 2026-11-20): recall/episodic memory first, then lessons. Skills, the project
+#: group (AGENTS.md / steering) and the crew/seat spec are never trimmed.
+TRIM_ORDER: tuple[str, ...] = ("memory", "lessons")
+
+#: The injected context that stays when everything trimmable is dropped:
+#: conduct, skills index, crew/seat spec and the project group.
+KEPT_CONTEXT_TOKENS = INJECTED_CONTEXT_TOKENS - sum(CONTEXT_GROUP_TOKENS.values())
+
+#: Output tokens each local seat reserves per request
+#: (``CLAUDE_CODE_MAX_OUTPUT_TOKENS`` on ``local-background`` and
+#: ``local-fleet`` in the engine map); the router admits input + reserve
+#: against the lane window, so the reserve comes off the input budget.
+LOCAL_OUTPUT_RESERVE_TOKENS = 8192
+
+#: The window each role serves when ``health.local.ctx`` has no live reading:
+#: qwen-fast on the CPU lane, the Noda agent lane.
+LOCAL_CTX_FALLBACK: dict[str, int] = {"subagent": 32768, "agent": 131072}
+
+_ALL_GROUPS = frozenset({"memory", "lessons", "project"})
+
+
+def context_tokens(groups: frozenset[str] | None) -> int:
+    """The injected KiroCrew context for a run keeping *groups* (``None`` = every group)."""
+    kept = _ALL_GROUPS if groups is None else groups
+    return KEPT_CONTEXT_TOKENS + sum(t for g, t in CONTEXT_GROUP_TOKENS.items() if g in kept)
+
+
+def estimate_tokens(
+    brief: str, *, include_context: bool = True, groups: frozenset[str] | None = None
+) -> dict[str, int]:
+    """Per local router role, the first request a local seat would send for *brief*.
+
+    *groups* (the context groups the run keeps) sizes the injected context by
+    group; without it the measured median whole is used, or nothing when
+    *include_context* is false.
+    """
+    if groups is not None:
+        ctx = context_tokens(groups)
+    else:
+        ctx = INJECTED_CONTEXT_TOKENS if include_context else 0
+    base = brief_tokens(brief) + ctx
     return {role: base + over for role, over in LOCAL_HARNESS_OVERHEAD_TOKENS.items()}
+
+
+def input_budget(role: str, ctx: int | None = None) -> int:
+    """What a local *role* can take as input: its window minus the output reserve."""
+    window = ctx if isinstance(ctx, int) and ctx > 0 else LOCAL_CTX_FALLBACK.get(role, 0)
+    return max(0, window - LOCAL_OUTPUT_RESERVE_TOKENS)
+
+
+class LocalFit:
+    """Whether a run fits a local *role*, and which context groups it drops to."""
+
+    __slots__ = ("role", "fits", "drop", "budget", "need")
+
+    def __init__(
+        self, role: str, fits: bool, drop: tuple[str, ...], budget: int, need: int
+    ) -> None:
+        self.role = role
+        self.fits = fits
+        self.drop = drop
+        self.budget = budget
+        self.need = need
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return (
+            f"LocalFit({self.role!r}, fits={self.fits}, drop={self.drop}, "
+            f"budget={self.budget}, need={self.need})"
+        )
+
+
+def fit_local(
+    role: str,
+    brief: str,
+    *,
+    groups: frozenset[str] | None = None,
+    pinned: frozenset[str] = frozenset(),
+    ctx: int | None = None,
+) -> LocalFit:
+    """Fit a run keeping *groups* to local *role*, trimming in :data:`TRIM_ORDER`.
+
+    Budget = (window - output reserve) - the seat's measured harness overhead -
+    the brief; the injected context must fit what is left. A group in *pinned*
+    (the caller set its ``include_*`` true explicitly) is never dropped. When
+    the minimal set still does not fit, ``fits`` is false: the candidate is
+    skipped as too big rather than sent to overflow.
+    """
+    budget = input_budget(role, ctx)
+    room = budget - LOCAL_HARNESS_OVERHEAD_TOKENS.get(role, 0) - brief_tokens(brief)
+    kept = set(_ALL_GROUPS if groups is None else groups)
+    drop: list[str] = []
+    need = context_tokens(frozenset(kept))
+    for group in TRIM_ORDER:
+        if need <= room:
+            break
+        if group in kept and group not in pinned:
+            kept.discard(group)
+            drop.append(group)
+            need = context_tokens(frozenset(kept))
+    fits = need <= room
+    return LocalFit(role, fits, tuple(drop) if fits else (), budget, need)
+
+
+def trim_line_for(drop: list[str] | tuple[str, ...], budget: int) -> str:
+    """The receipt clause for a trimmed local pick: ``local: trimmed memory, lessons to fit 24.6k``."""
+    return f"local: trimmed {', '.join(drop)} to fit {budget / 1000:.1f}k"
+
+
+#: ``info.delegation`` keys (``dict[str, str]``, comma-joined groups) so both
+#: survive the queue, a restart and a successor like the rest of a delegation.
+#: ``context_pinned``: groups the caller set ``include_*=true`` explicitly.
+#: ``context_trimmed``: groups this run dropped to fit its local lane.
+PINNED_KEY = "context_pinned"
+TRIMMED_KEY = "context_trimmed"
+
+_FLAG_OF = {"memory": "include_memory", "lessons": "include_lessons", "project": "include_project"}
+
+
+def _groups_of(raw: object) -> frozenset[str]:
+    return frozenset(g for g in str(raw or "").split(",") if g in _FLAG_OF)
+
+
+def pinned_groups(info: Any) -> frozenset[str]:
+    """The groups *info*'s caller asked for explicitly: never trimmed."""
+    return _groups_of((getattr(info, "delegation", None) or {}).get(PINNED_KEY))
+
+
+def trimmed_groups(info: Any) -> frozenset[str]:
+    """The groups *info* dropped to fit a local lane (restored for a cloud successor)."""
+    return _groups_of((getattr(info, "delegation", None) or {}).get(TRIMMED_KEY))
+
+
+def spawn_delegation(body: Any, check: str) -> dict[str, Any]:
+    """The ``delegation`` kwarg ``POST /api/spawn`` passes: the check and the pinned groups.
+
+    A group is pinned when the body set its ``include_*`` to ``true`` itself
+    (validation fills absent flags with the same value, so explicitness is
+    read from the raw body): a local lane may trim an unpinned group to fit,
+    never a pinned one (:func:`fit_local`).
+    """
+    delegation: dict[str, str] = {}
+    if (check or "").strip():
+        delegation["check"] = check.strip()
+    if isinstance(body, dict):
+        pinned = [g for g in sorted(_FLAG_OF) if body.get(_FLAG_OF[g]) is True]
+        if pinned:
+            delegation[PINNED_KEY] = ",".join(pinned)
+    return {"delegation": delegation} if delegation else {}
+
+
+def apply_trim(info: Any, drop: list[str] | tuple[str, ...]) -> None:
+    """Drop *drop* from *info*'s context scope through its ``include_*`` flags.
+
+    The same switch a parent's ``include_*=false`` throws, so the context
+    builder, the ``state.json`` scope record and the harness memory switch all
+    read one value. A pinned group is never dropped, whatever *drop* says.
+    """
+    pinned = pinned_groups(info)
+    done = [g for g in drop if g in _FLAG_OF and g not in pinned]
+    for g in done:
+        setattr(info, _FLAG_OF[g], False)
+    if done:
+        delegation = dict(getattr(info, "delegation", None) or {})
+        delegation[TRIMMED_KEY] = ",".join(sorted(trimmed_groups(info) | set(done)))
+        info.delegation = delegation
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +513,7 @@ async def _fall_through(
             session_key=info.parent_session_key or None,
             exclude_vendors=chain,
             tier=sr.FALLBACK_TIER,
+            **qs._local_scope(info),
         )
         if not routed:
             info.local_check_line = f"{label} -> no cloud candidate left"

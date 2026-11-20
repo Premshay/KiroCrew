@@ -725,7 +725,9 @@ def all_candidates(
     if parent_vendor == "local":
         cands += local_candidates({f"local/{r}": {"backend": ""} for r in LOCAL_ROLES})
     else:
-        cands += candidates_for(parent_vendor, {parent_vendor: effective_tiers(parent_vendor, config)})
+        cands += candidates_for(
+            parent_vendor, {parent_vendor: effective_tiers(parent_vendor, config)}
+        )
     if not cross_vendor:
         return cands
     if backends is None:
@@ -828,6 +830,7 @@ def build_state(
     health: Mapping[str, Mapping[str, Any]],
     has_check: bool = False,
     include_context: bool = True,
+    estimate: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     from kiro_crew.subagent_manager.local_check import estimate_tokens
 
@@ -839,7 +842,13 @@ def build_state(
         # role: the FULL brief plus that seat's measured first-request overhead,
         # to read against ``health.local.ctx`` for the same role.
         "has_check": bool(has_check),
-        "estimate_tokens": estimate_tokens(brief or "", include_context=include_context),
+        # *estimate* is the fitted figure (``fit_local``: after any context trim)
+        # when the caller computed one.
+        "estimate_tokens": (
+            dict(estimate)
+            if estimate is not None
+            else estimate_tokens(brief or "", include_context=include_context)
+        ),
         # the child's seat: a conductor/orchestrator agent is itself the orchestration cue
         "agent": agent or "",
         "parent_vendor": vendor,
@@ -939,17 +948,25 @@ async def routed_spawn(
     cross_vendor: bool = True,
     exclude_vendors: Sequence[str] = (),
     has_check: bool = False,
-    include_context: bool = True,
+    context_groups: frozenset[str] | None = None,
+    pinned_groups: frozenset[str] = frozenset(),
 ) -> dict[str, Any] | None:
     """The model -- and, for another vendor, the backend -- a model-less spawn should run on.
 
     ``None`` leaves the seat's default. Otherwise ``{route_id, model, tier, vendor,
     backend, runtime_agent, native_backend, p, reason, vendor_out, vendor_until,
-    limit, low, out, latency_ms}``: ``backend`` is ``""`` for the parent's own seat;
+    limit, low, out, latency_ms, trim, trim_budget, too_big}``: ``backend`` is ``""``
+    for the parent's own seat;
     for another vendor exactly one of ``runtime_agent`` (an execution seat's alias)
     and ``native_backend`` (a native ACP backend id) is set. ``reason`` is the
-    provider's own one-line account when it sent one. Never raises except
-    :class:`asyncio.CancelledError`.
+    provider's own one-line account when it sent one.
+
+    A local candidate is fitted to its lane first (:func:`fit_local_candidates`):
+    *context_groups* (the groups the run keeps, ``None`` = all) are trimmed
+    memory-then-lessons to fit, never a group in *pinned_groups*; a candidate
+    whose minimal set still does not fit is skipped (``too_big``). ``trim`` is
+    what the chosen local candidate drops (empty for every cloud pick). Never
+    raises except :class:`asyncio.CancelledError`.
     """
     started = time.monotonic()
     route_id = uuid.uuid4().hex[:16]
@@ -972,6 +989,11 @@ async def routed_spawn(
         limits = await asyncio.to_thread(limit_health, ag_models)
         health = merged_health(tombs, limits)
         _apply_quota_outs(health, outs)
+        cands, fits, too_big = fit_local_candidates(
+            cands, brief, health, groups=context_groups, pinned=pinned_groups
+        )
+        if not cands:
+            return None
         state = build_state(
             brief,
             agent=agent,
@@ -980,7 +1002,8 @@ async def routed_spawn(
             cands=cands,
             health=health,
             has_check=has_check,
-            include_context=include_context,
+            include_context=context_groups is None or bool(context_groups),
+            estimate=_fitted_estimate(brief, fits, context_groups),
         )
         answers = await core.decide(
             POINT,
@@ -1011,6 +1034,7 @@ async def routed_spawn(
         if spec.get("backend") != backend:
             return None
     vendor_state = health.get(chosen["vendor"], {})
+    fit = fits.get(chosen["tier"]) if chosen["vendor"] == "local" else None
     return {
         "route_id": route_id,
         "model": chosen["model"],
@@ -1024,12 +1048,67 @@ async def routed_spawn(
         "vendor_out": bool(vendor_state.get("out")),
         "vendor_until": vendor_state.get("until"),
         "limit": _limit_summary(chosen, vendor_state),
-        "low": sorted(
-            v for v, st in health.items() if not st.get("out") and _is_low(st)
-        ),
+        "low": sorted(v for v, st in health.items() if not st.get("out") and _is_low(st)),
         "out": sorted(v for v, st in health.items() if st.get("out")),
         "latency_ms": int((time.monotonic() - started) * 1000),
+        # Never set for a cloud pick: a cloud window carries the full context.
+        "trim": list(fit.drop) if fit is not None else [],
+        "trim_budget": fit.budget if fit is not None else 0,
+        "too_big": too_big,
     }
+
+
+def fit_local_candidates(
+    cands: Sequence[dict[str, str]],
+    brief: str,
+    health: Mapping[str, Mapping[str, Any]],
+    *,
+    groups: frozenset[str] | None = None,
+    pinned: frozenset[str] = frozenset(),
+) -> tuple[list[dict[str, str]], dict[str, Any], list[str]]:
+    """Fit each local candidate to its lane: ``(kept cands, {role: LocalFit}, too-big roles)``.
+
+    A local candidate's run keeps *groups* minus what :func:`local_check.fit_local`
+    drops to fit ``health.local.ctx[role]`` (or the role's known window). One
+    whose minimal set (skills, project, spec, and every *pinned* group) still
+    does not fit is removed, so the oracle only sees candidates that can carry
+    the run. Cloud candidates pass through untouched.
+    """
+    from kiro_crew.subagent_manager.local_check import fit_local
+
+    local_ctx = (health.get("local") or {}).get("ctx")
+    ctx_by_role = local_ctx if isinstance(local_ctx, Mapping) else {}
+    kept: list[dict[str, str]] = []
+    fits: dict[str, Any] = {}
+    too_big: list[str] = []
+    for c in cands:
+        if c.get("vendor") != "local":
+            kept.append(c)
+            continue
+        role = c.get("tier") or ""
+        fit = fit_local(role, brief, groups=groups, pinned=pinned, ctx=ctx_by_role.get(role))
+        if fit.fits:
+            fits[role] = fit
+            kept.append(c)
+        else:
+            too_big.append(role)
+    return kept, fits, too_big
+
+
+def _fitted_estimate(
+    brief: str, fits: Mapping[str, Any], groups: frozenset[str] | None
+) -> dict[str, int] | None:
+    """``estimate_tokens`` for the state with each fitted role at its trimmed size."""
+    if groups is None and not fits:
+        return None
+    from kiro_crew.subagent_manager import local_check as lc
+
+    est = lc.estimate_tokens(brief, groups=groups)
+    for role, fit in fits.items():
+        est[role] = (
+            lc.brief_tokens(brief) + lc.LOCAL_HARNESS_OVERHEAD_TOKENS.get(role, 0) + fit.need
+        )
+    return est
 
 
 #: The tier a fall-through prefers when the oracle gives no answer: the
@@ -1037,9 +1116,7 @@ async def routed_spawn(
 FALLBACK_TIER = "small"
 
 
-def fallback_choice(
-    cands: Sequence[Mapping[str, str]], tier: str = ""
-) -> dict[str, str] | None:
+def fallback_choice(cands: Sequence[Mapping[str, str]], tier: str = "") -> dict[str, str] | None:
     """A deterministic pick for a quota fall-through the oracle did not answer.
 
     Another vendor first (the failed one is already excluded), at the failed
@@ -1063,6 +1140,8 @@ async def reroute_after_quota(
     exclude_vendors: Sequence[str],
     tier: str = "",
     config: Any | None = None,
+    context_groups: frozenset[str] | None = None,
+    pinned_groups: frozenset[str] = frozenset(),
 ) -> dict[str, Any] | None:
     """Where a routed run whose vendor ran out continues, or ``None`` when every vendor is out.
 
@@ -1080,6 +1159,8 @@ async def reroute_after_quota(
         config=config,
         cross_vendor=True,
         exclude_vendors=exclude_vendors,
+        context_groups=context_groups,
+        pinned_groups=pinned_groups,
     )
     if routed and routed.get("vendor") not in set(exclude_vendors):
         return routed
@@ -1096,6 +1177,10 @@ async def reroute_after_quota(
         )
         outs = await asyncio.to_thread(_vl.quota_outs)
         cands = drop_quota_outs(cands, outs, exclude_vendors)
+        # No live health on this path: each local role is fitted to its known window.
+        cands, fits, too_big = fit_local_candidates(
+            cands, brief, {}, groups=context_groups, pinned=pinned_groups
+        )
         chosen = fallback_choice(cands, tier)
     except asyncio.CancelledError:
         raise
@@ -1111,6 +1196,7 @@ async def reroute_after_quota(
         spec = backends.get(key) or {}
         if spec.get("backend") != backend:
             return None
+    fit = fits.get(chosen["tier"]) if chosen["vendor"] == "local" else None
     return {
         "route_id": uuid.uuid4().hex[:16],
         "model": chosen["model"],
@@ -1127,6 +1213,9 @@ async def reroute_after_quota(
         "low": [],
         "out": sorted(set(exclude_vendors) | {v for v, m in outs.items() if m.get("until")}),
         "latency_ms": int((time.monotonic() - started) * 1000),
+        "trim": list(fit.drop) if fit is not None else [],
+        "trim_budget": fit.budget if fit is not None else 0,
+        "too_big": too_big,
     }
 
 
@@ -1141,7 +1230,8 @@ def pins_vendor(info: Any, *, own_worker: bool = False) -> bool:
     if own_worker or getattr(info, "backend", None) is not None:
         return True
     return any(
-        bool(getattr(info, name, "")) for name in ("runtime_agent", "crew", "agent", "conversation_key")
+        bool(getattr(info, name, ""))
+        for name in ("runtime_agent", "crew", "agent", "conversation_key")
     )
 
 
@@ -1226,4 +1316,10 @@ def reason_line(routed: Mapping[str, Any]) -> str:
         line += f"; out: {', '.join(others_out)}"
     if others_low:
         line += f"; low: {', '.join(others_low)}"
+    if routed.get("trim"):
+        from kiro_crew.subagent_manager.local_check import trim_line_for
+
+        line += f"; {trim_line_for(routed['trim'], int(routed.get('trim_budget') or 0))}"
+    if routed.get("too_big"):
+        line += f"; local {', '.join(routed['too_big'])} skipped: too big"
     return line

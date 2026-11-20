@@ -374,6 +374,13 @@ async def _run_inner_impl(
             info.route_reason = routed["line"]
             info.route_tier = str(routed.get("tier") or "")
             info.route_vendor = str(routed.get("vendor") or "")
+            if routed.get("trim"):
+                # A local pick fitted to its lane: its context groups are
+                # dropped through the include_* switches before the context
+                # below is built (``spawn_route.fit_local_candidates``).
+                from kiro_crew.subagent_manager import local_check as _local_check
+
+                _local_check.apply_trim(info, routed["trim"])
     # Fork: a start on a vendor (or Antigravity model group) a run already
     # proved out fails now, before its session exists, instead of being sent
     # and refused; the ending then switches or reports it (``quota_switch``).

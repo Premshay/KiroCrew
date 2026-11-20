@@ -233,6 +233,7 @@ class RunEventCoordinator(ManagerComponent):
                     parent_model = provider_active_model(provider) if provider is not None else ""
                 except Exception:
                     parent_model = ""
+            from ..subagent import _context_groups_of
             from . import local_check as _local_check
 
             routed = await _spawn_route.routed_spawn(
@@ -242,9 +243,10 @@ class RunEventCoordinator(ManagerComponent):
                 session_key=info.parent_session_key or None,
                 cross_vendor=cross_vendor,
                 has_check=bool(_local_check.check_for(info)),
-                include_context=bool(
-                    info.include_memory or info.include_lessons or info.include_project
-                ),
+                # A local pick is fitted to its lane by trimming these (never
+                # the pinned ones); ``_run_inner`` applies the trim it returns.
+                context_groups=_context_groups_of(info),
+                pinned_groups=_local_check.pinned_groups(info),
             )
         except asyncio.CancelledError:
             raise

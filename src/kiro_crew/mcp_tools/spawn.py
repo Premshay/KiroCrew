@@ -207,8 +207,20 @@ class _SpawnRunStep(DeferredTool):
         self._close_unsubmitted()
 
 
+def _explicit_true_groups(args: Any) -> tuple[str, ...]:
+    """The ``include_*`` flags *args* set to ``true`` explicitly (not by default)."""
+    if not isinstance(args, dict):
+        return ()
+    return tuple(
+        k for k in ("include_memory", "include_lessons", "include_project") if args.get(k) is True
+    )
+
+
 def spawn_run(name: str, args: dict[str, Any]) -> str | DeferredTool:
     """Prepare a background batch; its deferred steps submit one task at a time."""
+    # An include_* the caller set true EXPLICITLY, read before validation fills
+    # the defaults: forwarded as true so a local lane never trims that group.
+    explicit_groups = _explicit_true_groups(args)
     args = validate_tool_args(args, SPAWN_RUN_SCHEMA)
 
     tasks = args.get("tasks")
@@ -407,6 +419,8 @@ def spawn_run(name: str, args: dict[str, Any]) -> str | DeferredTool:
             body["include_lessons"] = False
         if not inc_project:
             body["include_project"] = False
+        for flag in explicit_groups:
+            body[flag] = True
         if approval_mode:
             body["approval_mode"] = approval_mode
         d = mcp_core._post("/api/spawn", body)

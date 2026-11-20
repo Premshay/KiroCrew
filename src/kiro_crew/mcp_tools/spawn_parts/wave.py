@@ -235,6 +235,13 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> "str | DeferredTool":
     posts one member, so a large batch never holds the shared worker for its
     cumulative submission time (see ``mcp_shared.DeferredTool``).
     """
+    # Explicit trues, read before validation fills the defaults (as spawn_run):
+    # forwarded so a local lane never trims a group the caller asked for.
+    sa_explicit = {
+        k: True
+        for k in ("include_memory", "include_lessons", "include_project")
+        if isinstance(args, dict) and args.get(k) is True
+    }
     args = validate_tool_args(args, SPAWN_SUB_AGENTS_SCHEMA)
     agents_input = args.get("agents")
     if not agents_input or not isinstance(agents_input, list):
@@ -247,6 +254,7 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> "str | DeferredTool":
         for k in ("include_memory", "include_lessons", "include_project")
         if args.get(k, True) is False
     }
+    sa_groups.update(sa_explicit)
     parent_session = mcp_core._resolve_session_key()
 
     def _redact_sa(text: str) -> str:
