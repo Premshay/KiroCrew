@@ -858,3 +858,24 @@ def resolve_turn_owner(
         memory_store = execution_context.store.legacy_name
         blocks_reads = blocks_reads or execution_context.memory_mode == "temporary"
     return execution_context, desk_member, member, memory_store, blocks_reads
+
+
+def essentials_template(essentials: str, execution_context: Any, member: str) -> str:
+    """The member template whose documents *essentials* carries, or ``""``.
+
+    The same resolution ``build_message`` hands ``_build_v2_essentials``: the
+    execution record's template when one exists, else the template the member's
+    identity names. ``""`` when there is no envelope, so a non-member chat
+    consults no member spec. Never raises: an unresolvable member reads as none.
+    """
+    if not essentials:
+        return ""
+    if execution_context is not None:
+        return str(getattr(execution_context, "template_id", "") or "")
+    from kiro_crew.member_essential_context import member_context_identity
+
+    try:
+        return member_context_identity(member, member_is_id=False)[1]
+    except Exception:
+        logger.debug("member template unresolved for %r", member, exc_info=True)
+        return ""

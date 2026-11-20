@@ -950,6 +950,7 @@ def build_config(
     tunnel_data = _coerced_section(data, "tunnel", _degraded)
     skills_data = _coerced_section(data, "skills", _degraded)
     session_summary_data = _coerced_section(data, "session_summary", _degraded)
+    context_data = _coerced_section(data, "context", _degraded)
     session_environments_data = _coerced_section(data, "session_environments", _degraded)
     messaging_data = _coerced_section(data, "messaging", _degraded)
     telemetry_data = _coerced_section(data, "telemetry", _degraded)
@@ -1259,6 +1260,7 @@ def build_config(
         browser=BrowserConfig.from_raw(browser_data),
         skills=_build_skills_config(skills_data),
         session_summary=_build_session_summary_config(session_summary_data),
+        context=_sections.ContextConfig.from_raw(context_data),
         session_environments=_sections.SessionEnvironmentsConfig.from_raw(
             session_environments_data
         ),

@@ -86,6 +86,7 @@ from kiro_crew.config.sections import (
     BrowserConfig,
     ChannelConfig,
     ComputerUseConfig,
+    ContextConfig,
     CronHistoryConfig,
     DashboardConfig,
     DecisionsConfig,
@@ -166,6 +167,13 @@ class KiroCrewConfig:
     skills: SkillsConfig = field(
         default_factory=SkillsConfig,
         metadata=_meta("Skills", "Skill loading and matching configuration."),
+    )
+    context: ContextConfig = field(
+        default_factory=ContextConfig,
+        metadata=_meta(
+            "Context",
+            "Session-context documents configured once for every agent session.",
+        ),
     )
     session_summary: SessionSummaryConfig = field(
         default_factory=SessionSummaryConfig,
@@ -747,6 +755,7 @@ class KiroCrewConfig:
             "decisions": asdict(self.decisions),
             "browser": asdict(self.browser),
             "skills": asdict(self.skills),
+            "context": asdict(self.context),
             "session_summary": asdict(self.session_summary),
             "session_environments": asdict(self.session_environments),
             "telemetry": asdict(self.telemetry),

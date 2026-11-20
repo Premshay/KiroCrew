@@ -6,7 +6,8 @@ what a parent withheld. :func:`_render_folder_steering_section` is the one folde
 steering renderer, :func:`skill_parts` the one loader call, and
 :func:`steering_resources_part` the one steering-resources gate for a harness that
 reads no agent ``resources`` (Claude Code and Codex), that session start and
-post-compaction re-injection share.
+post-compaction re-injection share, and :func:`shared_resources_part` the gate
+for the ``context.shared_resources`` documents every session receives.
 
 Three inclusion rules stay on :mod:`kiro_crew.context`: ``_skills_injection_plan``
 (a doc pins its return expression there), ``_config_scoped_groups`` (callers rebind
@@ -237,3 +238,52 @@ def steering_resources_part(
     if agent and not is_kirocrew_default_agent(agent):
         return ctx._load_seat_resources(agent, project, harness_reads_agents_md=reads_agents_md)
     return ctx._load_steering_resources(project, harness_reads_agents_md=reads_agents_md)
+
+
+def shared_resources_part(
+    *,
+    agent: str | None,
+    provider_type: str | None,
+    context_groups: frozenset[str] | None,
+    project: str | None = None,
+    member_template: str = "",
+) -> str:
+    """The ``context.shared_resources`` text for this session, or ``""``.
+
+    Session start frames it as ``[Shared resources]``; post-compaction
+    re-injection frames it as a ``[REINJECTED AFTER COMPACTION ...]`` block. One
+    gate for both, so the two cannot drift in who receives it.
+
+    Unlike :func:`steering_resources_part`, no harness, agent kind or member
+    envelope is excluded: the point of the key is that every session gets the
+    documents, whether its spec lists them or not. Two things narrow it. The
+    ``project`` context group, as for steering: a parent that withholds project
+    context from a sub-agent withholds these rules too, and the sub-agent is told
+    the group was withheld. And de-duplication: a document the session's own spec
+    already delivers is not sent again. The specs consulted are *agent*'s (the
+    default agent's ``kirocrew.json`` when *agent* is empty) and, in a member chat,
+    *member_template*'s, whose documents the essentials envelope carries.
+    Absolute ``file://`` entries always count as delivered; relative ones only
+    where something loads them (kiro-cli natively, the default agent's steering
+    load, the member envelope) -- a Claude Code or Codex seat loads only its
+    absolute entries (:func:`kiro_crew.context._load_seat_resources`).
+    """
+    from kiro_crew import context as ctx  # circular import: the facade imports this owner
+    from kiro_crew.agent_files import is_kirocrew_default_agent
+    from kiro_crew.context_assembly import shared_resources as _shared
+
+    if not _group_included(context_groups, CONTEXT_GROUP_PROJECT):
+        return ""
+    entries = _shared.configured_shared_resources()
+    if not entries:
+        return ""
+    template = agent or "kirocrew"
+    relative = (
+        bool(member_template)
+        or is_kirocrew_default_agent(template)
+        or not ctx.acp_driver.crew_loads_spec_steering(provider_type)
+    )
+    delivered = _shared.spec_delivered_paths(
+        (template, member_template), project, relative=relative
+    )
+    return _shared.load_shared_resources(entries, delivered=delivered)

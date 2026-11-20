@@ -67,6 +67,7 @@ begin on its own line; the assembly newline-terminates the caller's
 | 10 | `[WORKSPACE IDENTITY]` | `workspace_dir_for` | `kirocrew` agent only |
 | 11 | `[DOCUMENTATION]` | `_build_docs_section`, the packaged docs dir | `kirocrew` agent, `project` group |
 | 12 | `[Steering resources]` | `_load_steering_resources` → `file://*.md` in `~/.kiro/agents/kirocrew.json`, each anchored as kiro-cli anchors it (relative at the session's project, else `$HOME`; `~/` at `$HOME`; absolute at its own prefix), plus kiro-cli's inherited defaults (global steering; the project's steering and `AGENTS.md` when one is bound, except on Codex, which reads `AGENTS.md` from its working directory), front matter stripped; a `manual`/`auto`/`fileMatch` document withheld (`folder_steering.every_session_body`); gated by `context_assembly/inclusion.py` → `steering_resources_part` | **Claude Code and Codex backends** (`ACP_BACKENDS_CREW_LOADS_SPEC_STEERING`), `kirocrew` agent, `project` group, not a member chat; re-sent after a compaction (§2, item 8) |
+| 12a | `[Shared resources]` | `context_assembly/shared_resources.py` → `load_shared_resources`, the files `context.shared_resources` names (absolute paths or `file://` URIs, no globs), each admitted as a seat's absolute resource is (no symlink in the path, regular non-sensitive file, bounded read), front matter stripped, a `manual`/`auto`/`fileMatch` document withheld, bodies scrubbed of structural markers, whole files up to `SHARED_RESOURCES_MAX_CHARS` and the rest named in-band; a missing or unreadable file is a WARNING, never an error; gated by `context_assembly/inclusion.py` → `shared_resources_part` | **every harness and agent kind** -- default agent, custom agents and seats, member chats (outside the essentials envelope), sub-agents -- when the key is non-empty and the `project` group is in scope; a file the session's spec already lists in `resources` (the agent's spec, plus the member template's in a member chat) is skipped, counting relative entries only where something loads them (kiro-cli natively, the default agent's steering load, the member envelope; not a Claude Code or Codex seat); re-sent after a compaction (§2, item 8a) |
 | 13 | `[THREAD CONVERSATION HISTORY]` | `build_session_replay` (lossless, newest first), else `_recall_rows` truncation | new, non-resumed session |
 | 14 | `[PREVIOUS TURN WAS CANCELLED …]` | `_build_stop_event_notes` | recent user stop |
 | 15 | `[Memory …]` + `[Memory activity index]` + `[Memory activity]` + `[Memory tools]` | `memory.py` → `get_context`, `activity_index`, `get_activity_context` | not temporary, `memory` group; the activity block also needs `memory.inject_activity` |
@@ -530,6 +531,11 @@ re-adds, once:
    session start, payload scrubbed of structural markers. kiro-cli loads the agent's
    `resources` natively and keeps them across its own compaction, so the kiro and
    KAS paths get nothing here.
+8a. `[REINJECTED AFTER COMPACTION — shared resources]` — row 12a's text, every
+   harness (kiro-cli holds a shared file across its compaction only when the spec
+   lists it, and then the gate skips it anyway), through the same
+   `shared_resources_part` gate as session start, re-read from disk, payload scrubbed
+   of structural markers.
 
 The fork's latest session checkpoint is restored through
 `context_assembly/turn.py::post_compaction_parts`, with its payload scrubbed
@@ -539,7 +545,7 @@ explicit `include_session_history` input on the context facade.
 If that turn does not land (cancelled, refused, errored), `rearm_reinjection` puts
 the flag back, so the context is never lost to a failed turn. A minimal-context turn
 gets back only the agent contract and the reply-style preferences; the memory index,
-skills index, lessons, steering resources, folder steering, member section and work
+skills index, lessons, steering resources, shared resources, folder steering, member section and work
 ledger stay withheld
 (`post_compaction_parts(minimal_context=True)`).
 
