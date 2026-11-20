@@ -150,7 +150,7 @@ class TestLeanSessions:
     def test_the_profile_keeps_the_coding_tools(self):
         profile = lc.lean_helper_profile()
         assert profile == {
-            "tools": ["Bash", "Read", "Edit", "Write"],
+            "tools": ["Bash", "Read", "Edit", "Write", "Grep", "Glob"],
             "setting_sources": ["project", "local"],
         }
 

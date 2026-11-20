@@ -324,8 +324,9 @@ def apply_trim(info: Any, drop: list[str] | tuple[str, ...]) -> None:
 LEAN_CONTRACT_ROLES: frozenset[str] = frozenset({"subagent"})
 
 #: The built-in tools a lean helper keeps: what a coding helper needs. Grep and
-#: Glob are left out on purpose (1,567 tokens of schema; Bash greps).
-LOCAL_HELPER_TOOLS: tuple[str, ...] = ("Bash", "Read", "Edit", "Write")
+#: Glob stay (operator ruling 2026-11-20): searching code is how an agent finds
+#: what to read, and their 1,567 tokens of schema are worth that.
+LOCAL_HELPER_TOOLS: tuple[str, ...] = ("Bash", "Read", "Edit", "Write", "Grep", "Glob")
 
 #: The Claude Code setting tiers a lean helper loads: the project's, as every
 #: Crew session that binds MCP servers already does. The user tier stays out:
@@ -340,7 +341,7 @@ LOCAL_HELPER_SETTING_SOURCES: tuple[str, ...] = ("project", "local")
 LOCAL_HELPER_CONTRACT = """You are a Kiro Crew helper running on a local model. \
 The agent that started you reads your reply; no person is watching.
 
-- Do the task with the tools this session has (Read, Edit, Write, Bash). \
+- Do the task with the tools this session has (Read, Grep, Glob, Edit, Write, Bash). \
 Kiro Crew's MCP tools (spawning, scheduling, memory, dashboards) are not \
 mounted here: do not search for them or ask for them.
 - Work in your working directory. Prefer small, direct steps. When the task \
