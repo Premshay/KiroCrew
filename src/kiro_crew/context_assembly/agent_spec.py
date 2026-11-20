@@ -9,7 +9,8 @@ Computer Use gate and the browse gate, each read once per session
 the other reads of an agent's spec: its ``includeCrewContext`` flag
 (:func:`_read_include_crew_context`) and the Claude Code steering load
 (:func:`_load_steering_resources`) with its admission gate
-(:func:`steering_target_admissible`).
+(:func:`steering_target_admissible`), and a custom agent's own absolute
+``file://`` documents on those harnesses (:func:`_load_seat_resources`).
 
 ``_prompt_path``, ``_shipped_prompt``, ``kiro_agents_dir`` and ``has_dashboard_surface``
 are read through :mod:`kiro_crew.context` at call time, because callers rebind them
@@ -227,6 +228,110 @@ def steering_resource_documents(
             seen.add(resolved)
             documents.append((p, resolved, body))
     return documents
+
+
+def seat_loads_resource(uri: object) -> bool:
+    """Whether :func:`_load_seat_resources` takes *uri* from a seat's ``resources``.
+
+    An absolute ``file://`` path only: a relative or ``~``-anchored entry keeps
+    the behaviour it had before seats were loaded. The one predicate the loader
+    and the dashboard's unread-steering notice share, so the notice never names
+    an entry the load sends.
+    """
+    from kiro_crew.file_uri import file_uri_path_text
+
+    if not isinstance(uri, str) or not uri.startswith("file://"):
+        return False
+    text = file_uri_path_text(uri)
+    return not text.startswith("~") and Path(text).is_absolute()
+
+
+def _load_seat_resources(
+    agent: str, project: str | None = None, *, harness_reads_agents_md: bool = False
+) -> str:
+    """The text of *agent*'s own absolute ``file://`` documents, joined.
+
+    The custom-agent ("seat") half of ``inclusion.steering_resources_part``: on a
+    harness that reads no agent ``resources`` (Claude Code, Codex) a custom agent
+    gets its own prompt but never the documents its spec names, which kiro-cli
+    would load natively. Only ABSOLUTE entries are loaded (``file:///abs/doc.md``,
+    a glob in its tail allowed): a relative entry such as
+    ``file://.kiro/steering/**/*.md`` anchors at the session's project, and
+    loading those for a seat would change what every seat already receives. The
+    global and project default trees are not added either: this load is the
+    seat's own list, nothing kiro-cli would add to it.
+
+    The spec is resolved the way the seat's prompt is
+    (:func:`kiro_crew.member_essential_context.read_template_spec`, project spec
+    first), read through the hardened agent-spec reader, and each hit admitted
+    as :func:`steering_resource_documents` admits one -- the anchor as trust base,
+    ``every_session_body`` for ``inclusion`` -- through the bounded
+    :func:`kiro_crew.context.safe_read_file`. A symlink anywhere in a hit's path
+    is refused rather than followed: a seat's list is operator-written but the
+    targets are not, and an absolute entry has no project to scope a link to.
+    A refused or unreadable document is skipped with a WARNING naming it, so a
+    seat missing its guide is visible in the journal. A document two entries
+    match is read once, and ``<project>/AGENTS.md`` is left out where the
+    harness reads it itself (*harness_reads_agents_md*).
+    """
+    from kiro_crew import context as ctx  # circular import: the facade imports this owner
+    from kiro_crew.file_uri import file_uri_path_text
+    from kiro_crew.folder_steering import every_session_body
+    from kiro_crew.member_essential_context import read_template_spec
+
+    try:
+        resolved_spec = read_template_spec(
+            agent, project, operation="seat_resources", source="context"
+        )
+    except Exception as exc:
+        logger.warning("seat %s: agent spec unreadable for resources: %s", agent, exc)
+        return ""
+    if resolved_spec is None or resolved_spec[1] is None:
+        return ""
+    declared = resolved_spec[1].get("resources", [])
+    seen: set[Path] = set()
+    if harness_reads_agents_md and project:
+        seen.add((Path(project).expanduser() / "AGENTS.md").resolve())
+    parts: list[str] = []
+    for res in declared if isinstance(declared, list) else []:
+        if not isinstance(res, str) or not seat_loads_resource(res):
+            continue  # relative / home-anchored: unchanged, not this load's
+        try:
+            anchor, pattern = _steering_glob_anchor(file_uri_path_text(res), None)
+            hits = sorted(anchor.glob(pattern))
+        except Exception as exc:
+            logger.warning("seat %s: resource %s skipped: %s", agent, res, type(exc).__name__)
+            continue
+        if not hits:
+            logger.warning("seat %s: resource %s matched no file", agent, res)
+        for p in hits:
+            if p.suffix != ".md":
+                continue
+            try:
+                resolved = p.resolve()
+                if resolved in seen:
+                    continue
+                if resolved != Path(os.path.abspath(p)):
+                    logger.warning("seat %s: resource %s refused: path holds a symlink", agent, p)
+                    continue
+                if not steering_target_admissible(resolved, base=anchor):
+                    logger.warning("seat %s: resource %s refused: not admissible", agent, p)
+                    continue
+                body = every_session_body(ctx.safe_read_file(str(p)))
+            except Exception as exc:
+                logger.warning("seat %s: resource %s unreadable: %s", agent, p, type(exc).__name__)
+                continue
+            seen.add(resolved)
+            if body is not None:
+                parts.append(body)
+    if parts:
+        logger.debug(
+            "seat %s: loaded %d resource bytes from %d files",
+            agent,
+            sum(len(p) for p in parts),
+            len(parts),
+        )
+    return "\n".join(parts)
 
 
 def _read_include_crew_context(agent: str, pins: Mapping[str, str] | None = None) -> bool:

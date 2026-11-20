@@ -678,8 +678,14 @@ async def _run_impl(self: RunEventCoordinator, info: SubagentInfo) -> None:
         # ends ``quota_exhausted``. Before the cap and the report, so both carry
         # the outcome. Bounded and it never raises (``quota_switch``).
         if not reap_owns_report:
+            # Fork: a run the local fleet served is checked first (any outcome):
+            # a passing check commits its work, a failed check or an unusable
+            # run falls through once to cloud (``local_check``). It claims the
+            # retry, so the quota handler below then leaves the run alone.
+            from kiro_crew.subagent_manager import local_check as _local_check
             from kiro_crew.subagent_manager.quota_switch import handle_run_end_guarded
 
+            await _local_check.handle_run_end_guarded(self._manager, info)
             await handle_run_end_guarded(self._manager, info)
         # Every ending but a claimed one leaves result.txt capped before its
         # report exists, so the parent reads a bounded file. Bounded, and it

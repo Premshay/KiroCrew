@@ -365,8 +365,14 @@ rules `resources` `withheld` or `no-channel` gets one notice row naming the spec
 `file://` entries (`spec_steering_read_nowhere` in
 `src/kiro_crew/agent_sdk/spec_hooks.py`). The default agent gets no row. On
 `claude` and `codex` Crew's load sends its steering, and on the other harnesses
-folder steering or member essentials can carry it. Injecting a custom agent's
-steering is a separate, open decision. The ruling stays
+folder steering or member essentials can carry it. On `claude` and `codex` a
+custom agent that is not a crew member also gets its spec's ABSOLUTE `file://`
+entries (`file:///abs/guide.md`, a glob in the tail allowed) through
+`_load_seat_resources` in `src/kiro_crew/context_assembly/agent_spec.py`: same
+admission gate and bounded reader, a symlink anywhere in the path refused, and a
+refused or unreadable document skipped with a WARNING. Relative and `~/` entries
+and the default trees are still not loaded for it, and the notice row leaves the
+absolute entries out (`seat_loads_resource`). The ruling stays
 **no-reader** rather than context-instead because it is a statement about the
 harness: what reaches the session on the skill half is Crew's own injected
 directory, not the key the mirror declined to project.

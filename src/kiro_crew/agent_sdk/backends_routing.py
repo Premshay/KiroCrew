@@ -371,8 +371,10 @@ ACP_BACKENDS_CREW_ENFORCES_SPEC_TOOLS_SETTINGS: FrozenSet[str] = frozenset({ACP_
 #: global and project ``.kiro/steering`` trees kiro-cli adds to them
 #: (``context_assembly.inclusion.steering_resources_part``). Crew sends them at
 #: session start and again after a compaction, for the Kiro Crew default agent in a
-#: chat that is not a crew member's. Context assembly asks it by provider label
-#: (``agent_sdk.drivers.acp.crew_loads_spec_steering``).
+#: chat that is not a crew member's; a custom (non-member) agent on these harnesses
+#: gets only its own ABSOLUTE ``file://`` entries
+#: (``context_assembly.agent_spec._load_seat_resources``). Context assembly asks it
+#: by provider label (``agent_sdk.drivers.acp.crew_loads_spec_steering``).
 #:
 #: claude and codex are the members: each is handed no spec, and Crew's prompt text
 #: reaches each one. kiro-cli is NOT a member and must never become one: it reads
@@ -382,6 +384,17 @@ ACP_BACKENDS_CREW_ENFORCES_SPEC_TOOLS_SETTINGS: FrozenSet[str] = frozenset({ACP_
 ACP_BACKENDS_CREW_LOADS_SPEC_STEERING: FrozenSet[str] = frozenset(
     {ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX}
 )
+
+#: Provider labels of harnesses that are NOT ACP backends but are served through
+#: the companion's own provider seam, and that read no agent ``resources`` either.
+#: Same meaning as :data:`ACP_BACKENDS_CREW_LOADS_SPEC_STEERING`, asked by the same
+#: label (``drivers.acp.crew_loads_spec_steering``). It is a separate set because
+#: the backend set is closed over ``ACP_BACKENDS_KNOWN`` (every id there needs a
+#: label row, a card, a host-auth entry): ``antigravity`` has no backend id.
+#: Its provider reports ``context_provider_type == "antigravity"``; agy takes its
+#: ``--agent`` from the engine row, never from the KiroCrew spec, so Crew's prompt
+#: text is the only way a spec's documents reach it.
+PROVIDER_LABELS_CREW_LOADS_SPEC_STEERING: FrozenSet[str] = frozenset({"antigravity"})
 
 #: Backends that read the project's ``AGENTS.md`` themselves from the session's
 #: working directory, so Crew's steering load leaves that file out

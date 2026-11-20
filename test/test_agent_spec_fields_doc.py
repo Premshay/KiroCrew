@@ -58,7 +58,8 @@ def test_steering_is_still_the_backend_gated_half(doc_text: str) -> None:
     """The `file://` half IS backend-gated, so the page must keep saying so.
 
     The whole gate is matched as one contiguous block, ending at the
-    ``_load_steering_resources(project, ...)`` call it guards, in the one helper session
+    ``_load_steering_resources(project, ...)`` call it guards (a custom agent takes
+    ``_load_seat_resources`` for its absolute entries instead), in the one helper session
     start and post-compaction re-injection share; both callers are pinned to route
     through it. A token match on ``crew_loads_spec_steering`` anywhere would stay green
     with the steering gate's own condition dropped.
@@ -68,11 +69,12 @@ def test_steering_is_still_the_backend_gated_half(doc_text: str) -> None:
     gate = (
         "    if essentials or not ctx.acp_driver.crew_loads_spec_steering(provider_type):\n"
         '        return ""\n'
-        "    if agent and not is_kirocrew_default_agent(agent):\n"
-        '        return ""\n'
         "    if not _group_included(context_groups, CONTEXT_GROUP_PROJECT):\n"
         '        return ""\n'
-        "    return ctx._load_steering_resources(\n"
+        "    reads_agents_md = ctx.acp_driver.reads_project_agents_md(provider_type)\n"
+        "    if agent and not is_kirocrew_default_agent(agent):\n"
+        "        return ctx._load_seat_resources(agent, project, harness_reads_agents_md=reads_agents_md)\n"
+        "    return ctx._load_steering_resources(project, harness_reads_agents_md=reads_agents_md)\n"
     )
     assert gate in source, (
         "the steering block's gate no longer reads the backend set together with the "

@@ -86,6 +86,7 @@ from kiro_crew.context_assembly import tool_names as _tool_names  # noqa: F401 -
 from kiro_crew.context_assembly import turn as _turn  # noqa: F401 - loaded eagerly
 from kiro_crew.context_assembly import turn_message as _turn_message  # noqa: F401 - loaded eagerly
 from kiro_crew.context_assembly.agent_spec import (  # noqa: F401
+    _load_seat_resources,
     _load_steering_resources,
     _read_include_crew_context,
     _read_prompt_file,
@@ -1323,7 +1324,7 @@ def _skills_injection_plan(
     hand-copied second gate is exactly what let the re-injection path ship
     without scoping, handing a mapped agent the catalog its mapping excludes.
     """
-    inherit = provider_type == PROVIDER_ACP
+    inherit = acp_driver.lends_inherited_skills(provider_type)
     pinned = pinned_skill_globs(session_key, project_dir=project_dir, inherit_defaults=inherit)
     if pinned is not None:
         globs = pinned

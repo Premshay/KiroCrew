@@ -782,11 +782,13 @@ async def _notice_unread_steering(
 ) -> None:
     """One notice row naming the custom agent's ``file://`` steering *client* never loads.
 
-    Only a custom agent: Crew's steering load serves the default agent alone. On
-    Claude Code and Codex it sends the default agent's entries and steering trees
-    itself, and elsewhere folder steering or member essentials can carry them, so
-    a row there could claim a loss that did not happen. Best-effort: a spec that
-    cannot be read renders no row rather than failing the turn.
+    Only a custom agent: on Claude Code and Codex Crew's steering load sends the
+    default agent's entries and steering trees itself, and elsewhere folder
+    steering or member essentials can carry them, so a row there could claim a
+    loss that did not happen. On those two harnesses a custom agent's ABSOLUTE
+    entries are sent too (``context_assembly.agent_spec.seat_loads_resource``),
+    so the row leaves them out. Best-effort: a spec that cannot be read renders
+    no row rather than failing the turn.
     """
     if not spec_steering_read_nowhere(client):
         return
@@ -799,6 +801,13 @@ async def _notice_unread_steering(
         logger.debug("agent spec resources for %r could not be read", agent, exc_info=True)
         return
     entries = [entry for entry in entries if entry.removeprefix("file://") not in prepared_sources]
+    from kiro_crew.agent_sdk.drivers import acp as acp_driver
+    from kiro_crew.context_assembly.agent_spec import seat_loads_resource
+
+    # The harness as the mirror ruling above reads it (``capabilities_of``).
+    label = acp_driver.provider_label_for_backend(capabilities_of(client).backend)
+    if acp_driver.crew_loads_spec_steering(label):
+        entries = [entry for entry in entries if not seat_loads_resource(entry)]
     if entries:
         append_and_surface(
             state,
