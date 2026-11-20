@@ -542,3 +542,69 @@ class TestApply:
     def test_own_worker_pins(self):
         assert sr.pins_vendor(self._info(), own_worker=True) is True
         assert sr.pins_vendor(self._info()) is False
+
+
+class TestNexusCompanionSeats:
+    """The Nexus companion's declared seats resolve to a backend per vendor and local role.
+
+    Runs only where ``kirocrew_nexus_companion`` is importable (Nexus, with
+    ``PYTHONPATH`` at the companion's ``src``): it is the companion contract the
+    resolver above was written against, not something upstream ships.
+    """
+
+    ENGINES = {
+        "engines": {
+            "claude-max": {"env": {}},
+            "codex-sub": {"env": {"ACP_ENGINE": "codex", "CODEX_HOME": "/codex"}},
+            "local-fleet": {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8484",
+                                    "ANTHROPIC_MODEL": "agent"}},
+            "local-background": {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8484",
+                                         "ANTHROPIC_MODEL": "subagent"}},
+            "deepseek-flash": {"env": {"ACP_ENGINE": "deepseek"}},
+        },
+        "agents": {
+            "crew-claude": "claude-max",
+            "crew-codex": "codex-sub",
+            "crew-local": "local-fleet",
+            "kirocrew-heartbeat": "local-background",
+            "crew-deepseek": "deepseek-flash",
+        },
+    }
+
+    @pytest.fixture
+    def companion_cfg(self, tmp_path, monkeypatch):
+        companion = pytest.importorskip("kirocrew_nexus_companion")
+        from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
+        from kiro_crew.platform import context
+
+        path = tmp_path / "engines.yaml"
+        path.write_text(json.dumps(self.ENGINES), encoding="utf-8")
+        monkeypatch.setenv("KIROCREW_ENGINES", str(path))
+        registry = companion.NexusProviderRegistry()
+        monkeypatch.setattr(
+            context, "current_context", lambda: SimpleNamespace(providers=registry)
+        )
+        cfg = KiroCrewConfig()
+        for alias in self.ENGINES["agents"]:
+            cfg.agents[alias] = KiroCrewAgentConfig(kiro_agent=alias)
+        return cfg
+
+    def test_every_cross_vendor_role_resolves_to_its_seat(self, companion_cfg):
+        b = sr.route_backends("antigravity", companion_cfg)
+        assert {k: (v["backend"], v["runtime_agent"], v["native"]) for k, v in b.items()} == {
+            "claude": ("claude-max", "crew-claude", ""),
+            "codex": ("codex-sub", "crew-codex", ""),
+            "local/agent": ("local-fleet", "crew-local", ""),
+            "local/subagent": ("local-background", "kirocrew-heartbeat", ""),
+        }
+
+    def test_a_seat_wins_over_the_native_backend_of_its_vendor(self, companion_cfg):
+        b = sr.route_backends("claude", companion_cfg)
+        assert b["codex"]["backend"] == "codex-sub" and b["codex"]["native"] == ""
+        assert "claude" not in b and "deepseek" not in b
+
+    def test_ordinary_runs_are_admitted_onto_every_seat(self, companion_cfg):
+        from kiro_crew.execution_seats import validate_member_execution_seat
+
+        for alias in ("crew-claude", "crew-codex", "crew-local", "kirocrew-heartbeat"):
+            validate_member_execution_seat(alias, SimpleNamespace(member_id=None))
