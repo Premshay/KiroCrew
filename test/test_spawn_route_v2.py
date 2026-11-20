@@ -28,9 +28,14 @@ AGY_IDS = [
     "gemini-4-argon-high",
     "gemini-4-argon-low",
     "gemini-4-hydrogen-high",
+    "gemini-4-hydrogen-xhigh",
+    "gemini-4-hydrogen-medium",
+    "gemini-4-hydrogen-low",
     "gemini-pro-orchestrator-neon",
     "gemini-pro-orchestrator-g1-pro",
+    "gemini-3.8-flash-high",
     "gemini-3.8-flash-medium",
+    "gemini-3.8-flash-low",
     "claude-opus-5-5-high",
     "claude-sonnet-5-5-medium",
 ]
@@ -194,7 +199,7 @@ class TestOtherVendors:
                 {
                     "as_of": "2026-11-20T06:00:00Z",
                     "models": {
-                        "gemini-4-argon-medium": {
+                        "gemini-4-hydrogen-medium": {
                             "remaining_fraction": 0.7,
                             "reset_time": "2099-01-01T00:00:00Z",
                         },
@@ -211,12 +216,12 @@ class TestOtherVendors:
                 }
             )
         )
-        h = vl.antigravity_health(["gemini-4-argon-medium"], now=NOW)
-        assert h["per_model"] == {"gemini-4-argon-medium": 30.0, "gemini-4-neon-medium": 100.0}
+        h = vl.antigravity_health(["gemini-4-hydrogen-medium"], now=NOW)
+        assert h["per_model"] == {"gemini-4-hydrogen-medium": 30.0, "gemini-4-neon-medium": 100.0}
         assert (h["out"], h["used_pct"], h["window"], h["source"]) == (
             False, 30.0, "per_model", "agy_quota"
         )
-        both = vl.antigravity_health(["gemini-4-argon-medium", "gemini-4-neon-medium"], now=NOW)
+        both = vl.antigravity_health(["gemini-4-hydrogen-medium", "gemini-4-neon-medium"], now=NOW)
         assert both["out"] is False and both["used_pct"] == 100.0
         assert vl.antigravity_health(["gemini-4-neon-medium"], now=NOW)["out"] is True
 
@@ -237,12 +242,25 @@ class TestOtherVendors:
 
 
 class TestAntigravityTiers:
-    def test_argon_reads_neon_builds(self):
+    def test_flash_hydrogen_neon_and_never_argon(self):
         tiers = sr.advertised_tiers("antigravity", AGY_IDS)
-        assert tiers["small"] == ["gemini-4-argon-medium", "gemini-4-neon-medium"]
-        assert tiers["mini"] == ["gemini-4-argon-medium"]
-        assert tiers["large"] == ["gemini-4-neon-high"]
+        assert tiers["mini"] == ["gemini-3.8-flash-medium"]
+        assert tiers["small"] == ["gemini-4-hydrogen-medium", "gemini-4-neon-medium"]
+        assert tiers["large"] == ["gemini-4-hydrogen-high", "gemini-4-neon-high"]
         assert "top" not in tiers
+        offered = [m for ids in tiers.values() for m in ids]
+        assert not any("argon" in m or "claude" in m or "orchestrator" in m for m in offered)
+
+    def test_an_argon_pin_is_never_offered(self, monkeypatch):
+        monkeypatch.setattr(
+            sr,
+            "tier_map",
+            lambda config=None: {
+                "antigravity": {"small": ["gemini-4-argon-medium", "gemini-4-hydrogen-medium"]}
+            },
+        )
+        monkeypatch.setattr(sr, "advertised_tiers", lambda vendor, advertised=None: {})
+        assert sr.effective_tiers("antigravity")["small"] == ["gemini-4-hydrogen-medium"]
 
     def test_advertised_ids_come_from_agy_when_nothing_is_cached(self, monkeypatch):
         calls = []
@@ -254,9 +272,9 @@ class TestAntigravityTiers:
     def test_the_quota_file_lists_ids_without_running_agy(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sr, "_run_agy_models", lambda: pytest.fail("agy run"))
         (tmp_path / vl.ANTIGRAVITY_QUOTA_NAME).write_text(
-            json.dumps({"models": {"gemini-4-argon-low": {"remaining_fraction": 1.0}}})
+            json.dumps({"models": {"gemini-4-hydrogen-low": {"remaining_fraction": 1.0}}})
         )
-        assert sr.antigravity_advertised(now=NOW) == ["gemini-4-argon-low"]
+        assert sr.antigravity_advertised(now=NOW) == ["gemini-4-hydrogen-low"]
 
 
 def _fake_tiers(vendor, config=None):
@@ -266,7 +284,7 @@ def _fake_tiers(vendor, config=None):
         "antigravity": {
             "top": [],
             "large": ["gemini-4-neon-high"],
-            "small": ["gemini-4-argon-medium", "gemini-4-neon-medium"],
+            "small": ["gemini-4-hydrogen-medium", "gemini-4-neon-medium"],
             "mini": [],
         },
         "deepseek": {"top": [], "large": ["deepseek-v4-pro"], "small": [], "mini": []},
@@ -289,7 +307,7 @@ class TestCandidates:
             "key": "antigravity/small/0",
             "vendor": "antigravity",
             "tier": "small",
-            "model": "gemini-4-argon-medium",
+            "model": "gemini-4-hydrogen-medium",
             "backend": "antigravity",
         }
         assert by_key["codex/large/0"]["backend"] == "codex"
@@ -361,7 +379,7 @@ class TestCandidates:
         assert set(sr.route_backends("codex")) == {"claude"}
 
     @pytest.mark.parametrize(
-        "model,vendor", [("opus", "claude"), ("gemini-4-argon-medium", "antigravity")]
+        "model,vendor", [("opus", "claude"), ("gemini-4-hydrogen-medium", "antigravity")]
     )
     def test_vendor_from_model_family(self, model, vendor):
         assert sr.vendor_of_seat("derrick", model) == vendor
@@ -411,7 +429,7 @@ def routed_env(monkeypatch):
         "limit_health",
         lambda models=(), now=None: {
             "antigravity": {"out": False, "used_pct": 30.0, "window": "per_model",
-                            "per_model": {"gemini-4-argon-medium": 30.0}, "source": "agy_quota"},
+                            "per_model": {"gemini-4-hydrogen-medium": 30.0}, "source": "agy_quota"},
             "codex": {"out": False, "used_pct": 87.0, "window": "weekly", "source": "codex_rollout"},
         },
     )
@@ -432,7 +450,7 @@ class TestRoutedAcrossVendors:
         )
         assert got is not None
         assert (got["vendor"], got["model"], got["backend"], got["runtime_agent"]) == (
-            "antigravity", "gemini-4-argon-medium", "antigravity", "crew-antigravity"
+            "antigravity", "gemini-4-hydrogen-medium", "antigravity", "crew-antigravity"
         )
         state = oracle.states[0]
         assert state["parent_vendor"] == "claude"
@@ -440,7 +458,7 @@ class TestRoutedAcrossVendors:
         assert state["health"]["codex"]["used_pct"] == 87.0
         line = sr.reason_line(got)
         assert line.startswith(
-            "spawn.route: read/simple -> antigravity small (gemini-4-argon-medium) on antigravity"
+            "spawn.route: read/simple -> antigravity small (gemini-4-hydrogen-medium) on antigravity"
         )
         assert "30% of its quota" in line and "low: codex" in line
 

@@ -9,7 +9,7 @@ child's vendor should run it, and records why on the child's card.
 The unit is a (vendor, model tier) candidate: the tiers are derived from the
 models each vendor's adapter ADVERTISES, sorted by the operator's family rule
 (:data:`FAMILY_TIERS` -- top fable/astra/pro, large opus/sol/pro/neon, small
-sonnet/terra/flash/argon/neon, mini haiku/luna/flash/argon), and
+sonnet/terra/flash/hydrogen/neon, mini haiku/luna/flash), and
 ``decisions.spawn_route`` may override a tier with explicit ids.
 
 Since the operator ruling of 2026-11-20 (nexus ``eval/decision-lane/POLICY.md``)
@@ -328,13 +328,30 @@ FAMILY_TIERS: dict[str, dict[str, tuple[str, ...]]] = {
     "claude": {"top": ("fable",), "large": ("opus",), "small": ("sonnet",), "mini": ("haiku",)},
     "codex": {"top": ("astra",), "large": ("sol",), "small": ("terra",), "mini": ("luna",)},
     "deepseek": {"top": ("pro",), "large": ("pro",), "small": ("flash",), "mini": ("flash",)},
-    # Owner fit of 2026-11-19: Argon reads (small/mini), Neon builds (small/large).
-    # Argon leads ``small`` so a read lands on it; Neon is the second small id.
-    "antigravity": {"large": ("neon",), "small": ("argon", "neon"), "mini": ("argon",)},
+    # Owner fit, corrected 2026-11-20 (Argon dropped): Flash for lookups and small
+    # edits (mini -> ``-medium``), Hydrogen medium for reads and traces (small),
+    # Hydrogen high for bounded builds and Neon high to step up or plan (large,
+    # ``-high``); Neon medium is the small step-up. Claude ids agy also serves are
+    # still Anthropic, not this vendor, and match no family here.
+    "antigravity": {
+        "large": ("hydrogen", "neon"),
+        "small": ("hydrogen", "neon"),
+        "mini": ("flash",),
+    },
 }
 
+#: Families never offered for a vendor, whatever the adapter advertises or the
+#: owner pins (operator ruling 2026-11-20: Antigravity Argon is dropped).
+DROPPED_FAMILIES: dict[str, tuple[str, ...]] = {"antigravity": ("argon",)}
+
+
+def _dropped(vendor: str, model_id: str) -> bool:
+    fams = DROPPED_FAMILIES.get(vendor)
+    return fams is not None and _family_rank(model_id, fams) is not None
+
+
 #: How a vendor spells a reasoning effort on an id: ``gpt-5.6-sol[high]`` (bracket)
-#: or ``gemini-4-argon-medium`` (dash). Unlisted vendors use brackets.
+#: or ``gemini-4-hydrogen-medium`` (dash). Unlisted vendors use brackets.
 EFFORT_STYLE: dict[str, str] = {"antigravity": "dash"}
 
 #: The router roles the local fleet is offered as (``/fleet/status`` ``roles``):
@@ -390,7 +407,7 @@ def advertised_tiers(vendor: str, advertised: list[str] | None = None) -> dict[s
         by_model: dict[str, list[str]] = {}
         ranks: dict[str, int] = {}
         for mid in advertised or []:
-            if not isinstance(mid, str) or _EXCLUDE.search(mid):
+            if not isinstance(mid, str) or _EXCLUDE.search(mid) or _dropped(vendor, mid):
                 continue
             rank = _family_rank(mid, fams)
             if rank is None:
@@ -486,7 +503,10 @@ def effective_tiers(vendor: str, config: Any | None = None) -> dict[str, list[st
     """
     pinned = tier_map(config).get(vendor, {})
     derived = advertised_tiers(vendor)
-    return {tier: list(pinned.get(tier) or derived.get(tier) or []) for tier in TIERS}
+    return {
+        tier: [m for m in (pinned.get(tier) or derived.get(tier) or []) if not _dropped(vendor, m)]
+        for tier in TIERS
+    }
 
 
 def candidates_for(
@@ -898,7 +918,7 @@ def _limit_summary(chosen: Mapping[str, str], state: Mapping[str, Any]) -> str:
 def reason_line(routed: Mapping[str, Any]) -> str:
     """One line for the child's card: vendor, model, kind (the provider's note) and limit state.
 
-    ``spawn.route: read/simple -> antigravity small (gemini-4-argon-medium) on antigravity
+    ``spawn.route: read/simple -> antigravity small (gemini-4-hydrogen-medium) on antigravity
     p=0.90; 30% of its quota; skipped low: codex``
     """
     r = routed.get("reason")
