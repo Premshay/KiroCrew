@@ -70,6 +70,11 @@ SPAWN_RUN_TASK_ITEM_SCHEMA = ToolSchema(
         FieldSpec("backend", str, max_len=MAX_SHORT_STRING, pattern=_BACKEND_NAME_RE),
         # Display name for this task's row; see ``normalize_spawn_label``.
         FieldSpec("label", str, max_len=MAX_SHORT_STRING),
+        # Optional machine check (a shell command, exit 0 = pass). A run the
+        # local fleet serves runs it in its cwd when it ends: a pass commits
+        # the worker's changes, a fail falls through once to cloud
+        # (``subagent_manager.local_check``).
+        FieldSpec("check", str, max_len=MAX_MEDIUM_STRING),
     ],
 )
 
@@ -125,6 +130,8 @@ SPAWN_RUN_SCHEMA = ToolSchema(
         # Display only: the task the sub-agent receives is unchanged, and the
         # value is normalized to one bounded line (``normalize_spawn_label``).
         FieldSpec("label", str, max_len=MAX_SHORT_STRING),
+        # Machine check for a local run (``subagent_manager.local_check``).
+        FieldSpec("check", str, max_len=MAX_MEDIUM_STRING),
         # keep=True makes the run a continuable conversation: its session
         # persists (hibernated on disk) after completion, and spawn_continue
         # can dispatch follow-up turns into it with full prior context.

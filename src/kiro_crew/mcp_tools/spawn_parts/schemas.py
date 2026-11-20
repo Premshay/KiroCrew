@@ -311,6 +311,7 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                                 "reasoning_effort": {"type": "string"},
                                 "backend": {"type": "string"},
                                 "label": {"type": "string"},
+                                "check": {"type": "string"},
                             },
                             "required": ["task"],
                             "additionalProperties": False,
@@ -318,7 +319,7 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                         "description": (
                             "Multiple tasks to run in parallel as one wave. Each entry is a "
                             "prompt string, or an object {task, model?, "
-                            "reasoning_effort?, backend?, label?} whose fields override the "
+                            "reasoning_effort?, backend?, label?, check?} whose fields override the "
                             "call's batch-wide value for that task only, e.g. the same review "
                             "prompt on two models or two backends, delivered together."
                         ),
@@ -431,6 +432,19 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                             f"(one line, at most {SPAWN_LABEL_MAX_CHARS} characters; longer "
                             "is cut). Display only: the subagent still receives the task "
                             "text. Batch-wide; a tasks[] object can set its own."
+                        ),
+                    },
+                    "check": {
+                        "type": "string",
+                        "description": (
+                            "Optional machine check: a shell command whose exit 0 means the "
+                            "work is right (e.g. `python -m pytest -q tests/test_x.py`). When "
+                            "the local fleet serves the run, the check runs in its cwd as it "
+                            "ends: PASS commits the worker's uncommitted changes, FAIL (or an "
+                            "unusable local run) falls through once to a cloud model with a "
+                            "handoff. Omitted, a pytest command or node id the brief names "
+                            "obviously is used; with none, a local run is never auto-committed. "
+                            "Batch-wide; a tasks[] object can set its own."
                         ),
                     },
                     "keep": {

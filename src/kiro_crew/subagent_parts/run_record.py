@@ -480,6 +480,12 @@ class SubagentInfo:
     # first briefed, so a second fall-through does not nest handoffs.
     quota_routable: bool | None = None
     route_tier: str = ""
+    # The vendor ``spawn.route`` (or a fall-through) put the run on; ``local``
+    # makes its ending run the local check (``subagent_manager.local_check``).
+    route_vendor: str = ""
+    # That check's receipt for the parent: ``local check: <cmd> PASS ->
+    # committed <sha>`` / ``local check FAIL -> <vendor> <model>``; "" when none ran.
+    local_check_line: str = ""
     quota_chain: tuple[str, ...] = ()
     quota_origin_task: str = ""
     # Per-call reasoning-effort override (spawn_run ``reasoning_effort``).

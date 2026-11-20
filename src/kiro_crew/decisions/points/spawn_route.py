@@ -826,9 +826,20 @@ def build_state(
     parent_model: str,
     cands: list[dict[str, str]],
     health: Mapping[str, Mapping[str, Any]],
+    has_check: bool = False,
+    include_context: bool = True,
 ) -> dict[str, Any]:
+    from kiro_crew.subagent_manager.local_check import estimate_tokens
+
     return {
         "brief": (brief or "")[:MAX_BRIEF_CHARS],
+        # Local-first gating inputs (fork, ``subagent_manager.local_check``): a
+        # run with a machine check can be tried locally and falls through to
+        # cloud when the check fails. ``estimate_tokens`` is per local router
+        # role: the FULL brief plus that seat's measured first-request overhead,
+        # to read against ``health.local.ctx`` for the same role.
+        "has_check": bool(has_check),
+        "estimate_tokens": estimate_tokens(brief or "", include_context=include_context),
         # the child's seat: a conductor/orchestrator agent is itself the orchestration cue
         "agent": agent or "",
         "parent_vendor": vendor,
@@ -849,7 +860,17 @@ def build_state(
     }
 
 
-_HEALTH_KEYS = ("used_pct", "window", "resets_at", "per_model", "lanes", "source", "as_of")
+_HEALTH_KEYS = (
+    "used_pct",
+    "window",
+    "resets_at",
+    "per_model",
+    "lanes",
+    "ctx",
+    "cpu_busy",
+    "source",
+    "as_of",
+)
 
 
 def read_choice(
@@ -917,6 +938,8 @@ async def routed_spawn(
     config: Any | None = None,
     cross_vendor: bool = True,
     exclude_vendors: Sequence[str] = (),
+    has_check: bool = False,
+    include_context: bool = True,
 ) -> dict[str, Any] | None:
     """The model -- and, for another vendor, the backend -- a model-less spawn should run on.
 
@@ -950,7 +973,14 @@ async def routed_spawn(
         health = merged_health(tombs, limits)
         _apply_quota_outs(health, outs)
         state = build_state(
-            brief, agent=agent, vendor=vendor, parent_model=parent_model, cands=cands, health=health
+            brief,
+            agent=agent,
+            vendor=vendor,
+            parent_model=parent_model,
+            cands=cands,
+            health=health,
+            has_check=has_check,
+            include_context=include_context,
         )
         answers = await core.decide(
             POINT,

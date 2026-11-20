@@ -314,11 +314,31 @@ def local_health(status: Mapping[str, Any] | None = None) -> dict[str, Any]:
     if not isinstance(roles, Mapping) or not isinstance(lanes, Mapping):
         return {}
     up: dict[str, bool] = {}
+    ctx: dict[str, int] = {}
     for role in ("subagent", "agent"):
         r = roles.get(role)
         lane = lanes.get(r.get("lane")) if isinstance(r, Mapping) else None
         up[role] = bool(isinstance(lane, Mapping) and lane.get("available"))
-    return {"out": not any(up.values()), "lanes": up, "source": "fleet_status", "as_of": time.time()}
+        # The window the role's model serves (``live_ctx`` per model on its lane):
+        # what spawn.route reads ``estimate_tokens`` against.
+        live = lane.get("live_ctx") if isinstance(lane, Mapping) else None
+        model = r.get("model") if isinstance(r, Mapping) else None
+        if isinstance(live, Mapping) and isinstance(live.get(model), int):
+            ctx[role] = int(live[model])
+    out: dict[str, Any] = {
+        "out": not any(up.values()),
+        "lanes": up,
+        "source": "fleet_status",
+        "as_of": time.time(),
+    }
+    if ctx:
+        out["ctx"] = ctx
+    # The router's host CPU reading (``host.cpu_busy``), when it publishes one.
+    host = status.get("host")
+    busy = host.get("cpu_busy") if isinstance(host, Mapping) else None
+    if isinstance(busy, (bool, int, float)):
+        out["cpu_busy"] = busy
+    return out
 
 
 def _fleet_status() -> Any:

@@ -407,51 +407,16 @@ async def _fall_through(manager: Any, info: Any, hit: QuotaHit, now: float | Non
             git=git,
             now=now,
         )
-        execution = info.execution_context
-        if execution is None:
-            from kiro_crew.subagent_persistence import read_run_execution
-
-            execution = await asyncio.to_thread(read_run_execution, info.id)
-        native = routed.get("native_backend") or ""
-        successor = await manager.spawn_async(
-            brief,
-            parent_session_key=info.parent_session_key,
-            agent=info.agent,
-            max_turns=info.max_turns,
-            cwd=info.cwd,
-            model=routed["model"],
-            backend=native or None,
-            runtime_agent=routed.get("runtime_agent") or "",
-            approval_mode=info.approval_mode or None,
-            silent=info.silent,
-            delegation=dict(info.delegation),
-            include_memory=info.include_memory,
-            include_lessons=info.include_lessons,
-            include_project=info.include_project,
-            memory_store=info.memory_store,
-            crew=info.crew,
-            label=info.label,
-            app=execution.app,
-            _memory_mode=execution.memory_mode,
-            _execution_context=execution.to_record(),
-            _depth=getattr(info, "depth", None),
-            _root_session_key=getattr(info, "root_session_key", None),
+        switch = f"quota fall-through: {what} -> {routed['vendor']} {routed['model']}"
+        successor, refusal = await spawn_successor(
+            manager, info, routed, brief, chain=chain, origin=origin, switch=switch
         )
-        if successor is None or (successor.done and successor.error):
-            why = successor.error if successor is not None else "capacity reached"
+        if successor is None:
             info.error = (
                 f"{QUOTA_ERROR_CODE}: {what}; the fall-through to {routed['vendor']} "
-                f"{routed['model']} could not start: {why}"
+                f"{routed['model']} could not start: {refusal}"
             )
-            successor = None
             return
-        switch = f"quota fall-through: {what} -> {routed['vendor']} {routed['model']}"
-        successor.quota_routable = True
-        successor.quota_chain = chain
-        successor.quota_origin_task = origin
-        successor.route_tier = routed.get("tier") or ""
-        successor.route_reason = f"{switch}; {sr.reason_line(routed)}"
-        info.route_reason = f"{info.route_reason}; {switch} (run {successor.id})".lstrip("; ")
         info.error = (
             f"{switch}: continuing as run {successor.id}, same cwd and memory. "
             f"Wait for that run's completion; do not re-spawn this task."
@@ -459,6 +424,67 @@ async def _fall_through(manager: Any, info: Any, hit: QuotaHit, now: float | Non
         logger.warning("Subagent %s: %s as run %s", info.id, switch, successor.id)
     finally:
         manager.settle_retry(info, successor.id if successor is not None else None)
+
+
+async def spawn_successor(
+    manager: Any,
+    info: Any,
+    routed: dict[str, Any],
+    brief: str,
+    *,
+    chain: tuple[str, ...],
+    origin: str,
+    switch: str,
+) -> tuple[Any, str]:
+    """Start *info*'s successor on *routed*: same cwd, memory identity and delegation.
+
+    Returns ``(successor, "")`` or ``(None, why it could not start)``. The
+    successor is routable, carries *chain* (vendors it must not go back to) and
+    the original task, and both runs' route reasons name *switch*. Shared by the
+    quota fall-through and the local-check fall-through (``local_check``).
+    """
+    from kiro_crew.decisions.points import spawn_route as sr
+
+    execution = info.execution_context
+    if execution is None:
+        from kiro_crew.subagent_persistence import read_run_execution
+
+        execution = await asyncio.to_thread(read_run_execution, info.id)
+    native = routed.get("native_backend") or ""
+    successor = await manager.spawn_async(
+        brief,
+        parent_session_key=info.parent_session_key,
+        agent=info.agent,
+        max_turns=info.max_turns,
+        cwd=info.cwd,
+        model=routed["model"],
+        backend=native or None,
+        runtime_agent=routed.get("runtime_agent") or "",
+        approval_mode=info.approval_mode or None,
+        silent=info.silent,
+        delegation=dict(info.delegation),
+        include_memory=info.include_memory,
+        include_lessons=info.include_lessons,
+        include_project=info.include_project,
+        memory_store=info.memory_store,
+        crew=info.crew,
+        label=info.label,
+        app=execution.app,
+        _memory_mode=execution.memory_mode,
+        _execution_context=execution.to_record(),
+        _depth=getattr(info, "depth", None),
+        _root_session_key=getattr(info, "root_session_key", None),
+    )
+    if successor is None or (successor.done and successor.error):
+        return None, (successor.error if successor is not None else "capacity reached")
+    successor.quota_routable = True
+    successor.quota_chain = chain
+    successor.quota_origin_task = origin
+    successor.route_tier = routed.get("tier") or ""
+    successor.route_vendor = routed.get("vendor") or ""
+    successor.route_reason = f"{switch}; {sr.reason_line(routed)}"
+    info.route_reason = f"{info.route_reason}; {switch} (run {successor.id})".lstrip("; ")
+    return successor, ""
 
 
 async def handle_run_end_guarded(manager: Any, info: Any) -> None:

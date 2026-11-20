@@ -233,12 +233,18 @@ class RunEventCoordinator(ManagerComponent):
                     parent_model = provider_active_model(provider) if provider is not None else ""
                 except Exception:
                     parent_model = ""
+            from . import local_check as _local_check
+
             routed = await _spawn_route.routed_spawn(
                 info.task,
                 agent=agent or "",
                 parent_model=parent_model,
                 session_key=info.parent_session_key or None,
                 cross_vendor=cross_vendor,
+                has_check=bool(_local_check.check_for(info)),
+                include_context=bool(
+                    info.include_memory or info.include_lessons or info.include_project
+                ),
             )
         except asyncio.CancelledError:
             raise

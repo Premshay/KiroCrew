@@ -188,6 +188,11 @@ def _compose_subagent_completion(info: SubagentInfo, *, _flush_only: bool) -> _S
         detail = summarize_result(info.result, result_path)
     else:
         detail = info.result or "_No response._"
+    # Fork: a local run's machine-check receipt leads, so the parent sees whether
+    # the work was committed or handed to cloud before it reads the narration.
+    _check_line = getattr(info, "local_check_line", "")
+    if isinstance(_check_line, str) and _check_line:
+        detail = f"{_check_line}\n\n{detail}"
     detail, _ = redact_exfiltration_urls(detail)
     detail, _ = redact_credentials(detail)
     task_text, _ = redact_exfiltration_urls(info.task)

@@ -268,6 +268,7 @@ def spawn_run(name: str, args: dict[str, Any]) -> str | DeferredTool:
     reasoning_effort = args.get("reasoning_effort") or ""
     backend = args.get("backend") or ""
     label = normalize_spawn_label(args.get("label"))
+    check = str(args.get("check") or "").strip()
     keep = bool(args.get("keep"))
     silent = args.get("silent") is True
     # Context scope: absent ⇒ true, so a parent that passes nothing gets the
@@ -362,6 +363,7 @@ def spawn_run(name: str, args: dict[str, Any]) -> str | DeferredTool:
         t_effort = over.get("reasoning_effort") or reasoning_effort
         t_backend = over.get("backend") or backend
         t_label = normalize_spawn_label(over.get("label")) or label
+        t_check = str(over.get("check") or check or "").strip()
         if a in refused_agents:
             # Short line on purpose: the full roster is already on the first
             # refusal above, and repeating it once per remaining member would
@@ -391,6 +393,8 @@ def spawn_run(name: str, args: dict[str, Any]) -> str | DeferredTool:
             body["backend"] = t_backend
         if t_label:
             body["label"] = t_label
+        if t_check:
+            body["check"] = t_check
         if keep:
             body["keep"] = True
         if silent:

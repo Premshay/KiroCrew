@@ -446,6 +446,7 @@ async def api_spawn(request: web.Request) -> web.Response:
                 "target_member": body.get("target_member", ""),
                 "backend": body.get("backend", ""),
                 "label": body.get("label", ""),
+                "check": body.get("check", ""),
             },
             SPAWN_RUN_SCHEMA,
         )
@@ -685,6 +686,13 @@ async def api_spawn(request: web.Request) -> web.Response:
             # what it did before.
             **({"failover_from": failover_from} if failover_from else {}),
             label=str(cleaned.get("label") or ""),
+            # Kept in ``delegation`` so it survives the queue, a restart and a
+            # successor exactly as the rest of the delegation does.
+            **(
+                {"delegation": {"check": str(cleaned["check"]).strip()}}
+                if str(cleaned.get("check") or "").strip()
+                else {}
+            ),
             approval_mode=approval_mode or None,
             silent=silent,
             batch_id=batch_id,
