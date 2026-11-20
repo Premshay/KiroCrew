@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 import pytest
 
+import kiro_crew.agent as agent_mod
 from kiro_crew.acp.types import PROVIDER_LABEL_CODEX, PROVIDER_LABEL_KAS
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_CLAUDE,
@@ -28,7 +29,6 @@ from kiro_crew.agent_sdk.backends import (
 )
 from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.agent_sdk.provider_identity import PROVIDER_ACP, PROVIDER_CLAUDE_CODE
-import kiro_crew.agent as agent_mod
 from kiro_crew.config import paths as paths_mod
 from kiro_crew.context import _MULTIBYTE_TABLE, ContextBuilder
 from kiro_crew.context_assembly import inclusion

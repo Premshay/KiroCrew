@@ -118,9 +118,7 @@ class TestTombstoneVendor:
         assert sr._vendor_of_tombstone({"agent": "derrick", "provider": "acp"}) == "claude"
 
     def test_same_resolution_as_quota_switch(self):
-        info = SimpleNamespace(
-            agent="crew-claude", runtime_agent="crew-antigravity", backend=None
-        )
+        info = SimpleNamespace(agent="crew-claude", runtime_agent="crew-antigravity", backend=None)
         assert qs.run_vendor(info, "gemini-4-hydrogen-medium") == "antigravity"
         assert sr._vendor_of_tombstone(
             {"agent": "crew-claude", "runtime_agent": "crew-antigravity"}
@@ -220,9 +218,7 @@ class TestChatOutMark:
 
     @pytest.mark.asyncio
     async def test_claude_chat_with_rejected_health_is_not_marked_without_text(self, monkeypatch):
-        monkeypatch.setattr(
-            vl, "claude_health", lambda now=None: {"out": True, "resets_at": 9e12}
-        )
+        monkeypatch.setattr(vl, "claude_health", lambda now=None: {"out": True, "resets_at": 9e12})
         hit = qs.note_chat_quota("boom", runtime_agent="crew-claude", model="sonnet")
         assert hit is None
         assert vl.quota_outs() == {}

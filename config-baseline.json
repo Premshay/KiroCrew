@@ -4918,7 +4918,6 @@
       "hasChildren": false,
       "enumValues": [
         "local",
-        "bridge",
         "apple",
         "transcribe",
         "codex",

@@ -48,7 +48,9 @@ class TestHybridRetrieverExtended:
         assert retriever._graph_search("Quokka", status="archived", source_id=selected) == [
             (archived, 1)
         ]
-        assert {item for item, _ in retriever._graph_search("Quokka", status=None, source_id=selected)} == {
+        assert {
+            item for item, _ in retriever._graph_search("Quokka", status=None, source_id=selected)
+        } == {
             kept,
             archived,
             located,

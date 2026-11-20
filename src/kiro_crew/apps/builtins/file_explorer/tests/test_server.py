@@ -81,8 +81,9 @@ def patch_allowed_roots(tmp_tree):
         with patch.object(server, "_HOME", tmp_tree):
             with patch.object(server, "is_sensitive_path", mock_is_sensitive):
                 with patch.object(server, "sel", MagicMock()):
-                    with patch.object(server, "wrap_argv", mock_wrap_argv), patch.object(
-                        server, "_crew_home_index", fixture_crew_home_index
+                    with (
+                        patch.object(server, "wrap_argv", mock_wrap_argv),
+                        patch.object(server, "_crew_home_index", fixture_crew_home_index),
                     ):
                         yield
 

@@ -68,8 +68,10 @@ def _agy_groups(tmp_path):
 class TestDetect:
     def test_antigravity_individual_quota_with_its_reset(self):
         hit = qs.detect(
-            "failed (refusal)\n" + AGY_FAULT, vendor="antigravity",
-            model="gemini-4-hydrogen-medium", now=NOW,
+            "failed (refusal)\n" + AGY_FAULT,
+            vendor="antigravity",
+            model="gemini-4-hydrogen-medium",
+            now=NOW,
         )
         assert hit is not None
         assert (hit.vendor, hit.model) == ("antigravity", "gemini-4-hydrogen-medium")
@@ -107,8 +109,12 @@ class TestDetect:
         assert qs.detect(AGY_FAULT, vendor="claude", now=NOW) is None
 
     def test_an_ordinary_failure_is_not_a_quota(self):
-        assert qs.detect("Antigravity provider fault: status ERROR: boom", vendor="antigravity",
-                         now=NOW) is None
+        assert (
+            qs.detect(
+                "Antigravity provider fault: status ERROR: boom", vendor="antigravity", now=NOW
+            )
+            is None
+        )
         assert qs.detect("throttling requests", vendor="claude", now=NOW) is None
 
 
@@ -155,25 +161,53 @@ class TestOutMarks:
 
     def test_spawn_route_drops_marked_candidates(self):
         cands = [
-            {"key": "antigravity/small/0", "vendor": "antigravity", "tier": "small",
-             "model": "gemini-4-hydrogen-medium", "backend": ""},
-            {"key": "antigravity/large/0", "vendor": "antigravity", "tier": "large",
-             "model": "gemini-4-neon-high", "backend": ""},
-            {"key": "codex/large/0", "vendor": "codex", "tier": "large", "model": "gpt",
-             "backend": "codex"},
-            {"key": "claude/small/0", "vendor": "claude", "tier": "small", "model": "sonnet",
-             "backend": "claude"},
+            {
+                "key": "antigravity/small/0",
+                "vendor": "antigravity",
+                "tier": "small",
+                "model": "gemini-4-hydrogen-medium",
+                "backend": "",
+            },
+            {
+                "key": "antigravity/large/0",
+                "vendor": "antigravity",
+                "tier": "large",
+                "model": "gemini-4-neon-high",
+                "backend": "",
+            },
+            {
+                "key": "codex/large/0",
+                "vendor": "codex",
+                "tier": "large",
+                "model": "gpt",
+                "backend": "codex",
+            },
+            {
+                "key": "claude/small/0",
+                "vendor": "claude",
+                "tier": "small",
+                "model": "sonnet",
+                "backend": "claude",
+            },
         ]
-        outs = {"antigravity": {"models": {"gemini-4-hydrogen-medium": NOW + 1}},
-                "codex": {"until": NOW + 1}}
+        outs = {
+            "antigravity": {"models": {"gemini-4-hydrogen-medium": NOW + 1}},
+            "codex": {"until": NOW + 1},
+        }
         kept = sr.drop_quota_outs(cands, outs, exclude_vendors=("claude",))
         assert [c["key"] for c in kept] == ["antigravity/large/0"]
 
     def test_known_out_fails_a_start_on_the_marked_group(self, tmp_path):
         _agy_groups(tmp_path)
         vl.note_quota_out("antigravity", until=NOW + 100, model="gemini-4-hydrogen-high", now=NOW)
-        info = SimpleNamespace(agent="crew-antigravity", runtime_agent="", backend=None,
-                               resolved_model="", requested_model="", model="")
+        info = SimpleNamespace(
+            agent="crew-antigravity",
+            runtime_agent="",
+            backend=None,
+            resolved_model="",
+            requested_model="",
+            model="",
+        )
         hit = qs.known_out(info, "gemini-4-hydrogen-medium", now=NOW)
         assert hit is not None and hit.until == NOW + 100
         assert qs.known_out(info, "gemini-4-neon-high", now=NOW) is None
@@ -188,8 +222,12 @@ def _tiers(vendor, config=None):
     return {
         "claude": {"top": [], "large": ["opus"], "small": ["sonnet"], "mini": []},
         "codex": {"top": [], "large": ["gpt-6.2-sol"], "small": [], "mini": []},
-        "antigravity": {"top": [], "large": ["gemini-4-neon-high"],
-                        "small": ["gemini-4-hydrogen-medium"], "mini": []},
+        "antigravity": {
+            "top": [],
+            "large": ["gemini-4-neon-high"],
+            "small": ["gemini-4-hydrogen-medium"],
+            "mini": [],
+        },
     }.get(vendor, {})
 
 
@@ -212,24 +250,30 @@ def no_oracle(monkeypatch):
 class TestReroute:
     def test_unanswered_oracle_falls_back_to_the_same_tier_elsewhere(self, no_oracle):
         got = asyncio.run(
-            sr.reroute_after_quota("t", agent="crew-antigravity", exclude_vendors=("antigravity",),
-                                   tier="small")
+            sr.reroute_after_quota(
+                "t", agent="crew-antigravity", exclude_vendors=("antigravity",), tier="small"
+            )
         )
-        assert (got["vendor"], got["model"], got["runtime_agent"]) == ("claude", "sonnet",
-                                                                       "crew-claude")
+        assert (got["vendor"], got["model"], got["runtime_agent"]) == (
+            "claude",
+            "sonnet",
+            "crew-claude",
+        )
 
     def test_marked_vendors_are_skipped(self, no_oracle):
         vl.note_quota_out("claude", until=9e12)
         got = asyncio.run(
-            sr.reroute_after_quota("t", agent="crew-antigravity", exclude_vendors=("antigravity",),
-                                   tier="small")
+            sr.reroute_after_quota(
+                "t", agent="crew-antigravity", exclude_vendors=("antigravity",), tier="small"
+            )
         )
         assert (got["vendor"], got["native_backend"]) == ("codex", "codex")
 
     def test_every_vendor_out_is_none(self, no_oracle):
         got = asyncio.run(
-            sr.reroute_after_quota("t", agent="crew-antigravity",
-                                   exclude_vendors=("antigravity", "claude", "codex"))
+            sr.reroute_after_quota(
+                "t", agent="crew-antigravity", exclude_vendors=("antigravity", "claude", "codex")
+            )
         )
         assert got is None
 
@@ -287,10 +331,21 @@ def _failed(cwd="", **kw):
 
 
 ROUTED = {
-    "route_id": "r", "model": "sonnet", "tier": "small", "vendor": "claude",
-    "backend": "claude-max", "runtime_agent": "crew-claude", "native_backend": "",
-    "p": 0.8, "reason": "", "vendor_out": False, "vendor_until": None, "limit": "",
-    "low": [], "out": ["antigravity"], "latency_ms": 1,
+    "route_id": "r",
+    "model": "sonnet",
+    "tier": "small",
+    "vendor": "claude",
+    "backend": "claude-max",
+    "runtime_agent": "crew-claude",
+    "native_backend": "",
+    "p": 0.8,
+    "reason": "",
+    "vendor_out": False,
+    "vendor_until": None,
+    "limit": "",
+    "low": [],
+    "out": ["antigravity"],
+    "latency_ms": 1,
 }
 
 
@@ -298,8 +353,10 @@ ROUTED = {
 def git_repo(tmp_path):
     repo = tmp_path / "wt"
     repo.mkdir()
-    run = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True,  # noqa: E731
-                                    capture_output=True)
+
+    def run(*a):
+        return subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True)
+
     run("init", "-q", "-b", "fix/5654")
     run("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "base")
     (repo / "half.txt").write_text("x")
@@ -324,7 +381,7 @@ class TestRoutedFallThrough:
         assert asked["exclude_vendors"] == ("antigravity",) and asked["tier"] == "small"
         assert asked["brief"] == "Review PR #5654 read-only."
         # same task, cwd and memory identity, on the routed seat
-        (brief, kw), = mgr.spawned
+        ((brief, kw),) = mgr.spawned
         assert kw["cwd"] == git_repo and kw["runtime_agent"] == "crew-claude"
         assert kw["model"] == "sonnet" and kw["backend"] is None
         assert kw["_execution_context"] == {"template_id": "crew-antigravity"}
@@ -371,7 +428,9 @@ class TestRoutedFallThrough:
         mgr, info = _Manager(), _failed()
         asyncio.run(qs.handle_run_end(mgr, info, now=NOW))
         assert mgr.spawned == [] and mgr.settled == [None]
-        assert info.error.startswith("quota_exhausted: antigravity gemini-4-hydrogen-high out until")
+        assert info.error.startswith(
+            "quota_exhausted: antigravity gemini-4-hydrogen-high out until"
+        )
         assert "every routed vendor is out (antigravity)" in info.error
 
     def test_a_successor_that_cannot_start_is_reported(self, monkeypatch):
@@ -433,6 +492,8 @@ class TestNotAQuotaEnding:
         mgr, info = _Manager(), _failed(quota_routable=False)
         info.agent, info.requested_model = "crew-codex", "gpt-6.2"
         info.result = ""
-        info.error = "RuntimeError: quota_exhausted: codex gpt-6.2 out until x (known out before this start)"
+        info.error = (
+            "RuntimeError: quota_exhausted: codex gpt-6.2 out until x (known out before this start)"
+        )
         hit = asyncio.run(qs.handle_run_end(mgr, info, now=NOW))
         assert hit is not None and hit.until == NOW + 500

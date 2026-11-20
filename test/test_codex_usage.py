@@ -266,7 +266,11 @@ def test_only_the_codex_limit_counts_and_a_weekly_primary_is_weekly(codex_home: 
                 "2026-11-18T20:06:27Z",
                 {
                     "limit_id": "codex",
-                    "primary": {"used_percent": 95.0, "window_minutes": 10080, "resets_at": _FUTURE},
+                    "primary": {
+                        "used_percent": 95.0,
+                        "window_minutes": 10080,
+                        "resets_at": _FUTURE,
+                    },
                     "secondary": None,
                 },
             ),

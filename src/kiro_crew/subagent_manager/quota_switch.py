@@ -429,8 +429,8 @@ async def _fall_through(manager: Any, info: Any, hit: QuotaHit, now: float | Non
 
 def _local_scope(info: Any) -> dict[str, Any]:
     """The scope a fall-through fits a local candidate to: the caller's, before any trim."""
-    from kiro_crew.subagent_manager import local_check as _local_check
     from kiro_crew.subagent import _context_groups_of
+    from kiro_crew.subagent_manager import local_check as _local_check
 
     return {
         "context_groups": _context_groups_of(info) | _local_check.trimmed_groups(info),

@@ -31,8 +31,14 @@ def schemas() -> list[dict[str, Any]]:
                         "type": "string",
                         "description": "The goal in plain language, e.g. 'deep research on the origin of pizza'",
                     },
-                    "author_agent": {"type": "string", "description": "Agent for the authoring session"},
-                    "author_model": {"type": "string", "description": "Model for the authoring session"},
+                    "author_agent": {
+                        "type": "string",
+                        "description": "Agent for the authoring session",
+                    },
+                    "author_model": {
+                        "type": "string",
+                        "description": "Model for the authoring session",
+                    },
                     "author_effort": {
                         "type": "string",
                         "enum": ["", *EFFORT_LEVELS],
@@ -81,8 +87,14 @@ def schemas() -> list[dict[str, Any]]:
                         "type": "string",
                         "description": "If no source: a NL goal to author then run",
                     },
-                    "author_agent": {"type": "string", "description": "Agent for the authoring session"},
-                    "author_model": {"type": "string", "description": "Model for the authoring session"},
+                    "author_agent": {
+                        "type": "string",
+                        "description": "Agent for the authoring session",
+                    },
+                    "author_model": {
+                        "type": "string",
+                        "description": "Model for the authoring session",
+                    },
                     "author_effort": {
                         "type": "string",
                         "enum": ["", *EFFORT_LEVELS],
