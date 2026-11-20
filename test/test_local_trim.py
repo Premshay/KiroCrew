@@ -4,6 +4,8 @@ Operator ruling 2026-11-20: a local worker keeps skills, the seat/crew spec and
 the project group; only what does not fit its lane is trimmed, memory first,
 then lessons. Cloud picks and explicit ``include_*=true`` are never trimmed; a
 run whose minimal set does not fit skips the local candidate (``too big``).
+The CPU role fits a first-turn token target (12,000), not its window, and
+carries the lean helper contract (``test_local_lean_helper``).
 """
 
 from __future__ import annotations
@@ -25,17 +27,21 @@ from kiro_crew.subagent_manager import quota_switch as qs
 
 ALL = frozenset({"memory", "lessons", "project"})
 
-#: Brief sizes against the measured figures (subagent room = 24,576 - 7,080 = 17,496):
-#: full context 20,797 never fits; minus memory (16,930) fits a brief <= 566
-#: tokens; minus lessons too (11,129) fits a brief <= 6,367 tokens.
-SHORT = "x" * 320  # 101 tokens -> drop memory
+#: Brief sizes against the measured figures (subagent room = 12,000 - 4,050 = 7,950
+#: before the brief; lean context 13,835 in full, 9,968 without memory, 4,167
+#: without lessons too): the CPU role keeps memory or lessons only when they are
+#: smaller than the medians, so a median run drops both; minus both it fits a
+#: brief <= 3,783 tokens.
+SHORT = "x" * 320  # 101 tokens -> drop memory, then lessons
 MID = "x" * 6400  # 2,001 tokens -> drop memory, then lessons
+BIG = "x" * 16000  # 5,001 tokens -> too big for the CPU target even trimmed
 HUGE = "x" * 32000  # 10,001 tokens -> too big even trimmed
 
 
 class TestFit:
     def test_measured_inputs(self):
-        assert lc.input_budget("subagent") == 24576
+        assert lc.input_budget("subagent") == 12000
+        assert lc.input_budget("subagent", 65536) == 12000
         assert lc.input_budget("agent") == 131072 - 8192
         assert lc.input_budget("subagent", 16384) == 8192
         assert lc.context_tokens(None) == lc.INJECTED_CONTEXT_TOKENS
@@ -46,26 +52,29 @@ class TestFit:
         assert fit.fits and fit.drop == ()
 
     def test_cpu_lane_drops_memory_first(self):
-        fit = lc.fit_local("subagent", SHORT, groups=ALL)
+        # Without lessons in the run, dropping memory alone fits.
+        fit = lc.fit_local("subagent", SHORT, groups=frozenset({"memory", "project"}))
         assert fit.fits and fit.drop == ("memory",)
 
     def test_cpu_lane_then_drops_lessons(self):
-        fit = lc.fit_local("subagent", MID, groups=ALL)
-        assert fit.fits and fit.drop == ("memory", "lessons")
-        assert fit.need == lc.KEPT_CONTEXT_TOKENS
+        for brief in (SHORT, MID):
+            fit = lc.fit_local("subagent", brief, groups=ALL)
+            assert fit.fits and fit.drop == ("memory", "lessons")
+            assert fit.need == lc.context_tokens(frozenset({"project"}), "subagent")
 
     def test_never_drops_project(self):
-        fit = lc.fit_local("subagent", HUGE, groups=ALL)
-        assert not fit.fits and fit.drop == ()
+        for brief in (BIG, HUGE):
+            fit = lc.fit_local("subagent", brief, groups=ALL)
+            assert not fit.fits and fit.drop == ()
 
     def test_explicit_include_is_kept_and_then_too_big(self):
-        fit = lc.fit_local("subagent", MID, groups=ALL, pinned=frozenset({"lessons"}))
-        assert not fit.fits
         fit = lc.fit_local("subagent", SHORT, groups=ALL, pinned=frozenset({"lessons"}))
-        assert fit.fits and fit.drop == ("memory",)
+        assert not fit.fits
+        fit = lc.fit_local("subagent", SHORT, groups=ALL, pinned=frozenset({"memory"}))
+        assert not fit.fits
 
     def test_a_group_already_withheld_is_not_reported_trimmed(self):
-        fit = lc.fit_local("subagent", SHORT, groups=frozenset({"lessons", "project"}))
+        fit = lc.fit_local("subagent", SHORT, groups=frozenset({"project"}))
         assert fit.fits and fit.drop == ()
 
     def test_live_ctx_is_read(self):
@@ -74,8 +83,8 @@ class TestFit:
         assert not lc.fit_local("agent", SHORT, groups=ALL, ctx=32768).fits
 
     def test_trim_line(self):
-        assert lc.trim_line_for(("memory", "lessons"), 24576) == (
-            "local: trimmed memory, lessons to fit 24.6k"
+        assert lc.trim_line_for(("memory", "lessons"), 12000) == (
+            "local: trimmed memory, lessons to fit 12.0k"
         )
 
 
@@ -197,21 +206,25 @@ class TestRouted:
 
     def test_cpu_pick_trims_memory_then_lessons(self, routed_env):
         oracle = routed_env(_Oracle("local/subagent/0"))
-        got = _route(SHORT, context_groups=ALL)
+        got = _route(SHORT, context_groups=frozenset({"memory", "project"}))
         assert got["trim"] == ["memory"]
         got = _route(MID, context_groups=ALL)
         assert got["trim"] == ["memory", "lessons"]
-        assert "local: trimmed memory, lessons to fit 24.6k" in sr.reason_line(got)
+        assert "local: trimmed memory, lessons to fit 12.0k" in sr.reason_line(got)
         # the oracle read the fitted size, not the untrimmed one
         est = oracle.states[-1]["estimate_tokens"]["subagent"]
-        assert est == lc.brief_tokens(MID) + 7080 + lc.KEPT_CONTEXT_TOKENS
+        assert est == lc.brief_tokens(MID) + 4050 + lc.context_tokens(
+            frozenset({"project"}), "subagent"
+        )
 
     def test_explicit_include_is_respected(self, routed_env):
         oracle = routed_env(_Oracle("local/subagent/0"))
-        # memory pinned: it stays, lessons goes instead
+        # memory pinned: it stays, and the run no longer fits the CPU target
         got = _route(SHORT, context_groups=ALL, pinned_groups=frozenset({"memory"}))
-        assert got["tier"] == "subagent" and got["trim"] == ["lessons"]
-        # both pinned: the full set cannot fit 32k, so local/subagent is skipped
+        keys = {c["key"] for c in oracle.states[-1]["candidates"]}
+        assert "local/subagent/0" not in keys and "local/agent/0" in keys
+        assert got is None or got.get("tier") != "subagent"
+        # both pinned: the same
         got = _route(SHORT, context_groups=ALL, pinned_groups=frozenset({"memory", "lessons"}))
         keys = {c["key"] for c in oracle.states[-1]["candidates"]}
         assert "local/subagent/0" not in keys and "local/agent/0" in keys

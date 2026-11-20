@@ -13,7 +13,7 @@ Instance fields written: ``_allowed_tools``, ``_capability_projection_gaps``,
 ``_loaded_capability_template``, ``_mcp_mount_opened_at``, ``_mcp_mount_servers``, ``_mcp_pruned``,
 ``_mcp_pruned_names``, ``_mcp_pruned_omitted``, ``_mcp_report_frame_floor``,
 ``_member_dispatch_mounted``, ``_member_stub_allowlist``, ``_pending_oauth_requests``,
-``_pi_mcp_handoff``, ``_session_agent_spec``, ``_session_harness_deny_rules``,
+``_pi_mcp_handoff``, ``_restricted_setting_sources``, ``_session_agent_spec``, ``_session_harness_deny_rules``,
 ``_session_mcp_cache``, ``_session_mcp_excludes_local``, ``_session_mcp_inline_settings``,
 ``_session_mcp_snapshot``, ``_session_mcp_unhonoured``, ``_session_mcp_withheld``,
 ``_spec_denied_tools``, ``_spec_shell_allowlist``, ``_spec_write_allowlist``, ``_spec_write_cwd``,
@@ -1680,8 +1680,17 @@ def _session_capability_mcp_servers(self: AcpClient) -> list[dict[str, Any]]:
     )
 
 
-def restrict_tools(self: AcpClient, allowed_tools: list[str]) -> None:
-    """Install a native tool whitelist before the Claude session starts."""
+def restrict_tools(
+    self: AcpClient,
+    allowed_tools: list[str],
+    setting_sources: list[str] | None = None,
+) -> None:
+    """Install a native tool whitelist before the Claude session starts.
+
+    *setting_sources*, when given, are the Claude Code setting tiers the
+    restricted session loads (``user``, ``project``, ``local``); ``None`` keeps
+    the adapter's default.
+    """
     if self._process is not None or self._session_id:
         raise RuntimeError("Tool restrictions must be set before provider startup")
     if self.backend == ACP_BACKEND_CLAUDE:
@@ -1690,7 +1699,15 @@ def restrict_tools(self: AcpClient, allowed_tools: list[str]) -> None:
             not isinstance(tool, str) or tool not in supported for tool in allowed_tools
         ):
             raise ValueError("Claude tool whitelist requires exact file/shell tool names")
+        if setting_sources is not None and (
+            not isinstance(setting_sources, list)
+            or any(s not in {"user", "project", "local"} for s in setting_sources)
+        ):
+            raise ValueError("Claude setting sources must be user, project or local")
         self._allowed_tools = tuple(allowed_tools)
+        self._restricted_setting_sources = (
+            tuple(setting_sources) if setting_sources is not None else None
+        )
         return
     raise NotImplementedError(
         f"Backend {self.backend!r} cannot enforce a tool whitelist before execution"
