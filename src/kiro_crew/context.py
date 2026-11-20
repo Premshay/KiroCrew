@@ -86,6 +86,7 @@ from kiro_crew.context_assembly import tool_names as _tool_names  # noqa: F401 -
 from kiro_crew.context_assembly import turn as _turn  # noqa: F401 - loaded eagerly
 from kiro_crew.context_assembly import turn_message as _turn_message  # noqa: F401 - loaded eagerly
 from kiro_crew.context_assembly.agent_spec import (  # noqa: F401
+    _load_seat_resources,
     _load_steering_resources,
     _read_include_crew_context,
     _read_prompt_file,

@@ -1480,7 +1480,10 @@ _EXPECTED_SCOPE_GUARD_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
 
 
 _EXPECTED_TEMPLATE_SPEC_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
-    "kiro_crew/context_assembly/agent_spec.py": [("agent_prompt", "context")],
+    "kiro_crew/context_assembly/agent_spec.py": [
+        ("agent_prompt", "context"),
+        ("seat_resources", "context"),
+    ],
     "kiro_crew/member_essential_context.py": [("member_essentials", "context")],
 }
 _EXPECTED_LINKED_TEMPLATE_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {

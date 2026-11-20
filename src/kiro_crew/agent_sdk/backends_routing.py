@@ -371,8 +371,10 @@ ACP_BACKENDS_CREW_ENFORCES_SPEC_TOOLS_SETTINGS: FrozenSet[str] = frozenset({ACP_
 #: global and project ``.kiro/steering`` trees kiro-cli adds to them
 #: (``context_assembly.inclusion.steering_resources_part``). Crew sends them at
 #: session start and again after a compaction, for the Kiro Crew default agent in a
-#: chat that is not a crew member's. Context assembly asks it by provider label
-#: (``agent_sdk.drivers.acp.crew_loads_spec_steering``).
+#: chat that is not a crew member's; a custom (non-member) agent on these harnesses
+#: gets only its own ABSOLUTE ``file://`` entries
+#: (``context_assembly.agent_spec._load_seat_resources``). Context assembly asks it
+#: by provider label (``agent_sdk.drivers.acp.crew_loads_spec_steering``).
 #:
 #: claude and codex are the members: each is handed no spec, and Crew's prompt text
 #: reaches each one. kiro-cli is NOT a member and must never become one: it reads
