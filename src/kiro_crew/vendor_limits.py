@@ -24,6 +24,11 @@ Sources
 - Antigravity: ``antigravity_quota.json`` under the data home, written by the
   Nexus companion: ``{as_of, models: {<id>: {remaining_fraction, reset_time}}}``.
 - Local: ``GET /fleet/status`` of the fleet router (a role's lane is up).
+- Quota outs: a run that HIT its vendor's quota marks the vendor (or, for
+  Antigravity, the model's quota group) out until its reset at once
+  (:func:`note_quota_out`, called by ``subagent_manager.quota_switch``), so no
+  new spawn waits for a probe or a tombstone scan to learn it. Kept in
+  ``vendor_limits.json`` under ``_outs``.
 
 Every reader here never raises: a missing or malformed source is "unknown".
 """
@@ -326,6 +331,127 @@ def _fleet_status() -> Any:
     except Exception:
         logger.debug("vendor_limits: fleet status unreachable", exc_info=True)
         return None
+
+
+OUTS_KEY = "_outs"
+
+
+def _antigravity_group_peers(model: str, path: Path | None = None) -> list[str]:
+    """Every model sharing *model*'s Antigravity quota group (the companion's probe file).
+
+    Quota is held per group, so one model out means its whole group is. A model
+    the file does not group stands alone.
+    """
+    try:
+        raw = json.loads((path or _data_home() / ANTIGRAVITY_QUOTA_NAME).read_text("utf-8"))
+        rows = raw.get("models") if isinstance(raw, dict) else None
+        if not isinstance(rows, dict):
+            return [model]
+        group = (rows.get(model) or {}).get("group") if isinstance(rows.get(model), dict) else None
+        if not isinstance(group, str) or not group:
+            return [model]
+        peers = [m for m, r in rows.items() if isinstance(r, dict) and r.get("group") == group]
+        return sorted(set(peers) | {model})
+    except Exception:
+        return [model]
+
+
+def note_quota_out(
+    vendor: str,
+    *,
+    until: float,
+    model: str = "",
+    detail: str = "",
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Mark *vendor* out until *until* (epoch s) after a run hit its quota. Never raises.
+
+    Antigravity's quota is per model group, so with a *model* only that group
+    is marked; every other vendor is out whole. Returns the mark written (``{}``
+    when nothing could be). A later mark extends, never shortens, an earlier one.
+    """
+    try:
+        now = float(time.time() if now is None else now)
+        until = float(until)
+        if not vendor or until <= now:
+            return {}
+        mark: dict[str, Any] = {
+            "until": until,
+            "as_of": now,
+            "model": model or "",
+            "detail": (detail or "")[:300],
+        }
+        per_model = vendor == "antigravity" and bool(model)
+        if per_model:
+            mark["models"] = _antigravity_group_peers(model)
+        with _lock:
+            store = _load()
+            outs = store.setdefault(OUTS_KEY, {})
+            key = "models" if per_model else "vendor"
+            row = outs.setdefault(vendor, {})
+            if per_model:
+                bucket = row.setdefault("models", {})
+                for m in mark["models"]:
+                    prev = bucket.get(m) or {}
+                    if float(prev.get("until") or 0) < until:
+                        bucket[m] = {k: v for k, v in mark.items() if k != "models"}
+            else:
+                prev = row.get(key) or {}
+                if float(prev.get("until") or 0) < until:
+                    row[key] = {k: v for k, v in mark.items() if k != "models"}
+            snapshot = json.loads(json.dumps(store))
+        _persist(snapshot)
+        return mark
+    except Exception:
+        logger.debug("vendor_limits: quota out not recorded", exc_info=True)
+        return {}
+
+
+def quota_out(vendor: str, model: str = "", now: float | None = None) -> dict[str, Any] | None:
+    """The live quota mark covering *vendor* (and *model*), or ``None``. Never raises."""
+    try:
+        now = time.time() if now is None else now
+        with _lock:
+            row = dict(_load().get(OUTS_KEY, {}).get(vendor) or {})
+        whole = row.get("vendor")
+        if isinstance(whole, dict) and float(whole.get("until") or 0) > now:
+            return dict(whole)
+        if model:
+            m = (row.get("models") or {}).get(model)
+            if isinstance(m, dict) and float(m.get("until") or 0) > now:
+                return {**m, "model": model}
+    except Exception:
+        logger.debug("vendor_limits: quota out unreadable", exc_info=True)
+    return None
+
+
+def quota_outs(now: float | None = None) -> dict[str, dict[str, Any]]:
+    """Live quota marks: ``{vendor: {"until": s, "models": {id: until}}}``; whole-vendor
+    marks carry ``until``, per-model ones only ``models``. Never raises."""
+    now = time.time() if now is None else now
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        with _lock:
+            raw = json.loads(json.dumps(_load().get(OUTS_KEY, {})))
+        for vendor, row in raw.items():
+            if not isinstance(row, dict):
+                continue
+            state: dict[str, Any] = {}
+            whole = row.get("vendor")
+            if isinstance(whole, dict) and float(whole.get("until") or 0) > now:
+                state["until"] = float(whole["until"])
+            models = {
+                m: float(r["until"])
+                for m, r in (row.get("models") or {}).items()
+                if isinstance(r, dict) and float(r.get("until") or 0) > now
+            }
+            if models:
+                state["models"] = models
+            if state:
+                out[vendor] = state
+    except Exception:
+        logger.debug("vendor_limits: quota outs unreadable", exc_info=True)
+    return out
 
 
 def is_low(state: Mapping[str, Any]) -> bool:

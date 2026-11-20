@@ -471,6 +471,17 @@ class SubagentInfo:
     # rather than a routed id the child session may have withheld.
     routed_model: str = ""
     routed_tier: str = ""
+    # Quota fall-through (``subagent_manager.quota_switch``, fork, operator
+    # ruling 2026-11-20). ``quota_routable``: the start named no model,
+    # backend, seat, crew or agent, so a quota hit may move it to another
+    # vendor (``None`` until the start decides; read as pinned). ``route_tier``:
+    # the tier ``spawn.route`` ran it at. ``quota_chain``: the vendors earlier
+    # runs of this task already ran out on. ``quota_origin_task``: the task as
+    # first briefed, so a second fall-through does not nest handoffs.
+    quota_routable: bool | None = None
+    route_tier: str = ""
+    quota_chain: tuple[str, ...] = ()
+    quota_origin_task: str = ""
     # Per-call reasoning-effort override (spawn_run ``reasoning_effort``).
     # Wins over the ``role_efforts['subagent']`` pin; ``""`` defers to it.
     # Like ``model``, a non-empty value forces the dedicated-process path.

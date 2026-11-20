@@ -757,6 +757,47 @@ def read_choice(
     return None, None, None
 
 
+def drop_quota_outs(
+    cands: Sequence[Mapping[str, str]],
+    outs: Mapping[str, Mapping[str, Any]],
+    exclude_vendors: Sequence[str] = (),
+) -> list[dict[str, str]]:
+    """*cands* minus every candidate a live quota mark covers, and every excluded vendor.
+
+    A quota mark is a run's own proof that the vendor (or, for Antigravity, the
+    model's group) refused work until its reset, so it is a hard filter, not a
+    hint for the oracle: an offered candidate that is known out would be
+    answered and fail again (quota fall-through, operator ruling 2026-11-20).
+    """
+    excluded = set(exclude_vendors)
+    kept: list[dict[str, str]] = []
+    for c in cands:
+        v = c.get("vendor", "")
+        if v in excluded:
+            continue
+        mark = outs.get(v) or {}
+        if mark.get("until"):
+            continue
+        if c.get("model", "") in (mark.get("models") or {}):
+            continue
+        kept.append(dict(c))
+    return kept
+
+
+def _apply_quota_outs(
+    health: dict[str, dict[str, Any]], outs: Mapping[str, Mapping[str, Any]]
+) -> None:
+    """A whole-vendor quota mark reads as ``out`` until its reset in *health*."""
+    for vendor, mark in outs.items():
+        until = mark.get("until")
+        if not until:
+            continue
+        state = health.setdefault(vendor, {"out": False, "until": None, "probe_after": None})
+        state["out"] = True
+        state["until"] = max(float(state.get("until") or 0), float(until))
+        state["source"] = "quota_hit"
+
+
 async def routed_spawn(
     brief: str,
     *,
@@ -765,6 +806,7 @@ async def routed_spawn(
     session_key: str | None = None,
     config: Any | None = None,
     cross_vendor: bool = True,
+    exclude_vendors: Sequence[str] = (),
 ) -> dict[str, Any] | None:
     """The model -- and, for another vendor, the backend -- a model-less spawn should run on.
 
@@ -786,12 +828,17 @@ async def routed_spawn(
         cands = await asyncio.to_thread(
             all_candidates, vendor, config, cross_vendor=cross_vendor, backends=backends
         )
+        from kiro_crew import vendor_limits as _vl
+
+        outs = await asyncio.to_thread(_vl.quota_outs)
+        cands = drop_quota_outs(cands, outs, exclude_vendors)
         if not cands:
             return None
         ag_models = [c["model"] for c in cands if c["vendor"] == "antigravity"]
         tombs = await asyncio.to_thread(cached_health)
         limits = await asyncio.to_thread(limit_health, ag_models)
         health = merged_health(tombs, limits)
+        _apply_quota_outs(health, outs)
         state = build_state(
             brief, agent=agent, vendor=vendor, parent_model=parent_model, cands=cands, health=health
         )
@@ -841,6 +888,104 @@ async def routed_spawn(
             v for v, st in health.items() if not st.get("out") and _is_low(st)
         ),
         "out": sorted(v for v, st in health.items() if st.get("out")),
+        "latency_ms": int((time.monotonic() - started) * 1000),
+    }
+
+
+#: The tier a fall-through prefers when the oracle gives no answer: the
+#: failed run's own, else ordinary bounded work.
+FALLBACK_TIER = "small"
+
+
+def fallback_choice(
+    cands: Sequence[Mapping[str, str]], tier: str = ""
+) -> dict[str, str] | None:
+    """A deterministic pick for a quota fall-through the oracle did not answer.
+
+    Another vendor first (the failed one is already excluded), at the failed
+    run's *tier* when offered, else :data:`FALLBACK_TIER`, else the first offered.
+    """
+    if not cands:
+        return None
+    for want in (tier, FALLBACK_TIER):
+        for c in cands:
+            if want and c.get("tier") == want:
+                return dict(c)
+    return dict(cands[0])
+
+
+async def reroute_after_quota(
+    brief: str,
+    *,
+    agent: str,
+    parent_model: str = "",
+    session_key: str | None = None,
+    exclude_vendors: Sequence[str],
+    tier: str = "",
+    config: Any | None = None,
+) -> dict[str, Any] | None:
+    """Where a routed run whose vendor ran out continues, or ``None`` when every vendor is out.
+
+    The oracle is asked first, with every vendor in *exclude_vendors* and every
+    quota-marked candidate removed. A fall-through must not depend on the
+    Decisions seam being sampled, so with no answer the pick is
+    :func:`fallback_choice` over the same filtered candidates. Never raises
+    except :class:`asyncio.CancelledError`.
+    """
+    routed = await routed_spawn(
+        brief,
+        agent=agent,
+        parent_model=parent_model,
+        session_key=session_key,
+        config=config,
+        cross_vendor=True,
+        exclude_vendors=exclude_vendors,
+    )
+    if routed and routed.get("vendor") not in set(exclude_vendors):
+        return routed
+    started = time.monotonic()
+    try:
+        from kiro_crew import vendor_limits as _vl
+
+        vendor = vendor_of_seat(agent, parent_model)
+        if not vendor:
+            return None
+        backends = await asyncio.to_thread(route_backends, vendor)
+        cands = await asyncio.to_thread(
+            all_candidates, vendor, config, cross_vendor=True, backends=backends
+        )
+        outs = await asyncio.to_thread(_vl.quota_outs)
+        cands = drop_quota_outs(cands, outs, exclude_vendors)
+        chosen = fallback_choice(cands, tier)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("spawn.route: no fall-through candidate", exc_info=True)
+        return None
+    if chosen is None:
+        return None
+    backend = chosen.get("backend") or ""
+    spec: Mapping[str, str] = {}
+    if backend:
+        key = f"local/{chosen['tier']}" if chosen["vendor"] == "local" else chosen["vendor"]
+        spec = backends.get(key) or {}
+        if spec.get("backend") != backend:
+            return None
+    return {
+        "route_id": uuid.uuid4().hex[:16],
+        "model": chosen["model"],
+        "tier": chosen["tier"],
+        "vendor": chosen["vendor"],
+        "backend": backend,
+        "runtime_agent": spec.get("runtime_agent", ""),
+        "native_backend": spec.get("native", ""),
+        "p": None,
+        "reason": "quota fall-through (deterministic)",
+        "vendor_out": False,
+        "vendor_until": None,
+        "limit": "",
+        "low": [],
+        "out": sorted(set(exclude_vendors) | {v for v, m in outs.items() if m.get("until")}),
         "latency_ms": int((time.monotonic() - started) * 1000),
     }
 
