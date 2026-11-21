@@ -19,11 +19,27 @@ def test_model_prefix_uses_most_specific_match():
     assert identify_vendor(specs, "worker-runner", "model-small") == "specific"
 
 
+@pytest.mark.parametrize("seat", ["crew-local-claude", "crew-codex-local"])
+def test_a_seat_with_two_vendor_segments_is_ambiguous(seat):
+    specs = tuple(VendorSpec(name, (name,)) for name in ("claude", "codex", "local"))
+
+    assert identify_vendor(specs, seat) == ""
+    assert identify_vendor(tuple(reversed(specs)), seat) == ""
+
+
+def test_a_partial_seat_segment_does_not_name_a_vendor():
+    specs = (VendorSpec("local", ("local",)), VendorSpec("claude", ("claude",)))
+
+    assert identify_vendor(specs, "crew.claude/localize") == "claude"
+    assert identify_vendor(specs, "crew-localize") == ""
+
+
 @pytest.mark.parametrize(
     "spec",
     [
         VendorSpec("same"),
         VendorSpec("bad id"),
+        VendorSpec("another", seat_tokens=("two-parts",)),
         VendorSpec("another", seat_tokens=("worker",)),
         VendorSpec("another", model_prefixes=("model-",)),
     ],

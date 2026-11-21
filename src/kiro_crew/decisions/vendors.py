@@ -9,7 +9,9 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 _IDENTIFIER = re.compile(r"[a-z][a-z0-9_-]*")
-_TOKEN = re.compile(r"[a-z0-9][a-z0-9_.:/-]*")
+_SEAT_TOKEN = re.compile(r"[a-z0-9]+")
+_SEAT_SEPARATOR = re.compile(r"[-_.:/]")
+_MODEL_PREFIX = re.compile(r"[a-z0-9][a-z0-9_.:/-]*")
 
 
 @dataclass(frozen=True)
@@ -43,11 +45,14 @@ def validate_vendors(specs: Iterable[VendorSpec]) -> tuple[VendorSpec, ...]:
             raise ValueError(f"Invalid or duplicate native backend {backend!r}")
         if backend:
             backends.add(backend)
-        for values, seen in ((spec.seat_tokens, seat_tokens), (spec.model_prefixes, prefixes)):
+        for values, seen, pattern in (
+            (spec.seat_tokens, seat_tokens, _SEAT_TOKEN),
+            (spec.model_prefixes, prefixes, _MODEL_PREFIX),
+        ):
             if not isinstance(values, tuple):
                 raise ValueError("Expected a tuple of routing tokens")
             for token in values:
-                if not isinstance(token, str) or not _TOKEN.fullmatch(token) or token in seen:
+                if not isinstance(token, str) or not pattern.fullmatch(token) or token in seen:
                     raise ValueError(f"Invalid or duplicate routing token {token!r}")
                 seen.add(token)
     return result
@@ -74,9 +79,10 @@ def identify_vendor(specs: tuple[VendorSpec, ...], seat: str, model: str = "") -
     for spec in specs:
         if seat and seat in (spec.id, spec.native_backend):
             return spec.id
-    for spec in specs:
-        if any(token in seat for token in spec.seat_tokens):
-            return spec.id
+    segments = set(_SEAT_SEPARATOR.split(seat))
+    matches = [spec.id for spec in specs if segments.intersection(spec.seat_tokens)]
+    if matches:
+        return matches[0] if len(matches) == 1 else ""
     model = model.lower()
     match = max(
         (

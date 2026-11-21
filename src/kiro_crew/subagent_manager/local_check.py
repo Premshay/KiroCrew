@@ -43,7 +43,15 @@ import shlex
 import subprocess
 import threading
 from collections import OrderedDict
+from contextlib import suppress
 from typing import Any
+
+from kiro_crew.sandbox import (
+    configured_sandbox_mode,
+    sandboxed_spawn_argv,
+    wrapped_by_crew_sandbox,
+)
+from kiro_crew.sandbox_rlimit import run_limited
 
 logger = logging.getLogger(__name__)
 
@@ -553,17 +561,29 @@ def check_for(info: Any) -> str:
 
 
 def run_check(cmd: str, cwd: str, timeout: float = CHECK_TIMEOUT_S) -> tuple[bool, str]:
-    """(passed, output tail). A timeout or a spawn failure is a fail. Never raises."""
+    """Run a check through the worker's OS sandbox at the configured tier."""
     if _UNSAFE.search(cmd):
         return False, "check contains unsupported shell syntax"
+    cleanup = None
     try:
         argv = shlex.split(cmd)
         if not argv:
             return False, "check command is empty"
-        p = subprocess.run(
+        env = {name: os.environ[name] for name in ("PATH", "HOME", "LANG") if name in os.environ}
+        argv, env, cleanup = sandboxed_spawn_argv(
+            argv,
+            mode=configured_sandbox_mode(),
+            env=env,
+            strip_python_env=True,
+            is_kiro_cli=False,
+        )
+        if not wrapped_by_crew_sandbox(argv):
+            return False, "check could not run: a Kiro Crew sandbox is required"
+        p = run_limited(
             argv,
             cwd=cwd or None,
-            env={name: os.environ[name] for name in ("PATH", "HOME", "LANG") if name in os.environ},
+            env=env,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -572,8 +592,12 @@ def run_check(cmd: str, cwd: str, timeout: float = CHECK_TIMEOUT_S) -> tuple[boo
     except subprocess.TimeoutExpired as exc:
         out = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
         return False, f"{out[-CHECK_OUTPUT_TAIL_CHARS:]}\n(check timed out after {timeout:.0f}s)"
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         return False, f"check could not run: {exc}"
+    finally:
+        if cleanup is not None:
+            with suppress(OSError):
+                os.unlink(cleanup)
     out = (p.stdout or "") + (p.stderr or "")
     tail = out[-CHECK_OUTPUT_TAIL_CHARS:]
     return p.returncode == 0, f"{tail}\n(exit {p.returncode})".strip()
