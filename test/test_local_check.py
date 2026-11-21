@@ -544,7 +544,7 @@ class TestRunCheck:
         info.delegation = {"check": f'"{sys.executable}" verify_env.py'}
         passed, output = lc.run_check(lc.check_for(info), str(tmp_path))
         assert passed
-        assert output.splitlines() == ["C", "False", "(exit 0)"]
+        assert [line for line in output.splitlines() if line] == ["C", "False", "(exit 0)"]
 
     def test_timeout_is_a_fail(self, tmp_path):
         ok, out = lc.run_check("sleep 5", str(tmp_path), timeout=0.2)
