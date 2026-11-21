@@ -760,7 +760,7 @@ class TestAHarnessChangeReloadsTheLiveChat:
         status, data = await self._put(chat.app, {"acp_backend": "claude", "model": ""})
 
         assert status == 200, data
-        assert KiroCrewConfig.load().agents["atlas"].acp_backend == "claude"
+        assert KiroCrewConfig.load().agents[chat.slot.agent].acp_backend == "claude"
         assert chat.slot.runtime_agent == "crew-codex"
         assert chat.slot.messages[: len(before)] == before
         notice = "\n".join(message["content"] for message in chat.slot.messages[len(before) :])

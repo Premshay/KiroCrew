@@ -176,6 +176,11 @@ def _cfg(
     )
 
 
+def _member_alias(cfg: SimpleNamespace) -> str:
+    (alias,) = cfg.agents
+    return alias
+
+
 @pytest.fixture
 def declared(_floor_monkeypatch):
     """Whether config.json holds ``agent.member_acp_backend``; False by default."""
@@ -456,8 +461,8 @@ class TestWorkerSpecPolicy:
         limits["value"] = ("tool limits",)
         cfg = _cfg("claude", "claude", inherited=True)
         assert crewmate_backend_pin(cfg, DM_KEY) is None
-        assert pinned_backend(cfg, "atlas", "claude") == "claude"
-        assert crewmate_worker_backend(cfg, "atlas") == "claude"
+        assert pinned_backend(cfg, _member_alias(cfg), "claude") == "claude"
+        assert crewmate_worker_backend(cfg, _member_alias(cfg)) == "claude"
 
     def test_the_gate_keeps_the_inherited_harness(self, limits):
         from kiro_crew.crewmate_harness import crewmate_backend_pin
@@ -512,8 +517,8 @@ class TestWorkerSpecPolicy:
         limits["value"] = ("tool limits",)
         cfg = _cfg("claude", "claude", inherited=True)
         with caplog.at_level(logging.WARNING, logger=crewmate_harness.logger.name):
-            assert not crewmate_harness.inherited_falls_back(cfg, "atlas")
-            assert not crewmate_harness.inherited_falls_back(cfg, "atlas")
+            assert not crewmate_harness.inherited_falls_back(cfg, _member_alias(cfg))
+            assert not crewmate_harness.inherited_falls_back(cfg, _member_alias(cfg))
         assert not [r for r in caplog.records if "for its workers" in r.getMessage()]
 
     @pytest.mark.parametrize("fields", [("hooks",), ("permissions",), ("toolsSettings",)])
@@ -523,7 +528,7 @@ class TestWorkerSpecPolicy:
         limits["value"] = fields
         cfg = _cfg("claude", "claude", inherited=True)
         assert crewmate_backend_pin(cfg, DM_KEY) is None
-        assert pinned_backend(cfg, "atlas", "claude") == "claude"
+        assert pinned_backend(cfg, _member_alias(cfg), "claude") == "claude"
 
     def test_a_readout_of_a_pinned_mate_logs_nothing(self, limits, declared, caplog):
         from kiro_crew import crewmate_harness
@@ -574,11 +579,11 @@ class TestWorkerSpecPolicy:
         limits["revision"] = ("r", 1)
         limits["value"] = ("tool limits",)
         cfg = _cfg("claude", "claude", inherited=True)
-        assert crewmate_harness.worker_spec_kas_fields(cfg, "atlas") == ("tool limits",)
-        assert crewmate_harness.worker_spec_kas_fields(cfg, "atlas") == ("tool limits",)
+        assert crewmate_harness.worker_spec_kas_fields(cfg, _member_alias(cfg)) == ("tool limits",)
+        assert crewmate_harness.worker_spec_kas_fields(cfg, _member_alias(cfg)) == ("tool limits",)
         assert limits["reads"] == 1
         limits["revision"], limits["value"] = ("r", 2), ()
-        assert crewmate_harness.worker_spec_kas_fields(cfg, "atlas") == ()
+        assert crewmate_harness.worker_spec_kas_fields(cfg, _member_alias(cfg)) == ()
         assert limits["reads"] == 2
 
     def test_the_readout_names_the_mates_real_harness(self, limits, declared):
@@ -598,7 +603,7 @@ class TestWorkerSpecPolicy:
         )
         pinned = _cfg("claude", "claude", pin="claude", inherited=True)
         assert crewmate_harness_source(pinned, "atlas").source == SOURCE_PIN
-        assert crewmate_inherited_source(pinned, "atlas").source == SOURCE_SETTINGS
+        assert crewmate_inherited_source(pinned, _member_alias(pinned)).source == SOURCE_SETTINGS
 
     def test_the_model_is_judged_on_the_selected_harness(self, limits):
         from kiro_crew.dashboard.handlers.agents import _pin_entitlement_backend
@@ -606,8 +611,8 @@ class TestWorkerSpecPolicy:
         cfg = _cfg("claude", "claude", inherited=True)
         assert _pin_entitlement_backend(cfg, "atlas") == "claude"
         limits["value"], limits["revision"] = ("tool limits",), ("r", 1)
-        assert _pin_entitlement_backend(cfg, "atlas") == "claude"
-        assert _pin_entitlement_backend(cfg, "atlas", for_workers=True) == "claude"
+        assert _pin_entitlement_backend(cfg, _member_alias(cfg)) == "claude"
+        assert _pin_entitlement_backend(cfg, _member_alias(cfg), for_workers=True) == "claude"
 
 
 class TestModelSpelling:
@@ -760,7 +765,7 @@ class TestChatToolLimits:
         limits["chat"] = ("github/search",)
         cfg = _cfg("codex", "codex", inherited=True)
         assert crewmate_backend_pin(cfg, DM_KEY) is None
-        assert pinned_backend(cfg, "atlas", "codex") == "codex"
+        assert pinned_backend(cfg, _member_alias(cfg), "codex") == "codex"
 
     def test_the_real_check_skips_a_harness_that_carries_chat_limits(self, _floor_monkeypatch):
         from kiro_crew import crewmate_harness
@@ -860,7 +865,7 @@ class TestColdStartRefresh:
         limits["value"], limits["revision"] = ("hooks",), ("r", 9)
         asyncio.run(crewmate_harness.refresh_session_verdict(DM_KEY))
         assert crewmate_harness.crewmate_backend_pin(cfg, DM_KEY) is None
-        assert crewmate_harness.pinned_backend(cfg, "atlas", "claude") == "claude"
+        assert crewmate_harness.pinned_backend(cfg, _member_alias(cfg), "claude") == "claude"
 
     def test_a_plain_bot_cold_start_sends_one_moved_note(
         self, limits, declared, _floor_monkeypatch
@@ -911,7 +916,7 @@ class TestColdStartRefresh:
         )
         assert asyncio.run(crewmate_harness.refresh_session_verdict(DM_KEY)) is None
         assert crewmate_harness.crewmate_backend_pin(cfg, DM_KEY) is None
-        assert crewmate_harness.pinned_backend(cfg, "atlas", "claude") == "claude"
+        assert crewmate_harness.pinned_backend(cfg, _member_alias(cfg), "claude") == "claude"
 
     def test_the_factory_seam_awaits_the_refresh(self):
         import inspect
@@ -940,7 +945,7 @@ class TestChatOnlyPin:
         cfg = _cfg("claude", "claude", pin=pinned, inherited=True)
         pin = crewmate_backend_pin(cfg, DM_KEY)
         assert pin is not None and pin.backend == pinned and not pin.harness_fallback
-        assert pinned_backend(cfg, "atlas", "claude") == pinned
+        assert pinned_backend(cfg, _member_alias(cfg), "claude") == pinned
 
     @pytest.mark.parametrize("pinned", ["claude", "codex", "kas", "pi"])
     def test_a_pin_bots_can_run_on_is_kept(self, pinned):
@@ -967,7 +972,7 @@ class TestChatOnlyPin:
         from kiro_crew.crewmate_harness import SOURCE_PIN, crewmate_harness_source
 
         cfg = _cfg("claude", "claude", pin="goose", inherited=True)
-        got = crewmate_harness_source(cfg, "atlas")
+        got = crewmate_harness_source(cfg, _member_alias(cfg))
         assert (got.harness, got.source) == ("goose", SOURCE_PIN)
 
     def test_kept_pins_do_not_ring_a_fallback(self, declared):
@@ -1069,11 +1074,11 @@ class TestModelSaveRefresh:
         )
         limits["value"], limits["revision"] = ("hooks",), ("r", 1)
         crewmate_harness.refresh_worker_spec_verdicts(cfg)
-        assert agents._pin_entitlement_backend(cfg, "atlas") == "claude"
+        assert agents._pin_entitlement_backend(cfg, _member_alias(cfg)) == "claude"
         limits["value"], limits["revision"] = (), ("r", 2)
         asyncio.run(crewmate_harness.refresh_crew_verdict("atlas"))
-        assert agents._pin_entitlement_backend(cfg, "atlas") == "claude"
-        assert crewmate_harness.worker_spec_kas_fields(cfg, "atlas") == ()
+        assert agents._pin_entitlement_backend(cfg, _member_alias(cfg)) == "claude"
+        assert crewmate_harness.worker_spec_kas_fields(cfg, _member_alias(cfg)) == ()
 
     def test_the_update_handler_awaits_the_refresh(self):
         import inspect

@@ -138,10 +138,10 @@ class TestVendorOfSeat:
     @pytest.mark.parametrize(
         "agent,model,expected",
         [
-            ("crew-codex-atlas", "", "codex"),
+            ("crew-codex-example", "", "codex"),
             ("crew-claude", "", "claude"),
             ("crew-deepseek-pro", "", "deepseek"),
-            ("crew-local-atlas", "", "local"),
+            ("crew-local-example", "", "local"),
             ("", "claude-fable-5-1[1m]", "claude"),
             ("", "gpt-5.6-sol", "codex"),
             ("", "deepseek-3.2", "deepseek"),

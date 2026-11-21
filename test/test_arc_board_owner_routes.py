@@ -859,7 +859,7 @@ async def test_a_refused_nudge_is_reported_not_raised(client: TestClient, monkey
 
 @pytest.mark.asyncio
 async def test_settings_set_repo_and_coordinator(client: TestClient) -> None:
-    arc = await _make_arc(client, members=[{"session_key": MEMBER, "role": "Baton"}])
+    arc = await _make_arc(client, members=[{"session_key": MEMBER, "role": "Coordinator"}])
     url = f"/api/arc-board/arcs/{arc['id']}/settings"
     body = await (await client.post(url, json={"repo": "o/r", "coordinator": MEMBER})).json()
     assert (body["arc"]["repo"], body["arc"]["coordinator"]) == ("o/r", MEMBER)

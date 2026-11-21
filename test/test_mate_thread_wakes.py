@@ -579,7 +579,7 @@ async def test_milestones_holds_a_plain_turn_end_without_a_wake(dispatched, repo
     await _settle(state)
 
     assert dispatched == []
-    held = state._mate_wakes["member-atlas"]["chat-worker-1"]
+    held = state._mate_wakes[mate.key]["chat-worker-1"]
     assert held["turns"] == 2 and held["reply"] == "read half of them"
 
 
@@ -698,7 +698,7 @@ async def test_off_never_wakes_the_crewmate(dispatched, reports_mode):
     await _settle(state)
 
     assert dispatched == []
-    assert not getattr(state, "_mate_wakes", {}).get("member-atlas")
+    assert not getattr(state, "_mate_wakes", {}).get(mate.key)
 
 
 def test_an_unreadable_config_reads_as_every_turn(monkeypatch):

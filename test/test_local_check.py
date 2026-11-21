@@ -123,12 +123,12 @@ class TestEstimateInputs:
     def test_local_health_reads_ctx_per_role_and_cpu_busy(self):
         status = {
             "lanes": {
-                "nexus-swap": {"available": True, "live_ctx": {"qwen-fast": 32768}},
-                "noda-swap": {"available": False, "live_ctx": {"qwen38-mtp": 131072}},
+                "cpu-lane": {"available": True, "live_ctx": {"fast-model": 32768}},
+                "gpu-lane": {"available": False, "live_ctx": {"large-model": 131072}},
             },
             "roles": {
-                "subagent": {"lane": "nexus-swap", "model": "qwen-fast"},
-                "agent": {"lane": "noda-swap", "model": "qwen38-mtp"},
+                "subagent": {"lane": "cpu-lane", "model": "fast-model"},
+                "agent": {"lane": "gpu-lane", "model": "large-model"},
             },
             "host": {"cpu_busy": 0.42},
         }
@@ -142,8 +142,8 @@ class TestEstimateInputs:
 
     def test_cpu_busy_absent_is_tolerated(self):
         status = {
-            "lanes": {"nexus-swap": {"available": True}},
-            "roles": {"subagent": {"lane": "nexus-swap", "model": "qwen-fast"}},
+            "lanes": {"cpu-lane": {"available": True}},
+            "roles": {"subagent": {"lane": "cpu-lane", "model": "fast-model"}},
         }
         h = vl.local_health(status)
         assert "cpu_busy" not in h and "ctx" not in h
@@ -454,7 +454,7 @@ class TestUnusable:
         "error",
         [
             "context_window_exceeded: request (40000 tokens) exceeds the available context size",
-            "lane_busy: nexus-swap has an active request",
+            "lane_busy: cpu-lane has an active request",
             "Reaped after 900s (exceeded 900s deadline)",
             "RuntimeError: adapter crashed",
         ],

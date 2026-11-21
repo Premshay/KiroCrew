@@ -421,7 +421,7 @@ async def _run_inner_impl(
         extra_kwargs["bare"] = True
     if info.allowed_tools:
         extra_kwargs["allowed_tools"] = info.allowed_tools
-    # Fork (Nexus): a run on the CPU lane of the local fleet takes the lean helper
+    # A run on the CPU lane of the local fleet takes the lean helper
     # profile (``local_check.LEAN_CONTRACT_ROLES``): the short contract, the
     # coding tools alone, and its context trimmed to the role's first-turn token
     # target. A dedicated process only: a shared runtime's session is not this

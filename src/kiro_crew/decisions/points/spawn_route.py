@@ -79,7 +79,7 @@ _MONTHS = {m: i for i, m in enumerate("Jan Feb Mar Apr May Jun Jul Aug Sep Oct N
 
 
 def _vendor_of_name(agent: str, model: str = "") -> str:
-    """The vendor a seat or backend name (``crew-codex-atlas``) or, failing that, a model id names."""
+    """Resolve a vendor from the seat or backend name, then the model ID."""
     specs = routing_vendors()
     if specs is not None:
         return identify_vendor(specs, agent or "", model or "")
@@ -100,7 +100,7 @@ def _vendor_of_name(agent: str, model: str = "") -> str:
 
 
 def vendor_of_seat(agent: str, model: str = "") -> str:
-    """The vendor a seat name (``crew-codex-atlas``) or, failing that, a model id names; ``""`` unknown."""
+    """Resolve a seat vendor, returning an empty string when unknown."""
     return _vendor_of_name(agent, model) or _vendor_of_runtime_policy(agent)
 
 

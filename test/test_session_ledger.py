@@ -550,9 +550,9 @@ async def test_route_record_marks_a_reporting_workers_milestone(_open_route, mon
     routes = _open_route
     _unit(slot=sl.ledger_key("chat-r-1"))
     monkeypatch.setattr(wakes, "worker_reports_mode", lambda: "milestones")
-    worker = SimpleNamespace(key="chat-r-1", _created_by="member-atlas", _lineage_minted=True)
+    worker = SimpleNamespace(key="chat-r-1", _created_by="member-example", _lineage_minted=True)
     thread = SimpleNamespace(
-        key="member-atlas", mode=wakes.members_mod.DM_SLOT_MODE, agent="atlas", executor=""
+        key="member-example", mode=wakes.members_mod.DM_SLOT_MODE, agent="example", executor=""
     )
     req = _mk_request(
         "POST",

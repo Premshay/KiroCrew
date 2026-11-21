@@ -75,7 +75,7 @@ You (the Chairman) pick the concrete seats; bias by the task:
   `crew-codex`, `crew-antigravity`) + a strong-synthesizer chairman.
 - **High-fan-out / low-stakes / simple `vote`** → the flash seats (`crew-deepseek`,
   `crew-local`), still spread across vendors.
-- **Code review (`adversarial` on code)** → the `-atlas` / `-harness` variants of the
+- **Code review (`adversarial` on code)** → the project-specific variants of the
   seats carry project steering; include one strong general reasoner.
 - **Unsure** → one seat per vendor across 3–4 vendors.
 

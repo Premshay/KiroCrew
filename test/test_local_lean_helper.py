@@ -1,7 +1,7 @@
-"""The lean helper profile for runs on the CPU lane of the local fleet (fork, Nexus).
+"""The lean helper profile for runs on the CPU lane of the local fleet.
 
 Measured 2026-11-20: a helper spawned on ``local-background`` sent a 24,532-token
-first turn to qwen-fast (Claude Code harness 15,153; Kiro Crew block 9,379, of
+first turn to a local model (Claude Code harness 15,153; Kiro Crew block 9,379, of
 which the shipped contract was 7,152) and was reaped at 300 s before its first
 output. The lean profile sends the short contract, the four coding tools and a
 context trimmed to a first-turn TOKEN TARGET, not to the window: raising the

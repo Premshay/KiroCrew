@@ -56,7 +56,7 @@ async def _configured_backend_for_slot(
     """
     if config is None:
         config = await asyncio.to_thread(KiroCrewConfig.load)
-    # MERGE-REVIEW: Nexus seats can share a harness but select different
+    # Companion seats can share a harness but select different
     # engines. Resolve an explicit seat before the generic harness choice.
     if slot.runtime_agent:
         from kiro_crew.platform.context import current_context

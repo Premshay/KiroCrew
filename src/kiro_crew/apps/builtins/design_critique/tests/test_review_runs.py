@@ -56,8 +56,8 @@ def test_project_context_keeps_repository_and_supporting_paths(tmp_path, monkeyp
 
     context = routes._create_context(
         {
-            "name": "Atlas",
-            "repository": "/work/atlas",
+            "name": "Example",
+            "repository": "/work/example",
             "context_paths": ["AGENTS.md", "docs/design-system.md"],
             "notes": "Keep the outcome model visible to operators.",
         }
@@ -65,7 +65,7 @@ def test_project_context_keeps_repository_and_supporting_paths(tmp_path, monkeyp
     updated = routes._update_context(context["id"], {"notes": "Review any workflow."})
 
     assert updated is not None
-    assert updated["repository"] == "/work/atlas"
+    assert updated["repository"] == "/work/example"
     assert updated["context_paths"] == ["AGENTS.md", "docs/design-system.md"]
     assert updated["notes"] == "Review any workflow."
     assert routes._delete_context(context["id"])
@@ -81,12 +81,12 @@ def test_design_round_compiles_grounded_prompt_and_harvest_evidence(tmp_path, mo
         {
             "mode": "generate-prototype",
             "intent": "ground",
-            "project_name": "Atlas",
-            "repository": "/work/atlas",
+            "project_name": "Example",
+            "repository": "/work/example",
             "context_paths": "docs/design-system.md\nwebsite/src/Queue.tsx",
             "notes": "Keep outcome states explicit.",
             "target": "The operator review queue and its state transitions.",
-            "claude_design_url": "https://claude.ai/design/p/atlas-project",
+            "claude_design_url": "https://claude.ai/design/p/example-project",
             "handoff_path": "docs/design/handoffs/review-queue",
             "review_run_id": "review-1",
             "report": {

@@ -219,7 +219,7 @@ def steering_resources_part(
     A member chat (*essentials* non-empty) carries its steering
     inside the essentials envelope, and the ``project`` context group decides
     whether steering is in scope at all. A custom (non-default, non-member) agent
-    -- a seat such as ``crew-claude-atlas`` -- gets only its spec's own ABSOLUTE
+    -- a seat such as ``crew-claude-example`` -- gets only its spec's own ABSOLUTE
     ``file://`` documents (:func:`kiro_crew.context._load_seat_resources`): its
     relative entries and the default trees stay out, as before.
     *project* is the session's project: relative entries anchor there, as

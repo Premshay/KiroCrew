@@ -945,7 +945,7 @@ class TestAttachedSessionWake:
         message = ChannelMessage(
             id="interrupt4",
             from_id="peer",
-            from_role="Baton",
+            from_role="Coordinator",
             mention=["codex"],
             msg_type="mention",
             delivery="interrupt",
@@ -962,7 +962,7 @@ class TestAttachedSessionWake:
         # The notice sits after the envelope, so the dashboard still parses the card.
         end_marker = "[End KiroCrew Channel message]"  # brand-ok: legacy channel envelope
         notice = queued[queued.index(end_marker) :]
-        assert "stopped by this channel message from Baton (channel deadbeef)" in notice
+        assert "stopped by this channel message from Coordinator (channel deadbeef)" in notice
         assert "not by the user" in notice
 
     @pytest.mark.asyncio
@@ -977,7 +977,7 @@ class TestAttachedSessionWake:
         message = ChannelMessage(
             id="interrupt5",
             from_id="peer",
-            from_role="Baton",
+            from_role="Coordinator",
             mention=["codex"],
             msg_type="mention",
             delivery="interrupt",
@@ -1007,7 +1007,7 @@ class TestAttachedSessionWake:
         message = ChannelMessage(
             id="request03",
             from_id="peer",
-            from_role="Baton",
+            from_role="Coordinator",
             mention=["codex"],
             msg_type="mention",
             content="When you are done, rebase.",
@@ -1036,7 +1036,7 @@ class TestAttachedSessionWake:
         message = ChannelMessage(
             id="interrupt6",
             from_id="peer",
-            from_role="Baton",
+            from_role="Coordinator",
             mention=["codex"],
             msg_type="mention",
             delivery="interrupt",
@@ -1199,7 +1199,7 @@ class TestAttachedSessionWake:
 
 class TestStatusToolNamesTheCaller:
     def test_status_text_includes_self_and_coordinator(self, monkeypatch) -> None:
-        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:baton")
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:coordinator")
         monkeypatch.setattr(
             mcp_core,
             "_post",
@@ -1210,7 +1210,7 @@ class TestStatusToolNamesTheCaller:
                         {
                             "id": "deadbeef",
                             "topic": "Import",
-                            "self": {"id": "2241fef0", "role": "Baton"},
+                            "self": {"id": "2241fef0", "role": "Coordinator"},
                             "coordinator": True,
                             "peers": [],
                             "capacity": {"used": 1, "max": 10},
@@ -1222,5 +1222,5 @@ class TestStatusToolNamesTheCaller:
 
         text = mcp_core._call_tool_inner("session_channel_status", {})
 
-        assert "You: Baton (2241fef0), coordinator." in text
+        assert "You: Coordinator (2241fef0), coordinator." in text
         assert "Peers: none." in text

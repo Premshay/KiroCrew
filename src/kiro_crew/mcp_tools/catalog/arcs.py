@@ -12,7 +12,7 @@ _ENTRY_RULES = (
     "Kinds: CLAIM, FACT, FAIL, ASK, DONE. "
     "text is at most 100 characters (FACT and DONE at most 300); put long evidence in link. "
     "CLAIM needs step and checked (the decision records and components you read). "
-    "ASK needs to: a member key, a member's role (e.g. Baton), coordinator, or owner. "
+    "ASK needs to: a member key, a member's role, coordinator, or owner. "
     "DONE needs link; set completes_milestone true on the DONE that finishes the current "
     "milestone's criteria, which asks the owner to sign it off. "
     "reply_to closes your CLAIM or answers an ASK; the short id from the brief "

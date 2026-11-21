@@ -18,7 +18,7 @@ def arc(tmp_path, monkeypatch):
         {"title": "Pilot", "repo": "o/r", "milestones": [{"name": "M1"}]},
         members=[
             {"session_key": MEMBER, "role": "Tenon"},
-            {"session_key": COORDINATOR, "role": "Baton"},
+            {"session_key": COORDINATOR, "role": "Coordinator"},
             {"session_key": PEER, "role": "Review"},
         ],
     )

@@ -429,10 +429,10 @@ class TestCronTabWorkspace:
     async def test_new_tab_takes_the_agent_workspace(self, monkeypatch):
         import kiro_crew.dashboard.cron_inject as ci
 
-        monkeypatch.setattr(ci, "cron_job_workspace", lambda job: "atlomy-atlas")
+        monkeypatch.setattr(ci, "cron_job_workspace", lambda job: "example-project")
         state = _make_state()
         await ensure_cron_slot(state, _make_job())
-        assert state.get_slot("cron-job42").workspace == "atlomy-atlas"
+        assert state.get_slot("cron-job42").workspace == "example-project"
 
     @pytest.mark.asyncio
     async def test_existing_linked_tab_is_corrected(self, monkeypatch):
@@ -444,9 +444,9 @@ class TestCronTabWorkspace:
         slot = state.get_slot("cron-job42")
         assert slot.workspace == "default" and slot.linked_session_key
 
-        monkeypatch.setattr(ci, "cron_job_workspace", lambda job: "atlomy-atlas")
+        monkeypatch.setattr(ci, "cron_job_workspace", lambda job: "example-project")
         await ensure_cron_slot(state, _make_job())
-        assert slot.workspace == "atlomy-atlas"
+        assert slot.workspace == "example-project"
 
     @pytest.mark.asyncio
     async def test_unresolved_agent_leaves_the_workspace_alone(self, monkeypatch):
@@ -474,16 +474,16 @@ class TestCronTabWorkspace:
         import kiro_crew.config.loader as loader
         from kiro_crew.dashboard.cron_inject import cron_job_workspace
 
-        cfg = SimpleNamespace(workspaces={"atlomy-atlas": SimpleNamespace(dir="/w/atlas")})
+        cfg = SimpleNamespace(workspaces={"example-project": SimpleNamespace(dir="/w/example")})
         monkeypatch.setattr(loader.KiroCrewConfig, "load", staticmethod(lambda: cfg))
         monkeypatch.setattr(
             loader,
             "resolve_agent_bindings",
             lambda c, agent, **kw: SimpleNamespace(
-                workspace_dir=Path("/w/atlas"), requested_resolved=agent == "conductor-atlas"
+                workspace_dir=Path("/w/example"), requested_resolved=agent == "conductor-example"
             ),
         )
-        job = SimpleNamespace(id="j", member_id="", agent_id="conductor-atlas")
-        assert cron_job_workspace(job) == "atlomy-atlas"
+        job = SimpleNamespace(id="j", member_id="", agent_id="conductor-example")
+        assert cron_job_workspace(job) == "example-project"
         assert cron_job_workspace(SimpleNamespace(id="j", member_id="", agent_id="nope")) == ""
         assert cron_job_workspace(SimpleNamespace(id="j", member_id="", agent_id="")) == ""

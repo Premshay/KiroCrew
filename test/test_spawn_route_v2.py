@@ -14,7 +14,7 @@ from kiro_crew.decisions import log as log_mod
 from kiro_crew.decisions.points import spawn_route as sr
 from kiro_crew.decisions.types import Answer
 
-#: ``agy models`` on Nexus, 2026-11-20 (ids only).
+#: ``agy models`` sample (IDs only).
 AGY_IDS = [
     "gemini-4-neon-high",
     "gemini-4-neon-xhigh",
@@ -255,13 +255,48 @@ class TestOtherVendors:
 
     def test_local_lanes_from_fleet_status(self):
         status = {
-            "lanes": {"nexus-swap": {"available": True}, "noda-swap": {"available": False}},
-            "roles": {"subagent": {"lane": "nexus-swap"}, "agent": {"lane": "noda-swap"}},
+            "lanes": {"cpu-lane": {"available": True}, "gpu-lane": {"available": False}},
+            "roles": {"subagent": {"lane": "cpu-lane"}, "agent": {"lane": "gpu-lane"}},
         }
         h = vl.local_health(status)
         assert h["lanes"] == {"subagent": True, "agent": False} and h["out"] is False
         assert h["source"] == "fleet_status"
         assert vl.local_health({"nothing": 1}) == {}
+
+    @pytest.mark.parametrize("override", [None, "http://127.0.0.1:8081/fleet/status"])
+    def test_local_health_uses_the_configured_status_url(self, monkeypatch, override):
+        from unittest.mock import Mock, mock_open
+
+        from kiro_crew.platform import context
+
+        companion_url = "http://127.0.0.1:8080/fleet/status"
+        registry = SimpleNamespace(fleet_status_url=lambda: companion_url)
+        monkeypatch.setattr(context, "current_context", lambda: SimpleNamespace(providers=registry))
+        monkeypatch.delenv("KIROCREW_FLEET_STATUS_URL", raising=False)
+        if override:
+            monkeypatch.setenv("KIROCREW_FLEET_STATUS_URL", override)
+        status = {"lanes": {"cpu": {"available": True}}, "roles": {"subagent": {"lane": "cpu"}}}
+        opener = Mock(return_value=mock_open(read_data=json.dumps(status))())
+        monkeypatch.setattr("urllib.request.urlopen", opener)
+
+        assert vl.local_health()["lanes"]["subagent"]
+        opener.assert_called_once_with(override or companion_url, timeout=vl.FLEET_TIMEOUT_S)
+
+    def test_local_health_has_no_builtin_endpoint(self, monkeypatch):
+        from unittest.mock import Mock
+
+        from kiro_crew.platform import context
+        from kiro_crew.platform.defaults import DefaultProviderRegistry
+
+        monkeypatch.setattr(
+            context, "current_context", lambda: SimpleNamespace(providers=DefaultProviderRegistry())
+        )
+        monkeypatch.delenv("KIROCREW_FLEET_STATUS_URL", raising=False)
+        opener = Mock()
+        monkeypatch.setattr("urllib.request.urlopen", opener)
+
+        assert vl.local_health() == {}
+        opener.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -532,7 +567,7 @@ class TestRoutedAcrossVendors:
         got = asyncio.run(
             sr.routed_spawn(
                 "READ-ONLY: trace callers.",
-                agent="crew-claude-atlas",
+                agent="crew-claude-example",
                 parent_model="claude-opus-5",
                 session_key="s1",
             )
@@ -642,51 +677,35 @@ class TestApply:
         assert sr.pins_vendor(self._info()) is False
 
 
-class TestNexusCompanionSeats:
-    """The Nexus companion's declared seats resolve to a backend per vendor and local role.
-
-    Runs only where ``kirocrew_nexus_companion`` is importable (Nexus, with
-    ``PYTHONPATH`` at the companion's ``src``): it is the companion contract the
-    resolver above was written against, not something upstream ships.
-    """
-
-    ENGINES = {
-        "engines": {
-            "claude-max": {"env": {}},
-            "codex-sub": {"env": {"ACP_ENGINE": "codex", "CODEX_HOME": "/codex"}},
-            "local-fleet": {
-                "env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8484", "ANTHROPIC_MODEL": "agent"}
-            },
-            "local-background": {
-                "env": {
-                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8484",
-                    "ANTHROPIC_MODEL": "subagent",
-                }
-            },
-            "deepseek-flash": {"env": {"ACP_ENGINE": "deepseek"}},
-        },
-        "agents": {
-            "crew-claude": "claude-max",
-            "crew-codex": "codex-sub",
-            "crew-local": "local-fleet",
-            "kirocrew-heartbeat": "local-background",
-            "crew-deepseek": "deepseek-flash",
-        },
-    }
+class TestCompanionSeats:
+    """Exercise seat routing with the same generic records any companion can supply."""
 
     @pytest.fixture
-    def companion_cfg(self, tmp_path, monkeypatch):
-        companion = pytest.importorskip("kirocrew_nexus_companion")
+    def companion_cfg(self, monkeypatch):
         from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
         from kiro_crew.platform import context
 
-        path = tmp_path / "engines.yaml"
-        path.write_text(json.dumps(self.ENGINES), encoding="utf-8")
-        monkeypatch.setenv("KIROCREW_ENGINES", str(path))
-        registry = companion.NexusProviderRegistry()
+        rows = [
+            {"id": "claude-max", "runtime_agent": "crew-claude", "vendor": "claude"},
+            {"id": "codex-sub", "runtime_agent": "crew-codex", "vendor": "codex"},
+            {
+                "id": "local-fleet",
+                "runtime_agent": "crew-local",
+                "vendor": "local",
+                "role": "agent",
+            },
+            {
+                "id": "local-background",
+                "runtime_agent": "kirocrew-heartbeat",
+                "vendor": "local",
+                "role": "subagent",
+            },
+        ]
+        registry = SimpleNamespace(execution_seats=lambda cfg: rows)
         monkeypatch.setattr(context, "current_context", lambda: SimpleNamespace(providers=registry))
         cfg = KiroCrewConfig()
-        for alias in self.ENGINES["agents"]:
+        for row in rows:
+            alias = row["runtime_agent"]
             cfg.agents[alias] = KiroCrewAgentConfig(kiro_agent=alias)
         return cfg
 

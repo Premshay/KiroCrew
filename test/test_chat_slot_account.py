@@ -17,7 +17,7 @@ from kiro_crew.platform.defaults import DefaultProviderRegistry
 def test_default_provider_registry_session_account_seam_is_noop() -> None:
     registry = DefaultProviderRegistry()
     assert registry.session_account_state("dashboard:chat-1", "claude-engine") is None
-    assert registry.set_session_account("dashboard:chat-1", "atlomy", "claude-engine") == {
+    assert registry.set_session_account("dashboard:chat-1", "work", "claude-engine") == {
         "ok": False,
         "available": False,
     }
@@ -60,10 +60,10 @@ def account_state(monkeypatch):
             "reason": "" if eligible else "Not a Claude subscription seat (codex)",
             "current": store["current"],
             "default": store["default"],
-            "default_label": "Personal" if store["default"] == "personal" else "Atlomy",
+            "default_label": "Personal" if store["default"] == "personal" else "Work",
             "accounts": [
                 {"id": "personal", "label": "Personal"},
-                {"id": "atlomy", "label": "Atlomy"},
+                {"id": "work", "label": "Work"},
             ],
         }
 
@@ -119,7 +119,7 @@ async def test_native_account_read_and_write_receive_effective_harness(
             "available": True,
             "eligible": backend == "claude",
             "current": store["current"],
-            "accounts": [{"id": "personal"}, {"id": "atlomy"}],
+            "accounts": [{"id": "personal"}, {"id": "work"}],
         }
 
     def write(key, account, identity="", *, backend=None):
@@ -141,7 +141,7 @@ async def test_native_account_read_and_write_receive_effective_harness(
         assert response.status == 200
         assert (await response.json())["eligible"] == (backend == "claude")
         response = await client.post(
-            f"/api/chat/slots/{slot.key}/account", json={"account": "atlomy"}
+            f"/api/chat/slots/{slot.key}/account", json={"account": "work"}
         )
         assert response.status == (200 if backend == "claude" else 409)
     assert ("read", backend) in observed
@@ -195,7 +195,7 @@ async def test_get_slot_account_returns_state_for_eligible_session(account_state
         "default_label": "Personal",
         "accounts": [
             {"id": "personal", "label": "Personal"},
-            {"id": "atlomy", "label": "Atlomy"},
+            {"id": "work", "label": "Work"},
         ],
     }
     assert calls == [("state", (effective_session_key(slot), "crew-derrick"))]
@@ -221,15 +221,15 @@ async def test_get_slot_account_when_edition_contributes_none(account_state, mon
 async def test_post_slot_account_switches_and_reloads_idle_session(account_state) -> None:
     state, slot, store, calls, reloaded = account_state
     async with TestClient(TestServer(_account_app(state))) as client:
-        resp = await client.post(f"/api/chat/slots/{slot.key}/account", json={"account": "atlomy"})
+        resp = await client.post(f"/api/chat/slots/{slot.key}/account", json={"account": "work"})
         assert resp.status == 200
         body = await resp.json()
     assert body["ok"] is True
-    assert body["account"] == "atlomy"
-    assert body["current"] == "atlomy"
+    assert body["account"] == "work"
+    assert body["current"] == "work"
     assert body["deferred"] is False
-    assert store["current"] == "atlomy"
-    assert ("set", (effective_session_key(slot), "atlomy", "crew-derrick")) in calls
+    assert store["current"] == "work"
+    assert ("set", (effective_session_key(slot), "work", "crew-derrick")) in calls
     reloaded.assert_awaited_once()
 
 
@@ -241,14 +241,14 @@ async def test_post_slot_account_defers_reset_when_turn_in_flight(account_state)
         status=409,
     )
     async with TestClient(TestServer(_account_app(state))) as client:
-        resp = await client.post(f"/api/chat/slots/{slot.key}/account", json={"account": "atlomy"})
+        resp = await client.post(f"/api/chat/slots/{slot.key}/account", json={"account": "work"})
         assert resp.status == 200
         body = await resp.json()
     assert body["ok"] is True
-    assert body["account"] == "atlomy"
-    assert body["current"] == "atlomy"
+    assert body["account"] == "work"
+    assert body["current"] == "work"
     assert body["deferred"] is True
-    assert store["current"] == "atlomy"
+    assert store["current"] == "work"
     assert slot._pending_reset_history_key == effective_session_key(slot)
 
 
@@ -257,7 +257,7 @@ async def test_post_slot_account_refuses_ineligible_seat(account_state) -> None:
     state, slot, store, calls, reloaded = account_state
     slot.runtime_agent = "codex"
     async with TestClient(TestServer(_account_app(state))) as client:
-        resp = await client.post(f"/api/chat/slots/{slot.key}/account", json={"account": "atlomy"})
+        resp = await client.post(f"/api/chat/slots/{slot.key}/account", json={"account": "work"})
         assert resp.status == 409
         body = await resp.json()
     assert body["code"] == "session_account_ineligible"
@@ -291,7 +291,7 @@ async def test_slot_account_route_is_owner_only(account_state) -> None:
         )
         post_resp = await client.post(
             f"/api/chat/slots/{slot.key}/account",
-            data=json.dumps({"account": "atlomy"}),
+            data=json.dumps({"account": "work"}),
             headers={"Content-Type": "application/json", "X-Test-App": "plugin"},
         )
         assert get_resp.status == 403
@@ -303,7 +303,7 @@ async def test_slot_account_route_is_owner_only(account_state) -> None:
 @pytest.mark.asyncio
 async def test_account_menu_follows_the_current_agent_across_switches(account_state) -> None:
     state, slot, store, calls, _ = account_state
-    store["current"] = "atlomy"
+    store["current"] = "work"
     seen: list[tuple[bool, str]] = []
     async with TestClient(TestServer(_account_app(state))) as client:
         for agent in ("derrick", "codex", "derrick"):
@@ -312,7 +312,7 @@ async def test_account_menu_follows_the_current_agent_across_switches(account_st
             assert resp.status == 200
             body = await resp.json()
             seen.append((body["eligible"], body["current"]))
-    assert seen == [(True, "atlomy"), (False, "atlomy"), (True, "atlomy")]
+    assert seen == [(True, "work"), (False, "work"), (True, "work")]
     assert [c[1][1] for c in calls if c[0] == "state"] == [
         "crew-derrick",
         "codex-engine",
@@ -325,7 +325,7 @@ async def test_post_slot_account_refused_while_session_is_on_codex(account_state
     state, slot, store, calls, reloaded = account_state
     slot.agent = "codex"
     async with TestClient(TestServer(_account_app(state))) as client:
-        resp = await client.post(f"/api/chat/slots/{slot.key}/account", json={"account": "atlomy"})
+        resp = await client.post(f"/api/chat/slots/{slot.key}/account", json={"account": "work"})
         assert resp.status == 409
         body = await resp.json()
     assert body["code"] == "session_account_ineligible"

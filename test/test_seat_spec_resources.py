@@ -2,7 +2,7 @@
 
 Neither harness reads an agent's ``resources``; kiro-cli loads them natively and a
 crew member's essentials envelope carries its own. A seat such as
-``crew-claude-atlas`` used to get only its ``prompt``, so a shared guide named by
+``crew-claude-example`` used to get only its ``prompt``, so a shared guide named by
 absolute path never reached it. ``inclusion.steering_resources_part`` now loads
 the seat's ABSOLUTE entries (``agent_spec._load_seat_resources``) at session start
 and after a compaction, through one gate; relative entries keep their old
@@ -39,7 +39,7 @@ from kiro_crew.learn import LessonStore
 from kiro_crew.memory import MemoryStore
 from kiro_crew.skills import SkillsLoader
 
-_SEAT = "crew-claude-atlas"
+_SEAT = "crew-claude-example"
 _GUIDE_RULE = "SEAT_DELEGATION_GUIDE_K9"
 _TREE_RULE = "PROJECT_TREE_RULE_P4"
 _START = "[Steering resources]"
