@@ -52,6 +52,7 @@ from typing import Any, Mapping, Sequence
 
 from kiro_crew import decisions as core
 from kiro_crew.decisions.types import Answer, Choice, Question
+from kiro_crew.decisions.vendors import identify_vendor, routing_vendors
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,9 @@ _MONTHS = {m: i for i, m in enumerate("Jan Feb Mar Apr May Jun Jul Aug Sep Oct N
 
 def _vendor_of_name(agent: str, model: str = "") -> str:
     """The vendor a seat or backend name (``crew-codex-atlas``) or, failing that, a model id names."""
+    specs = routing_vendors()
+    if specs is not None:
+        return identify_vendor(specs, agent or "", model or "")
     a = (agent or "").lower()
     for v in ("codex", "deepseek", "antigravity", "local", "claude"):
         if v in a:
@@ -152,6 +156,12 @@ def _vendor_of_runtime_policy(agent: str) -> str:
         return ""
     if not isinstance(policy, dict):
         return ""
+    specs = routing_vendors()
+    if specs is not None:
+        declared = policy.get("vendor")
+        if isinstance(declared, str) and any(spec.id == declared for spec in specs):
+            return declared
+        return identify_vendor(specs, str(policy.get("backend") or ""))
     if str(policy.get("engine") or "").startswith("local"):
         return "local"
     backend = str(policy.get("backend") or "")
@@ -210,9 +220,11 @@ def tier_map(config: Any | None = None) -> dict[str, dict[str, list[str]]]:
         return {}
     if not isinstance(raw, dict):
         return {}
+    specs = routing_vendors()
+    vendor_ids = VENDORS if specs is None else tuple(spec.id for spec in specs)
     out: dict[str, dict[str, list[str]]] = {}
     for vendor, tiers in raw.items():
-        if vendor not in VENDORS or not isinstance(tiers, dict):
+        if vendor not in vendor_ids or not isinstance(tiers, dict):
             continue
         out[vendor] = {}
         for tier in TIERS:
@@ -275,6 +287,14 @@ LOCAL_ROLES: tuple[str, ...] = ("subagent", "agent")
 #: Vendors offered to a parent of ANOTHER vendor. DeepSeek is metered (AGENTS.md:
 #: a metered seat is only ever an explicitly named row), so it is never switched to.
 CROSS_VENDORS: tuple[str, ...] = ("claude", "codex", "antigravity", "local")
+
+
+def _cross_vendors() -> tuple[str, ...]:
+    specs = routing_vendors()
+    if specs is None:
+        return CROSS_VENDORS
+    return tuple(spec.id for spec in specs if not spec.metered)
+
 
 #: Codex advertises one id per reasoning effort (``gpt-5.6-sol[high]``); the
 #: effort a tier runs at when the adapter offers no bare id.
@@ -489,9 +509,10 @@ def route_backends(parent_vendor: str, cfg: Any | None = None) -> dict[str, dict
     except Exception:
         logger.debug("spawn.route: execution seats unreadable", exc_info=True)
         seats = {}
+    vendors = _cross_vendors()
     for seat_id, seat in sorted(seats.items()):
         vendor = vendor_of_seat(seat_id) or vendor_of_seat(seat.get("runtime_agent", ""))
-        if vendor not in CROSS_VENDORS or vendor == parent_vendor:
+        if vendor not in vendors or vendor == parent_vendor:
             continue
         key = f"local/{_local_role_of_seat(seat_id)}" if vendor == "local" else vendor
         out.setdefault(
@@ -501,14 +522,20 @@ def route_backends(parent_vendor: str, cfg: Any | None = None) -> dict[str, dict
         from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND, selectable_backend_values
 
         selectable = set(selectable_backend_values())
-        native = {name: b for b, name in POLICY_ID_BY_BACKEND.items() if b in selectable}
+        native = {b: name for b, name in POLICY_ID_BY_BACKEND.items() if b in selectable}
     except Exception:
         logger.debug("spawn.route: native backends unreadable", exc_info=True)
         native = {}
-    for vendor in ("claude", "codex"):
-        if vendor == parent_vendor or vendor in out or vendor not in native:
+    specs = routing_vendors()
+    native_vendors = (
+        {vendor: vendor for vendor in ("claude", "codex")}
+        if specs is None
+        else {spec.id: spec.native_backend for spec in specs if not spec.metered}
+    )
+    for vendor, backend in native_vendors.items():
+        if vendor == parent_vendor or vendor in out or backend not in native:
             continue
-        out[vendor] = {"backend": vendor, "runtime_agent": "", "native": native[vendor]}
+        out[vendor] = {"backend": native[backend], "runtime_agent": "", "native": backend}
     return out
 
 
@@ -536,7 +563,7 @@ def all_candidates(
         return cands
     if backends is None:
         backends = route_backends(parent_vendor)
-    for vendor in CROSS_VENDORS:
+    for vendor in _cross_vendors():
         if vendor == parent_vendor:
             continue
         if vendor == "local":
@@ -554,6 +581,12 @@ def all_candidates(
 #: How long the limit readings (files, the fleet router) are reused.
 LIMITS_CACHE_S = 30
 _limits_cache: tuple[float, tuple[str, ...], dict[str, dict[str, Any]]] | None = None
+
+
+def invalidate_vendor_state() -> None:
+    """Force the next route to read vendor headroom again."""
+    global _limits_cache
+    _limits_cache = None
 
 
 def limit_health(

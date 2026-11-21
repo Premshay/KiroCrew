@@ -323,7 +323,7 @@ def _eligible(manager: Any, info: Any) -> bool:
 def _forget_route_caches() -> None:
     from kiro_crew.decisions.points import spawn_route as sr
 
-    sr._limits_cache = None
+    sr.invalidate_vendor_state()
 
 
 def _parent_model(manager: Any, info: Any) -> str:

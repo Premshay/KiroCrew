@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, List, Optional
 
 if TYPE_CHECKING:
     from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.decisions.vendors import VendorSpec
     from kiro_crew.security import DeniedCommandRule
     from kiro_crew.skill_providers.base import SkillProvider
     from kiro_crew.tips_pool import TipsPool
@@ -74,6 +75,10 @@ class ProviderRegistry(Protocol):
         re-registering an alternate ACP backend) — but kiro-cli stays the default
         for both editions unless the companion is explicitly opted in.
         """
+        ...
+
+    def routing_vendors(self) -> tuple[VendorSpec, ...] | None:
+        """Return declared routing identities and eligibility, or defer to legacy routing."""
         ...
 
     def agent_runtime_policy(self, engine_identity: str) -> dict[str, Any] | None:
