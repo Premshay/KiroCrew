@@ -41,7 +41,6 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(vl, "codex_health", lambda reading=None: {})
     vl._reset_for_tests()
     monkeypatch.setattr(sr, "_limits_cache", None)
-    monkeypatch.setattr(sr, "_health_cache", None)
     yield
     vl._reset_for_tests()
 

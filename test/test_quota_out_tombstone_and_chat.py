@@ -1,15 +1,4 @@
-"""Quota out-marks beyond the spawned run's own ending (fork, operator ruling 2026-11-20).
-
-1. ``spawn_route``'s tombstone scan attributes a run to the seat that SERVED it
-   (``runtime_agent``, then provider, then model, then the template seat) through
-   the same resolution ``quota_switch`` uses, and reads Antigravity's quota text
-   from the run's result tail. Fixture shaped like the real tombstone of run
-   521d4974a303c81e: the ``crew-claude`` template on the ``crew-antigravity``
-   seat, ``detail`` the generic refusal text, the fault only in ``result.txt``.
-2. A dashboard chat turn that failed on its quota writes the same out-mark
-   (chat-2069, 11:19 IST, ``Individual quota reached`` on gemini-4-hydrogen-high)
-   without switching the chat's model, raising or delaying the error card.
-"""
+"""Quota marks from dashboard chat failures and serving-seat provenance."""
 
 from __future__ import annotations
 
@@ -38,118 +27,11 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(vl, "_data_home", lambda: tmp_path)
     vl._reset_for_tests()
     monkeypatch.setattr(sr, "_limits_cache", None)
-    monkeypatch.setattr(sr, "_health_cache", None)
     yield
     vl._reset_for_tests()
 
 
-def _write_521d4974(root):
-    """The run's folder as it stood on 2026-11-20 (task text shortened)."""
-    d = root / "521d4974a303c81e"
-    d.mkdir(parents=True)
-    tomb = {
-        "id": "521d4974a303c81e",
-        "task": "Read-only inventory. ...",
-        "agent": "crew-claude",
-        "parent_session": "dashboard:chat-2066-1795095153",
-        "started": 1795170779.6387768,
-        "died": DIED,
-        "cause": "error",
-        "recovery_action": "partial_result",
-        "result_available": True,
-        "result_path": str(d / "result.txt"),
-        "provider": "acp",
-        "cwd": "/home/prems/dev/repos/atlomy/Atlomy-Atlas",
-        "pid": None,
-        "turns": 0,
-        "last_tool": "",
-        "outcome": "failed",
-        "elapsed": 5.376590013504028,
-        "credits": 0.0,
-        "detail": "failed (refusal) — partial result preserved",
-        "taskq_attempt": 1,
-    }
-    state = {
-        "id": "521d4974a303c81e",
-        "agent": "crew-claude",
-        "runtime_agent": "crew-antigravity",
-        "requested_model": "gemini-4-hydrogen-medium",
-        "resolved_model": "gemini-4-hydrogen-medium",
-        "provider": "acp",
-    }
-    (d / "tombstone.json").write_text(json.dumps(tomb), encoding="utf-8")
-    (d / "state.json").write_text(json.dumps(state), encoding="utf-8")
-    (d / "result.txt").write_text("x" * 5000 + "\n" + AGY_TAIL, encoding="utf-8")
-    return d
-
-
 class TestTombstoneVendor:
-    def test_521d4974_reads_as_antigravity_out_not_claude(self, tmp_path):
-        _write_521d4974(tmp_path / "subagents")
-        rows = sr.load_tombstones(tmp_path / "subagents")
-        assert len(rows) == 1
-        row = rows[0]
-        assert row["runtime_agent"] == "crew-antigravity"
-        assert row["resolved_model"] == "gemini-4-hydrogen-medium"
-        assert sr._vendor_of_tombstone(row) == "antigravity"
-        hit = sr.limit_hit(row)
-        assert hit is not None
-        assert hit["vendor"] == "antigravity"
-        assert hit["model"] == "gemini-4-hydrogen-medium"
-        assert hit["until"] == pytest.approx(DIED + 3600 + 30 * 60 + 18)
-        health = sr.vendor_health(rows, now=DIED + 60)
-        assert health["antigravity"]["out"] is True
-        assert health["claude"]["out"] is False
-
-    def test_runtime_agent_on_the_row_wins_over_the_template_seat(self):
-        row = {"agent": "crew-claude", "runtime_agent": "crew-antigravity", "provider": "acp"}
-        assert sr._vendor_of_tombstone(row) == "antigravity"
-
-    def test_order_provider_then_model_then_agent(self):
-        assert sr._vendor_of_tombstone({"agent": "crew-claude", "provider": "codex"}) == "codex"
-        assert (
-            sr._vendor_of_tombstone(
-                {"agent": "crew-claude", "provider": "acp", "resolved_model": "gpt-5.5"}
-            )
-            == "codex"
-        )
-        # Legacy: a base seat on the shared adapter names no vendor and is Claude.
-        assert sr._vendor_of_tombstone({"agent": "kirocrew", "provider": "acp"}) == "claude"
-        assert sr._vendor_of_tombstone({"agent": "derrick", "provider": "acp"}) == "claude"
-
-    def test_same_resolution_as_quota_switch(self):
-        info = SimpleNamespace(agent="crew-claude", runtime_agent="crew-antigravity", backend=None)
-        assert qs.run_vendor(info, "gemini-4-hydrogen-medium") == "antigravity"
-        assert sr._vendor_of_tombstone(
-            {"agent": "crew-claude", "runtime_agent": "crew-antigravity"}
-        ) == qs.run_vendor(info)
-
-    @pytest.mark.parametrize(
-        "detail", ["status QUOTA_EXHAUSTED", "429 RESOURCE_EXHAUSTED", AGY_TAIL]
-    )
-    def test_antigravity_quota_text_in_detail(self, detail):
-        row = {"agent": "crew-antigravity", "died": DIED, "detail": detail}
-        hit = sr.limit_hit(row)
-        assert hit is not None and hit["vendor"] == "antigravity"
-
-    def test_another_vendors_quota_text_in_a_claude_tail_is_not_a_hit(self):
-        row = {
-            "agent": "crew-claude",
-            "provider": "acp",
-            "died": DIED,
-            "detail": "failed (refusal)",
-            "result_tail": "the report mentions Individual quota reached once",
-        }
-        assert sr.limit_hit(row) is None
-
-    def test_delivered_rows_are_not_enriched(self, tmp_path):
-        d = _write_521d4974(tmp_path / "subagents")
-        tomb = json.loads((d / "tombstone.json").read_text())
-        tomb.update(outcome=None, cause="delivered")
-        (d / "tombstone.json").write_text(json.dumps(tomb))
-        (row,) = sr.load_tombstones(tmp_path / "subagents")
-        assert "result_tail" not in row and "runtime_agent" not in row
-
     def test_tombstone_writer_records_the_serving_seat(self, tmp_path, monkeypatch):
         from kiro_crew import subagent_persistence as sp
 
@@ -171,7 +53,6 @@ class TestTombstoneVendor:
         tomb = json.loads((tmp_path / "abc123" / "tombstone.json").read_text())
         assert tomb["runtime_agent"] == "crew-antigravity"
         assert tomb["resolved_model"] == "gemini-4-hydrogen-medium"
-        assert sr._vendor_of_tombstone(tomb) == "antigravity"
 
 
 # ---------------------------------------------------------------------------

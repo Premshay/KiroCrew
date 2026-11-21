@@ -487,6 +487,7 @@ class SubagentInfo:
     # That check's receipt for the parent: ``local check: <cmd> PASS ->
     # committed <sha>`` / ``local check FAIL -> <vendor> <model>``; "" when none ran.
     local_check_line: str = ""
+    _local_commit_scope: tuple[str, str, str, frozenset[str]] | str | None = None
     quota_chain: tuple[str, ...] = ()
     quota_origin_task: str = ""
     # Per-call reasoning-effort override (spawn_run ``reasoning_effort``).

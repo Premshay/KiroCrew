@@ -426,12 +426,14 @@ async def _run_inner_impl(
     # coding tools alone, and its context trimmed to the role's first-turn token
     # target. A dedicated process only: a shared runtime's session is not this
     # run's to shape.
-    if not plan.shared:
-        from kiro_crew.subagent_manager import local_check as _local_check
+    from kiro_crew.subagent_manager import local_check as _local_check
 
+    if not plan.shared:
         _lean = await asyncio.to_thread(_local_check.prepare_lean_run, info, session_key)
         if _lean is not None:
             extra_kwargs["local_helper_profile"] = _lean
+    if _local_check.check_for(info):
+        info._local_commit_scope = await asyncio.to_thread(_local_check.start_commit_scope, info)
     if info.cwd:
         extra_kwargs["cwd"] = info.cwd
     # A run that withholds memory keeps the harness's own memory out too.

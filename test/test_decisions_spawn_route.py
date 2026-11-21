@@ -82,13 +82,6 @@ def no_host_limits(monkeypatch):
     monkeypatch.setattr(sr, "route_backends", lambda parent_vendor, cfg=None: {})
 
 
-@pytest.fixture(autouse=True)
-def no_tombstones(monkeypatch):
-    """No registry read by default; a test that wants health installs its own rows."""
-    monkeypatch.setattr(sr, "_health_cache", None)
-    monkeypatch.setattr(sr, "load_tombstones", lambda root=None: [])
-
-
 @pytest.fixture
 def snapshot(monkeypatch):
     import kiro_crew.decisions.gate as gate_mod
@@ -139,126 +132,6 @@ def _run(coro):
 
 def _local(y, mo, d, h, mi) -> float:
     return dt.datetime(y, mo, d, h, mi).astimezone().timestamp()
-
-
-def _hit(vendor_agent: str, died: float, detail: str, **extra) -> dict:
-    return {
-        "id": "x",
-        "agent": vendor_agent,
-        "died": died,
-        "started": died - 10,
-        "cause": "error",
-        "recovery_action": "pending",
-        "detail": detail,
-        **extra,
-    }
-
-
-def _delivered(vendor_agent: str, died: float) -> dict:
-    return {
-        "id": "d",
-        "agent": vendor_agent,
-        "died": died,
-        "started": died - 60,
-        "cause": "delivered",
-        "recovery_action": "delivered",
-    }
-
-
-class TestVendorHealth:
-    def test_a_named_clock_is_the_reset_on_the_same_day(self):
-        died = _local(2026, 9, 10, 11, 35)
-        rows = [
-            _hit(
-                "crew-codex",
-                died,
-                "AcpError: {'message': \"You've hit your usage limit for GPT-5.3-Codex-Spark. "
-                "Switch to another model now, or try again at 4:20 PM.\", 'codexErrorInfo': 'usageLimitExceeded'}",
-            )
-        ]
-        h = sr.vendor_health(rows, now=died + 60)
-        assert h["codex"]["out"] is True
-        assert h["codex"]["until"] == _local(2026, 9, 10, 16, 20)
-        assert h["codex"]["models"] == ["GPT-5.3-Codex-Spark"]
-        assert sr.vendor_health(rows, now=_local(2026, 9, 10, 16, 21))["codex"]["out"] is False
-
-    def test_a_named_date_is_the_reset(self):
-        died = _local(2026, 9, 26, 0, 12)
-        rows = [
-            _hit(
-                "crew-codex",
-                died,
-                "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage "
-                "to purchase more credits or try again at Oct 1st, 2026 9:19 AM.",
-            )
-        ]
-        h = sr.vendor_health(rows, now=died + 3600)
-        assert h["codex"]["out"] is True
-        assert h["codex"]["until"] == _local(2026, 10, 1, 9, 19)
-        # a week-out reset is an upper bound: one probe may go after the 5-h window
-        assert h["codex"]["probe_after"] == died + sr.PROBE_AFTER_S
-
-    def test_no_named_time_is_the_five_hour_window(self):
-        died = _local(2026, 9, 9, 22, 41)
-        rows = [
-            _hit(
-                "crew-claude-atlas",
-                died,
-                "AcpError: {'errorKind': 'rate_limit'}. Retrying will not help until the limit resets.",
-            )
-        ]
-        h = sr.vendor_health(rows, now=died + 60)
-        assert h["claude"]["out"] is True and h["claude"]["until"] == died + sr.DEFAULT_WINDOW_S
-        assert sr.vendor_health(rows, now=died + sr.DEFAULT_WINDOW_S + 1)["claude"]["out"] is False
-
-    def test_a_later_delivery_clears_the_outage_before_the_named_reset(self):
-        died = _local(2026, 9, 18, 12, 50)
-        rows = [
-            _hit(
-                "crew-codex",
-                died,
-                "You've hit your usage limit. Visit ... or try again at Sep 24th, 2026 12:03 AM.",
-            ),
-            _delivered("crew-codex", died + 33 * 3600),
-        ]
-        assert sr.vendor_health(rows, now=died + 3600)["codex"]["out"] is True
-        assert sr.vendor_health(rows, now=died + 34 * 3600)["codex"]["out"] is False
-
-    def test_a_future_tombstone_is_not_evidence_when_replaying(self):
-        died = _local(2026, 9, 18, 12, 50)
-        rows = [
-            _hit("crew-codex", died, "try again at Sep 24th, 2026 12:03 AM. usageLimitExceeded"),
-            _delivered("crew-codex", died + 3600),
-        ]
-        assert sr.vendor_health(rows, now=died + 60)["codex"]["out"] is True
-
-    def test_throttling_is_a_blip(self):
-        died = 1_700_000_000.0
-        rows = [
-            _hit(
-                "crew-claude",
-                died,
-                "Bedrock is throttling requests. Try: (1) wait a few seconds and retry",
-            )
-        ]
-        assert sr.vendor_health(rows, now=died + 60)["claude"]["out"] is True
-        assert sr.vendor_health(rows, now=died + sr.THROTTLE_WINDOW_S + 1)["claude"]["out"] is False
-
-    def test_other_vendors_are_untouched(self):
-        died = 1_700_000_000.0
-        rows = [_hit("crew-codex", died, "usageLimitExceeded try again at 4:46 PM.")]
-        h = sr.vendor_health(rows, now=died + 60)
-        assert h["claude"]["out"] is False and h["deepseek"]["out"] is False
-
-    def test_a_non_limit_death_is_not_a_hit(self):
-        rows = [
-            _hit(
-                "crew-codex",
-                1_700_000_000.0,
-                "AcpProcessDied: Runtime process died during prompt (rc=-15)",
-            )
-        ]
-        assert sr.vendor_health(rows, now=1_700_000_060.0)["codex"]["out"] is False
 
 
 class TestVendorOfSeat:
@@ -347,14 +220,8 @@ class TestRoutedSpawn:
         died = _local(2026, 9, 26, 0, 12)
         monkeypatch.setattr(
             sr,
-            "load_tombstones",
-            lambda root=None: [
-                _hit(
-                    "crew-codex",
-                    died,
-                    "usage limit. try again at Oct 1st, 2026 9:19 AM. usageLimitExceeded",
-                )
-            ],
+            "limit_health",
+            lambda models: {"codex": {"out": True, "resets_at": died + 3600}},
         )
         monkeypatch.setattr(sr.time, "time", lambda: died + 600)
         oracle = install_oracle(_Oracle("codex/large/0"))

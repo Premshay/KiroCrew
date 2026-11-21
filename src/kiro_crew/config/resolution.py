@@ -45,6 +45,7 @@ _KNOWN_CONFIG_SECTIONS: frozenset = frozenset(
     {
         "agent",
         "session",
+        "subagent",
         "memory",
         "slack",
         "publish",

@@ -43,7 +43,6 @@ from __future__ import annotations
 
 import asyncio
 import datetime as _dt
-import json
 import logging
 import re
 import time
@@ -69,23 +68,6 @@ TIERS: tuple[str, ...] = ("top", "large", "small", "mini")
 #: and ``model.route`` apply to a message, and a brief is a message to the child.
 MAX_BRIEF_CHARS = 2000
 
-#: How long a vendor is read as out after a limit hit whose error names no reset
-#: (Claude's ``rate_limit`` carries none): the 5-hour rolling window.
-DEFAULT_WINDOW_S = 5 * 3600
-#: Bedrock throttling is a blip, not a quota.
-THROTTLE_WINDOW_S = 120
-#: A named reset a week out is an upper bound, not the truth: the tombstones show
-#: deliveries resuming 9-36 h after each one. After this long the caller may send
-#: one spawn to find out; a delivery clears the outage whatever the reset said.
-PROBE_AFTER_S = 5 * 3600
-#: How long a tombstone scan is reused before the directory is read again.
-HEALTH_CACHE_S = 60
-
-_LIMIT_MARKS = (
-    (re.compile(r"usageLimitExceeded|hit your usage limit", re.I), DEFAULT_WINDOW_S),
-    (re.compile(r"errorKind':\s*'rate_limit'|rate[_ ]limit", re.I), DEFAULT_WINDOW_S),
-    (re.compile(r"throttling requests", re.I), THROTTLE_WINDOW_S),
-)
 # "try again at 4:46 PM."  /  "try again at Sep 24th, 2026 12:03 AM."  (local wall clock)
 _AT_CLOCK = re.compile(r"try again at (\d{1,2}):(\d{2}) ?(AM|PM)", re.I)
 _AT_DATE = re.compile(
@@ -95,9 +77,6 @@ _AT_DATE = re.compile(
 # Antigravity: "Individual quota reached. ... Resets in 1h30m18s."
 _RESETS_IN = re.compile(r"Resets? in\s+(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s)?", re.I)
 _MONTHS = {m: i for i, m in enumerate("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(), 1)}
-_MODEL = re.compile(r"usage limit for ([A-Za-z0-9.\-]+?)\.?(?:\s|$)")
-
-_health_cache: tuple[float, dict[str, dict[str, Any]]] | None = None
 
 
 def _vendor_of_name(agent: str, model: str = "") -> str:
@@ -181,24 +160,6 @@ def _vendor_of_runtime_policy(agent: str) -> str:
     return backend if backend in ("claude", "codex", "deepseek") else ""
 
 
-def _vendor_of_tombstone(row: Mapping[str, Any]) -> str:
-    v = served_vendor(
-        runtime_agent=str(row.get("runtime_agent") or ""),
-        provider=str(row.get("provider") or ""),
-        model=str(row.get("resolved_model") or row.get("model") or ""),
-        agent=str(row.get("agent") or ""),
-        policy=False,
-    )
-    if v:
-        return v
-    p = str(row.get("provider") or "").lower()
-    a = str(row.get("agent") or "").lower()
-    # A base seat on the shared ACP adapter or Claude Code names no vendor: Claude.
-    if p in ("claude_code", "acp") or a in ("kirocrew", ""):
-        return "claude"
-    return ""
-
-
 def _to_24h(h: int, m: int, ampm: str) -> tuple[int, int]:
     return h % 12 + (12 if ampm.upper() == "PM" else 0), m
 
@@ -237,163 +198,6 @@ def reset_time(detail: str, died: float, window_s: int) -> float:
     if rel is not None:
         return rel
     return died + window_s
-
-
-def limit_hit(row: Mapping[str, Any]) -> dict[str, Any] | None:
-    """The outage a tombstone proves, or ``None`` when it is not a quota or rate-limit death.
-
-    The generic marks read ``detail``. The vendor's own quota signals
-    (:data:`quota_switch.QUOTA_PATTERNS`, e.g. Antigravity's ``Individual quota
-    reached``) also read ``result_tail``: a refused Antigravity turn's detail is
-    the generic ``failed (refusal)`` and the fault is the last line it streamed.
-    """
-    from kiro_crew.subagent_manager.quota_switch import QUOTA_PATTERNS
-
-    detail = str(row.get("detail") or "")
-    tail = str(row.get("result_tail") or "")
-    if not detail and not tail:
-        return None
-    vendor = _vendor_of_tombstone(row)
-    died = float(row.get("died") or 0)
-    window = 0
-    for rx, w in _LIMIT_MARKS:
-        if detail and rx.search(detail):
-            window = w
-            break
-    else:
-        text = f"{detail}\n{tail}"
-        if any(rx.search(text) for rx in QUOTA_PATTERNS.get(vendor, ())):
-            window = DEFAULT_WINDOW_S
-            detail = text
-    if not window:
-        return None
-    mm = _MODEL.search(detail)
-    return {
-        "vendor": vendor,
-        "from": died,
-        "until": reset_time(detail, died, window),
-        "model": mm.group(1) if mm else str(row.get("resolved_model") or ""),
-    }
-
-
-def vendor_health(
-    rows: Sequence[Mapping[str, Any]], now: float | None = None
-) -> dict[str, dict[str, Any]]:
-    """Per vendor: ``out`` when its LAST event was a limit hit and the reset has not passed.
-
-    A delivery after the hit clears it whatever the named reset said. ``probe_after``
-    is when one spawn may be sent to find out; ``until`` is the named or default reset.
-    """
-    now = time.time() if now is None else now
-    out: dict[str, dict[str, Any]] = {
-        v: {
-            "out": False,
-            "until": None,
-            "probe_after": None,
-            "models": [],
-            "last_hit": None,
-            "last_delivery": None,
-        }
-        for v in VENDORS
-    }
-    for r in rows:
-        v = _vendor_of_tombstone(r)
-        if not v:
-            continue
-        s = out.setdefault(v, dict(out["claude"]))
-        t = float(r.get("died") or r.get("started") or 0)
-        if t > now:
-            continue
-        h = limit_hit(r)
-        if h:
-            if (s["last_hit"] or 0) < h["from"]:
-                s["last_hit"] = h["from"]
-                s["until"] = h["until"]
-                s["models"] = [h["model"]] if h["model"] else []
-        elif (
-            r.get("cause") in ("delivered", "result_available")
-            or r.get("recovery_action") == "delivered"
-        ):
-            s["last_delivery"] = max(s["last_delivery"] or 0, t)
-    for s in out.values():
-        hit = s["last_hit"]
-        if hit and (s["last_delivery"] or 0) < hit and now < (s["until"] or 0):
-            s["out"] = True
-            s["probe_after"] = min(s["until"], hit + PROBE_AFTER_S)
-        else:
-            s["until"] = None
-            s["models"] = []
-    return out
-
-
-#: How much of a failed run's ``result.txt`` the scan reads for its vendor's fault
-#: line (``quota_switch.RESULT_TAIL_CHARS``: the fault is the last thing it streamed).
-_RESULT_TAIL_BYTES = 600
-
-
-def _enrich_tombstone(row: dict[str, Any], folder: Path) -> None:
-    """Add what a failed run's tombstone lacks from its own folder. Never raises.
-
-    The serving seat and model live in ``state.json`` (``runtime_agent``,
-    ``resolved_model``) and the provider's fault in ``result.txt``'s tail, read
-    from the folder itself, never the ``result_path`` the file names.
-    """
-    if row.get("outcome") != "failed":
-        return
-    if not row.get("runtime_agent") or not row.get("resolved_model"):
-        try:
-            state = json.loads((folder / "state.json").read_text(encoding="utf-8"))
-        except Exception:
-            state = None
-        if isinstance(state, dict):
-            for key in ("runtime_agent", "resolved_model"):
-                if not row.get(key) and isinstance(state.get(key), str) and state[key]:
-                    row[key] = state[key]
-    if row.get("result_available") and "result_tail" not in row:
-        try:
-            with open(folder / "result.txt", "rb") as fh:
-                fh.seek(0, 2)
-                size = fh.tell()
-                fh.seek(max(0, size - _RESULT_TAIL_BYTES))
-                row["result_tail"] = fh.read().decode("utf-8", "replace")
-        except Exception:
-            pass
-
-
-def load_tombstones(root: Path | None = None) -> list[dict[str, Any]]:
-    """Every readable ``tombstone.json`` under the subagents registry. Never raises.
-
-    A failed run's row also carries its serving seat, model and result tail
-    (:func:`_enrich_tombstone`), which the tombstone itself does not record.
-    """
-    if root is None:
-        from kiro_crew.subagent_persistence import _subagents_dir
-
-        root = _subagents_dir()
-    rows: list[dict[str, Any]] = []
-    try:
-        for f in Path(root).glob("*/tombstone.json"):
-            try:
-                row = json.loads(f.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            if isinstance(row, dict):
-                _enrich_tombstone(row, f.parent)
-                rows.append(row)
-    except Exception:
-        logger.debug("spawn.route: tombstones unreadable", exc_info=True)
-    return rows
-
-
-def cached_health(now: float | None = None) -> dict[str, dict[str, Any]]:
-    """:func:`vendor_health` over the registry, reused for :data:`HEALTH_CACHE_S`."""
-    global _health_cache
-    now = time.time() if now is None else now
-    if _health_cache is not None and now - _health_cache[0] < HEALTH_CACHE_S:
-        return _health_cache[1]
-    health = vendor_health(load_tombstones(), now)
-    _health_cache = (now, health)
-    return health
 
 
 def tier_map(config: Any | None = None) -> dict[str, dict[str, list[str]]]:
@@ -785,25 +589,16 @@ def limit_health(
     return out
 
 
-def merged_health(
-    tombstones: Mapping[str, Mapping[str, Any]], limits: Mapping[str, Mapping[str, Any]]
-) -> dict[str, dict[str, Any]]:
-    """The tombstone outage and the live headroom, per vendor: out when either says so."""
-    out: dict[str, dict[str, Any]] = {}
-    for vendor in set(tombstones) | set(limits):
-        t = tombstones.get(vendor) or {}
-        lim = dict(limits.get(vendor) or {})
-        state: dict[str, Any] = {
-            "out": bool(t.get("out") or lim.get("out")),
-            "until": t.get("until") if t.get("out") else None,
-            "probe_after": t.get("probe_after") if t.get("out") else None,
+def _routing_health(limits: Mapping[str, Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Copy current vendor readings and expose the reset for exhausted vendors."""
+    return {
+        vendor: {
+            **reading,
+            "out": bool(reading.get("out")),
+            "until": reading.get("resets_at") if reading.get("out") else None,
         }
-        lim.pop("out", None)
-        state.update(lim)
-        if state["out"] and state["until"] is None and lim.get("resets_at") is not None:
-            state["until"] = lim["resets_at"]
-        out[vendor] = state
-    return out
+        for vendor, reading in limits.items()
+    }
 
 
 def questions(cands: list[dict[str, str]]) -> list[Question]:
@@ -990,9 +785,8 @@ async def routed_spawn(
         if not cands:
             return None
         ag_models = [c["model"] for c in cands if c["vendor"] == "antigravity"]
-        tombs = await asyncio.to_thread(cached_health)
         limits = await asyncio.to_thread(limit_health, ag_models)
-        health = merged_health(tombs, limits)
+        health = _routing_health(limits)
         _apply_quota_outs(health, outs)
         cands, fits, too_big = fit_local_candidates(
             cands, brief, health, groups=context_groups, pinned=pinned_groups

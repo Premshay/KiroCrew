@@ -44,7 +44,7 @@ from kiro_crew.config.loader_builders import (
     mark_member_backend_inherited,
     resolve_loop_stall_exit_after,
 )
-from kiro_crew.config.loader_config import KiroCrewConfig
+from kiro_crew.config.loader_config import KiroCrewConfig, SubagentConfig
 from kiro_crew.config.loader_document import (
     _SIDECAR_AGENTS_REPAIRED,
     _SIDECAR_BASE_SHADOW,
@@ -1008,6 +1008,7 @@ def build_config(
     work_ledger_data = _coerced_section(data, "work_ledger", _degraded)
     power_data = _coerced_section(data, "power", _degraded)
     decisions_data = _coerced_section(data, "decisions", _degraded)
+    subagent_data = _coerced_section(data, "subagent", _degraded)
     browser_data = _coerced_section(data, "browser", _degraded)
     resource_limits_data = _coerced_section(data, "resource_limits", _degraded)
 
@@ -1319,6 +1320,7 @@ def build_config(
         heartbeat=HeartbeatConfig(default_deliver=heartbeat_default_deliver),
         monitoring=_build_monitoring_config(monitoring_data, monitoring_prefer_structured_arming),
         decisions=DecisionsConfig.from_raw(decisions_data),
+        subagent=SubagentConfig.from_raw(subagent_data),
         browser=BrowserConfig.from_raw(browser_data),
         skills=_build_skills_config(skills_data),
         session_summary=_build_session_summary_config(session_summary_data),

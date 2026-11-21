@@ -154,6 +154,27 @@ def template_model_pin(config: KiroCrewConfig, template: str | None) -> str:
 
 
 @dataclass
+class LocalCheckConfig:
+    auto_commit: bool = field(
+        default=False,
+        metadata=_meta(
+            "Auto-commit", "Commit eligible local worker changes after a passing check."
+        ),
+    )
+
+
+@dataclass
+class SubagentConfig:
+    local_check: LocalCheckConfig = field(default_factory=LocalCheckConfig)
+
+    @classmethod
+    def from_raw(cls, data: dict) -> SubagentConfig:
+        local_check = data.get("local_check")
+        enabled = isinstance(local_check, dict) and local_check.get("auto_commit") is True
+        return cls(local_check=LocalCheckConfig(auto_commit=enabled))
+
+
+@dataclass
 class KiroCrewConfig:
     agent: AgentConfig = field(
         default_factory=AgentConfig,
@@ -163,6 +184,7 @@ class KiroCrewConfig:
         default_factory=SessionConfig,
         metadata=_meta("Session", "Session management settings."),
     )
+    subagent: SubagentConfig = field(default_factory=SubagentConfig)
     taskrunner: TaskRunnerConfig = field(
         default_factory=TaskRunnerConfig,
         metadata=_meta("Task Runner", "Task runner configuration."),
@@ -763,6 +785,7 @@ class KiroCrewConfig:
         d: dict = {
             "agent": _stored_agent_dict(self.agent),
             "session": asdict(self.session),
+            "subagent": asdict(self.subagent),
             "memory": asdict(self.memory),
             "slack": asdict(self.slack),
             "publish": asdict(self.publish),
