@@ -81,3 +81,31 @@ def test_other_vendors_are_untouched(home):
     _probe(home, now, {"gemini-4-hydrogen-high": 0.9})
     vl.note_quota_out("claude", until=now + 3600, detail="limit", now=now - 5)
     assert vl.quota_outs(now)["claude"]["until"] > now
+
+
+def test_newer_claude_reading_not_limited_clears_claude_mark(home):
+    # Two Claude accounts: one hit its limit, the other keeps serving turns.
+    now = time.time()
+    vl.note_quota_out("claude", until=now + 5 * 3600, detail="rate_limit", now=now - 60)
+    assert vl.quota_outs(now)["claude"]["until"] > now
+    vl.note_claude_rate_limit({"status": "allowed", "rateLimitType": "seven_day"}, now=now)
+    assert "claude" not in vl.quota_outs(now)
+    assert vl.quota_out("claude", now=now) is None
+
+
+def test_newer_claude_reading_rejected_keeps_claude_mark(home):
+    now = time.time()
+    vl.note_quota_out("claude", until=now + 5 * 3600, detail="rate_limit", now=now - 60)
+    vl.note_claude_rate_limit(
+        {"status": "rejected", "rateLimitType": "five_hour", "resetsAt": now + 3600}, now=now
+    )
+    assert vl.quota_outs(now)["claude"]["until"] > now
+
+
+def test_codex_reading_newer_and_not_out_clears_codex_mark(home, monkeypatch):
+    now = time.time()
+    vl.note_quota_out("codex", until=now + 86400, detail="usage limit", now=now - 60)
+    monkeypatch.setattr(
+        vl, "codex_health", lambda reading=None: {"out": False, "as_of": now, "used_pct": 40.0}
+    )
+    assert "codex" not in vl.quota_outs(now)

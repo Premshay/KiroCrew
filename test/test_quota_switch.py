@@ -37,6 +37,8 @@ CLAUDE_FAULT = "AcpError: {'errorKind': 'rate_limit', 'message': 'Rate limited'}
 @pytest.fixture(autouse=True)
 def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(vl, "_data_home", lambda: tmp_path)
+    # No host Codex rollout: a live reading would reconcile (clear) the marks under test.
+    monkeypatch.setattr(vl, "codex_health", lambda reading=None: {})
     vl._reset_for_tests()
     monkeypatch.setattr(sr, "_limits_cache", None)
     monkeypatch.setattr(sr, "_health_cache", None)

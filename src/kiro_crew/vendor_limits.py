@@ -399,15 +399,46 @@ def _antigravity_live_room(path: Path | None = None) -> tuple[float, set[str]]:
         return 0.0, set()
 
 
+def _live_reading(vendor: str) -> dict[str, Any]:
+    """The vendor's newest live quota reading as ``{as_of, out, room}``; ``{}`` when none.
+
+    Claude: the rate-limit event every Claude turn carries (any account). Codex: the
+    newest rollout reading. Antigravity: the companion's per-model probe (``room`` =
+    models with quota left). Read on every routing call, so a mark is reconciled
+    against live data without waiting for a restart.
+    """
+    try:
+        if vendor == "antigravity":
+            as_of, room = _antigravity_live_room()
+            return {"as_of": as_of, "out": not room, "room": room} if as_of else {}
+        if vendor == "claude":
+            h = claude_health()
+        elif vendor == "codex":
+            h = codex_health()
+        else:
+            return {}
+        if not h or not h.get("as_of"):
+            return {}
+        return {"as_of": float(h["as_of"]), "out": bool(h.get("out")), "room": None}
+    except Exception:
+        return {}
+
+
 def _stale_against_live(
-    vendor: str, mark: Mapping[str, Any], model: str, live: tuple[float, set[str]]
+    vendor: str, mark: Mapping[str, Any], model: str, live: Mapping[str, Any]
 ) -> bool:
-    """Whether a newer live probe shows room where *mark* claims none (Antigravity only)."""
-    if vendor != "antigravity":
+    """Whether a live reading newer than *mark* shows the vendor (or *model*) has quota.
+
+    A mark is one refused turn's word, kept until the reset the error named; a newer
+    live reading that is not out (another account, an early reset, a plan change)
+    outranks it.
+    """
+    as_of = float(live.get("as_of") or 0) if live else 0.0
+    if not as_of or as_of <= float(mark.get("as_of") or 0) or live.get("out"):
         return False
-    as_of, room = live
-    if not as_of or as_of <= float(mark.get("as_of") or 0):
-        return False
+    room = live.get("room")
+    if room is None:
+        return True
     return (model in room) if model else bool(room)
 
 
@@ -468,7 +499,7 @@ def quota_out(vendor: str, model: str = "", now: float | None = None) -> dict[st
         now = time.time() if now is None else now
         with _lock:
             row = dict(_load().get(OUTS_KEY, {}).get(vendor) or {})
-        live = _antigravity_live_room() if vendor == "antigravity" else (0.0, set())
+        live = _live_reading(vendor)
         whole = row.get("vendor")
         if (
             isinstance(whole, dict)
@@ -501,7 +532,7 @@ def quota_outs(now: float | None = None) -> dict[str, dict[str, Any]]:
             if not isinstance(row, dict):
                 continue
             state: dict[str, Any] = {}
-            live = _antigravity_live_room() if vendor == "antigravity" else (0.0, set())
+            live = _live_reading(vendor)
             whole = row.get("vendor")
             if (
                 isinstance(whole, dict)
