@@ -42,7 +42,7 @@ def validate_member_execution_seat(runtime_agent: str, execution: Any) -> None:
         )
 
 
-def declared_execution_seats(cfg: Any = None) -> dict[str, dict[str, str]]:
+def declared_execution_seats(cfg: Any = None) -> dict[str, dict[str, Any]]:
     from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND
     from kiro_crew.config import KiroCrewConfig
     from kiro_crew.platform.context import current_context
@@ -74,4 +74,20 @@ def declared_execution_seats(cfg: Any = None) -> dict[str, dict[str, str]]:
             "runtime_agent": alias,
             "runtime": str(row.get("runtime") or name),
         }
+        for key in ("vendor", "role", "account"):
+            if key in row:
+                value = row[key]
+                if not isinstance(value, str) or not value or value.strip() != value:
+                    raise ValueError(f"Execution seat {name!r} requires a nonempty {key}")
+                result[name][key] = value
+        for key, minimum in (("ctx", 1), ("overhead_tokens", 0)):
+            if key in row:
+                value = row[key]
+                if type(value) is not int or value < minimum:
+                    raise ValueError(f"Execution seat {name!r} requires {key} >= {minimum}")
+                result[name][key] = value
+        if "metered" in row:
+            if type(row["metered"]) is not bool:
+                raise ValueError(f"Execution seat {name!r} requires a boolean metered flag")
+            result[name]["metered"] = row["metered"]
     return result
