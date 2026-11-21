@@ -376,6 +376,72 @@ def _antigravity_group_peers(model: str, path: Path | None = None) -> list[str]:
         return [model]
 
 
+def _antigravity_live_room(path: Path | None = None) -> tuple[float, set[str]]:
+    """``(as_of, models with quota left)`` from the companion's live probe; ``(0, set())`` when unknown.
+
+    A quota mark comes from one refused turn and holds until the reset the error
+    named. The probe is read after every turn, so a newer probe that shows room
+    on a model proves the mark is stale (an early reset, a plan change).
+    """
+    try:
+        raw = json.loads((path or _data_home() / ANTIGRAVITY_QUOTA_NAME).read_text("utf-8"))
+        as_of = _iso_ts(raw.get("as_of")) if isinstance(raw, dict) else None
+        rows = raw.get("models") if isinstance(raw, dict) else None
+        if as_of is None or not isinstance(rows, dict):
+            return 0.0, set()
+        room = {
+            m
+            for m, r in rows.items()
+            if isinstance(r, dict) and (_finite(r.get("remaining_fraction")) or 0.0) > 0.0
+        }
+        return float(as_of), room
+    except Exception:
+        return 0.0, set()
+
+
+def _live_reading(vendor: str) -> dict[str, Any]:
+    """The vendor's newest live quota reading as ``{as_of, out, room}``; ``{}`` when none.
+
+    Claude: the rate-limit event every Claude turn carries (any account). Codex: the
+    newest rollout reading. Antigravity: the companion's per-model probe (``room`` =
+    models with quota left). Read on every routing call, so a mark is reconciled
+    against live data without waiting for a restart.
+    """
+    try:
+        if vendor == "antigravity":
+            as_of, room = _antigravity_live_room()
+            return {"as_of": as_of, "out": not room, "room": room} if as_of else {}
+        if vendor == "claude":
+            h = claude_health()
+        elif vendor == "codex":
+            h = codex_health()
+        else:
+            return {}
+        if not h or not h.get("as_of"):
+            return {}
+        return {"as_of": float(h["as_of"]), "out": bool(h.get("out")), "room": None}
+    except Exception:
+        return {}
+
+
+def _stale_against_live(
+    vendor: str, mark: Mapping[str, Any], model: str, live: Mapping[str, Any]
+) -> bool:
+    """Whether a live reading newer than *mark* shows the vendor (or *model*) has quota.
+
+    A mark is one refused turn's word, kept until the reset the error named; a newer
+    live reading that is not out (another account, an early reset, a plan change)
+    outranks it.
+    """
+    as_of = float(live.get("as_of") or 0) if live else 0.0
+    if not as_of or as_of <= float(mark.get("as_of") or 0) or live.get("out"):
+        return False
+    room = live.get("room")
+    if room is None:
+        return True
+    return (model in room) if model else bool(room)
+
+
 def note_quota_out(
     vendor: str,
     *,
@@ -433,12 +499,21 @@ def quota_out(vendor: str, model: str = "", now: float | None = None) -> dict[st
         now = time.time() if now is None else now
         with _lock:
             row = dict(_load().get(OUTS_KEY, {}).get(vendor) or {})
+        live = _live_reading(vendor)
         whole = row.get("vendor")
-        if isinstance(whole, dict) and float(whole.get("until") or 0) > now:
+        if (
+            isinstance(whole, dict)
+            and float(whole.get("until") or 0) > now
+            and not _stale_against_live(vendor, whole, "", live)
+        ):
             return dict(whole)
         if model:
             m = (row.get("models") or {}).get(model)
-            if isinstance(m, dict) and float(m.get("until") or 0) > now:
+            if (
+                isinstance(m, dict)
+                and float(m.get("until") or 0) > now
+                and not _stale_against_live(vendor, m, model, live)
+            ):
                 return {**m, "model": model}
     except Exception:
         logger.debug("vendor_limits: quota out unreadable", exc_info=True)
@@ -457,13 +532,20 @@ def quota_outs(now: float | None = None) -> dict[str, dict[str, Any]]:
             if not isinstance(row, dict):
                 continue
             state: dict[str, Any] = {}
+            live = _live_reading(vendor)
             whole = row.get("vendor")
-            if isinstance(whole, dict) and float(whole.get("until") or 0) > now:
+            if (
+                isinstance(whole, dict)
+                and float(whole.get("until") or 0) > now
+                and not _stale_against_live(vendor, whole, "", live)
+            ):
                 state["until"] = float(whole["until"])
             models = {
                 m: float(r["until"])
                 for m, r in (row.get("models") or {}).items()
-                if isinstance(r, dict) and float(r.get("until") or 0) > now
+                if isinstance(r, dict)
+                and float(r.get("until") or 0) > now
+                and not _stale_against_live(vendor, r, m, live)
             }
             if models:
                 state["models"] = models
