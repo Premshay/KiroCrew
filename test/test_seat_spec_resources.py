@@ -66,7 +66,7 @@ def home(tmp_path, monkeypatch):
 
 @pytest.fixture
 def guide(home):
-    docs = home / "repos" / "nexus" / "docs" / "crewmates"
+    docs = home / "example-project" / "guides"
     docs.mkdir(parents=True)
     path = docs / "delegation.md"
     path.write_text(f"# Delegation\n{_GUIDE_RULE}\n", encoding="utf-8")
@@ -150,7 +150,8 @@ def test_a_relative_glob_resource_is_not_newly_loaded(home, guide, project):
 
 
 def test_a_home_anchored_resource_is_not_newly_loaded(home, guide):
-    _write_seat(home, ["file://~/repos/nexus/docs/crewmates/delegation.md"])
+    uri = "file://" + str(guide).replace(str(home), "~", 1)
+    _write_seat(home, [uri])
     assert _part() == ""
 
 

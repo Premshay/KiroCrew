@@ -56,7 +56,7 @@ def home(tmp_path, monkeypatch):
 
 @pytest.fixture
 def guide(home):
-    docs = home / "repos" / "nexus" / "docs" / "crewmates"
+    docs = home / "example-project" / "guides"
     docs.mkdir(parents=True)
     path = docs / "delegation.md"
     path.write_text(f"# Delegation\n{_RULE}\n", encoding="utf-8")
@@ -281,8 +281,8 @@ def test_a_relative_entry_counts_on_kiro_cli_but_not_for_a_claude_code_seat(
 ):
     """A Claude Code seat never loads a relative entry, so it must still get the file."""
     configured(str(guide))
-    project = home / "repos" / "nexus"
-    _write_spec(home, _SEAT, ["file://docs/crewmates/*.md"])
+    project = home / "example-project"
+    _write_spec(home, _SEAT, ["file://guides/*.md"])
     assert _RULE in _part(provider_type=PROVIDER_CLAUDE_CODE, project=str(project))
     assert _part(provider_type=PROVIDER_ACP, project=str(project)) == ""
 
@@ -311,7 +311,7 @@ def test_a_missing_file_does_not_break_session_start(home, configured, caplog):
     assert "file not found" in caplog.text
 
 
-@pytest.mark.parametrize("entry", ["docs/delegation.md", "~/delegation.md", "/abs/*.md"])
+@pytest.mark.parametrize("entry", ["relative-guide.md", "~/delegation.md", "/abs/*.md"])
 def test_a_relative_home_or_glob_entry_is_refused(home, configured, caplog, entry):
     configured(entry)
     with caplog.at_level(logging.WARNING, logger="kiro_crew.context"):
