@@ -143,8 +143,7 @@ def _windows_view(
         view["resets_at"] = r["resets_at"]
     if r.get("status"):
         view["status"] = r["status"]
-    as_ofs = [_num(x.get("as_of")) for x in live.values()]
-    as_ofs = [a for a in as_ofs if a is not None]
+    as_ofs = [a for a in (_num(x.get("as_of")) for x in live.values()) if a is not None]
     if as_ofs:
         view["as_of"] = max(as_ofs)
     return view
