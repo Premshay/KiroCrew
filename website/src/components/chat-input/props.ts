@@ -44,7 +44,11 @@ export interface ChatInputProps {
    *  text over through its store so the host does not re-render per keystroke. */
   value?: string
   onChange: (v: string) => void
-  onSend: () => void
+  /** Send the composer. A host that can tell returns a promise of whether the
+   *  server confirmed delivery: a draft restored from the prompt stash keeps
+   *  its stash entry until that resolves `true`, so a host returning nothing
+   *  keeps the entry (safe default). */
+  onSend: () => void | Promise<boolean>
   /** Keep identified sessions pending until their local/remote metadata is available. */
   terminalCommands?: 'local' | 'remote' | 'pending'
   /** Rendered inside the composer's own width wrapper, directly above the
@@ -74,9 +78,12 @@ export interface ChatInputProps {
    *
    * `text` is a follow-up chip's own text: steer exactly that, leaving the
    * composer draft and its staging untouched (the rule an option send follows).
-   * A host that renders follow-up chips while busy must honour it. */
-  onSteer?: (opts?: { auto?: boolean; text?: string }) => void
-  /** Whether the host may offer `Auto (Jev)` in the split button's mode picker:
+   * A host that renders follow-up chips while busy must honour it.
+   *
+   * Like `onSend`, a composer steer may return a promise of confirmed delivery
+   * for the prompt stash; returning nothing keeps a restored entry. */
+  onSteer?: (opts?: { auto?: boolean; text?: string }) => void | Promise<boolean>
+  /** Whether the host may offer `Auto (decision model)` in the split button's mode picker:
    * the gateway reports the Decisions seam as permitted by governance AND
    * consented to. Defaults to false, so a surface that never asks cannot offer a
    * mode the gateway would refuse to act on. */
@@ -224,7 +231,7 @@ export interface ChatInputProps {
    * preview is on, so `model.route` puts the turn in a tier and runs it on that
    * tier's model.
    *
-   * The chip then names the POLICY (`Auto (Jev)`) in place of `modelName`, rather
+   * The chip then names the POLICY (`Auto (decision model)`) in place of `modelName`, rather
    * than an id with a marker beside it. A routed session's model changes from turn
    * to turn, so naming one makes a chip that reads like a pin and is stale by the
    * next reply; the model a given turn actually ran on is on that turn's routing
@@ -235,7 +242,7 @@ export interface ChatInputProps {
    * Hosts compute it from the SAME `jevRouteOffered()` the picker's row is drawn
    * from (`lib/jevRoute.ts`) against the slot's raw `model`, which is what the
    * routing gate reads. One condition, so the chip cannot say Auto for a turn that
-   * routed, nor Auto (Jev) for one that did not.
+   * routed, nor Auto (decision model) for one that did not.
    *
    * Wins over `modelIsInheritedDefault`: both describe a slot that pinned nothing,
    * and this one names WHO picks instead, which is the more specific fact and the
@@ -306,6 +313,10 @@ export interface ChatInputProps {
   /** Show used/window token counts in the inline context readout. */
   showContextTokens?: boolean
   isRunning?: boolean
+  /** Names the chat's current turn (`stagedProjectTurnKey`), so a queued turn
+   *  that starts without the composer going idle re-takes the start project
+   *  the staged-pick badge compares against (#20350). */
+  projectTurnKey?: string
   /** Lock the project chip: the composer is busy only because sub-agents are
    *  attached. A pick there cannot land at the next turn, because the deferred
    *  session reset stays armed while children share the runtime. */
@@ -355,7 +366,7 @@ export interface ChatInputProps {
   approvalMode?: string
   /** The approval-mode picker drives another machine's session (crew window). */
   approvalModeRemote?: ApprovalModeRemote
-  /** Drawn directly right of the approval-mode picker (the mid-chat Ultra Mode chip). */
+  /** Drawn directly right of the approval-mode picker (the mid-chat conductor mode chip). */
   afterApprovalMode?: React.ReactNode
   reasoningEffort?: string
   /** True when `reasoningEffort` is the configured default rather than a
@@ -431,6 +442,14 @@ export interface ChatInputProps {
    *  drop, no `!` shell). The context popover shows the reading only, without
    *  this machine's auto-compact slider. */
   sessionOnPeer?: boolean
+  /** The running reply's own project as the server reports it (the slot's
+   *  `turn_project`). Preferred over the composer's start-of-response
+   *  snapshot, which a reload would take from a mid-reply pick. */
+  turnProject?: string | null
+  /** True when `turnProject` is a fallback from a hidden scratch folder the chat
+   *  still stores, not a pick waiting to take effect (the slot's
+   *  `turn_project_fallback`). */
+  turnProjectFallback?: boolean
   /** Checked-out branch of the active project (or short SHA when detached). */
   projectBranch?: string
   /** True when the project's HEAD is detached, so the label is a commit. */
@@ -564,6 +583,12 @@ export interface ChatInputProps {
    * composer's shape itself.
    */
   inlineToolbarWhileFits?: boolean
+  /**
+   * Persisted prompt stash. Defaults on for ordinary on-record composers.
+   * Off-record composers whose drafts intentionally live only in memory must
+   * opt out so their text cannot cross that persistence boundary.
+   */
+  promptStash?: boolean
   /**
    * The user-driven collapse: the "put the message box away while I read" entry
    * point, the bar that replaces it, and the persisted preference.

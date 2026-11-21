@@ -13,11 +13,12 @@ from __future__ import annotations
 import importlib.util
 import math
 import os
+import shutil
 import subprocess
 import sys
-import time
 
 import pytest
+from push_guard_helpers import _fixture_git_env
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SCRIPT_PATH = os.path.join(_REPO_ROOT, "scripts", "check_brand_name.py")
@@ -162,11 +163,18 @@ class TestUrlBoundary:
     def test_a_very_long_line_stays_linear(self, filler: str, glue: str) -> None:
         # A generated file can carry one enormous line. Quadratic backtracking here
         # would blow the CI job's timeout on input nobody can see is pathological.
-        line = filler * (200_000 // len(filler)) + glue + "KiroCrew is here"
-        started = time.monotonic()
-        found = _hits(line, path="big.md")
-        assert time.monotonic() - started < 2.0
-        assert found == ["KiroCrew"]
+        # The cost is inside the regex engine, which no work counter can see, so
+        # the shared ramp holds this thread's CPU to its 2 s budget
+        # (``REDOS_LARGE_BUDGET_SECONDS``, the constant this guard carries), one
+        # filler unit at a time and then at growing pumps.
+        from conftest import assert_rejected_without_backtracking
+
+        def reject(line: str) -> None:
+            assert _hits(line, path="big.md") == ["KiroCrew"]
+
+        assert_rejected_without_backtracking(
+            reject, lambda n: filler * n + glue + "KiroCrew is here"
+        )
 
     def test_many_brand_names_on_one_line_stay_linear(self) -> None:
         # The other axis: not one long line, but MANY matches on it. Any per-match
@@ -263,10 +271,17 @@ class TestUrlBoundary:
         )
 
     def test_many_backticks_stay_linear(self) -> None:
-        line = "`x`" * 30_000 + " KiroCrew"
-        started = time.monotonic()
-        assert _hits(line, path="big.md") == ["KiroCrew"]
-        assert time.monotonic() - started < 2.0
+        # Pairing the backtick runs must stay linear in their number. A rescan per
+        # run can sit in C (a slice, a regex), which no work counter can see, so
+        # the shared ramp holds this thread's CPU to its 2 s budget
+        # (``REDOS_LARGE_BUDGET_SECONDS``, the constant this guard carries), one
+        # ``x`` span at a time and then at growing pumps.
+        from conftest import assert_rejected_without_backtracking
+
+        def reject(line: str) -> None:
+            assert _hits(line, path="big.md") == ["KiroCrew"]
+
+        assert_rejected_without_backtracking(reject, lambda n: "`x`" * n + " KiroCrew")
 
 
 # ---------------------------------------------------------------------------
@@ -405,28 +420,44 @@ class TestScope:
         assert [v.line_no for v in gate.scan_file("crlf.md")] == [3]
 
 
+@pytest.fixture(scope="session")
+def brand_repo_seed(tmp_path_factory) -> str:
+    """A commit-less repo holding the gate's two scripts, built once; tests copy it.
+
+    ``git init`` plus two ``git config`` calls cost three spawns per diff-scoped
+    case. Session scope is safe because the seed is never handed to a test, only
+    copied from.
+    """
+    root = str(tmp_path_factory.mktemp("brand-gate-seed") / "repo")
+    os.makedirs(root)
+    # Session scope runs before the per-test git floor, so the host's git config,
+    # templates and hooks are shut out here explicitly.
+    env = _fixture_git_env()
+    run = lambda *a: subprocess.run(a, cwd=root, env=env, check=True, capture_output=True)  # noqa: E731
+    run("git", "init", "-q", "-b", "main")
+    run("git", "config", "user.email", "t@example.com")
+    run("git", "config", "user.name", "t")
+    os.makedirs(os.path.join(root, "scripts"))
+    # The gate delegates its git plumbing to scripts/ratchet_scope.py and
+    # loads it by path relative to itself, so the throwaway repo needs both
+    # files or every diff-scoped run dies at the loader instead of testing
+    # anything.
+    for name in ("check_brand_name.py", "ratchet_scope.py"):
+        with open(os.path.join(_REPO_ROOT, "scripts", name), encoding="utf-8") as src:
+            body = src.read()
+        with open(os.path.join(root, "scripts", name), "w", encoding="utf-8") as fh:
+            fh.write(body)
+    return root
+
+
 @pytest.mark.xdist_group(name="subprocess_spawn")
 class TestDiffScopedRun:
     """End-to-end through a throwaway repo: only ADDED lines may fail the gate."""
 
     @staticmethod
-    def _repo(tmp_path) -> str:
+    def _repo(tmp_path, seed) -> str:
         root = str(tmp_path / "repo")
-        os.makedirs(root)
-        run = lambda *a: subprocess.run(a, cwd=root, check=True, capture_output=True)  # noqa: E731
-        run("git", "init", "-q", "-b", "main")
-        run("git", "config", "user.email", "t@example.com")
-        run("git", "config", "user.name", "t")
-        os.makedirs(os.path.join(root, "scripts"))
-        # The gate delegates its git plumbing to scripts/ratchet_scope.py and
-        # loads it by path relative to itself, so the throwaway repo needs both
-        # files or every diff-scoped run dies at the loader instead of testing
-        # anything.
-        for name in ("check_brand_name.py", "ratchet_scope.py"):
-            with open(os.path.join(_REPO_ROOT, "scripts", name), encoding="utf-8") as src:
-                body = src.read()
-            with open(os.path.join(root, "scripts", name), "w", encoding="utf-8") as fh:
-                fh.write(body)
+        shutil.copytree(seed, root)
         return root
 
     @staticmethod
@@ -463,8 +494,8 @@ class TestDiffScopedRun:
         subprocess.run(["git", "add", "-A"], cwd=root, check=True, capture_output=True)
         subprocess.run(["git", "commit", "-qm", msg], cwd=root, check=True, capture_output=True)
 
-    def test_preexisting_violation_does_not_fail_the_diff_gate(self, tmp_path) -> None:
-        root = self._repo(tmp_path)
+    def test_preexisting_violation_does_not_fail_the_diff_gate(self, tmp_path, brand_repo_seed) -> None:
+        root = self._repo(tmp_path, brand_repo_seed)
         self._commit(root, "doc.md", "Old line about KiroCrew.\n", "base")
         base = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, encoding="utf-8", check=True
@@ -476,9 +507,9 @@ class TestDiffScopedRun:
         assert "no misspellings" in result.stdout
 
     def test_added_violation_fails_with_the_correct_spelling_in_the_message(
-        self, tmp_path
+        self, tmp_path, brand_repo_seed
     ) -> None:
-        root = self._repo(tmp_path)
+        root = self._repo(tmp_path, brand_repo_seed)
         self._commit(root, "doc.md", "Nothing to see.\n", "base")
         base = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, encoding="utf-8", check=True
@@ -491,8 +522,8 @@ class TestDiffScopedRun:
         assert "'Kiro Crew'" in result.stdout
         assert "doc.md:2" in result.stdout
 
-    def test_no_base_ref_reports_the_whole_tree_without_failing(self, tmp_path) -> None:
-        root = self._repo(tmp_path)
+    def test_no_base_ref_reports_the_whole_tree_without_failing(self, tmp_path, brand_repo_seed) -> None:
+        root = self._repo(tmp_path, brand_repo_seed)
         self._commit(root, "doc.md", "Prose about KiroCrew everywhere.\n", "base")
 
         result = self._run(root, None)
@@ -502,10 +533,10 @@ class TestDiffScopedRun:
 
     # --- the three ways a diff-scoped gate can skip itself green -------------
 
-    def test_a_no_diff_gitattribute_cannot_hide_a_file(self, tmp_path) -> None:
+    def test_a_no_diff_gitattribute_cannot_hide_a_file(self, tmp_path, brand_repo_seed) -> None:
         # `-diff` makes git report only "Binary files differ" with no @@ hunks.
         # Without --text there is nothing to scan and the file passes unread.
-        root = self._repo(tmp_path)
+        root = self._repo(tmp_path, brand_repo_seed)
         self._commit(root, ".gitattributes", "*.md -diff\n", "base")
         base = self._head(root)
         self._commit(root, "doc.md", "Run KiroCrew today.\n", "head")
@@ -514,10 +545,10 @@ class TestDiffScopedRun:
         assert result.returncode == 1, result.stdout
         assert "doc.md:1" in result.stdout
 
-    def test_a_non_ascii_path_cannot_hide_a_file(self, tmp_path) -> None:
+    def test_a_non_ascii_path_cannot_hide_a_file(self, tmp_path, brand_repo_seed) -> None:
         # git quotes such a path as `+++ "b/docs/\346..."`, which a `+++ b/` parser
         # misses — and then misattributes the hunks to whichever file came before.
-        root = self._repo(tmp_path)
+        root = self._repo(tmp_path, brand_repo_seed)
         self._commit(root, "clean.md", "nothing here\n", "base")
         base = self._head(root)
         self._commit(root, "日本語.md", "Run KiroCrew today.\n", "head")
@@ -527,8 +558,8 @@ class TestDiffScopedRun:
         assert "日本語.md:1" in result.stdout
         assert "clean.md" not in result.stdout
 
-    def test_an_undecodable_changed_file_fails_closed(self, tmp_path) -> None:
-        root = self._repo(tmp_path)
+    def test_an_undecodable_changed_file_fails_closed(self, tmp_path, brand_repo_seed) -> None:
+        root = self._repo(tmp_path, brand_repo_seed)
         self._commit(root, "clean.md", "nothing here\n", "base")
         base = self._head(root)
         with open(os.path.join(root, "notes.txt"), "wb") as fh:
@@ -541,8 +572,8 @@ class TestDiffScopedRun:
         assert "cannot read" in result.stdout
         assert "notes.txt" in result.stdout
 
-    def test_a_pure_deletion_hunk_contributes_nothing(self, tmp_path) -> None:
-        root = self._repo(tmp_path)
+    def test_a_pure_deletion_hunk_contributes_nothing(self, tmp_path, brand_repo_seed) -> None:
+        root = self._repo(tmp_path, brand_repo_seed)
         self._commit(root, "doc.md", "keep\nKiroCrew line\nkeep\n", "base")
         base = self._head(root)
         self._commit(root, "doc.md", "keep\nkeep\n", "head")
@@ -550,9 +581,9 @@ class TestDiffScopedRun:
         result = self._run(root, base)
         assert result.returncode == 0, result.stdout
 
-    def test_a_brand_new_file_is_scanned(self, tmp_path) -> None:
+    def test_a_brand_new_file_is_scanned(self, tmp_path, brand_repo_seed) -> None:
         # `@@ -0,0 +1,N @@` — the shape every added file produces.
-        root = self._repo(tmp_path)
+        root = self._repo(tmp_path, brand_repo_seed)
         self._commit(root, "existing.md", "nothing\n", "base")
         base = self._head(root)
         self._commit(root, "fresh.md", "line one\nRun KiroCrew here.\n", "head")
@@ -561,10 +592,10 @@ class TestDiffScopedRun:
         assert result.returncode == 1, result.stdout
         assert "fresh.md:2" in result.stdout
 
-    def test_a_base_with_no_common_ancestor_still_enforces(self, tmp_path) -> None:
+    def test_a_base_with_no_common_ancestor_still_enforces(self, tmp_path, brand_repo_seed) -> None:
         # What a shallow CI clone looks like: the base is fetched as its own tip, so
         # `merge-base` finds nothing and the base tip has to serve as the range end.
-        root = self._repo(tmp_path)
+        root = self._repo(tmp_path, brand_repo_seed)
         self._commit(root, "doc.md", "clean\n", "first")
         subprocess.run(
             ["git", "checkout", "-q", "--orphan", "detached"],
@@ -584,8 +615,8 @@ class TestDiffScopedRun:
         assert result.returncode == 1, result.stdout
         assert "doc.md:1" in result.stdout
 
-    def test_a_translated_catalog_cannot_fail_the_gate(self, tmp_path) -> None:
-        root = self._repo(tmp_path)
+    def test_a_translated_catalog_cannot_fail_the_gate(self, tmp_path, brand_repo_seed) -> None:
+        root = self._repo(tmp_path, brand_repo_seed)
         os.makedirs(os.path.join(root, "website/src/i18n/locales"))
         self._commit(root, "website/src/i18n/locales/de.json", "{}\n", "base")
         base = self._head(root)
@@ -599,12 +630,12 @@ class TestDiffScopedRun:
         result = self._run(root, base)
         assert result.returncode == 0, result.stdout
 
-    def test_a_clean_verdict_survives_a_non_utf8_console(self, tmp_path) -> None:
+    def test_a_clean_verdict_survives_a_non_utf8_console(self, tmp_path, brand_repo_seed) -> None:
         # The clean verdict ends in a check mark and the error line carries an em
         # dash. A cp1252 console (the Windows default) cannot encode the check mark,
         # which turned a PASS into a traceback and failed the build on a good tree.
         # PYTHONIOENCODING reproduces that on any platform.
-        root = self._repo(tmp_path)
+        root = self._repo(tmp_path, brand_repo_seed)
         self._commit(root, "doc.md", "nothing here\n", "base")
         base = self._head(root)
         self._commit(root, "doc.md", "nothing here\nstill clean\n", "head")
@@ -614,8 +645,8 @@ class TestDiffScopedRun:
         assert "UnicodeEncodeError" not in result.stderr
         assert "no misspellings" in result.stdout
 
-    def test_a_non_ascii_path_is_printable_on_a_non_utf8_console(self, tmp_path) -> None:
-        root = self._repo(tmp_path)
+    def test_a_non_ascii_path_is_printable_on_a_non_utf8_console(self, tmp_path, brand_repo_seed) -> None:
+        root = self._repo(tmp_path, brand_repo_seed)
         self._commit(root, "clean.md", "nothing here\n", "base")
         base = self._head(root)
         self._commit(root, "日本語.md", "Run KiroCrew today.\n", "head")
@@ -626,8 +657,8 @@ class TestDiffScopedRun:
         # The path itself may be replacement-charactered, but the finding must print.
         assert ".md:1" in result.stdout
 
-    def test_self_test_mode_passes(self, tmp_path) -> None:
-        root = self._repo(tmp_path)
+    def test_self_test_mode_passes(self, tmp_path, brand_repo_seed) -> None:
+        root = self._repo(tmp_path, brand_repo_seed)
         self._commit(root, "doc.md", "clean\n", "base")
         result = subprocess.run(
             [sys.executable, os.path.join(root, "scripts", "check_brand_name.py"), "--test"],
@@ -639,7 +670,7 @@ class TestDiffScopedRun:
         assert result.returncode == 0, result.stdout
         assert "self-test passed" in result.stdout
 
-    def test_self_test_actually_judges_the_growth_ratio(self, tmp_path) -> None:
+    def test_self_test_actually_judges_the_growth_ratio(self, tmp_path, brand_repo_seed) -> None:
         """The repeated-brands check must reach a verdict, not skip itself.
 
         A fixed 20k-brand baseline costs fast hardware ~19-21ms against a 20ms
@@ -648,7 +679,7 @@ class TestDiffScopedRun:
         quadratic guard is a coin-flip no-op. The workload grows until the
         baseline is measurable, so a real ratio is always reported.
         """
-        root = self._repo(tmp_path)
+        root = self._repo(tmp_path, brand_repo_seed)
         self._commit(root, "doc.md", "clean\n", "base")
         result = subprocess.run(
             [sys.executable, os.path.join(root, "scripts", "check_brand_name.py"), "--test"],

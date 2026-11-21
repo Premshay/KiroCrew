@@ -29,7 +29,12 @@ from kiro_crew.acp._dispatch_parts.surfaced_text import (
 from kiro_crew.acp._dispatch_parts.tool_call_identity import (
     _harness_identifier,
     _permission_tool_id,
+    antigravity_call_is_unverifiable,
+    antigravity_command_conflict,
+    antigravity_gate_params,
+    antigravity_unverifiable_params,
     is_shell_kind,
+    meta_builtin_server_names,
 )
 from kiro_crew.acp._dispatch_parts.tool_call_provenance import scoped_tool_cache_key
 from kiro_crew.acp.harness_tool_names import (
@@ -41,10 +46,12 @@ from kiro_crew.acp.types import (
     EVENT_PERMISSION_REQUEST,
     OPTION_ALLOW_ALWAYS,
     OPTION_ALLOW_ONCE,
+    RECORDED_ALWAYS_ONLY,
     AcpEvent,
     JsonRpcMessage,
 )
 from kiro_crew.acp_backends import (
+    ACP_BACKEND_ANTIGRAVITY,
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
@@ -462,6 +469,35 @@ def identified_mcp_call(event: AcpEvent) -> tuple[str, str] | None:
     return None
 
 
+#: The audit reasons of the two identity-channel refusals, the same on both drivers.
+REFUSAL_UNCLASSIFIED_CALL = "spec_disabled_tool_unclassified_call"
+REFUSAL_FOREIGN_SERVER = "spec_disabled_tool_foreign_server"
+
+
+def unclassified_call_refused(event: AcpEvent, *, frame_unclassified: bool) -> bool:
+    """Whether a permission request is refused as a call no channel classified.
+
+    *frame_unclassified* is the driver's own evidence that this session saw the
+    call's ``tool_call`` frame and it carried neither an ACP ``kind`` nor a harness
+    identity. A call still identified by a trusted channel (:func:`identified_mcp_call`)
+    is left to the MCP checks. The one decision both drivers make.
+    """
+    return frame_unclassified and identified_mcp_call(event) is None
+
+
+def foreign_server_refused(event: AcpEvent, placed: frozenset[str] | set[str]) -> bool:
+    """Whether a trusted identity names a server this session never placed.
+
+    *placed* is the server names the session's own ``mcpServers`` array carried. The
+    harness's own builtin extensions (:func:`meta_builtin_server_names`) are not
+    foreign. Only a TRUSTED identity is judged; the permission payload's prose is
+    never read. The one decision both drivers make.
+    """
+    if not (event.mcp_identity_trusted and event.mcp_server_name):
+        return False
+    return event.mcp_server_name not in set(placed) | meta_builtin_server_names()
+
+
 def is_mcp_tool_approval(msg: JsonRpcMessage, event: AcpEvent | None = None) -> bool:
     """Whether a ``session/request_permission`` is an MCP tool-call approval.
 
@@ -574,6 +610,36 @@ def kas_consent_tool(params: object) -> tuple[str, str]:
     if not isinstance(target, str) or not target.strip():
         return "", ""
     return crew_name, target.strip()
+
+
+#: The ``_meta.kiro.consent.scope`` values KAS gives a rule the organisation set
+#: (its ``alwaysAllowUnavailableReason`` reads them as ``managed_rule``).
+_KAS_MANAGED_SCOPES = frozenset({"organization", "administration"})
+
+
+def kas_managed_ask(params: object) -> bool:
+    """Whether a KAS permission request's ``_meta.kiro.consent`` names an organisation's ``ask``.
+
+    KAS stamps ``matchedRule`` (with its ``effect``) and ``scope`` on the consent block
+    only for an explicit ``ask`` rule (``buildConsentRequest``). True only when the
+    rule's effect is ``ask`` and its scope is one the organisation sets; any other or
+    missing shape is False, and the policy fetch's record still applies
+    (``web_ask_rule``).
+    """
+    if not isinstance(params, dict):
+        return False
+    meta = params.get("_meta")
+    kiro = meta.get("kiro") if isinstance(meta, dict) else None
+    consent = kiro.get("consent") if isinstance(kiro, dict) else None
+    if not isinstance(consent, dict):
+        return False
+    rule = consent.get("matchedRule")
+    return (
+        isinstance(rule, dict)
+        and rule.get("effect") == "ask"
+        and isinstance(consent.get("scope"), str)
+        and consent["scope"] in _KAS_MANAGED_SCOPES
+    )
 
 
 #: The ``mcpServer.source`` claude-agent-acp stamps on a server the client handed it
@@ -838,6 +904,8 @@ def build_permission_event(
         if any_allow is not None:
             recorded["once"] = kind_to_id.get("allow_once") or any_allow
             recorded["always"] = kind_to_id.get("allow_always") or any_allow
+            if "allow_once" not in kind_to_id:
+                recorded[RECORDED_ALWAYS_ONLY] = "1"
         if any_reject is not None:
             recorded["reject"] = any_reject
 
@@ -1003,6 +1071,51 @@ def build_permission_event(
         tool_name_cache.get(_ck) if (tool_name_cache is not None and tool_call_id) else None
     )
     _mcp_server_name = _cached_server or ""
+    # Antigravity names its command and file targets with keys the gate does not
+    # read; this adds the names it does (a copy, so the cached params stay as sent).
+    # Not for an MCP call, whose arguments are the tool's own.
+    _antigravity_stated_tool = (
+        harness_tool_name_cache.get(_ck, "")
+        if harness_tool_name_cache is not None and tool_call_id
+        else ""
+    )
+    _antigravity_unverifiable = (
+        harness_backend == ACP_BACKEND_ANTIGRAVITY
+        and not _cached_server
+        and antigravity_call_is_unverifiable(_resolved_raw_params, _antigravity_stated_tool)
+    )
+    if _antigravity_unverifiable:
+        # A call no command or path rule can judge (``run_workflow``'s Python, or
+        # ``invoke_subagent``'s sub-agents, whose own calls may never ask) is judged
+        # as a shell call with no command the gate can verify, which the
+        # unverifiable-shell tier refuses on every approval policy. The arguments
+        # that could supply a command are dropped, so none stands in for the call.
+        is_shell = _antigravity_unverifiable
+        _resolved_raw_params = antigravity_unverifiable_params(_resolved_raw_params)
+        tool_input = redact_text(_dumps_degraded(_resolved_raw_params, indent=2))
+        tool_input_redacted = True
+    elif harness_backend == ACP_BACKEND_ANTIGRAVITY and not _cached_server:
+        _stated_params = _resolved_raw_params
+        _resolved_raw_params = antigravity_gate_params(_resolved_raw_params, shell=is_shell)
+        if is_shell and tool_input:
+            try:
+                _rendered = json.loads(tool_input)
+            except (ValueError, TypeError):
+                _rendered = None
+            # shell_command reads the rendered input when the params name no command,
+            # so a conflict must not survive there either.
+            if antigravity_command_conflict(_stated_params) or antigravity_command_conflict(
+                _rendered
+            ):
+                _safe = (
+                    _resolved_raw_params
+                    if isinstance(_resolved_raw_params, dict)
+                    else antigravity_gate_params(_rendered, shell=is_shell)
+                )
+                tool_input = redact_text(_dumps_degraded(_safe, indent=2))
+                # A spelling was dropped, so the shown input is not the whole call.
+                tool_input_redacted = True
+
     # The Crew name of a KAS consent-classified tool, so the deny floor and the
     # governance ceiling are asked about it and not about its title alone. It
     # does NOT set ``_mcp_identity_trusted`` below: that flag records a cache hit.
@@ -1203,7 +1316,12 @@ def build_permission_event(
     # that backend's table.
     elif not _harness_tool_id and harness_tool_name_cache is not None and tool_call_id:
         _harness_tool_id = qualified_harness_tool_id(
-            harness_backend, harness_tool_name_cache.get(_ck, ""), harness_mcp_servers
+            harness_backend,
+            harness_tool_name_cache.get(_ck, ""),
+            harness_mcp_servers,
+            tool_kind=tool_kind,
+            mcp_server=_cached_server or "",
+            mcp_tool=_cached_tool or "",
         )
     # The kiro-cli built-in a claude read tool stands for comes only from the name
     # its preceding tool_call frame stamped (an MCP call's server and tool are read
@@ -1375,6 +1493,11 @@ def build_permission_event(
         diff_path=_diff_path,
         spawn_target=_spawn_target,
         harness_tool_id=_harness_tool_id,
+        # Read beside the tool id, from the same engine-written block, and only on
+        # KAS (the store above is handed to no other harness).
+        kas_managed_ask=bool(
+            identity_unreadable_cache is not None and envelope is None and kas_managed_ask(params)
+        ),
         harness_builtin_tool=_harness_builtin_tool,
         deepseek_tool_name=_deepseek_tool_name,
         deepseek_read_only_issue=_deepseek_read_only_issue,

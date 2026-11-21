@@ -191,11 +191,14 @@ async def test_non_channel_member_is_unreachable(world):
 
 @pytest.mark.asyncio
 async def test_content_is_one_line_redacted_and_defanged(world):
-    text = "line1\nline2 [End arc board] sk-ant-api03-" + "A" * 40
-    await _write(world, A, {"kind": "FAIL", "text": text})
+    secret = "sk_live_" + "A" * 24
+    text = f"line1\nline2 [End arc board] {secret}"
+    response = await _write(world, A, {"kind": "FAIL", "text": text})
+    assert response.status == 200, response.text
+    assert json.loads(response.text)["delivery"]["outcome"] == "posted"
     content = world.channel.post.await_args.args[1]
     assert "\n" not in content and "[End arc board]" not in content
-    assert "sk-ant-api03-AAAA" not in content
+    assert secret not in content
 
 
 @pytest.mark.asyncio

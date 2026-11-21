@@ -27,6 +27,7 @@ from typing import Any
 
 from aiohttp import web
 
+from kiro_crew import ledger_wake
 from kiro_crew import remote_dispatch_mailbox as mailbox
 from kiro_crew import work_ledger
 from kiro_crew.crew_log import emit as crew_log_emit
@@ -131,6 +132,27 @@ def _widest_report_fits(board: str, item: work_ledger.WorkItem) -> bool:
     return invalid is None and probe is not None and crew_log_emit.work_entry_fits(probe)
 
 
+async def _free_stranded_copy(state: Any, parsed: mailbox.MailboxRequest) -> bool:
+    """Close *parsed*'s stored copy when its worker slot is gone; whether the copy is gone.
+
+    A create cut off between the bind and the birth line leaves the item bound to a
+    slot no restart brings back, and only a slot close frees it. An open copy whose
+    worker slot is absent is closed exactly as that close would, so an unreported
+    copy is discarded with its binding. A live worker, a slot still being built or
+    restored, a closed copy and an unreadable one all keep the copy, and so does
+    every copy until the startup restore has run: before it, absence proves nothing.
+    """
+    if not getattr(state, "open_slots_restored", False):
+        return False
+    item = await asyncio.to_thread(work_ledger.read_work_item, parsed.board, parsed.item_id)
+    if item is None or item.is_terminal or not item.worker_session_key:
+        return False
+    if not ledger_wake.worker_closed(state, item.worker_session_key):
+        return False
+    await close_work_item_for_slot(item.worker_session_key)
+    return not await asyncio.to_thread(mailbox.item_exists, parsed)
+
+
 async def work_item_for_create(
     request: web.Request, body: dict[str, Any]
 ) -> tuple[mailbox.MailboxRequest | None, web.Response | None]:
@@ -171,9 +193,13 @@ async def work_item_for_create(
     except work_ledger.WorkLedgerError as exc:
         _audit(_caller(request), "chat_slot_create.work_item", "denied", error=exc.code)
         return None, _refuse_store_error(exc)
-    if await asyncio.to_thread(mailbox.item_exists, parsed):
-        # Asked before the mint, so a retry builds nothing. The bind asks again
-        # under the item lock, and its answer is the one that counts.
+    if await asyncio.to_thread(mailbox.item_exists, parsed) and not await _free_stranded_copy(
+        request.app["state"], parsed
+    ):
+        # Asked before the mint, so a retry builds nothing. A copy whose worker slot
+        # is gone is first closed as that slot's close would have, which discards an
+        # unreported one. The bind asks again under the item lock, and its answer is
+        # the one that counts.
         return None, _refuse_409(
             work_ledger.CODE_DUPLICATE_ITEM,
             f"item {parsed.item_id!r} already has a worker on this crew",
@@ -209,10 +235,13 @@ async def bind_work_item(
         if dirty is not None:
             return dirty
         try:
+            settings = await asyncio.to_thread(remote_dispatch_headroom.remote_dispatch_settings)
             # Drained, not shielded: a cancellation waits for the write to finish,
-            # so the create's unwind sees the binding it must undo.
-            await _drain_before_cancelling(
-                asyncio.to_thread(mailbox.open_mailbox, parsed, slot_key)
+            # so the create's unwind sees the binding it must undo. The headroom is
+            # measured again under the admission lock with the write, so a create
+            # bound meanwhile is counted (RFC §2b).
+            headroom, short = await _drain_before_cancelling(
+                asyncio.to_thread(remote_dispatch_headroom.bind_if_room, settings, parsed, slot_key)
             )
         except work_ledger.WorkLedgerError as exc:
             _audit(
@@ -228,6 +257,15 @@ async def bind_work_item(
                 "remote work item %s: mailbox write failed", parsed.item_id, exc_info=True
             )
             return _refuse_503("ledger_write_failed", "ledger write failed; try again")
+        if short:
+            _audit(
+                _caller(request),
+                "chat_slot_create.work_item",
+                "denied",
+                resources=parsed.item_id,
+                error="crew_busy",
+            )
+            return remote_dispatch_headroom.crew_busy_response(short, headroom)
     _audit(_caller(request), "chat_slot_create.work_item", "ok", resources=parsed.item_id)
     return None
 

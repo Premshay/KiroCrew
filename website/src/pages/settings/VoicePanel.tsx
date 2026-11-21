@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { SettingsSection, SettingsCard, SettingsToggle, SettingsSelect, SettingsInput } from '../../components/settings'
 import { Btn, FormSkeleton } from '../../components/ui'
@@ -9,6 +9,7 @@ import AwsConsentGate from '../../components/AwsConsentGate'
 import { i18nT } from '../../i18n/t'
 import { Info } from 'lucide-react'
 import ErrorNotice from '../../components/ErrorNotice'
+import { useViewerIsNotOwner } from '../../hooks/sharedCrew/useSharedCrew'
 import SpeechProviderNotice from '../../components/SpeechProviderNotice'
 import { parseSpeechProviders, speechProviderNotice, speechProviderOptions } from '../../lib/speechProviders'
 import { languageOptionLabel } from '../../lib/sttProviders'
@@ -99,7 +100,7 @@ export function VoicePanel() {
   const [localRegion, setLocalRegion] = useState('')
   const [localPiperBinary, setLocalPiperBinary] = useState('')
   const [localPiperModel, setLocalPiperModel] = useState('')
-  const [localPocketVoice, setLocalPocketVoice] = useState('')
+  const [localPocketVoice, setLocalPocketVoice] = useState<string | null>(null)
 
   // ── Text-to-Speech config (server-side) ──
   const voiceQ = useQuery<VoiceConfig>({ queryKey: ['voiceConfig'], queryFn: () => api.voiceConfig() })
@@ -127,7 +128,6 @@ export function VoicePanel() {
     setLocalRegion(voiceQ.data.region || '')
     setLocalPiperBinary(voiceQ.data.piper_binary || '')
     setLocalPiperModel(voiceQ.data.piper_model || '')
-    setLocalPocketVoice(voiceQ.data.voice || '')
   }
 
   // `voice` takes the first fallback entry rather than respelling the VoiceId:
@@ -136,9 +136,6 @@ export function VoicePanel() {
   const voiceCfg = voiceQ.data ?? { enabled: false, provider: 'system', voice: VOICE_OPTIONS_FALLBACK[0].value, engine: 'generative', rate: '100%', autoSpeak: false, aws_profile: '', region: '', piper_binary: '', piper_model: '', piper_model_config: '', piper_length_scale: 1.0, system_voice: '' }
   const isPolly = voiceCfg.provider === 'polly'
   const isPocket = voiceCfg.provider === 'pocket'
-  useEffect(() => {
-    if (isPocket) setLocalPocketVoice(voiceCfg.voice || '')
-  }, [isPocket, voiceCfg.voice])
   const isSystem = voiceCfg.provider === 'system'
   const servedProviders = parseSpeechProviders(voiceCfg.providers)
   const providerChoices = speechProviderOptions(servedProviders, PROVIDER_OPTIONS, p =>
@@ -148,6 +145,9 @@ export function VoicePanel() {
   // (install one, or switch provider), so it is surfaced rather than left to a
   // failed synthesis. Only claimed once the probe has actually answered.
   const systemUnavailable = isSystem && systemVoicesQ.isSuccess && !systemVoicesQ.data.available
+  // The engine is installed on the Crew's computer, which a teammate cannot reach,
+  // so they get the same status without the install command.
+  const { notOwner } = useViewerIsNotOwner()
   // A failed probe would otherwise collapse to a picker offering only the OS
   // default, which reads as "this host has one voice" rather than as a failure.
   const systemVoicesFailed = isSystem && systemVoicesQ.isError
@@ -187,16 +187,12 @@ export function VoicePanel() {
     onError: (_err, _vars, ctx) => {
       if (ctx?.prev) {
         qc.setQueryData(['voiceConfig'], ctx.prev)
-        setLocalProfile(ctx.prev.aws_profile || '')
-        setLocalRegion(ctx.prev.region || '')
-        setLocalPiperBinary(ctx.prev.piper_binary || '')
-        setLocalPiperModel(ctx.prev.piper_model || '')
-        setLocalPocketVoice(ctx.prev.voice || '')
         window.dispatchEvent(new CustomEvent('voice-config-changed', { detail: ctx.prev }))
       }
       setSaveError(i18nT('pages.settings.voicePanel.failed_to_save_voice_config'))
     },
     onSuccess: (_data, patch) => {
+      if ('voice' in patch || 'provider' in patch) setLocalPocketVoice(null)
       // The consent gate caches the resolved account under this key; a new
       // profile/region does not touch it, so the gate keeps showing the old
       // account and Confirm 409s on the stale value. Re-probe on a real change.
@@ -215,11 +211,8 @@ export function VoicePanel() {
 
   return (
     <>
-      {/* askAgent ON: `onError` above has already reverted localProfile /
-          localRegion to the server value
-          by the time this banner shows, so the navigation cannot destroy an
-          unsaved edit — the fields hold exactly what is persisted. */}
-      <ErrorNotice message={saveError} onDismiss={() => setSaveError('')} className="mb-4 animate-rise" askAgent />
+      {/* A failed save keeps the typed draft available for retry. */}
+      <ErrorNotice message={saveError} onDismiss={() => setSaveError('')} className="mb-4 animate-rise" />
 
       <SettingsSection title={i18nT('pages.settings.voicePanel.text_to_speech')}>
         <SettingsCard>
@@ -252,7 +245,9 @@ export function VoicePanel() {
                        user who installs espeak-ng would otherwise stare at this
                        line until a full reload. */
                     <div className="flex flex-wrap items-center gap-2 mb-2 text-[13px]" data-testid="system-engine-absent">
-                      <span className="flex items-center gap-1.5"><Info size={13} className="lucide-inline" /> {i18nT('pages.settings.voicePanel.this_host_has_no_built_in_speech_engine_install_es')}</span>
+                      <span className="flex items-center gap-1.5"><Info size={13} className="lucide-inline" /> {notOwner
+                        ? i18nT('pages.settings.voicePanel.no_engine_teammate')
+                        : i18nT('pages.settings.voicePanel.this_host_has_no_built_in_speech_engine_install_es')}</span>
                       {/* "Check again", not "Retry": nothing failed here. The engine is
                           absent, so this re-runs detection after the user installs one --
                           the two genuine fetch failures below keep "Retry". */}
@@ -293,7 +288,16 @@ export function VoicePanel() {
                   <SettingsInput label={i18nT('pages.settings.voicePanel.aws_region_polly')} hint={i18nT('pages.settings.voicePanel.aws_region_for_polly_api')} value={localRegion} onChange={setLocalRegion} onBlur={() => setVoice({ region: localRegion.trim() })} placeholder={i18nT('pages.settings.voicePanel.us_east_1')} disabled={voiceDisabled} />
                 </>
               ) : isPocket ? (
-                <SettingsInput label={i18nT('pages.settings.voicePanel.voice')} value={localPocketVoice} onChange={setLocalPocketVoice} onBlur={() => setVoice({ voice: localPocketVoice.trim() })} placeholder="michael" disabled={voiceDisabled} />
+                <SettingsInput
+                  label={i18nT('pages.settings.voicePanel.voice')}
+                  value={localPocketVoice ?? voiceCfg.voice}
+                  onChange={setLocalPocketVoice}
+                  onBlur={() => {
+                    if (localPocketVoice !== null) setVoice({ voice: localPocketVoice.trim() })
+                  }}
+                  placeholder="michael"
+                  disabled={voiceDisabled}
+                />
               ) : voiceCfg.provider === 'piper' ? (
                 <>
                   <SettingsInput label={i18nT('pages.settings.voicePanel.piper_model')} description={i18nT('pages.settings.voicePanel.path_to_the_piper_voice_model_onnx_required_down')} value={localPiperModel} onChange={setLocalPiperModel} onBlur={() => setVoice({ piper_model: localPiperModel.trim() })} placeholder={i18nT('pages.settings.voicePanel.piper_en_us_lessac_medium_onnx')} disabled={voiceDisabled} />

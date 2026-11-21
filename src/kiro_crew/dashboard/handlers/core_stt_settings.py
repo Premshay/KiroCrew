@@ -223,7 +223,7 @@ async def api_stt_config(request: web.Request) -> web.Response:
         try:
             body = await request.json()
         except Exception:
-            return web.json_response({"error": "invalid JSON"}, status=400)
+            return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
         # Every field read below is a membership test followed by a subscript, and
         # a JSON array satisfies `"model" in body` while `body["model"]` raises
         # TypeError — a 500 out of a partial-update endpoint, and out of the
@@ -584,7 +584,9 @@ def _ffmpeg_install_commands() -> list[str]:
     if system == "Darwin":
         return ["brew install ffmpeg"]
     if system == "Windows":
-        return ["winget install --id Gyan.FFmpeg"]
+        # No command: winget installs Gyan.FFmpeg under WinGet\Packages, which
+        # `_find_ffmpeg` never searches, so the page's decoder fetch is the remedy.
+        return []
     if shutil.which("apt-get"):
         return ["sudo apt-get install -y ffmpeg"]
     # Amazon Linux: no ffmpeg in the distro repos. A source build is the only

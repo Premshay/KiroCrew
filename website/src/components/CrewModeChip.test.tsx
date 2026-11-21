@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { act, render, screen, fireEvent, within } from '@testing-library/react'
 import { CrewModeChip } from './CrewModeChip'
+import { CONDUCTOR_MODE_EFFECT_EVENT } from '../lib/conductorModeEffect'
 import CrewModeWelcome, { CREW_WELCOME_PLAY_SECS } from './CrewModeWelcome'
 
 describe('CrewModeChip', () => {
@@ -15,13 +16,13 @@ describe('CrewModeChip', () => {
     render(<CrewModeChip onTurnOn={vi.fn()} />)
     const chip = screen.getByTestId('crew-mode-chip')
     expect(chip).toHaveAttribute('aria-pressed', 'false')
-    expect(chip).toHaveAttribute('aria-label', 'Ultra Mode')
+    expect(chip).toHaveAttribute('aria-label', 'Conductor mode')
   })
 
-  it('shows only the text "Ultra Mode", at every width', () => {
+  it('shows only the text "Conductor mode", at every width', () => {
     render(<CrewModeChip onTurnOn={vi.fn()} />)
     const chip = screen.getByTestId('crew-mode-chip')
-    expect(chip.textContent).toBe('Ultra Mode')
+    expect(chip.textContent).toBe('Conductor mode')
     expect(chip.querySelector('.hidden, .sm\\:hidden, .sm\\:inline')).toBeNull()
   })
 
@@ -29,14 +30,14 @@ describe('CrewModeChip', () => {
     render(<CrewModeChip onTurnOn={vi.fn()} />)
     expect(screen.getByTestId('crew-mode-chip')).toHaveAttribute(
       'title',
-      'Turn on Ultra Mode: each task runs in its own chat and reports back here.',
+      'Turn on conductor mode: each task runs in its own chat and reports back here.',
     )
   })
 
   it('has no on state and no off control', () => {
     render(<CrewModeChip onTurnOn={vi.fn()} />)
     const chip = screen.getByTestId('crew-mode-chip')
-    expect(chip).not.toHaveTextContent('Ultra Mode on')
+    expect(chip).not.toHaveTextContent('Conductor mode on')
     expect(chip.querySelector('svg.lucide-x')).toBeNull()
     expect(screen.queryByRole('button', { pressed: true })).toBeNull()
   })
@@ -46,6 +47,41 @@ describe('CrewModeChip', () => {
     render(<CrewModeChip onTurnOn={onTurnOn} />)
     fireEvent.click(screen.getByTestId('crew-mode-chip'))
     expect(onTurnOn).toHaveBeenCalledTimes(1)
+  })
+
+  describe('the turn-on effect', () => {
+    const listen = () => {
+      const seen = vi.fn()
+      window.addEventListener(CONDUCTOR_MODE_EFFECT_EVENT, seen)
+      return { seen, stop: () => window.removeEventListener(CONDUCTOR_MODE_EFFECT_EVENT, seen) }
+    }
+
+    it('plays at once for a switch that starts on the click', () => {
+      const { seen, stop } = listen()
+      render(<CrewModeChip onTurnOn={() => {}} />)
+      fireEvent.click(screen.getByTestId('crew-mode-chip'))
+      expect(seen).toHaveBeenCalledTimes(1)
+      stop()
+    })
+
+    it('waits for the confirm, and plays only when the person said yes', async () => {
+      const { seen, stop } = listen()
+      let answer: (ok: boolean) => void = () => {}
+      render(<CrewModeChip onTurnOn={() => new Promise<boolean>(r => { answer = r })} />)
+      fireEvent.click(screen.getByTestId('crew-mode-chip'))
+      expect(seen).not.toHaveBeenCalled()
+      await act(async () => { answer(true) })
+      expect(seen).toHaveBeenCalledTimes(1)
+      stop()
+    })
+
+    it('never plays when the confirm is cancelled', async () => {
+      const { seen, stop } = listen()
+      render(<CrewModeChip onTurnOn={() => Promise.resolve(false)} />)
+      await act(async () => { fireEvent.click(screen.getByTestId('crew-mode-chip')) })
+      expect(seen).not.toHaveBeenCalled()
+      stop()
+    })
   })
 
   it('cannot be pressed while disabled', () => {
@@ -86,19 +122,19 @@ describe('CrewModeChip', () => {
     const chip = () => screen.getByTestId('crew-mode-chip')
     const bolt = () => chip().querySelector('.lucide-zap')!
     expect(chip()).toHaveClass('text-muted')
-    expect(bolt()).not.toHaveClass('ultra-accent')
+    expect(bolt()).not.toHaveClass('conductor-mode-accent')
     rerender(<CrewModeChip onTurnOn={vi.fn()} onTurnOff={vi.fn()} pressed />)
-    expect(bolt()).toHaveClass('ultra-accent')
+    expect(bolt()).toHaveClass('conductor-mode-accent')
   })
 
-  it('keeps the accessible name Ultra Mode', () => {
+  it('keeps the accessible name conductor mode', () => {
     render(<CrewModeChip onTurnOn={vi.fn()} />)
-    expect(screen.getByRole('button', { name: 'Ultra Mode', pressed: false })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Conductor mode', pressed: false })).toBeInTheDocument()
   })
 
   it('names the visible line that describes it', () => {
     render(<><CrewModeChip onTurnOn={vi.fn()} describedBy="note" /><span id="note">Available after the reply.</span></>)
-    expect(screen.getByRole('button', { name: 'Ultra Mode' })).toHaveAccessibleDescription('Available after the reply.')
+    expect(screen.getByRole('button', { name: 'Conductor mode' })).toHaveAccessibleDescription('Available after the reply.')
   })
 
   it('fades when disabled for any other reason', () => {
@@ -111,16 +147,16 @@ describe('CrewModeWelcome', () => {
   it('shows the title, the slogan, the flow labels and one button, and no other words', () => {
     render(<CrewModeWelcome onOpenTaskBoard={vi.fn()} />)
     const page = screen.getByTestId('crew-mode-welcome')
-    expect(within(page).getByRole('heading', { name: 'Ultra Mode' })).toBeInTheDocument()
+    expect(within(page).getByRole('heading', { name: 'Conductor mode' })).toBeInTheDocument()
     expect(within(page).getByRole('button', { name: 'Board' })).toBeInTheDocument()
     expect(within(page).getAllByRole('button')).toHaveLength(1)
     // Every visible word on the page, in order: nothing beyond these.
-    expect(page.textContent).toBe('Ultra ModeYou set the goal. Your crew does the work.ProjectsSplitOwn chatsBoardNeeds youBoard')
+    expect(page.textContent).toBe('Conductor modeYou set the goal. Your crew does the work.ProjectsSplitOwn chatsBoardNeeds youBoard')
   })
 
   it('reads the flow as an ordered list a screen reader can follow', () => {
     render(<CrewModeWelcome />)
-    const flow = screen.getByRole('list', { name: 'How Ultra Mode works' })
+    const flow = screen.getByRole('list', { name: 'How conductor mode works' })
     const steps = within(flow).getAllByRole('listitem').map(li => li.textContent)
     expect(steps).toEqual(['Projects', 'Split', 'Own chats', 'Board', 'Needs you'])
   })

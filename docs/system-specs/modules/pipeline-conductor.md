@@ -58,15 +58,16 @@ into the kiro agents directory. It derives from `build_agent_config` and then
 narrows, and each narrowing is a permission decision:
 
 - **Tools:** `execute_bash`, `fs_read`, `web_fetch`, `session`, `report`,
-  `tool_search`, plus the `@kirocrew-core` and `@kirocrew-dashboard` servers.
+  `tool_search`, plus the `@kirocrew-core`, `@kirocrew-dashboard` and
+  `@kirocrew-work` servers.
   Neither `fs_write` nor `code` is mounted, which is what makes "never does the
   work" structural.
 - **`allowedTools` is verb by verb, never a whole server.** The conductor ingests
   untrusted content by design (issue text, PR bodies) on unattended cycles, so a
   server-wide grant would let that content start persistent work or spawn
   arbitrary subagents with nobody in the loop.
-- **`mcpServers` is narrowed** to `kirocrew-core` and a hand-built
-  `kirocrew-dashboard` entry. That entry carries `type` in registry mode (a
+- **`mcpServers` is narrowed** (`_conductor_mcp_servers`) to `kirocrew-core`, a
+  hand-built `kirocrew-dashboard` entry and `kirocrew-work`. That entry carries `type` in registry mode (a
   registry-mode client silently drops an entry without it) and the managed MCP
   env (without the data-home pin the shim reads the default home while the
   gateway runs under an override).
@@ -109,9 +110,10 @@ ledger (`session_ledger_read`, `session_ledger_record`), and reporting to the
 owner (`send_message`, `send_notification`, `ask_question`), and the quiet end
 of a patrol cycle with nothing to report (`nothing_to_do`, which mutates
 nothing). Auto-approved
-dashboard verbs are create-or-read only: `chat_folder_tree`,
-`chat_folder_create`, `session_create`, `session_read_message`, and
-`session_status` (a read of the caller's own children).
+dashboard verbs are create-or-read only: `session_create`,
+`session_read_message`, and `session_status` (a read of the caller's own
+children). Every `chat_folder_*` verb is withheld: a dispatcher does not manage
+folders, so the verbs stay mounted behind an approval.
 
 `session_send`, `session_stop` and `spawn_run` are mounted and **never**
 auto-approved, even though the intervention ladder uses all three. They start
@@ -122,6 +124,13 @@ practice: every script call goes through it, because `allowedTools` cannot match
 arguments, so trusting the five bundled scripts cannot be told apart from
 trusting arbitrary shell. A conductor session that was not armed therefore stalls
 on its first probe, not on its first intervention.
+
+After the initial seed, every direct Pipeline Conductor message to an existing
+worker passes `steer: true`. Rulings, corrections, nudges, resume requests and
+follow-ups therefore reach a busy worker's current turn instead of queueing
+behind it; an idle worker starts a turn. The initial seed remains a plain
+`session_send` because the new session has no turn to steer. A superseding steer
+names any older queued instruction it replaces.
 
 ## The pipeline spec file
 
@@ -447,7 +456,9 @@ Radar one, proposed in
 exists, and every conductor mounts it from the shared conductor base, this one
 included: each dispatched item is created, bound, reported and closed in the work
 ledger, and the queue and `decisions.md` stay the detail behind that row. The
-pipeline conductor auto-approves `work_ledger_read` and `work_ledger_record`; the
+pipeline conductor auto-approves `work_ledger_read`, `work_ledger_record` and
+`work_ask_record` (the shared protocol's relay step: a person wait counts on any
+surface only once its ask is recorded); the
 worker verbs stay gated.
 
 One sibling agent shares this one's installer mechanics and nothing else:

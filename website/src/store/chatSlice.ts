@@ -24,7 +24,7 @@ import { isChatPageSurface } from '../utils/channelOrigin'
 import { isNoteRow } from '../lib/noteContract'
 import { isUntitledSession } from '../utils/sessionDisplayTitle'
 import type { RootState } from './index'
-import type { ChatMessage, SideSnapshot, TurnIdentityFields } from '../types'
+import type { ChatMessage, ChatSlot, SideSnapshot, TurnIdentityFields } from '../types'
 import { SOFT_STOP_DEBOUNCE_MS } from '../pages/chat/types'
 import { mergePreservedPastes } from '../utils/pasteTokens'
 import { forgetSlotUploadFailure } from '../utils/slotUploadFailures'
@@ -53,7 +53,7 @@ import { composerCardReducers } from './chat/composerCards'
 import { messageReducers } from './chat/messages'
 import { queueReducers } from './chat/queue'
 import { activityReducers } from './chat/activity'
-import { subagentReducers } from './chat/subagents'
+import { markParentStopped, subagentReducers } from './chat/subagents'
 import { automationReducers } from './chat/automations'
 import { sideReducers } from './chat/side'
 import { workflowReducers } from './chat/workflows'
@@ -176,6 +176,16 @@ export const batchedTextAboveFloor = (parts: BatchedChunkPart[], floor: number |
 /** One `chat_message` frame as the WebSocket hook hands it to `sseChatMessage`. */
 type ChatFrame = TurnIdentityFields & { slot: string; role: string; content: string; ts?: string; seq?: number; gen?: string; cls?: string; meta?: Record<string, unknown>; kind?: string; batched?: boolean; parts?: BatchedChunkPart[] }
 
+/** A Stop card that settled as stopped ended the parent turn, which leaves
+ *  any still-running subagent without its parent. `stop_failed_reset` ends it
+ *  too: the cooperative cancel timed out and the slot was hard-reset. A
+ *  declined Stop (`stop_declined_compacting`) and the in-flight `stopping`
+ *  card leave the parent as it was. */
+function stopCardStoppedTurn(meta: ChatFrame['meta']): boolean {
+  const s = meta?.state
+  return s === 'stopped' || s === 'force_stopped' || s === 'stop_failed_reset'
+}
+
 /**
  * Path B (native session grid): apply a WS chat frame for a NON-active slot
  * into the per-slot store so a pane rendering that slot streams live. The
@@ -201,6 +211,7 @@ function applyNonActiveFrame(
     const msg: ChatMessage = ensureMsgId({ role, content, cls: cls || '', ts, meta: { ...meta, kind: 'stop_event' }, kind: 'stop_event' })
     if (idx >= 0) msgs[idx] = msg
     else msgs.push(msg)
+    if (stopCardStoppedTurn(meta)) markParentStopped(state, slot)
     return
   }
   if (role === '_segment') {
@@ -398,6 +409,7 @@ function applyActiveFrame(state: ChatState, p: ChatFrame): void {
     countLiveFrame(state)
     const msg: ChatMessage = ensureMsgId({ role, content, cls: cls || '', ts, meta: { ...meta, kind: 'stop_event' }, kind: 'stop_event' })
     if (idx >= 0) { state.messages[idx] = msg } else { state.messages.push(msg) }
+    if (stopCardStoppedTurn(meta)) markParentStopped(state, slot)
     return
   }
   // WS segment — finalize streaming into assistant without resetting sequence or slot state
@@ -677,10 +689,12 @@ export const deleteSlot = createAsyncThunk<
     if (root.chat.activeSlot === key) {
       // A Crew Mode worker is its conductor's, never where a close lands: not by
       // the sidebar's displayed order (where it may sit right under its root) and
-      // not by recency. Both sets leave it out.
-      const sameSurface = new Set(root.dashboard.slots.filter(s => !crewRootOf(s) && slotSurfaceKey(s) === deletedSurface).map(s => s.key))
+      // not by recency. Both sets leave it out, and a conversation the Slack list
+      // setting leaves out (`slack_list_hidden`) too, as `autoOpenRows` does.
+      const landable = (s: ChatSlot) => !crewRootOf(s) && !s.slack_list_hidden
+      const sameSurface = new Set(root.dashboard.slots.filter(s => landable(s) && slotSurfaceKey(s) === deletedSurface).map(s => s.key))
       const sidebarSurface = isChatPageSurface(deletedSurface)
-        ? new Set(root.dashboard.slots.filter(s => !crewRootOf(s) && isChatPageSurface(slotSurfaceKey(s))).map(s => s.key))
+        ? new Set(root.dashboard.slots.filter(s => landable(s) && isChatPageSurface(slotSurfaceKey(s))).map(s => s.key))
         : sameSurface
       // Land on the sidebar row below the closed one (above at the bottom): the
       // tab-strip landing rule, applied to the sidebar's displayed order. The
@@ -1017,9 +1031,16 @@ const chatSlice = createSlice({
       const p = action.payload
       state.agentSwitchNotice = p === null ? null : typeof p === 'string' ? { message: p } : { ...p }
     },
-    setVoicePlaying(state, action: PayloadAction<boolean>) { state.voicePlaying = action.payload },
     setVoiceBusy(state, action: PayloadAction<boolean>) { state.voiceBusy = action.payload },
-    setVoicePreparing(state, action: PayloadAction<boolean>) { state.voicePreparing = action.payload },
+    setVoicePlaying(state, action: PayloadAction<boolean>) {
+      state.voicePlaying = action.payload
+      if (!state.voicePlaying && !state.voicePreparing) state.voicePaused = false
+    },
+    setVoicePreparing(state, action: PayloadAction<boolean>) {
+      state.voicePreparing = action.payload
+      if (!state.voicePlaying && !state.voicePreparing) state.voicePaused = false
+    },
+    setVoicePaused(state, action: PayloadAction<boolean>) { state.voicePaused = action.payload },
     setVoiceAudio(state, action: PayloadAction<string | null>) { state.voiceAudio = action.payload },
     /** Ask the sidebar to reveal a session row (expand collapsed ancestor
      *  folders, scroll it into view, flash it). Consumed and cleared by
@@ -1128,9 +1149,11 @@ const chatSlice = createSlice({
         if (slot === state.activeSlot) return
         if ((state.slotPaneNextBefore?.[k] ?? 0) !== before) return
         const cur = state.slotMessages[k] ?? []
+        // The backend never stores `meta.pastes`, so re-collapse this page's sent pastes first.
+        const restored = mergePreservedPastes(cur, messages)
         // Identity is meta.mid only, as for the active walk: an overlapping
         // page must not reach the list as a duplicate row key.
-        const fresh = messages.filter(m => !isRedeliveredMessage(cur, m.meta))
+        const fresh = restored.filter(m => !isRedeliveredMessage(cur, m.meta))
         const merged = [...fresh, ...cur]
         // Paging older is exactly when a parked block's anchor becomes loaded,
         // as on the active walk; without this a split pane showed the restored
@@ -1173,8 +1196,9 @@ const chatSlice = createSlice({
 export const {
   setCloseRefused,
   setActiveSlot, dropActiveSlot, forkOpenStarted, forkOpenSettled, clearSlotState, setPendingInput, stagePendingSend, stageToMainComposer, setAgentSwitchNotice, clearUnresumableResume, clearUndeletableHistory, setQuestionCard, clearQuestionCard, setQuestionDraft, setQuestionNotice, setQuestionRequestInFlight, markQuestionSettled, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
+  // MERGE-REVIEW: Keep startRemoteTurn for the fork's websocket and composer callers.
   removeThinking, confirmOptimisticSend, markSendUnconfirmed, dropUnconfirmedRow, recordSendAttempt, resolveOptimisticSteer, removeByApprovalId, retireSwappedRows, resolveApprovalRow, resolveShownApprovalRow, resolveNativeApprovalRows, resolveElicitationRow, clearSlotHydrated, holdHydratedSlotPane, clearPendingPermissions, setSlotRunning, setSlotStopping, settleStopNotRunning, startLocalTurn, startRemoteTurn, startServerTurn, endLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, clearSlotCache, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
-  sseContextUsage, setVoiceBusy, setVoicePlaying, setVoicePreparing, setVoiceAudio,
+  sseContextUsage, setVoiceBusy, setVoicePlaying, setVoicePreparing, setVoicePaused, setVoiceAudio,
   toggleActivity, openActivityToTab, openActivityPanel, closeActivityPanel, setSidePanelAlwaysOpen, openActivityToTool, clearFocusToolCallId, requestSlotReveal, requestSlotFolderOpen, clearSlotReveal, requestFolderReveal, clearSubagentsForSnapshot, subagentReplayDone, sseSubagentPending, setSubagentApprovalTarget, markSubagentApproving, markSubagentApprovalGone, reconcileSubagentApprovalGone, sseSubagentSpawn, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued, reconcileSubagentQueuedFromSlots,
   sseSubagentBatchUpdate, sseSubagentBatchChunks, selectSubagent, clearTerminalSubagents,
   setAutomations, sseAutomation, removeAutomation,
@@ -1371,7 +1395,7 @@ export { beginSideQueueEdit, finishSideQueueEdit, forgetSideSteerSubmittedText, 
 export {
   selectActiveSlotProject, selectComposerBusy, selectContinuable, selectProjectChipLocked, selectSendAccepted, selectSendAttempts, selectSendConfirmed, selectSlotMessages,
   selectPendingTurn, selectSlotPendingApproval, selectSlotRunEpoch, selectSlotStreamState, selectSlotToolLog, selectTrailingSendUnconfirmed,
-  selectSlotTurnFromWake, selectTurnInterrupted,
+  selectResumeInterrupted, selectSlotTurnFromWake, selectTurnInterrupted,
   QUIET_END_SERVER, QUIET_END_TOOL,
 } from './chat/selectors'
 export { clearSwitchSlotGone, setSwitchSlotGone, switchSlot, switchSlotNoticeCopy, type SwitchSlotArg } from './chat/slotSwitch'

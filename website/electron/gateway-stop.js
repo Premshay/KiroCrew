@@ -731,6 +731,8 @@ async function confirmedFree(port, { confirmFree, waitMs, sleep, onWait, isAbort
  * With `failClosedOnProbeError`, an unavailable owner probe returns
  * `probeFailed:true, freed:false` instead of throwing or claiming the port is
  * free. Windows uses this because netstat failures must block a blind respawn.
+ * With `confirmFree` as well, a failed probe is settled by the same bind wait
+ * as an empty list: a port that binds is free, one still refused is not.
  * An empty owner list is not proof the port is free: netstat can omit or drop a
  * held port's row. With `confirmFree`, every empty list that would end in
  * `freed:true` (the first probe, or the re-probe after a kill) is checked with
@@ -774,16 +776,27 @@ async function forceStopPort(
   const bindWait = {
     confirmFree, waitMs: confirmFreeWaitMs, sleep, onWait: onConfirmFreeWait, isAborted, log,
   };
+  // A probe that cannot run (netstat timing out on a busy Windows host) names
+  // no owner, the same unproven answer as an empty list. With `confirmFree`,
+  // a real bind decides, as it does for an empty list; only a bind still
+  // refused at the end of the wait keeps `probeFailed`.
+  const probeError = async (e, what, { killed: k, serviceHolder: s }) => {
+    if (!failClosedOnProbeError) throw e;
+    log(`force-stop: ${what} failed on :${port} (${e && e.message})`);
+    if (confirmFree && (await confirmedFree(port, bindWait))) {
+      log(`force-stop: :${port} binds although the LISTEN probe failed; treating it as free`);
+      return { killed: k, freed: true, survivors: [], foreignHolder: false, serviceHolder: s };
+    }
+    return {
+      killed: k, freed: false, survivors: [], foreignHolder: false,
+      serviceHolder: s, probeFailed: true,
+    };
+  };
   let owners;
   try {
     owners = await getListenPids(port);
   } catch (e) {
-    if (!failClosedOnProbeError) throw e;
-    log(`force-stop: LISTEN probe failed on :${port} (${e && e.message})`);
-    return {
-      killed: 0, freed: false, survivors: [], foreignHolder: false,
-      serviceHolder: false, probeFailed: true,
-    };
+    return probeError(e, "LISTEN probe", { killed: 0, serviceHolder: false });
   }
   if (!owners.length) {
     if (confirmFree && !(await confirmedFree(port, bindWait))) {
@@ -839,12 +852,7 @@ async function forceStopPort(
     try {
       remaining = new Set(await getListenPids(port));
     } catch (e) {
-      if (!failClosedOnProbeError) throw e;
-      log(`force-stop: verify LISTEN probe failed on :${port} (${e && e.message})`);
-      return {
-        killed, freed: false, survivors: [], foreignHolder: false,
-        serviceHolder, probeFailed: true,
-      };
+      return probeError(e, "verify LISTEN probe", { killed, serviceHolder });
     }
     survivors = survivors.filter((pid) => remaining.has(pid));
   }
@@ -856,12 +864,7 @@ async function forceStopPort(
     try {
       remaining = new Set(await getListenPids(port));
     } catch (e) {
-      if (!failClosedOnProbeError) throw e;
-      log(`force-stop: verify LISTEN probe failed on :${port} (${e && e.message})`);
-      return {
-        killed, freed: false, survivors: [], foreignHolder: false,
-        serviceHolder, probeFailed: true,
-      };
+      return probeError(e, "verify LISTEN probe", { killed, serviceHolder });
     }
   }
 
@@ -944,16 +947,28 @@ async function probePortBinding(port, { getListenPids, log = () => {} }) {
  * quit targets a local app that isn't even running). The listening socket's
  * owner is the ground truth the payload lacks — on a tunnel it is `ssh`.
  *
- * Deliberately fail-safe: every outcome except a positively identified local
- * KiroCrew process is a reason NOT to evict.
+ * Deliberately fail-safe: "kirocrew" is the ONLY outcome that may authorise an
+ * eviction. Every other one is a reason not to, "service" included even though
+ * it is equally ours.
  *   "kirocrew" — a local LISTEN owner matching isKirocrewCommand. Only this
  *                value may authorise a takeover.
+ *   "service"  — a local Kiro Crew owner the OS service manager parents. Ours,
+ *                so the app-menu gate accepts it alongside "kirocrew", but
+ *                never evict it: the manager just respawns it.
  *   "foreign"  — a local LISTEN owner exists but is not ours (e.g. `ssh`).
  *                A holder whose command could not be read is not ours either.
  *   "none"     — nothing is listening locally, yet something answered. A race,
  *                or a socket we cannot see; treat as not ours.
- *   "unknown"  — the probe itself could not run (no lsof / EACCES). Never
- *                mistake "couldn't look" for "safe to kill".
+ *   "unknown"  — the probe itself could not run (no lsof / EACCES), so NOTHING
+ *                is known to hold the port. Never mistake "couldn't look" for
+ *                "safe to kill".
+ *   "unidentified"
+ *              — a holder the probe DID name, whose command line could not be
+ *                read. Something demonstrably holds the port and only its
+ *                identity is missing, which is why it is a separate value from
+ *                "unknown": the app-menu gate wants this ambiguity soft, and
+ *                the adopt path in holder-decision.js needs it hard, because
+ *                adopting posts this machine's `.local_secret`.
  *
  * Side effects are injected so this is unit-testable without Electron or real
  * OS processes (mirrors forceStopPort above).
@@ -964,16 +979,20 @@ async function probePortBinding(port, { getListenPids, log = () => {} }) {
  * @param {(pid:number)=>Promise<string>}    deps.getCommand     ps -o command=
  * @param {(pid:number)=>Promise<string>}    [deps.getPpid]      ps -o ppid=; see isServiceManaged
  * @param {(pid:number)=>Promise<boolean|null>} [deps.isLaunchdJob] macOS only; see isServiceManaged
+ * @param {(pid:number)=>boolean} [deps.isOwnChild]  true when `pid` is the live
+ *        gateway child this app spawned. Such a holder is "kirocrew" without a
+ *        command-line read: the app holds that ChildProcess, which is stronger
+ *        evidence than any command line, and the Windows read can time out.
  * @param {Array<{pid:number, command:string|null}>} [deps.holders]  on a
  *        "foreign" verdict, receives every holder found, so a caller can name
  *        them to the user; `command` is null when it could not be read.
- * @returns {Promise<"kirocrew"|"service"|"foreign"|"none"|"unknown">}
+ * @returns {Promise<"kirocrew"|"service"|"foreign"|"none"|"unknown"|"unidentified">}
  */
 async function classifyPortOwner(
   port,
   {
     getListenPids, getCommand, getPpid = null, isLaunchdJob = null,
-    isKirocrew = isKirocrewCommand, log = () => {}, holders = null,
+    isKirocrew = isKirocrewCommand, isOwnChild = null, log = () => {}, holders = null,
   }
 ) {
   let pids;
@@ -987,15 +1006,45 @@ async function classifyPortOwner(
     log(`port-owner: no local LISTEN owner on :${port}`);
     return "none";
   }
+  // A holder whose command line could not be READ is not a holder proven to
+  // belong to someone else. `windowsProcessCommand` returns an empty string
+  // when the netstat step named a pid but BOTH the PowerShell and WMIC lookups
+  // failed (execution-policy timeout, WMIC absent on current releases), and
+  // calling that `foreign` tells the app-menu gate a foreign process was proven
+  // to hold the port -- which revokes the local user's rows at once, with none
+  // of the grace an inconclusive probe earns. A PROVEN foreign holder still
+  // outranks an unreadable one: a pid positively identified as not ours is
+  // evidence, and must not be softened because a second pid went unread.
+  //
+  // It is `unidentified` and NOT `unknown`, and the distinction is load-bearing
+  // rather than cosmetic. `unknown` above means the probe never ran, so NOTHING
+  // is known to hold the port; `holder-decision.js` fails OPEN on it and adopts,
+  // which is only safe because no holder was found. Here a holder demonstrably
+  // EXISTS -- netstat named its pid -- and only its identity is missing, so
+  // adopting it would post this machine's `.local_secret` to a process we could
+  // not name. Two consumers need opposite answers from the same ambiguity: the
+  // app-menu gate wants it soft (see `INCONCLUSIVE_PORT_OWNERS`), and the adopt
+  // path needs it hard. A separate value is what lets both be right.
+  let anyUnidentifiedHolder = false;
+  let anyProvenForeignHolder = false;
   const found = [];
   for (const pid of pids) {
+    // The child this app spawned and still holds is ours whatever its command
+    // line reads, and on Windows that read is a PowerShell query a busy host
+    // can push past its budget, with no WMIC behind it on current releases.
+    // Only an exact live-child pid qualifies, so no other holder gains trust.
+    if (isOwnChild && isOwnChild(pid)) {
+      log(`port-owner: :${port} held by this app's own gateway child pid=${pid}`);
+      return "kirocrew";
+    }
     const cmd = (await getCommand(pid)).trim();
     if (!cmd) {
       // The command readers answer "" when the read failed or ran out of
       // time, and when the holder exited between the two probes. None of
       // those says what the holder is, so it is reported as unread rather
       // than as a program positively identified as someone else's.
-      log(`port-owner: :${port} held by pid=${pid}, whose command could not be read; not identified as Kiro Crew`);
+      anyUnidentifiedHolder = true;
+      log(`port-owner: :${port} held by pid=${pid} whose command line could not be read — owner unidentified, will not evict and will not adopt`);
       found.push({ pid, command: null });
       continue;
     }
@@ -1008,10 +1057,12 @@ async function classifyPortOwner(
       log(`port-owner: :${port} held by local KiroCrew pid=${pid} (${cmd.slice(0, 80)})`);
       return "kirocrew";
     }
+    anyProvenForeignHolder = true;
     log(`port-owner: :${port} held by NON-KiroCrew pid=${pid} (${cmd.slice(0, 80)})`);
     found.push({ pid, command: cmd });
   }
   if (holders) holders.push(...found);
+  if (!anyProvenForeignHolder && anyUnidentifiedHolder) return "unidentified";
   return "foreign";
 }
 
@@ -1046,6 +1097,7 @@ async function isServiceManaged(pid, getPpid, isLaunchdJob = null) {
 }
 
 module.exports = {
+  confirmedFree,
   postShutdown,
   stopGatewayGracefully,
   forceStopPort,

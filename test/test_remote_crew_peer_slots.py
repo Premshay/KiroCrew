@@ -19,6 +19,7 @@ from kiro_crew.dashboard.slot_projection import resolved_row_identity
 from kiro_crew.dashboard.state import MAX_LIVE_SLOTS, _ChatSlot
 from kiro_crew.instances.constants import PEER_SLOTS_REPLY_MAX_BYTES
 from kiro_crew.instances.ssh_tunnel_manager import ProxyRequestError
+from kiro_crew.testing.synthetic_credentials import github_classic
 
 
 class _Req:
@@ -131,8 +132,9 @@ def _manager(
     return SimpleNamespace(proxy_request=_proxy_request, calls=calls, params=params)
 
 
-def _state(mgr, slots: dict[str, _ChatSlot] | None = None):
-    return SimpleNamespace(instances_manager=mgr, _slots=slots or {})
+def _state(mgr, slots: dict[str, _ChatSlot] | None = None, registered=("nobita",)):
+    registry = SimpleNamespace(get=lambda i: object() if i in registered else None)
+    return SimpleNamespace(instances_manager=mgr, instances_registry=registry, _slots=slots or {})
 
 
 def _remote_slot(key: str = "chat-1", *, instance_id: str = "nobita", remote: str = "peer-chat-9"):
@@ -222,12 +224,12 @@ class TestPeerTextIsRedactedAndAllowlisted:
     async def test_a_credential_shaped_title_never_reaches_the_browser(self, monkeypatch):
         """The finding this pass exists for.
 
-        A peer answering with an access-key id in a session title would have had
+        A peer answering with an AWS secret key in a session title would have had
         it rendered verbatim in the sidebar, and the local slot beside it would
         have been redacted — the same string treated two ways in one list.
         """
         _enable_instances(monkeypatch)
-        secret = "AKIAIOSFODNN7EXAMPLE"
+        secret = github_classic(seed=319)
         mgr = _manager(body=json.dumps([{"key": "p1", "title": f"deploy {secret}"}]).encode())
 
         data = await _body(await hi.api_instances_chat_slots(_request(_state(mgr))))
@@ -244,7 +246,7 @@ class TestPeerTextIsRedactedAndAllowlisted:
         alone would remove it and the test would pin nothing.
         """
         _enable_instances(monkeypatch)
-        secret = "AKIAIOSFODNN7EXAMPLE"
+        secret = github_classic(seed=319)
         title = "x" * (512 - len(secret) // 2) + secret
         mgr = _manager(body=json.dumps([{"key": "p1", "title": title}]).encode())
 
@@ -433,7 +435,7 @@ class TestPeerTextIsRedactedAndAllowlisted:
         """``parent.key`` goes through the same sink as ``key``: a credential-shaped
         citation never reaches the browser, and an oversized one is clamped."""
         _enable_instances(monkeypatch)
-        secret = "AKIAIOSFODNN7EXAMPLE"
+        secret = github_classic(seed=319)
         rows = [
             {"key": "a", "parent": {"key": f"lead {secret}"}},
             {"key": "b", "parent": {"key": "x" * (hi._PEER_FIELD_MAX_CHARS * 3)}},
@@ -692,7 +694,7 @@ class TestAnInterruptedReplyIsRefusedNotDecoded:
         allowlisting or redaction the success path applies.
         """
         _enable_instances(monkeypatch)
-        secret = "AKIAIOSFODNN7EXAMPLE"
+        secret = github_classic(seed=319)
         body = json.dumps([{"key": "p1", "title": f"deploy {secret}"}]).encode()
         mgr = _manager(body=body, interrupt=aiohttp.ClientPayloadError())
 
@@ -833,6 +835,17 @@ class TestCarrierFailures:
 
         assert resp.status == 503
         assert (await _body(resp))["code"] == "instances_manager_unavailable"
+
+    async def test_an_unregistered_crew_is_a_404_and_never_reaches_a_peer(self, monkeypatch):
+        """An id naming no crew is not a crew that is down: 404, no tunnel call."""
+        _enable_instances(monkeypatch)
+        mgr = _manager()
+
+        resp = await hi.api_instances_chat_slots(_request(_state(mgr), instance_id="ghost"))
+
+        assert resp.status == 404
+        assert (await _body(resp))["code"] == "instance_not_found"
+        assert mgr.calls == []
 
 
 @pytest.mark.asyncio

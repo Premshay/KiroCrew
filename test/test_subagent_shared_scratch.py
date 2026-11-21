@@ -27,7 +27,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kiro_crew import agent_scratch as sc
-from kiro_crew.testing.wait import async_wait_until
+from kiro_crew import agent_scratch_trees as trees
 
 #: A pid no live process can own on any supported platform (above every pid_max),
 #: so a cleanup path that signals a fake reaches nothing on the runner.
@@ -39,8 +39,17 @@ _UNALLOCATABLE_PID = 99_999_999_999
 pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 
 
-@pytest.fixture
-def scratch_root(monkeypatch, tmp_path: Path) -> Path:
+@pytest.fixture(autouse=True)
+def isolated_tree_bindings(_floor_monkeypatch) -> None:
+    _floor_monkeypatch.setattr(trees, "_TREE_INDEX_LIVE", {})
+    _floor_monkeypatch.setattr(trees, "_TREE_INDEX_TICKETS", {})
+    _floor_monkeypatch.setattr(trees, "_TREE_INDEX_UNPERSISTED", set(), raising=False)
+    _floor_monkeypatch.setattr(trees, "_TREE_INDEX_RETIRED_TICKET", -1, raising=False)
+    _floor_monkeypatch.setattr(trees, "_TREE_INDEX_DISK_SNAPSHOT", None, raising=False)
+
+
+@pytest.fixture(name="scratch_root")
+def scratch_root_fixture(monkeypatch, tmp_path: Path) -> Path:
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setattr(sc, "config_dir", lambda: home)
@@ -1203,14 +1212,14 @@ class TestAResumedKeyRejoinsItsTree:
         scratch_root.mkdir(parents=True)
         old = scratch_root / "dashboard-chat-1-abcdef01"
         old.mkdir()
-        sc.record_tree("dashboard:chat-1", old)
-        assert sc.recorded_tree("dashboard:chat-1") == old
+        trees.record_tree("dashboard:chat-1", old)
+        assert trees.recorded_tree("dashboard:chat-1") == old
         old.rmdir()  # swept
         new = scratch_root / "dashboard-chat-2-12345678"
         new.mkdir()
-        sc.record_tree("dashboard:chat-2", new)
-        assert sc.recorded_tree("dashboard:chat-1") is None
-        assert sc.recorded_tree("dashboard:chat-2") == new
+        trees.record_tree("dashboard:chat-2", new)
+        assert trees.recorded_tree("dashboard:chat-1") is None
+        assert trees.recorded_tree("dashboard:chat-2") == new
 
     def test_only_a_direct_child_of_the_root_is_recorded(
         self, scratch_root: Path, tmp_path: Path
@@ -1218,24 +1227,24 @@ class TestAResumedKeyRejoinsItsTree:
         scratch_root.mkdir(parents=True)
         outside = tmp_path / "elsewhere"
         outside.mkdir()
-        sc.record_tree("dashboard:chat-1", outside)
-        assert sc.recorded_tree("dashboard:chat-1") is None
+        trees.record_tree("dashboard:chat-1", outside)
+        assert trees.recorded_tree("dashboard:chat-1") is None
 
     def test_a_row_naming_a_path_is_not_a_tree(self, scratch_root: Path) -> None:
         scratch_root.mkdir(parents=True)
-        (scratch_root / sc.TREE_INDEX_FILENAME).write_text(
+        (scratch_root / trees.TREE_INDEX_FILENAME).write_text(
             '{"dashboard:chat-1": "../../etc", "dashboard:chat-2": ".."}'
         )
-        assert sc.recorded_tree("dashboard:chat-1") is None
-        assert sc.recorded_tree("dashboard:chat-2") is None
+        assert trees.recorded_tree("dashboard:chat-1") is None
+        assert trees.recorded_tree("dashboard:chat-2") is None
 
     def test_the_sweep_leaves_the_index_alone(self, scratch_root: Path) -> None:
         scratch_root.mkdir(parents=True)
         tree = scratch_root / "dashboard-chat-1-abcdef01"
         tree.mkdir()
-        sc.record_tree("dashboard:chat-1", tree)
+        trees.record_tree("dashboard:chat-1", tree)
         sc.sweep_dead_scratch()
-        assert (scratch_root / sc.TREE_INDEX_FILENAME).is_file()
+        assert (scratch_root / trees.TREE_INDEX_FILENAME).is_file()
 
     def _manager(self, resume_sid: str, work_scratch: Path | None):
         from kiro_crew.session import SessionManager
@@ -1263,6 +1272,8 @@ class TestAResumedKeyRejoinsItsTree:
             mgr = SessionManager(cfg, provider_factory=factory)
         mgr._session_map = MagicMock()
         mgr._session_map.get = MagicMock(return_value=resume_sid or None)
+        mgr._session_map.consume_seat_switch.return_value = False
+        mgr._session_map.get_provider.return_value = None
         mgr._session_map.get_native_fork = MagicMock(return_value=None)
         mgr._session_map.get_cwd = MagicMock(return_value="")
         return mgr, factory
@@ -1272,7 +1283,7 @@ class TestAResumedKeyRejoinsItsTree:
         scratch_root.mkdir(parents=True)
         tree = scratch_root / "dashboard-chat-1-abcdef01"
         tree.mkdir()
-        sc.record_tree("dashboard:chat-1", tree)
+        trees.record_tree("dashboard:chat-1", tree)
         mgr, factory = self._manager("sid-1", None)
         try:
             await mgr.get_or_create("dashboard:chat-1", agent="kirocrew")
@@ -1285,7 +1296,7 @@ class TestAResumedKeyRejoinsItsTree:
         scratch_root.mkdir(parents=True)
         tree = scratch_root / "dashboard-chat-1-abcdef01"
         tree.mkdir()
-        sc.record_tree("dashboard:chat-1", tree)
+        trees.record_tree("dashboard:chat-1", tree)
         mgr, factory = self._manager("", None)
         try:
             await mgr.get_or_create("dashboard:chat-1", agent="kirocrew")
@@ -1301,13 +1312,9 @@ class TestAResumedKeyRejoinsItsTree:
         mgr, _factory = self._manager("", tree)
         try:
             await mgr.get_or_create("dashboard:chat-1", agent="kirocrew")
-            await async_wait_until(
-                lambda: sc.recorded_tree("dashboard:chat-1") is not None,
-                describe=lambda: "new session records its exposed scratch tree",
-            )
         finally:
             await mgr.close_all()
-        assert sc.recorded_tree("dashboard:chat-1") == tree
+        assert trees.recorded_tree("dashboard:chat-1") == tree
 
 
 class TestEveryProcessSpawnSeamIsAccountedFor:
@@ -1316,9 +1323,8 @@ class TestEveryProcessSpawnSeamIsAccountedFor:
     original bug with no red test. So enumerate the seams structurally: every
     ``AcpRuntime(`` / ``AcpClient(`` construction in ``src/`` either passes
     ``shared_scratch`` (directly, or via a ``**kwargs`` its caller filled) or is
-    a STANDALONE process with no session parent, or the single preparation-only
-    carrier tested in ``test_deepseek_shared_launch``. A new construction site
-    fails until it is placed."""
+    a STANDALONE process with no session parent. A new construction site fails
+    until it is placed."""
 
     _SRC = Path(sc.__file__).resolve().parent
     _CALL = re.compile(r"\b(AcpRuntime|AcpClient)\(")
@@ -1329,12 +1335,6 @@ class TestEveryProcessSpawnSeamIsAccountedFor:
             "app-owned review workers; no chat session is their parent"
         ),
         "knowledge/llm_pool.py": "knowledge-indexing helper process; no session parent",
-    }
-    _PLAN_ONLY = {
-        "acp/harness/deepseek_shared.py": (
-            "one unstarted AcpClient carries native launch preparation; "
-            "the shared AcpRuntime owns the process and its scratch tree"
-        ),
     }
 
     @classmethod
@@ -1370,8 +1370,6 @@ class TestEveryProcessSpawnSeamIsAccountedFor:
                 continue
             if rel in self._STANDALONE:
                 continue
-            if rel in self._PLAN_ONLY:
-                continue
             unplaced.append(rel)
         assert unplaced == [], (
             "a kiro-cli process is constructed without the session tree's "
@@ -1398,19 +1396,3 @@ class TestEveryProcessSpawnSeamIsAccountedFor:
         rels = {rel for rel, _ in self._constructions()}
         stale = sorted(set(self._STANDALONE) - rels)
         assert stale == [], f"standalone entries with no construction left: {stale}"
-
-    def test_the_plan_only_list_names_one_unstarted_carrier(self) -> None:
-        from kiro_crew.acp.harness.deepseek_shared import DeepseekHarness
-
-        counts = {rel: 0 for rel in self._PLAN_ONLY}
-        for rel, _args in self._constructions():
-            if rel in counts:
-                counts[rel] += 1
-        assert counts == {"acp/harness/deepseek_shared.py": 1}
-        source = inspect.getsource(DeepseekHarness.resolve_spawn)
-        assert source.count("AcpClient(") == 1
-        assert not re.search(
-            r"\b(?:start|_spawn|ensure_ready|start_new_session|create_subprocess\w*)\s*\(",
-            source,
-        )
-        assert not set(self._PLAN_ONLY) & set(self._STANDALONE)

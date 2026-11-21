@@ -194,14 +194,14 @@ class TestAbandonMarksOnlyWhatWasPrompted:
         log = _log_with(tmp_path, ["x" * (_CONSOLIDATION_PROMPT_BUDGET_CHARS // 2)] * 6)
         c = _make_consolidator(log)
         before = log.unconsolidated_count(KEY)
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(
-                KEY,
-                {
-                    "consolidation_attempts": _CONSOLIDATION_MAX_ATTEMPTS - 1,
-                    "consolidation_retry_at": 0.0,
-                },
-            )
+        await asyncio.to_thread(
+            log.update_metadata,
+            KEY,
+            {
+                "consolidation_attempts": _CONSOLIDATION_MAX_ATTEMPTS - 1,
+                "consolidation_retry_at": 0.0,
+            },
+        )
 
         with patch.object(c, "_call_llm", AsyncMock(return_value=None)):
             await c._consolidate(KEY, include_history=True)
@@ -214,14 +214,14 @@ class TestAbandonMarksOnlyWhatWasPrompted:
         """Abandoning is progress, not a dead end: the next pass starts after it."""
         log = _log_with(tmp_path, ["x" * (_CONSOLIDATION_PROMPT_BUDGET_CHARS // 2)] * 6)
         c = _make_consolidator(log)
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(
-                KEY,
-                {
-                    "consolidation_attempts": _CONSOLIDATION_MAX_ATTEMPTS - 1,
-                    "consolidation_retry_at": 0.0,
-                },
-            )
+        await asyncio.to_thread(
+            log.update_metadata,
+            KEY,
+            {
+                "consolidation_attempts": _CONSOLIDATION_MAX_ATTEMPTS - 1,
+                "consolidation_retry_at": 0.0,
+            },
+        )
         with patch.object(c, "_call_llm", AsyncMock(return_value=None)):
             await c._consolidate(KEY, include_history=True)
         remaining = log.unconsolidated_count(KEY)
@@ -376,6 +376,8 @@ class TestPrefsPassesAreBoundedToo:
             c.maybe_consolidate(KEY)
             while c._tasks:
                 await asyncio.gather(*list(c._tasks))
+                # A gather of done tasks does not yield; let their _tasks.discard run.
+                await asyncio.sleep(0)
             first = c._prefs_offset[KEY]
             assert 0 < first < 40, f"the offset jumped to {first}"
             assert f"body-{first - 1}-" in calls.await_args.args[0]
@@ -385,6 +387,8 @@ class TestPrefsPassesAreBoundedToo:
             c.maybe_consolidate(KEY)
             while c._tasks:
                 await asyncio.gather(*list(c._tasks))
+                # A gather of done tasks does not yield; let their _tasks.discard run.
+                await asyncio.sleep(0)
         second_prompt = calls.await_args.args[0]
         assert f"body-{first}-" in second_prompt and "body-0-" not in second_prompt
         assert c._prefs_offset[KEY] > first
@@ -393,8 +397,7 @@ class TestPrefsPassesAreBoundedToo:
     @staticmethod
     def _rotate(log: ConversationLog) -> None:
         """Bump the generation the way a rotation or rewrite does."""
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(KEY, {"rotation_generation": log.rotation_generation(KEY) + 1})
+        log.update_metadata(KEY, {"rotation_generation": log.rotation_generation(KEY) + 1})
 
     @pytest.mark.asyncio
     async def test_a_window_from_the_same_generation_is_skipped(self, tmp_path) -> None:
@@ -415,7 +418,7 @@ class TestPrefsPassesAreBoundedToo:
         log = _log_with(tmp_path, ["body-0", "body-1", "body-2"])
         c = _make_consolidator(log)
         old = log.rotation_generation(KEY)
-        self._rotate(log)
+        await asyncio.to_thread(self._rotate, log)
         window = PrefsWindow(2, old)
         call = AsyncMock(return_value={})
         with patch.object(c, "_call_llm", call):
@@ -480,6 +483,8 @@ class TestTheBudgetIsNotABehaviourChangeForOrdinarySessions:
             c.check_idle_sessions()
             while c._tasks:
                 await asyncio.gather(*list(c._tasks))
+                # A gather of done tasks does not yield; let their _tasks.discard run.
+                await asyncio.sleep(0)
         again.assert_not_awaited()
 
 
@@ -557,8 +562,8 @@ class TestABoundedAttemptIsNotReleasedByGrowth:
             for _ in range(_CONSOLIDATION_MAX_ATTEMPTS * 3):
                 if log.get_metadata(KEY).get("last_consolidated"):
                     break
+                await asyncio.to_thread(log.update_metadata, KEY, {"consolidation_retry_at": 0.0})
                 with history_mod.allow_on_loop_persist():
-                    log.update_metadata(KEY, {"consolidation_retry_at": 0.0})
                     log.append(KEY, "user", "another turn while the head is stuck")
                 await c._consolidate(KEY, include_history=True)
 
@@ -592,8 +597,7 @@ class TestABoundedAttemptIsNotReleasedByGrowth:
         # Drive the first slice to its cap (every attempt rejected).
         with patch.object(c, "_call_llm", AsyncMock(return_value=None)):
             for _ in range(_CONSOLIDATION_MAX_ATTEMPTS):
-                with history_mod.allow_on_loop_persist():
-                    log.update_metadata(KEY, {"consolidation_retry_at": 0.0})
+                await asyncio.to_thread(log.update_metadata, KEY, {"consolidation_retry_at": 0.0})
                 await c._consolidate(KEY, include_history=True)
 
         meta = log.get_metadata(KEY)
@@ -620,8 +624,7 @@ class TestABoundedAttemptIsNotReleasedByGrowth:
             return None
 
         with patch.object(c, "_call_llm", AsyncMock(side_effect=_capture)):
-            with history_mod.allow_on_loop_persist():
-                log.update_metadata(KEY, {"consolidation_retry_at": 0.0})
+            await asyncio.to_thread(log.update_metadata, KEY, {"consolidation_retry_at": 0.0})
             await c._consolidate(KEY, include_history=True)
 
         head = log.snapshot_for_consolidation(KEY)[0][0]
@@ -665,8 +668,7 @@ class TestSubChunkingDrainsAnOversizedHead:
         passes = 0
         with patch.object(c, "_call_llm", AsyncMock(side_effect=_ok)):
             while log.unconsolidated_count(KEY) and passes < 10:
-                with history_mod.allow_on_loop_persist():
-                    log.update_metadata(KEY, {"consolidation_retry_at": 0.0})
+                await asyncio.to_thread(log.update_metadata, KEY, {"consolidation_retry_at": 0.0})
                 before_marker = log.get_metadata(KEY).get("last_consolidated", 0)
                 before_sub = log.get_metadata(KEY).get("consolidation_sub_offset", 0)
                 await c._consolidate(KEY, include_history=True)
@@ -705,8 +707,7 @@ class TestSubChunkingDrainsAnOversizedHead:
         # One successful slice advances the durable sub-offset without moving the
         # message marker.
         with patch.object(c, "_call_llm", AsyncMock(return_value={"history_entry": "e"})):
-            with history_mod.allow_on_loop_persist():
-                log.update_metadata(KEY, {"consolidation_retry_at": 0.0})
+            await asyncio.to_thread(log.update_metadata, KEY, {"consolidation_retry_at": 0.0})
             await c._consolidate(KEY, include_history=True)
 
         meta = log.get_metadata(KEY)
@@ -715,8 +716,7 @@ class TestSubChunkingDrainsAnOversizedHead:
         gen_before = int(meta.get("rotation_generation", 0) or 0)
 
         # Simulate a rotation: bump the generation the way _maybe_rotate does.
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(KEY, {"rotation_generation": gen_before + 1})
+        await asyncio.to_thread(log.update_metadata, KEY, {"rotation_generation": gen_before + 1})
 
         # The snapshot's sub-offset is now 0 (its stamp does not match the
         # live generation), so the next pass re-slices the head from its start.
@@ -731,8 +731,7 @@ class TestSubChunkingDrainsAnOversizedHead:
             return {"history_entry": "e"}
 
         with patch.object(c, "_call_llm", AsyncMock(side_effect=_capture)):
-            with history_mod.allow_on_loop_persist():
-                log.update_metadata(KEY, {"consolidation_retry_at": 0.0})
+            await asyncio.to_thread(log.update_metadata, KEY, {"consolidation_retry_at": 0.0})
             await c._consolidate(KEY, include_history=True)
 
         head = log.snapshot_for_consolidation(KEY)[0][0]
@@ -826,14 +825,14 @@ class TestConsolidateNowDrainsTheTail:
     async def test_a_first_pass_refusal_is_reported_as_a_skip(self, tmp_path) -> None:
         log = _log_with(tmp_path, [f"m{i}" for i in range(4)])
         c = _make_consolidator(log)
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(
-                KEY,
-                {
-                    "consolidation_attempts": 1,
-                    "consolidation_retry_at": time.time() + 3600,
-                },
-            )
+        await asyncio.to_thread(
+            log.update_metadata,
+            KEY,
+            {
+                "consolidation_attempts": 1,
+                "consolidation_retry_at": time.time() + 3600,
+            },
+        )
 
         with patch.object(c, "_call_llm", AsyncMock(return_value={"history_entry": "e"})):
             assert (await c.consolidate_now(KEY)).status == "skipped"
@@ -1229,8 +1228,7 @@ class TestAPerHeadSliceCeilingBoundsTheCost:
             # Drive passes until the head is retired (marker moved) or we exceed
             # a hard bound that proves the ceiling failed.
             while log.unconsolidated_count(KEY) and passes < ceiling + 5:
-                with history_mod.allow_on_loop_persist():
-                    log.update_metadata(KEY, {"consolidation_retry_at": 0.0})
+                await asyncio.to_thread(log.update_metadata, KEY, {"consolidation_retry_at": 0.0})
                 await c._consolidate(KEY, include_history=True)
                 passes += 1
 
@@ -1271,8 +1269,7 @@ class TestAPerHeadSliceCeilingBoundsTheCost:
         with patch.object(c, "_call_llm", AsyncMock(return_value={"history_entry": "e"})):
             passes = 0
             while log.unconsolidated_count(KEY) and passes < ceiling + 5:
-                with history_mod.allow_on_loop_persist():
-                    log.update_metadata(KEY, {"consolidation_retry_at": 0.0})
+                await asyncio.to_thread(log.update_metadata, KEY, {"consolidation_retry_at": 0.0})
                 await c._consolidate(KEY, include_history=True)
                 passes += 1
 
@@ -1306,8 +1303,7 @@ class TestAPerHeadSliceCeilingBoundsTheCost:
         with patch.object(c, "_call_llm", AsyncMock(return_value={"history_entry": "e"})):
             passes = 0
             while log.unconsolidated_count(KEY) and passes < 10:
-                with history_mod.allow_on_loop_persist():
-                    log.update_metadata(KEY, {"consolidation_retry_at": 0.0})
+                await asyncio.to_thread(log.update_metadata, KEY, {"consolidation_retry_at": 0.0})
                 await c._consolidate(KEY, include_history=True)
                 passes += 1
 
@@ -1348,8 +1344,7 @@ class TestAPerHeadSliceCeilingBoundsTheCost:
         with patch.object(c, "_call_llm", llm):
             passes = 0
             while log.unconsolidated_count(KEY) and passes < ceiling + 5:
-                with history_mod.allow_on_loop_persist():
-                    log.update_metadata(KEY, {"consolidation_retry_at": 0.0})
+                await asyncio.to_thread(log.update_metadata, KEY, {"consolidation_retry_at": 0.0})
                 await c._consolidate(KEY, include_history=True)
                 passes += 1
 

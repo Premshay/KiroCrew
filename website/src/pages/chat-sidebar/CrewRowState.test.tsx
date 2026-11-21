@@ -2,11 +2,10 @@ import { describe, expect, it } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import { CREW_STATE_STYLE, CrewStateWord, type CrewStateKind } from './CrewRowState'
 import { crewRowOwnState } from './SessionRow'
-import { ULTRA_FLOW_SECONDS } from '../../components/crew/CrewModeMarks'
 
 const fontWeight = (tone: string) => tone.split(' ').find(c => /^font-/.test(c)) ?? 'font-normal'
 
-describe('Ultra Mode row state word', () => {
+describe('Conductor mode row state word', () => {
   it('Running and Waiting differ by shape and weight, not colour alone', () => {
     const run = CREW_STATE_STYLE.running
     const wait = CREW_STATE_STYLE.waiting
@@ -69,10 +68,5 @@ describe('Ultra Mode row state word', () => {
     expect(crewRowOwnState('goal_loop', '', true)?.kind).toBe('stalled')
     expect(crewRowOwnState('unread', '')).toBeNull()
     expect(crewRowOwnState(undefined, '')).toBeNull()
-  })
-
-  it('the Ultra Mode tag flows fast enough to read as moving', () => {
-    expect(ULTRA_FLOW_SECONDS).toBeLessThanOrEqual(2.5)
-    expect(ULTRA_FLOW_SECONDS).toBeGreaterThan(0)
   })
 })

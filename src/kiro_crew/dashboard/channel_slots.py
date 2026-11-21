@@ -72,6 +72,7 @@ from kiro_crew.dashboard.chat_utils import (
     effective_session_key,
     slot_history_key,
 )
+from kiro_crew.dashboard.slack_session_list import auto_folder_id as slack_auto_folder_id
 from kiro_crew.dashboard.slot_persistence.message_entries import remember_unknown_row_fields
 from kiro_crew.dashboard.state import (
     _normalize_slot_key,
@@ -626,7 +627,7 @@ def surface_channel_session(
         slot.workspace = meta["workspace"]
     if meta.get("memory_store"):
         slot.memory_store = str(meta["memory_store"])
-    seed_project_from_disk(state, slot, meta.get("project") or "")
+    seed_project_from_disk(state, slot, meta.get("project") or "", meta.get("project_picked"))
     if meta.get("channel_folder_filed"):
         slot._channel_folder_filed = True
     # Persisted tags are applied on EVERY surface, not just first filing: the
@@ -764,7 +765,7 @@ def _window_matches_disk(slot: "_ChatSlot", messages: list[dict[str, Any]]) -> b
 
     Matched on ``(role, ts, content)``: the window's ``cls`` and ``meta`` are
     presentation state that a persisted line need not carry, and content is
-    comparable because the write boundary already redacted non-user text before
+    comparable because the write boundary already redacted the text before
     it reached disk.
     """
     older = slot._disk_older_count
@@ -1129,6 +1130,7 @@ def _linked_running_flipped(state: "DashboardState") -> bool:
         try:
             now[name] = bool(slot.linked_turn_running)
         except Exception:
+            # One slot that cannot report must not stop the scan; the next reconcile reads it again.
             continue
     flipped = any(seen.get(name, False) != running for name, running in now.items())
     # A tab that closed while its turn ran needs no push of its own.
@@ -1363,6 +1365,11 @@ async def _reconcile_channel_slots_locked(
         ns = channel_namespace_of(key)
         if ns and ns not in folder_ids:
             folder_ids[ns] = await lookup_channel_folder(state, ns)
+            if ns == "slack" and not folder_ids[ns]:
+                # Listed Slack conversations with no ``slack.session_folder``
+                # file into a "Slack" folder made on first use, in one locked
+                # store transaction (see ``slack_session_list.auto_folder_id``).
+                folder_ids[ns] = await slack_auto_folder_id(state)
 
     # Folder tags are deliberately NOT read here: the raw ids are read fresh
     # under ``tags_write_lock`` immediately before validation and the filing

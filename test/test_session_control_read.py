@@ -7,6 +7,8 @@ before truncation at ``MAX_READ_CONTENT_CHARS``.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from chat_test_helpers import _make_state
 from session_control_helpers import (  # noqa: F401 -- the autouse fixtures register by import
@@ -19,6 +21,7 @@ from session_control_helpers import (  # noqa: F401 -- the autouse fixtures regi
 )
 
 from kiro_crew.dashboard import session_control as sc
+from kiro_crew.testing.synthetic_credentials import github_classic
 
 # ── Reading: cursor semantics ────────────────────────────────────────────────
 
@@ -68,11 +71,13 @@ def test_a_credential_at_the_truncation_boundary_is_still_redacted(tmp_path):
     state = _make_state(tmp_path)
     caller = _slot(state, "chat-1")
     target = _peer_target(state, "chat-2", caller)
-    secret = "ghp_" + "B" * 36
+    secret = github_classic(seed=140)  # a ghp_ without a valid checksum is no token
     # Straddle the boundary: only the first 10 chars of the secret survive a
     # naive slice, and a 10-char fragment does not match the credential
     # scanner — so it is exactly what leaks when the order is wrong.
-    filler = "x" * (sc.MAX_READ_CONTENT_CHARS - 10)
+    filler = (
+        "x" * (sc.MAX_READ_CONTENT_CHARS - 11) + " "
+    )  # a blank: a token glued to a letter is no token by its format
     surviving_fragment = secret[:10]
     target.append("assistant", filler + secret, "msg msg-a")
 
@@ -132,6 +137,21 @@ def test_read_returns_the_tail_with_a_total_to_poll_from(tmp_path):
     assert [m["content"] for m in out["messages"]] == ["line 3", "line 4"]
     assert [m["index"] for m in out["messages"]] == [3, 4]
     assert out["running"] is False
+
+
+def test_read_reports_a_workflow_owned_by_an_idle_target(tmp_path):
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    target = _peer_target(state, "chat-2", caller)
+    target_key = _key(target)
+    state.workflow_service = SimpleNamespace(
+        registry=SimpleNamespace(has_pending_work_for=lambda key: key == target_key)
+    )
+
+    out = sc.read_messages(state, caller_session_key=_key(caller), target="chat-2")
+
+    assert out["running"] is True
+    assert out["activity"] == ["workflow"]
 
 
 def test_read_since_returns_only_what_arrived_after(tmp_path):

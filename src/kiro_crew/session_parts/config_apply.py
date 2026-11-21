@@ -42,6 +42,9 @@ _CONFIG_SECTIONS: tuple[str, ...] = (
     # apps.<name>.model is a tier of the new-session model ladder, read off
     # ``_cfg`` at each cold start (session._session_model).
     "apps",
+    # templates.<name>.model is the tier above a template's spec pin, read off
+    # ``_cfg`` at each cold start and at a warm claim.
+    "templates",
 )
 # Paths honoured only by a rebuilt provider factory or a re-derived warm pool.
 # Anything else under ``session``/``agent`` is read off ``_cfg`` at its point of
@@ -69,6 +72,9 @@ _FACTORY_CONFIG_PATHS: tuple[str, ...] = (
     # A pin picks which file a pooled provider of a contested name runs, so a
     # warm provider started under the previous pin is retired, not claimed.
     "agent.spec_pins",
+    # The factory's fallback launches a template on templates.<name>.model, so a
+    # warm process started under the previous pick is retired, not claimed.
+    "templates",
     "session.pool_size",
     "session.pool_agent",
     "session.pool_ttl_secs",
@@ -149,12 +155,15 @@ def _sync_autocompact_pct(self: SessionManager) -> None:
         self._cfg.session.autocompact_pct = published
 
 
-async def reload_provider_factory(self: SessionManager, cfg: KiroCrewConfig | None = None) -> None:
+async def reload_provider_factory(
+    self: SessionManager, cfg: KiroCrewConfig | None = None, *, defer_busy: bool = False
+) -> None:
     """Rebuild the provider factory and retire sessions created by the old one.
 
     ``cfg`` is the config the live applier already holds; ``None`` loads.
+    ``defer_busy`` resets a session a turn holds when that turn ends instead of now.
     """
-    await self._lifecycle_boundary().reload_provider_factory(cfg=cfg)
+    await self._lifecycle_boundary().reload_provider_factory(cfg=cfg, defer_busy=defer_busy)
 
 
 def widen_cold_start_queues(self: SessionManager) -> None:

@@ -376,13 +376,14 @@ class TestRouteMessageAttachments:
         """The shutdown spool must not quote temp paths or file bodies.
 
         The turn's text is the ingested form; the spool gets what the user typed
-        (mention stripped, before transcription) and how many files it carried.
+        (mention stripped, before transcription), how many files it carried and
+        Slack's name for each ("" for the one Slack did not name).
         """
         orch = _make_orch(use_transport=use_transport)
         img = tmp_path / "shot.png"
         img.write_bytes(b"\x89PNG")
         files = [
-            {"mimetype": "image/png", "url_private": "https://x.invalid/a.png"},
+            {"name": "shot.png", "mimetype": "image/png", "url_private": "https://x.invalid/a.png"},
             {"mimetype": "text/plain", "url_private": "https://x.invalid/b.txt"},
         ]
         target = "handle_message_transport" if use_transport else "handle_message"
@@ -405,6 +406,7 @@ class TestRouteMessageAttachments:
         assert str(img) in hm.await_args[0][3]
         assert hm.await_args.kwargs["spool_text"] == "look"
         assert hm.await_args.kwargs["spool_attachments"] == 2
+        assert hm.await_args.kwargs["spool_attachment_names"] == ("shot.png", "")
 
     @pytest.mark.asyncio
     async def test_busy_session_queues_the_pre_ingestion_message(self, tmp_path):
@@ -413,7 +415,9 @@ class TestRouteMessageAttachments:
         orch.sessions.enqueue = MagicMock(return_value=True)
         img = tmp_path / "shot.png"
         img.write_bytes(b"\x89PNG")
-        files = [{"mimetype": "image/png", "url_private": "https://x.invalid/a.png"}]
+        files = [
+            {"name": "shot.png", "mimetype": "image/png", "url_private": "https://x.invalid/a.png"}
+        ]
         with patch("kiro_crew.slack.events.is_allowed_user", return_value=True):
             with patch("kiro_crew.slack.events.stt_available", return_value=False):
                 with patch(
@@ -425,6 +429,7 @@ class TestRouteMessageAttachments:
         kw = orch.sessions.enqueue.call_args.kwargs
         assert kw["spool_text"] == "look"
         assert kw["spool_attachments"] == 1
+        assert kw["spool_attachment_names"] == ("shot.png",)
 
     @pytest.mark.asyncio
     async def test_no_recoverable_text_cleans_up_temp_images(self, tmp_path):
@@ -636,6 +641,8 @@ class TestRouteMessageSlackDown:
         hm.assert_awaited_once()
         assert hm.await_args[0][0] is new_client
         assert str(img) in hm.await_args[0][3]
+        # The handled turn's attachment is removed once the turn is done.
+        assert not img.exists()
 
     @pytest.mark.parametrize("caption", ["look", ""])
     @pytest.mark.asyncio
@@ -965,13 +972,16 @@ class TestRouteMessageTempCleanup:
     async def test_missing_temp_image_does_not_raise_on_cleanup(self, tmp_path):
         orch = _make_orch()
         ghost = tmp_path / "already-gone.png"
+        # The cleanup walks past the missing file and still removes the one on disk.
+        present = tmp_path / "still-here.png"
+        present.write_bytes(b"\x89PNG")
         files = [{"mimetype": "image/png", "url_private": "https://x.invalid/a.png"}]
         with patch("kiro_crew.slack.events.is_allowed_user", return_value=True):
             with patch("kiro_crew.slack.events.stt_available", return_value=False):
                 with patch(
                     "kiro_crew.slack.events.process_slack_files",
                     new_callable=AsyncMock,
-                    return_value=([str(ghost)], []),
+                    return_value=([str(ghost), str(present)], []),
                 ):
                     with patch(
                         "kiro_crew.slack.events.handle_message", new_callable=AsyncMock
@@ -982,6 +992,7 @@ class TestRouteMessageTempCleanup:
                         await _drain(orch)
         hm.assert_awaited_once()
         assert str(ghost) in hm.await_args[0][3]
+        assert not present.exists()
 
 
 class TestDispatchQueued:
@@ -1000,13 +1011,19 @@ class TestDispatchQueued:
     @pytest.mark.parametrize("use_transport", [False, True])
     async def test_pre_ingestion_message_travels_to_the_handler(self, use_transport):
         orch = _make_orch(use_transport=use_transport)
-        kwargs = {"channel": "D1", "spool_text": "look", "spool_attachments": 1}
+        kwargs = {
+            "channel": "D1",
+            "spool_text": "look",
+            "spool_attachments": 1,
+            "spool_attachment_names": ("shot.png",),
+        }
         target = "handle_message_transport" if use_transport else "handle_message"
         with patch(f"kiro_crew.slack.events.{target}", new_callable=AsyncMock) as hm:
             with patch.object(KiroCrewConfig, "load", return_value=KiroCrewConfig()):
                 await ev._dispatch_queued(orch, "100.0", "101.0", "look\n/tmp/x.png", kwargs)
         assert hm.await_args.kwargs["spool_text"] == "look"
         assert hm.await_args.kwargs["spool_attachments"] == 1
+        assert hm.await_args.kwargs["spool_attachment_names"] == ("shot.png",)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("use_transport", [False, True])
@@ -1022,11 +1039,18 @@ class TestDispatchQueued:
     @pytest.mark.asyncio
     async def test_missing_temp_path_is_tolerated(self, tmp_path):
         orch = _make_orch()
-        kwargs = {"channel": "D1", "image_temp_paths": [str(tmp_path / "nope.png")]}
+        # A missing path must not stop the cleanup of the ones still on disk.
+        present = tmp_path / "still-here.png"
+        present.write_bytes(b"\x89PNG")
+        kwargs = {
+            "channel": "D1",
+            "image_temp_paths": [str(tmp_path / "nope.png"), str(present)],
+        }
         with patch("kiro_crew.slack.events.handle_message", new_callable=AsyncMock) as hm:
             await ev._dispatch_queued(orch, "100.0", "101.0", "queued text", kwargs)
         hm.assert_awaited_once()
         assert hm.await_args[0][3] == "queued text"
+        assert not present.exists()
         orch.slack.remove_reaction.assert_awaited_once_with("D1", "101.0", "hourglass_flowing_sand")
 
 

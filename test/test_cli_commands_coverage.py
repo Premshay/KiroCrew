@@ -160,7 +160,7 @@ class TestSpawnCli:
         ):
             cc._spawn(_ns(spawn_action="list", port=1234))
         assert exc.value.code == 1
-        assert "bad spawn" in capsys.readouterr().out
+        assert "bad spawn" in capsys.readouterr().err
 
     def test_list_http_error_with_opaque_body_prints_status(
         self, capsys: pytest.CaptureFixture[str]
@@ -171,7 +171,7 @@ class TestSpawnCli:
             pytest.raises(SystemExit),
         ):
             cc._spawn(_ns(spawn_action="list", port=1234))
-        assert "503" in capsys.readouterr().out
+        assert "503" in capsys.readouterr().err
 
     def test_list_unreachable_gateway_reports_port(
         self, capsys: pytest.CaptureFixture[str]
@@ -186,7 +186,7 @@ class TestSpawnCli:
         ):
             cc._spawn(_ns(spawn_action="list", port=4321))
         assert exc.value.code == 1
-        assert "4321" in capsys.readouterr().out
+        assert "4321" in capsys.readouterr().err
 
     def test_unknown_action_prints_usage(self, capsys: pytest.CaptureFixture[str]) -> None:
         cc._spawn(_ns(spawn_action="bogus", port=1))
@@ -290,7 +290,7 @@ class TestSpawnCli:
             pytest.raises(SystemExit),
         ):
             cc._spawn(_ns(spawn_action="run", port=1, task="t", fire_and_forget=True))
-        assert "task too long" in capsys.readouterr().out
+        assert "task too long" in capsys.readouterr().err
 
     def test_run_unreachable_gateway_exits_1(self, capsys: pytest.CaptureFixture[str]) -> None:
         with (
@@ -299,7 +299,7 @@ class TestSpawnCli:
             pytest.raises(SystemExit),
         ):
             cc._spawn(_ns(spawn_action="run", port=9, task="t", fire_and_forget=True))
-        assert "gateway not running" in capsys.readouterr().out
+        assert "gateway not running" in capsys.readouterr().err
 
 
 # ── app subcommands ──
@@ -666,6 +666,47 @@ class TestAppCli:
         assert "restart" not in out
         assert "backend process" not in out
 
+    def test_file_only_enable_prints_the_platform_refusal_instead_of_a_restart(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """An exec backend native Windows refuses starts at no restart."""
+        refusal = "App demo declares an exec (shell launcher) backend which is not supported."
+        with (
+            patch("kiro_crew.cli_commands._app_declares_backend", return_value=True),
+            patch("kiro_crew.apps.backend.exec_backend_platform_refusal", return_value=refusal),
+        ):
+            cc._print_file_only_app_result("demo", enabled=True)
+
+        out = capsys.readouterr().out
+        assert "picks up the app's crons and hooks within a minute." in out
+        assert refusal in out
+        assert "restart the gateway" not in out
+
+    def test_file_only_enable_keeps_the_restart_when_nothing_refuses_the_backend(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A Python or Node backend, or any POSIX host, gets no refusal and keeps the restart."""
+        with (
+            patch("kiro_crew.cli_commands._app_declares_backend", return_value=True),
+            patch("kiro_crew.apps.backend.exec_backend_platform_refusal", return_value=None),
+        ):
+            cc._print_file_only_app_result("demo", enabled=True)
+
+        assert "restart the gateway to start it now." in capsys.readouterr().out
+
+    def test_file_only_disable_never_asks_for_the_refusal(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A disable still stops the backend at the next start, so its line is unchanged."""
+        with (
+            patch("kiro_crew.cli_commands._app_declares_backend", return_value=True),
+            patch("kiro_crew.apps.backend.exec_backend_platform_refusal") as refusal,
+        ):
+            cc._print_file_only_app_result("demo", enabled=False)
+
+        refusal.assert_not_called()
+        assert "restart the gateway to stop it now." in capsys.readouterr().out
+
     def test_file_only_message_minute_covers_both_gateway_polls(self) -> None:
         """Both gateway polls behind the message's "within a minute" run at least once a minute."""
         assert max(CRON_POLL_SECS, HOOK_POLL_SECS) <= 60
@@ -779,8 +820,10 @@ class TestAppCli:
             # A relative path: the gateway's working directory is not this shell's.
             cc._handle_app(_ns(app_action="install", source="demo-app"))
 
-        assert len(requests) == 2
-        action = requests[1]
+        # Mint, the serving gateway's version, then install.
+        assert len(requests) == 3
+        assert "/api/version?" in requests[1].full_url
+        action = requests[2]
         assert action.get_method() == "POST"
         assert "/api/apps/install?" in action.full_url
         assert json.loads(action.data) == {"source": str(source.resolve())}
@@ -882,7 +925,12 @@ class TestAppCli:
             patch("kiro_crew.app_lifecycle_client.read_local_secret", return_value="local-secret"),
             patch(
                 "kiro_crew.app_lifecycle_client.unix_socket_urlopen",
-                side_effect=[_FakeResponse({"token": "dashboard-credential"}), error],
+                # Mint, the gateway's version (read before the action), the install.
+                side_effect=[
+                    _FakeResponse({"token": "dashboard-credential"}),
+                    _FakeResponse({"version": "0.0.1"}),
+                    error,
+                ],
             ),
             patch("kiro_crew.cli_commands.install_app") as local_install,
             pytest.raises(SystemExit) as exc,
@@ -893,6 +941,7 @@ class TestAppCli:
         err = capsys.readouterr().err
         assert "gateway refused: no app.json" in err
         assert "Nothing was installed; the gateway reads the app directory" in err
+        assert "Decided by the running gateway, Kiro Crew 0.0.1" in err
         local_install.assert_not_called()
 
     def test_install_gateway_mint_error_exits_without_file_edit(

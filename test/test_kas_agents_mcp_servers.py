@@ -460,6 +460,22 @@ class TestMutedServersAreNotDeclared:
         )
         assert out["mcpServers"] == {"live": {"command": "y"}}
 
+    def test_the_config_scopes_are_read_once_for_the_whole_block(self, monkeypatch):
+        """Many servers cost one read of every scope, not one read per server."""
+        from kiro_crew import mcp_cleanup
+
+        reads: list[int] = []
+
+        def scope_muted():
+            reads.append(1)
+            return frozenset({"scoped"})
+
+        monkeypatch.setattr(mcp_cleanup, "mcp_scope_muted_aliases", scope_muted)
+        servers = {f"s{i}": {"command": "x"} for i in range(5)} | {"scoped": {"command": "s"}}
+        out = to_client_custom_agent("a", _spec(mcpServers=servers), "p")
+        assert sorted(out["mcpServers"]) == [f"s{i}" for i in range(5)]
+        assert len(reads) == 1
+
     def test_forwarding_it_would_have_launched_the_server(self):
         """The round trip, stated as one assertion: declared means launched."""
         entry = {"command": "x", "disabled": True}
@@ -1130,6 +1146,7 @@ class TestRuntimeSuppliesTheStubbedSet:
             engine_features=frozenset(),
             forward_ssh_auth_sock=False,
             governance_app=None,
+            scope_muted=None,
         ):
             seen.append(stub_server_names)
             return [{"id": agent}]
@@ -1159,6 +1176,7 @@ class TestRuntimeSuppliesTheStubbedSet:
             engine_features=frozenset(),
             forward_ssh_auth_sock=False,
             governance_app=None,
+            scope_muted=None,
         ):
             seen.append((session_key, member_dispatch))
             return [{"id": agent}]
@@ -1283,6 +1301,30 @@ class TestNativeManagedMcpIdentity:
         assert "forged-parent" not in json.dumps(worker)
         unrelated = to_client_custom_agent("worker", spec, "p")
         assert "env" not in unrelated["mcpServers"]["kirocrew-work"]
+
+    def test_a_central_ceiling_puts_managed_stdio_children_in_cache_only_mode(self, monkeypatch):
+        """KAS gives managed children a minimal env; the gateway supplies the markers."""
+        from kiro_crew.platform import policy_distribution as pd
+
+        monkeypatch.setattr(pd, "central_ceiling_installed", lambda: True)
+        monkeypatch.setattr(pd, "effective_max_cache_age", lambda: 600)
+        out = to_client_custom_agent(
+            "a",
+            _spec(
+                mcpServers={
+                    "kirocrew-core": {
+                        "command": "x",
+                        "env": {pd.POLICY_CACHE_ONLY_ENV: "0", pd.POLICY_MAX_AGE_ENV: "9"},
+                    },
+                    "third-party": {"command": "y"},
+                }
+            ),
+            "p",
+        )
+        env = out["mcpServers"]["kirocrew-core"]["env"]
+        assert env[pd.POLICY_CACHE_ONLY_ENV] == "1"
+        assert env[pd.POLICY_MAX_AGE_ENV] == "600"
+        assert "env" not in out["mcpServers"]["third-party"]
 
 
 class TestHoistManagedServers:

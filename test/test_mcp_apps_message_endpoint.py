@@ -94,8 +94,9 @@ class _FakeSlot:
         self._stop_state = "idle"
 
     def queue_append(self, content: str, kind: str = "", meta=None, **_kw) -> str:
-        self._queue.append({"content": content, "kind": kind, "meta": meta})
-        return "q-1"
+        queue_id = f"q-{len(self._queue) + 1}"
+        self._queue.append({"id": queue_id, "content": content, "kind": kind, "meta": meta})
+        return queue_id
 
     def append(self, role, content, cls="", ts="", *, meta=None, **_kw):
         self.appended.append((role, content, cls, meta))
@@ -127,7 +128,11 @@ def message_env(monkeypatch):
         def push_slots_update(self):
             type(self).pushed += 1
 
+        def broadcast_ws(self, event, payload):
+            self.broadcasts.append((event, payload))
+
     state = _FakeState()
+    state.broadcasts = []
     app["state"] = state
 
     async def _no_rehydrate(_state, _key):
@@ -623,7 +628,7 @@ def test_slot_detail_queue_snapshot_carries_kind():
     view = queue_entry_view(snapshot_entry)
     assert view["meta"]["kind"] == MCP_APP_MESSAGE_KIND
     # The label the producer stamped rides the wire too — without it a reload
-    # renders the generic "app" attribution (round-6 Opus finding).
+    # renders the generic "app" attribution.
     assert view["meta"]["appLabel"] == "srv/tool"
 
 

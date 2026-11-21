@@ -21,11 +21,28 @@ import pytest
 from kiro_crew import undelivered_call_watch as ucw
 from kiro_crew import work_ledger
 from kiro_crew.acp._dispatch_parts.session_update_parser import parse_session_update
-from kiro_crew.acp.types import ACP_BACKEND_KAS, ACP_BACKEND_KIRO
+from kiro_crew.acp.types import (
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
+    ACP_BACKEND_KAS,
+    ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_PI,
+)
+from kiro_crew.agent_sdk.unresolved_tool_answers import unresolved_tool_answer
 
 CONDUCTOR = "chat-conductor-kas"
 WORKER = "chat-worker-kas"
 UNAVAILABLE = 'Tool "work_report" is not available.'
+KAS_ANSWER = unresolved_tool_answer("kas")
+
+#: Live pi, OpenCode and Claude frames for a model that called the bare name
+#: ``work_report``; each entry's ``_meta.note`` says how it was recorded.
+LIVE_FRAMES = json.loads(
+    (Path(__file__).parent / "fixtures" / "unresolved_work_tool_frames.json").read_text(
+        encoding="utf-8"
+    )
+)
 
 #: Captured live off KAS (kiro-cli 2.21.1, ``acp --agent-engine v3``): the
 #: ``session/update`` pair for a model that called the bare name ``work_report``.
@@ -130,7 +147,7 @@ def _item(item_id: str):
 
 
 def _kas_watch(monkeypatch, key: str = WORKER) -> ucw.UndeliveredCallWatch:
-    monkeypatch.setattr(ucw, "_serves_kas", lambda _provider: True)
+    monkeypatch.setattr(ucw, "_answer_of", lambda _provider: KAS_ANSWER)
     return ucw.UndeliveredCallWatch(key, object())
 
 
@@ -148,7 +165,11 @@ class TestWhichFailuresCount:
         output = f'Tool "{called}" is not available.'
         assert (
             ucw.undelivered_work_tool(
-                wire_title=called, kind="other", status="failed", output=output
+                answer=KAS_ANSWER,
+                wire_title=called,
+                kind="other",
+                status="failed",
+                output=output,
             )
             == expected
         )
@@ -156,6 +177,7 @@ class TestWhichFailuresCount:
     def test_a_json_quoted_raw_output_reads_the_same(self):
         assert (
             ucw.undelivered_work_tool(
+                answer=KAS_ANSWER,
                 wire_title="work_report",
                 kind="other",
                 status="failed",
@@ -188,7 +210,11 @@ class TestWhichFailuresCount:
         conductor tool or another server's tool: none is an undelivered report."""
         assert (
             ucw.undelivered_work_tool(
-                wire_title=wire_title, kind=kind, status=status, output=output
+                answer=KAS_ANSWER,
+                wire_title=wire_title,
+                kind=kind,
+                status=status,
+                output=output,
             )
             is None
         )
@@ -421,7 +447,7 @@ class TestTheWatch:
         watch.on_call(call)
         assert asyncio.run(watch.on_result(result)) is None
 
-    def test_off_kas_nothing_is_watched(self):
+    def test_an_unknown_provider_watches_nothing(self):
         _bound_item()
         watch = ucw.UndeliveredCallWatch(WORKER, object())
         call, result = _parsed(KAS_UNRESOLVED_CALL, KAS_UNRESOLVED_RESULT)
@@ -429,17 +455,211 @@ class TestTheWatch:
         assert asyncio.run(watch.on_result(result)) is None
 
     @pytest.mark.parametrize(
-        ("backend", "expected"), [(ACP_BACKEND_KAS, True), (ACP_BACKEND_KIRO, False)]
+        ("backend", "expected"),
+        [
+            (ACP_BACKEND_KAS, "kas"),
+            (ACP_BACKEND_PI, "pi"),
+            (ACP_BACKEND_OPENCODE, "opencode"),
+            (ACP_BACKEND_CLAUDE, "claude_code"),
+            (ACP_BACKEND_KIRO, None),
+            (ACP_BACKEND_CODEX, None),
+        ],
     )
-    def test_kas_is_read_off_the_provider_label(self, backend, expected):
+    def test_the_answer_is_read_off_the_provider_label(self, backend, expected):
         from kiro_crew.providers.acp import AcpProvider
 
         class _Provider(AcpProvider):
             def __init__(self) -> None:
                 self._client = SimpleNamespace(backend=backend)
 
-        assert ucw._serves_kas(_Provider()) is expected
-        assert ucw._serves_kas(MagicMock()) is False
+        want = unresolved_tool_answer(expected)
+        assert (expected is None) == (want is None)
+        assert ucw._answer_of(_Provider()) is want
+        assert ucw._answer_of(MagicMock()) is None
+
+
+def _provider_for(backend: str):
+    from kiro_crew.providers.acp import AcpProvider
+
+    class _Provider(AcpProvider):
+        def __init__(self) -> None:
+            self._client = SimpleNamespace(backend=backend)
+
+    return _Provider()
+
+
+def _live(harness: str) -> tuple[dict, dict]:
+    """The live ``tool_call`` frame and terminal result for *harness*'s capture."""
+    updates = LIVE_FRAMES[harness]["updates"]
+    call = next(u for u in updates if u["sessionUpdate"] == "tool_call")
+    result = updates[-1]
+    assert result["sessionUpdate"] == "tool_call_update" and result["status"] in (
+        "failed",
+        "completed",
+    )
+    return call, result
+
+
+class TestTheOtherHarnesses:
+    """pi, OpenCode and Claude, from the frames each sent live for a bare
+    ``work_report``.
+
+    Each watch is built off a real provider of that backend, so deleting a harness's
+    row from :mod:`kiro_crew.agent_sdk.unresolved_tool_answers` turns its test red.
+    """
+
+    @pytest.mark.parametrize(
+        ("harness", "backend"),
+        [
+            ("pi", ACP_BACKEND_PI),
+            ("opencode", ACP_BACKEND_OPENCODE),
+            ("claude_code", ACP_BACKEND_CLAUDE),
+        ],
+    )
+    def test_the_live_frames_are_recorded(self, harness, backend):
+        item_id = _bound_item()
+        watch = ucw.UndeliveredCallWatch(WORKER, _provider_for(backend))
+        events = _parsed(*LIVE_FRAMES[harness]["updates"])
+        for event in events:
+            if event.kind == "tool_call":
+                watch.on_call(event)
+        (result,) = [event for event in events if event.kind == "tool_result"]
+        noted = asyncio.run(watch.on_result(result))
+        assert noted is not None and noted["item_id"] == item_id
+
+    @pytest.mark.parametrize("harness", ["pi", "opencode", "claude_code"])
+    def test_another_harness_answer_does_not_match(self, harness):
+        """Each pattern is its own harness's: KAS's answer never reads pi's,
+        OpenCode's or Claude's text, so the per-harness row is what makes these
+        count."""
+        call, result = _live(harness)
+        output = result["content"][0]["content"]["text"]
+        assert (
+            ucw.undelivered_work_tool(
+                answer=KAS_ANSWER,
+                wire_title=call["title"],
+                kind=call["kind"],
+                status=result["status"],
+                output=output,
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        ("harness", "status", "output"),
+        [
+            # pi: the sentence inside other output, or a call that completed.
+            ("pi", "failed", "log\nTool work_report not found\nmore"),
+            ("pi", "completed", "Tool work_report not found"),
+            ("pi", "failed", "Tool read_file not found"),
+            # OpenCode: the same answer for a different tool, a failed status, a
+            # resolved call's own server answer, and bad arguments to a real tool.
+            (
+                "opencode",
+                "completed",
+                "The arguments provided to the tool are invalid: Model tried to call "
+                "unavailable tool 'read_file'. Available tools: bash.",
+            ),
+            (
+                "opencode",
+                "failed",
+                "The arguments provided to the tool are invalid: Model tried to call "
+                "unavailable tool 'work_report'. Available tools: bash.",
+            ),
+            ("opencode", "completed", "Recorded. status=progress item=it_abcd1234"),
+            (
+                "opencode",
+                "completed",
+                "The arguments provided to the tool are invalid: summary: Required",
+            ),
+            # Claude: a delivered call's own answers, the same answer for another
+            # tool or a completed call, the sentence inside other output, and a
+            # fence that is opened but never closed.
+            ("claude_code", "completed", "Recorded. status=progress item=it_abcd1234"),
+            ("claude_code", "failed", "done_without_evidence: put the evidence in artifacts"),
+            (
+                "claude_code",
+                "failed",
+                "<tool_use_error>InputValidationError: work_report failed due to the "
+                "following issue:\nThe required parameter `summary` is missing</tool_use_error>",
+            ),
+            (
+                "claude_code",
+                "completed",
+                "<tool_use_error>Error: No such tool available: work_report</tool_use_error>",
+            ),
+            (
+                "claude_code",
+                "failed",
+                "<tool_use_error>Error: No such tool available: read_file</tool_use_error>",
+            ),
+            (
+                "claude_code",
+                "failed",
+                "log\n<tool_use_error>Error: No such tool available: work_report</tool_use_error>",
+            ),
+            (
+                "claude_code",
+                "failed",
+                "```\n<tool_use_error>Error: No such tool available: work_report</tool_use_error>",
+            ),
+        ],
+    )
+    def test_everything_else(self, harness, status, output):
+        assert (
+            ucw.undelivered_work_tool(
+                answer=unresolved_tool_answer(harness),
+                wire_title="work_report",
+                kind="other",
+                status=status,
+                output=output,
+            )
+            is None
+        )
+
+    def test_only_the_head_of_opencodes_long_answer_is_read(self):
+        """OpenCode's answer lists every tool the session has, so it runs past the
+        whole-answer cap; its head still names the call."""
+        call, result = _live("opencode")
+        output = result["rawOutput"]["output"]
+        assert len(output) > ucw._MAX_ANSWER_LEN
+        assert (
+            ucw.undelivered_work_tool(
+                answer=unresolved_tool_answer("opencode"),
+                wire_title=call["title"],
+                kind=call["kind"],
+                status=result["status"],
+                output=output,
+            )
+            == "work_report"
+        )
+
+    @pytest.mark.parametrize("output_key", ["content", "rawOutput"])
+    def test_claudes_fenced_and_bare_answers_read_the_same(self, output_key):
+        """Claude's content text fences the answer; its ``rawOutput`` is bare."""
+        call, result = _live("claude_code")
+        output = (
+            result["content"][0]["content"]["text"]
+            if output_key == "content"
+            else result["rawOutput"]
+        )
+        assert (
+            ucw.undelivered_work_tool(
+                answer=unresolved_tool_answer("claude_code"),
+                wire_title=call["title"],
+                kind=call["kind"],
+                status=result["status"],
+                output=output,
+            )
+            == "work_report"
+        )
+
+    @pytest.mark.parametrize(
+        "called",
+        ["work_report", "mcp__kirocrew_work__work_report", "kirocrew-work_work_brief"],
+    )
+    def test_pi_and_opencode_spellings_are_worker_tools(self, called):
+        assert ucw._worker_tool(called) in ("work_report", "work_brief")
 
 
 class TestTheConductorHearsOfIt:
@@ -557,7 +777,7 @@ def test_a_channel_turn_records_it_too(monkeypatch):
     from kiro_crew.messaging.renderer import Renderer
 
     item_id = _bound_item()
-    monkeypatch.setattr(ucw, "_serves_kas", lambda _provider: True)
+    monkeypatch.setattr(ucw, "_answer_of", lambda _provider: KAS_ANSWER)
 
     class _Provider:
         async def stream(self, _message):
@@ -589,7 +809,7 @@ def test_an_unattended_turn_records_it_too(monkeypatch):
     from kiro_crew.llm_helpers_parts.turn_stream import stream_and_collect
 
     item_id = _bound_item()
-    monkeypatch.setattr(ucw, "_serves_kas", lambda _provider: True)
+    monkeypatch.setattr(ucw, "_answer_of", lambda _provider: KAS_ANSWER)
 
     class _Provider:
         async def stream(self, _message, **_kw):
@@ -613,8 +833,8 @@ async def test_the_dashboard_turn_records_it_from_the_live_frames(tmp_path: Path
 
     item_id = _bound_item()
     # The mocked client is no provider class, so the KAS label is read through
-    # the seam ``test_kas_is_read_off_the_provider_label`` pins.
-    monkeypatch.setattr(ucw, "_serves_kas", lambda _provider: True)
+    # the seam ``test_the_answer_is_read_off_the_provider_label`` pins.
+    monkeypatch.setattr(ucw, "_answer_of", lambda _provider: KAS_ANSWER)
     events = [
         *_parsed(KAS_UNRESOLVED_CALL, KAS_UNRESOLVED_RESULT),
         AcpEvent(kind=EVENT_TEXT_CHUNK, text="Opened the PR."),

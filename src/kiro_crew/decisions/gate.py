@@ -479,8 +479,9 @@ _unscoped_warned: set[str] = set()
 #: Which KEYSTONE FIELD each scoped point's consent is recorded in, as
 #: ``point -> state key``. The dashboard's per-point panel writes this exact key back
 #: through ``PUT /api/decisions/consent``. Built from the same sets as the enforcement
-#: table below, so a point is both enforced and listed; ``test_decisions_gate.py``
-#: pins the two against each other.
+#: table below, so a point is both enforced and listed;
+#: ``test_decisions_memory_text_scope.py`` and ``test_decisions_consent.py`` pin the two
+#: against each other.
 POINT_SCOPE_KEYS: dict[str, str] = {
     **{p: _consent.STATE_KEY_TOOL_ARGS for p in POINTS_NEEDING_TOOL_ARGS},
     **{p: _consent.STATE_KEY_COMPACTION for p in POINTS_NEEDING_COMPACTION},
@@ -779,11 +780,24 @@ def judge_evidence_scope_granted(
     alone. A loop whose owner armed no brief lacks the ``judge`` spec half of that
     lane's authorization, so screening it asks whether this point's own egress scope
     was granted. Fail-closed: anything unreadable answers False.
+
+    In an LTS build an endpoint the build refuses (hosted Jev, or one written by hand,
+    :func:`capability.edition_refuses`) can never be armed, so the judge falls to the
+    LLM lane, which sends to no decision endpoint. For that endpoint the consent
+    recorded for it, its scope and the row decide, not the endpoint's eligibility.
     """
     try:
         cfg = config if config is not None else _snapshot()
         if cfg is None:
             return False
+        from kiro_crew.decisions.capability import edition_refuses, provider_id
+
+        endpoint = configured_endpoint(cfg)
+        if edition_refuses(provider_id(endpoint, configured_provider_model(cfg))):
+            state = _consent.load_state()
+            if not _consent.permits(endpoint, state) or _capability_denied(session_key):
+                return False
+            return _point_scope_granted(JUDGE_POINT, state)
         if not _consented_for(cfg, session_key, JUDGE_POINT):
             return False
         return _point_scope_granted(JUDGE_POINT, _consent.load_state())
@@ -922,13 +936,14 @@ def scrub_reason(
     if warnings:
         return ERROR_SCRUBBED_CREDENTIAL
     try:
-        from kiro_crew.security import redact_exfiltration_urls
+        # The blocking scan, not the redaction pass: a URL is judged here, never rewritten.
+        from kiro_crew.security import scan_exfiltration_urls
 
-        _cleaned, warnings = redact_exfiltration_urls(text)
+        flagged = scan_exfiltration_urls(text)
     except Exception:
         logger.warning("decisions: exfiltration URL scan failed; refusing the state")
         return ERROR_SCRUBBED_SCAN_FAILED
-    return ERROR_SCRUBBED_URL if warnings else None
+    return ERROR_SCRUBBED_URL if flagged else None
 
 
 def _request_needs(

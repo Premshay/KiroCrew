@@ -229,17 +229,25 @@ const jsonMessage = (trimmed: string, keys: readonly string[]): string => {
 }
 
 /**
+ * True when a 429 came from the EDGE rather than from the gateway: exactly the
+ * 429s `friendlyErrText` labels as a tunnel-edge throttle.
+ *
+ * The edge rejects a burst before the request reaches the gateway, so nothing
+ * was applied and re-sending is safe. A 429 the gateway sends is a decision (a
+ * live-slot cap, a full queue) that names its reason, and re-sending it would
+ * only repeat a refusal the user needs to read.
+ */
+export const isEdgeThrottleBody = (body: string): boolean =>
+  !isSlotCapError(429, body) && jsonMessage(body.trim(), ['error', 'detail']) === ''
+
+/**
  * Map raw edge/proxy error bodies to a human-readable message. A dashboard
  * served through Builder Tunnels sits behind API Gateway, whose throttle
  * response is the opaque `{"message":"Rate exceeded","throttlingReasons":null}`
  * — rendering that verbatim in an error card is a terrible UX.
- *
- * The retry ladder in api/queryClient.ts absorbs edge throttles BEFORE this
- * message is reached, but only for calls that go through React Query. Direct
- * `post`/`put`/`del` handlers (channel create among them) have no retry at all,
- * so for those this text is the FIRST thing the operator sees rather than the
- * last resort — which is why it must not be shown unless the edge really is
- * what answered.
+ * React Query retries edge throttles on reads. `retryEdgeThrottle` retries
+ * eligible writes. A gateway 429 names its own reason in `error` and keeps
+ * that message.
  *
  * Returns `''` for a body carrying no human message: a caller with a sentence of
  * its own supplies it, and the transport falls back to {@link statusErrText}.

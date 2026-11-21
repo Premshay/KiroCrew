@@ -63,11 +63,36 @@ def test_a_binding_without_its_own_file_has_no_worker_kit(home):
     assert caught.value.code == "not_a_mate_file"
 
 
-def test_the_view_reports_only_the_member_and_revision(home):
+def test_the_view_reports_only_the_member_revision_and_unchecked_denies(home):
     """There is no recorded template and no 'additions since' — the file is the sum."""
     view = mate_worker_kit.view("pixel")
-    assert set(view) == {"member", "revision"}
+    assert set(view) == {"member", "revision", "unenforced_denies", "conditional_denies"}
+    assert view["unenforced_denies"] == []
+    assert view["conditional_denies"] == []
     assert view["member"] == "pixel"
+
+
+def test_a_deny_only_the_gate_reads_is_named_apart_from_the_unchecked_ones(home, monkeypatch):
+    """KAS does not carry ``docker\\s+push.*`` and the gate checks it only in a simple
+    command, so the worker holds other shapes of command for it: it is named, but
+    not among the denies nothing checks."""
+    from kiro_crew.acp_backends import ACP_BACKEND_KAS
+
+    monkeypatch.setattr(mate_worker_kit, "_crewmate_backend", lambda member, held: ACP_BACKEND_KAS)
+    user, mates = home
+    base = {"name": "kirocrew-mate-worker", "prompt": "w", "tools": ["*"], "mcpServers": {}}
+    (mates / "kirocrew-mate-worker.json").write_text(json.dumps(base), encoding="utf-8")
+    settings = {"shell": {"deniedCommands": [r"docker\s+push.*"]}}
+    (user / "release-bot.json").write_text(
+        json.dumps({**TEMPLATE, "toolsSettings": settings}), encoding="utf-8"
+    )
+    preview = mate_worker_kit.preview("pixel", {"template": "release-bot"})
+    assert preview["conditional_denies"] == [r"docker\s+push.*"]
+    assert preview["unenforced_denies"] == []
+    mate_worker_kit.apply("pixel", {"template": "release-bot", "revision": preview["revision"]})
+    view = mate_worker_kit.view("pixel")
+    assert view["conditional_denies"] == [r"docker\s+push.*"]
+    assert view["unenforced_denies"] == []
 
 
 def test_the_preview_names_every_added_item_and_writes_nothing(home):
@@ -602,6 +627,51 @@ def test_a_template_whose_limits_the_worker_cannot_carry_is_refused(home, limit)
         mate_worker_kit.preview("pixel", {"template": "release-bot"})
     assert caught.value.code == "template_restrictions_uncarried"
     assert _file(mates) == before
+
+
+def _kas_worker_base(mates, monkeypatch) -> dict:
+    from kiro_crew.acp_backends import ACP_BACKEND_KAS
+
+    monkeypatch.setattr(mate_worker_kit, "_crewmate_backend", lambda member, held: ACP_BACKEND_KAS)
+    base = {"name": "kirocrew-mate-worker", "prompt": "w", "tools": ["*"], "mcpServers": {}}
+    (mates / "kirocrew-mate-worker.json").write_text(json.dumps(base), encoding="utf-8")
+    return base
+
+
+def test_a_named_bundle_beside_the_rules_is_left_behind_and_the_rules_are_carried(
+    home, monkeypatch
+):
+    """KAS only expands a bundle (``policies``) into allow rules, and refuses a block
+    that names one. So the add leaves the bundle out, a narrowing, and carries the
+    rules beside it, denies included, as the upgrade path does."""
+    user, mates = home
+    base = _kas_worker_base(mates, monkeypatch)
+    rules = [
+        {"capability": "shell", "effect": "deny", "match": ["rm -rf *"]},
+        {"capability": "fs_read", "effect": "allow"},
+    ]
+    perms = {"policies": ["read-only-shell"], "rules": rules}
+    (user / "release-bot.json").write_text(
+        json.dumps({**TEMPLATE, "permissions": perms}), encoding="utf-8"
+    )
+    _add()
+    assert _file(mates)["permissions"] == {"rules": rules}
+    merged = mate_worker.merge_worker_spec(base, mate_worker.worker_additions(base, _file(mates)))
+    assert rules[0] in merged["permissions"]["rules"]
+
+
+def test_a_permissions_block_kas_refuses_names_why(home, monkeypatch):
+    """The refusal names what KAS refuses in the block, not only ``permissions``."""
+    user, mates = home
+    _kas_worker_base(mates, monkeypatch)
+    perms = {"rules": [{"capability": "shell", "effect": "deny", "tools": ["rm"]}]}
+    (user / "release-bot.json").write_text(
+        json.dumps({**TEMPLATE, "permissions": perms}), encoding="utf-8"
+    )
+    with pytest.raises(WorkerKitError) as caught:
+        mate_worker_kit.preview("pixel", {"template": "release-bot"})
+    assert caught.value.code == "template_restrictions_uncarried"
+    assert caught.value.detail == "permissions (rule 0 carries unknown key(s) tools)"
 
 
 def test_a_template_exclusion_is_carried_into_the_crewmates_file(home):

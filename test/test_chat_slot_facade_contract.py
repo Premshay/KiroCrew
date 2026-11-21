@@ -16,6 +16,9 @@ from kiro_crew.dashboard.chat_utils import chunk_generation
 from kiro_crew.dashboard.slot_queue_repository import RESTORED_QUEUE_KEY, RESTORED_SEND_CHOSEN_KEY
 from kiro_crew.dashboard.state import _ChatSlot
 
+#: Contract: the wire keys of the ``to_dict`` projection, in order, that the REST and
+#: WebSocket snapshots send and the dashboard reads. Adding, dropping or moving a
+#: key changes what every client receives, so the record changes with it.
 _TO_DICT_KEYS = (
     "key",
     "title",
@@ -25,7 +28,7 @@ _TO_DICT_KEYS = (
     "effective_agent",
     "model",
     "runtime_agent",
-    # The owner's per-turn model-routing choice (the picker's "Auto (Jev)" entry).
+    # The owner's per-turn model-routing choice (the picker's "Auto (decision model)" entry).
     # Present on EVERY slot, so an absent key and "pinned by hand" are not the
     # same reading for a stale client.
     "jev_route",
@@ -56,6 +59,9 @@ _TO_DICT_KEYS = (
     # pair to match an idle row to its `chat_done` and history reply.
     "turn",
     "turn_gen",
+    # The running turn's own project, which a mid-reply pick does not move.
+    "turn_project",
+    "turn_project_fallback",
     "compacting",
     "preparing",
     "preparing_text",
@@ -68,10 +74,13 @@ _TO_DICT_KEYS = (
     "pending_approval_info",
     "last_activity_ts",
     "last_agent_ts",
+    "unread_ts",
+    "unread_failed",
     "waiting_for_input",
     "needs_input",
     "interrupted",
     "interrupted_stale",
+    "interrupted_by_sign_in",
     "stop_state",
     "wait_state",
     "created",
@@ -118,6 +127,9 @@ _TO_DICT_KEYS = (
     "created_by",
     "lineage_minted",
     "attribution",
+    "participants",
+    "participants_dropped",
+    "work_aggregate",
     "peer_channel_inbox_count",
     "peer_channel_attention",
     "declared_goal",

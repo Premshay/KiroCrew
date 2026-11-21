@@ -107,6 +107,34 @@ class TestInternalHistoryEligibility:
         assert key not in consolidator._running
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("published", [True, False])
+    async def test_provider_publication_reports_the_durable_outcome(
+        self, consolidator, monkeypatch, published
+    ):
+        from kiro_crew.memory_provider import chokepoints, consolidation
+
+        key = "dashboard:provider-publication"
+        log = consolidator._log
+        log.append(key, "user", "Use the alternate memory provider.")
+
+        async def publish(owner, session_key, route, *, attempted, lease, commit_state, **kwargs):
+            if published:
+                commit_state.mark_committed()
+                await owner._advance_history_marker(session_key, attempted, lease)
+
+        monkeypatch.setattr(chokepoints, "session_route", lambda *_: MagicMock(replaces=True))
+        monkeypatch.setattr(consolidation, "publish", publish)
+
+        outcome = await consolidator.consolidate_now(key)
+
+        if published:
+            assert outcome == ConsolidationOutcome("consolidated", old_offset=0, new_offset=1)
+        else:
+            assert outcome.failed
+            assert not outcome.complete
+            assert log.consolidated_offset(key) == 0
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("mode", ["incognito", "temporary"])
     async def test_restriction_between_metadata_and_eligibility_read_is_withheld(
         self, consolidator, mode
@@ -1601,7 +1629,7 @@ class TestConsolidationToolPolicyForkContracts:
             assert "collector.example/c?" not in output
             assert "AKIAIOSFODNN7EXAMPLE" not in output
             assert credential not in output
-            assert "suspicious URL to collector.example" in output
+            assert "[REDACTED: URL]" in output
 
     def test_direct_request_requires_an_idle_local_fleet_lane(self) -> None:
         class _Response:

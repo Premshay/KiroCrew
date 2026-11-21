@@ -21,6 +21,7 @@ from kiro_crew.agent_discovery import (
     declared_spec_claim,
     spec_by_declared_name,
 )
+from kiro_crew.testing.synthetic_credentials import github_classic
 
 _HOOK_A = {"agentSpawn": [{"command": "metrics-hook --agent-package PkgA --event spawn"}]}
 _HOOK_B = {"agentSpawn": [{"command": "metrics-hook --agent-source-package=PkgB"}]}
@@ -535,7 +536,7 @@ def test_a_claimant_row_carries_its_own_description(tmp_path):
 def test_a_claimant_description_is_redacted_before_it_reaches_the_card(tmp_path):
     from kiro_crew.agent_spec_pin_ops import claimant_rows
 
-    secret = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
+    secret = github_classic(seed=94)
     a = _write(tmp_path, "A.json", name="helper", description=f"Uses token {secret} to sync")
     b = _write(tmp_path, "B.json", name="helper", description="Plain")
     rows = claimant_rows([a, b])
@@ -596,11 +597,37 @@ def test_cli_sets_lists_and_clears_a_pin(user_agents, capsys):
     _cli("helper", "PkgB-helper.json")
     assert _stored_pins() == {"helper": "PkgB-helper.json"}
     assert agent_spec_pins.spec_pins() == {"helper": "PkgB-helper.json"}
+    assert "It applies to sessions started from now on" in capsys.readouterr().out
     _cli()
     assert "helper -> PkgB-helper.json" in capsys.readouterr().out
     _cli("helper", "--clear")
     assert _stored_pins() == {}
     assert "Cleared" in capsys.readouterr().out
+
+
+def test_cli_says_a_pin_on_an_uncontested_name_is_ignored(user_agents, capsys):
+    # Only other.json declares `other`; the resolver ignores a pin with no choice.
+    _cli("other", "other.json")
+    assert _stored_pins() == {"other": "other.json"}
+    out = capsys.readouterr().out
+    assert "Only one spec declares other, so the pin is ignored" in out
+    assert "It applies to sessions" not in out
+
+
+def test_cli_keeps_the_general_wording_when_the_contest_read_fails(
+    user_agents, capsys, monkeypatch
+):
+    from kiro_crew import agent_spec_pin_ops
+
+    def unreadable(**_kwargs):
+        raise OSError("agents directory vanished")
+
+    monkeypatch.setattr(agent_spec_pin_ops, "contested_agents", unreadable)
+    _cli("other", "other.json")
+    assert _stored_pins() == {"other": "other.json"}
+    out = capsys.readouterr().out
+    assert "It applies to sessions started from now on" in out
+    assert "Only one spec declares" not in out
 
 
 @pytest.mark.parametrize(

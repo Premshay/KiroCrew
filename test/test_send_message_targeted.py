@@ -3,26 +3,17 @@
 from __future__ import annotations
 
 import contextlib
-import sys
-import types
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-# Ensure kiro_crew.slack.handler is importable for patching even when
-# heavy transitive deps (cron_descriptor, etc.) aren't installed.
-if "kiro_crew.slack.handler" not in sys.modules:
-    _stub = types.ModuleType("kiro_crew.slack.handler")
-    _stub.is_allowed_user = lambda uid: False  # type: ignore[attr-defined]
-    _stub.is_tracked_channel = lambda cid: False  # type: ignore[attr-defined]
-    sys.modules["kiro_crew.slack.handler"] = _stub
-
-from kiro_crew.dashboard.handlers import api_send_message, api_slack_profile  # noqa: E402
-from kiro_crew.messaging.link import ChannelLink  # noqa: E402
-from kiro_crew.telegram.client import TELEGRAM_MAX_TEXT  # noqa: E402
-from kiro_crew.validation import CHANNEL_ID_RE, CHANNEL_MAX_LEN  # noqa: E402
+from kiro_crew.dashboard.handlers import api_send_message, api_slack_profile
+from kiro_crew.messaging.link import ChannelLink
+from kiro_crew.telegram.client import TELEGRAM_MAX_TEXT
+from kiro_crew.testing.synthetic_credentials import SAMPLE_SLACK_BOT_TOKEN
+from kiro_crew.validation import CHANNEL_ID_RE, CHANNEL_MAX_LEN
 
 
 def _make_app(state) -> web.Application:
@@ -737,10 +728,10 @@ class TestSlackProfile:
 
     @pytest.mark.asyncio
     async def test_profile_redaction(self, mock_sel):
-        """Status text with exfiltration URL gets redacted."""
+        """Status text with a credential in a URL gets the value redacted."""
         slack = MagicMock()
-        # Use a URL with a long base64-like query that triggers exfil detection
-        exfil_url = "https://evil.com/steal?d=" + "A" * 200
+        # A URL whose query carries a credential parameter: the value goes, the link stays.
+        exfil_url = "https://evil.com/steal?access_token=" + "A" * 200
         slack.get_user_profile = AsyncMock(
             return_value={
                 "id": "U0123ABC456",
@@ -757,8 +748,8 @@ class TestSlackProfile:
                 assert resp.status == 200
                 data = await resp.json()
                 status = data["profile"].get("status_text", "")
-                # The exfiltration URL payload should be redacted
-                assert "REDACTED" in status
+                # The credential value in the URL should be redacted
+                assert "https://evil.com/steal?access_token=[REDACTED: credential]" in status
                 assert "A" * 200 not in status
 
 
@@ -1074,8 +1065,8 @@ class TestProactiveBodyMeetsTheDisplayFloor:
     """A proactive body is posted AS WRITTEN, so it needs the display-form floor.
 
     Every turn egress runs `redact_for_display`, which scans the form the client
-    RENDERS as well as the literal bytes: neither `AKIA**<rest>**` nor
-    `[AKIA](https://x)<rest>` matches a credential pattern as written, yet the
+    RENDERS as well as the literal bytes: neither `<head>**<rest>**` nor
+    `[<head>](https://x)<rest>` matches a credential pattern as written, yet the
     reader is shown an intact key. This path passes no renderer -- the handler
     hands `text` straight to the channel -- so a literal-only scan here is the one
     hole in that floor, and it is reachable by anything that can call the endpoint.
@@ -1083,7 +1074,8 @@ class TestProactiveBodyMeetsTheDisplayFloor:
 
     #: Split by emphasis markers the client renders away. The literal string is
     #: not a credential; what the reader sees is.
-    _COLLAPSING = "AKIA**IOSFODNN7EXAMPLE**"
+    _SECRET = SAMPLE_SLACK_BOT_TOKEN
+    _COLLAPSING = f"{_SECRET[:4]}**{_SECRET[4:]}**"
 
     @pytest.mark.asyncio
     async def test_a_markdown_collapse_credential_is_not_posted(self, mock_sel):
@@ -1102,7 +1094,7 @@ class TestProactiveBodyMeetsTheDisplayFloor:
 
         posted = slack.post_message.call_args.args[1]
         # Neither the literal form nor the form Slack renders may carry the key.
-        assert "AKIAIOSFODNN7EXAMPLE" not in posted.replace("*", "")
+        assert self._SECRET not in posted.replace("*", "")
         assert self._COLLAPSING not in posted
 
     @pytest.mark.asyncio
@@ -1421,7 +1413,7 @@ class TestChannelTypeDelivery:
                 resp = await client.post(
                     "/api/send-message",
                     json={
-                        "text": "hey @everyone key AKIAIOSFODNN7EXAMPLE",
+                        "text": "hey @everyone key " + SAMPLE_SLACK_BOT_TOKEN,
                         "channel_type": "telegram",
                     },
                     headers={"X-Session-Key": _TG_KEY},
@@ -1431,7 +1423,7 @@ class TestChannelTypeDelivery:
                 # A literal "@everyone" would mass-notify the group.
                 assert "@everyone" not in sent
                 assert "@​everyone" in sent
-                assert "AKIAIOSFODNN7EXAMPLE" not in sent
+                assert SAMPLE_SLACK_BOT_TOKEN not in sent
 
 
 class TestChannelTypeMutualExclusion:

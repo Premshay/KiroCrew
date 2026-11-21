@@ -21,11 +21,14 @@
  */
 export const CORE_APP_ROUTE_SEGMENTS = new Set([
   '_jobs',
+  '_sel',
+  'bot-grants',
   'config',
   'dev',
   'disable',
   'enable',
   'frames',
+  'kiro',
   'manifest',
   'migrate-cleanup',
   'open',
@@ -47,6 +50,7 @@ export const CORE_APP_ROUTE_SEGMENTS = new Set([
 export const RESERVED_APP_PATH_SEGMENTS = new Set([
   'blob',
   'install',
+  'market',
   'register',
   'registries',
   'registry',

@@ -256,6 +256,10 @@ class FakeTransport:
         self.outbound.append("text")
         return "mid-1"
 
+    # The real transport sends an already-converted chunk as it is; this fake
+    # converts nothing either way.
+    send_rendered = send_message
+
     async def send_voice(self, jid: str, data: bytes, mimetype: str) -> str:
         self.voice.append((jid, data, mimetype))
         self.outbound.append("voice")
@@ -331,6 +335,28 @@ def test_session_key_is_namespaced_and_stable():
     k2 = d._session_key(_DM)
     assert k1 == k2
     assert "whatsapp" in k1
+
+
+def test_a_typed_trust_reply_grants_through_the_dispatchers_own_manager():
+    """The reply grants before the request resolves, so it must reach the same
+    manager the decider's ``trusted`` predicate reads, or the next tool asks."""
+    from kiro_crew.messaging import approval, session_trust
+
+    d, _client, sessions, _transport = _make()
+    writes: list[tuple[str, str]] = []
+    sessions.set_approval_policy = lambda key, policy: writes.append((key, policy))
+    key = d._session_key(_DM, is_operator=True)
+
+    async def reply() -> str:
+        approval.open_approval(key, "r1", conversation_id=_DM)
+        return d._consume_approval_reply(_msg("3"))
+
+    try:
+        assert asyncio.run(reply()) == approval.RECEIPT_TRUSTED
+        assert writes == [(key, "auto")]
+    finally:
+        approval.reset_for_tests()
+        session_trust.clear_trusted_sessions()
 
 
 def test_group_scope_uses_forum_chat_type_in_session_key():
@@ -1535,3 +1561,23 @@ def test_a_hand_written_false_keeps_the_billed_voice_reply_off():
 
     assert _build_whatsapp_config({"auto_reply_to_voice": "false"}).auto_reply_to_voice is False
     assert _build_whatsapp_config({"auto_reply_to_voice": True}).auto_reply_to_voice is True
+
+
+@pytest.mark.parametrize("conv, warmed", [(_GROUP, [1]), (_DM, [])])
+def test_a_group_message_starts_the_embedding_model_load_itself(monkeypatch, conv, warmed):
+    """A group message is admitted with no route, so admission does not warm the model.
+
+    The dispatcher does it instead (a DM's routed admission already did).
+    """
+    import kiro_crew.whatsapp.transport_dispatch as wa_dispatch
+
+    calls: list[int] = []
+    monkeypatch.setattr(wa_dispatch, "warm_embedder_for_person_soon", lambda: calls.append(1))
+    d, _client, _sessions, transport = _make()
+    inbound = _msg("hi", conv=conv)
+    transport.pending_original[id(inbound)] = ("hi", ())
+    transport.pending_verdicts[id(inbound)] = GroupVerdict(respond=True)
+
+    _captured_turn(monkeypatch, d, inbound)
+
+    assert calls == warmed

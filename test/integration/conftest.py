@@ -135,6 +135,12 @@ cross-home flake three tests later.
      from the boot's config and home.
    * ``apps.credential_masks._cache`` -- the parsed ``credentialMasks`` of
      every app manifest the boot's spawns read, keyed on the home's paths.
+   * ``apps.manager_records._recorded_names_cache`` -- the apps folder's
+     recorded entry names that a boot's listings reuse, keyed on its path.
+   * ``apps.routes_proxy`` app-secret cache and its invalidation counts -- the
+     secret the reverse proxy signs each app's requests with, keyed by app name
+     only. A later home with an app of the same name would have its requests
+     signed with the earlier home's secret, which its backend refuses.
    * ``config.loader`` materialized-agent snapshot (``_MATERIALIZED_AGENTS``,
      ``_MATERIALIZED_STEMS``, ``_MATERIALIZED_SEEN``, ``_MATERIALIZED_COMPLETE``, ``_MATERIALIZED_MEMO``,
      ``_MATERIALIZED_AGENTS_READY``) -- the declared names, file-name map,
@@ -203,6 +209,12 @@ cross-home flake three tests later.
      describe the previous home's spec, whose hold must not carry over to the
      next home's rebuild; a fresh process has neither. The episode revision and
      its warning state belong to the same episode and are cleared with it.
+   * ``apps.hidden_sessions`` published sets (``_hiding_apps``, ``_app_ids``),
+     its dashboard bindings and its trust-config subscription handle -- the apps
+     of the home that may hide their chats, and every app id it has seen. A
+     refresh that lands after a boot's snapshot would otherwise publish the
+     previous home's apps into the next boot; the handle would keep the next
+     boot from subscribing again once ``config.live`` dropped the subscription.
 
 2. **Snapshot and restore** around the boot by ``booted_gateway``, on every
    exit: the SIGINT/SIGTERM handlers ``run()`` installs; the event loop's
@@ -219,6 +231,9 @@ cross-home flake three tests later.
    home as its ``KIROCREW_HOME`` and creates the directory as it starts, so
    one still starting would put ``<tmp_path>/home`` back after the test
    removed it; after the reap, teardown shuts that pool down and joins it.
+   The hidden-chat refresh startup asks for runs on the loop's default executor,
+   which nothing joins, so teardown waits until none is queued or running before
+   the reset clears what it publishes.
 
 4. **Reaped** by ``_teardown_boot``: every asyncio task the boot created that
    ``_shutdown()`` did not end. Production never needs to -- ``os._exit``
@@ -277,6 +292,7 @@ import re
 import secrets
 import signal
 import sys
+import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -299,10 +315,17 @@ from kiro_crew import (
     sandbox,
     shutdown_event,
     update_next_start,
+    vector_memory_member,
 )
 from kiro_crew.acp import client as acp_client
 from kiro_crew.agent_sdk import host_auth
-from kiro_crew.apps import credential_masks
+from kiro_crew.apps import (
+    credential_masks,
+    execution,
+    hidden_sessions,
+    manager_records,
+    routes_proxy,
+)
 from kiro_crew.apps.builtin_adoption_pins import HARNESS_PINS_ENV, load_adoption_pins
 from kiro_crew.config import live as config_live
 from kiro_crew.config import loader as config_loader
@@ -323,9 +346,10 @@ from kiro_crew.metrics import inventory_gauges
 from kiro_crew.platform import bootstrap as platform_bootstrap
 from kiro_crew.platform import context as platform_context
 from kiro_crew.platform import governance
+from kiro_crew.relay_client import provider as relay_provider
 from kiro_crew.security import paths as security_paths
 from kiro_crew.testing import fake_acp_backend
-from kiro_crew.testing.wait import async_wait_until, finished
+from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS, async_wait_until, finished
 
 try:  # POSIX only; the layer is Linux-only in CI, but keep the import honest.
     import resource as _resource
@@ -822,6 +846,20 @@ def _reset_home_bound_globals() -> None:
     sandbox._SLICE_OOM_SEEN = None
     sandbox._SHIM_ARGV_CACHE.clear()
     credential_masks.clear_cache()
+    manager_records._recorded_names_cache.clear()
+    with routes_proxy._app_secret_lock:
+        routes_proxy._app_secret_cache.clear()
+        routes_proxy._app_secret_generation.clear()
+    execution.invalidate_shipped_builtin_apps()
+    vector_memory_member._IDENTITY_CACHE.clear()
+    # Under the refresh lock, so a refresh still publishing finishes first and
+    # cannot write the old home's sets back after this clears them.
+    with hidden_sessions._refresh_lock:
+        hidden_sessions.bind_listing(None, None)
+        hidden_sessions._hiding_apps = None
+        hidden_sessions._app_ids = frozenset()
+        # ``config_live.reset_for_tests`` above dropped the subscription itself.
+        hidden_sessions._trust_config_sub = None
     config_loader._MATERIALIZED_AGENTS = frozenset()
     config_loader._MATERIALIZED_STEMS.clear()
     config_loader._MATERIALIZED_SEEN.clear()
@@ -834,6 +872,9 @@ def _reset_home_bound_globals() -> None:
     dashboard_updates._auto_effect_task = None
     dashboard_updates._shape_effect = None
     update_next_start._differs_memo = None
+    # The ingress a boot publishes for the relay provider belongs to that
+    # boot's app; the next boot publishes its own.
+    relay_provider.publish_gateway_ingress(None)
     # Cleared in place, never rebound: the security facade re-exports
     # ``_path_resolve_degraded`` by identity, and the second-boot witness
     # compares each container's identity.
@@ -892,6 +933,7 @@ def home_bound_globals_are_clear() -> bool:
         and token_auth._revoked_store_singleton is None
         and revocation_gen._gen is None
         and not token_auth._app_perms_cache
+        and not routes_proxy._app_secret_cache
         and crash_guard._CRASH_LOG is None
         and autonudge._INSTANCE is None
         and platform_context._ACTIVE is None
@@ -902,6 +944,8 @@ def home_bound_globals_are_clear() -> bool:
         and sandbox._SLICE_THROTTLE_EDGE_AT is None
         and not sandbox._SHIM_ARGV_CACHE
         and not config_loader._MATERIALIZED_AGENTS
+        and hidden_sessions._hiding_apps is None
+        and not hidden_sessions._app_ids
         and not config_loader._MATERIALIZED_STEMS
         and not config_loader._MATERIALIZED_SEEN
         and not config_loader._MATERIALIZED_COMPLETE
@@ -946,6 +990,53 @@ async def _drain_memory_fence() -> None:
             "the memory-preparation worker still held its fence "
             f"{MEMORY_FENCE_DRAIN_SECS}s after shutdown; it may still be writing "
             "to the discarded home"
+        ) from exc
+
+
+#: Hidden-chat refreshes inside ``refresh_hiding_apps`` right now, so teardown can
+#: wait for one that has left the queue but not yet published.
+_hiding_refreshes_running = 0
+_hiding_refreshes_lock = threading.Lock()
+_real_refresh_hiding_apps = hidden_sessions.refresh_hiding_apps
+
+
+def _counted_hiding_refresh() -> None:
+    """``refresh_hiding_apps``, counted while it runs; ``_boot`` installs it for the boot.
+
+    The gateway calls the refresh through the module attribute
+    (``slots_push.refresh_app_state``), so this sees every refresh a boot runs.
+    """
+    global _hiding_refreshes_running
+    with _hiding_refreshes_lock:
+        _hiding_refreshes_running += 1
+    try:
+        _real_refresh_hiding_apps()
+    finally:
+        with _hiding_refreshes_lock:
+            _hiding_refreshes_running -= 1
+
+
+async def _drain_hidden_chat_refresh() -> None:
+    """Wait for every hidden-chat refresh the boot asked for to finish publishing.
+
+    ``bind_serving_loop`` asks for one at startup and it runs on the loop's default
+    executor, where nothing joins it. One still queued or running when the reset
+    clears the published sets would write this home's apps back into the next boot.
+    A queued refresh holds ``_refresh_queued`` until it is inside
+    ``refresh_hiding_apps``, where ``_counted_hiding_refresh`` already counts it, so
+    the two together leave no gap. A boot asks for one refresh per built-in app it
+    registers, and they run one at a time. A refresh still pending at the deadline
+    fails the teardown by name.
+    """
+    try:
+        await async_wait_until(
+            lambda: not hidden_sessions._refresh_queued and not _hiding_refreshes_running,
+            timeout=FALLBACK_TIMEOUT_SECS,
+        )
+    except AssertionError as exc:
+        raise RuntimeError(
+            "the hidden-chat refresh the boot queued had not finished "
+            f"{FALLBACK_TIMEOUT_SECS}s after shutdown"
         ) from exc
 
 
@@ -1060,6 +1151,11 @@ async def _teardown_boot(
         await _drain_mcp_probes()
     except BaseException as exc:  # noqa: BLE001 -- re-raised below, after the reset
         failure = failure or exc
+    try:
+        await _drain_hidden_chat_refresh()
+    except BaseException as exc:  # noqa: BLE001 -- re-raised below, after the reset
+        failure = failure or exc
+    hidden_sessions.refresh_hiding_apps = _real_refresh_hiding_apps
     _reset_home_bound_globals()
     if failure is not None:
         raise failure
@@ -1081,6 +1177,7 @@ async def _boot(home: Path, *, boot_secs: float) -> IntegrationGateway:
 
     shutdown_event.clear()
     _reset_home_bound_globals()
+    hidden_sessions.refresh_hiding_apps = _counted_hiding_refresh
     tasks_before = frozenset(_live_tasks())
 
     cfg = KiroCrewConfig.load()

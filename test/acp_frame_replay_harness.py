@@ -33,7 +33,11 @@ from kiro_crew.acp._dispatch import (
 )
 from kiro_crew.acp.elicitation import ElicitationParseError, parse_elicitation_request
 from kiro_crew.acp.engine_fallback import normalize_kiro_v2
-from kiro_crew.acp.harness.pi_steer import steer_echo_seq
+from kiro_crew.acp.harness.pi_steer import model_error_line, steer_echo_seq
+from kiro_crew.acp.harness_notices import parse_notice
+from kiro_crew.acp.plan_checklist import plan_todo_snapshot
+from kiro_crew.acp.raw_sdk_tasks import METHOD_CLAUDE_SDK_MESSAGE, sdk_message
+from kiro_crew.acp.raw_sdk_workflow_cards import WorkflowRun, merge_rows, roster_rows
 from kiro_crew.acp.types import AcpEvent, JsonRpcMessage
 from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND
 
@@ -289,6 +293,10 @@ def _replay(
                         seq = steer_echo_seq(text, gate_envelope_nonce)
                         if seq is not None:
                             entry["pi_steer_consumed"] = seq
+                        # Its failed-model-call report, which fails the turn.
+                        failure = model_error_line(text, gate_envelope_nonce)
+                        if failure is not None:
+                            entry["pi_model_error"] = failure
             if discriminant == "usage_update":
                 entry["usage"] = list(parse_usage_update(update))
                 entry["usage_cost"] = parse_usage_cost(update)
@@ -298,6 +306,18 @@ def _replay(
                 )
                 if todo is not None:
                     entry["todo"] = todo
+            if discriminant == "plan":
+                # ``AcpClient`` reads this through ``acp.plan_checklist.todo_event``,
+                # gated on ``ACP_BACKENDS_PLAN_CHECKLIST``; the snapshot pins the parse.
+                plan_todo = plan_todo_snapshot(update)
+                if plan_todo is not None:
+                    entry["todo"] = plan_todo
+            if discriminant == "notice":
+                # ``AcpClient`` reads this through ``acp.harness_notices.text_chunk``,
+                # gated on ``ACP_BACKENDS_HARNESS_NOTICES``; the snapshot pins the parse.
+                harness_notice = parse_notice(update)
+                if harness_notice is not None:
+                    entry["harness_notice"] = dataclasses.asdict(harness_notice)
         elif action == "model_fallback":
             entry["model_fallback"] = [
                 dataclasses.asdict(notice) for notice in normalize_kiro_v2(update)
@@ -321,6 +341,16 @@ def _replay(
             # handlers read params directly, so the params ARE the behaviour.
             if params:
                 entry["params"] = params
+            sdk = sdk_message(params) if msg.method == METHOD_CLAUDE_SDK_MESSAGE else None
+            if sdk is not None:
+                # ``AcpClient`` reads this through ``acp.raw_sdk_tasks``, gated on
+                # ``ACP_BACKENDS_RAW_SDK_TASKS``; the snapshot pins the subtypes it
+                # takes and the cards a Workflow run's rows make.
+                entry["raw_sdk_subtype"] = sdk["subtype"]
+                if isinstance(sdk.get("workflow_progress"), list):
+                    run = WorkflowRun(task_id=str(sdk.get("task_id") or ""))
+                    merge_rows(run, sdk["workflow_progress"])
+                    entry["workflow_cards"] = roster_rows(run)
         out.append(entry)
     return out
 

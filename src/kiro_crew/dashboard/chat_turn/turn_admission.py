@@ -66,6 +66,7 @@ if TYPE_CHECKING:
         _app_agent_turn_backend,
         _provider_backend,
         _recover_app_agent_binding,
+        _refuse_app_bot_turn,
         _retire_app_agent_session,
         _runs_app_agent_launch,
         app_agent_binding_applies,
@@ -276,6 +277,22 @@ def _release_dispatch_lock(turn) -> None:
         _dispatch_lock.release()
 
 
+def _is_person_turn(turn: Any) -> bool:
+    """Whether a person typed *turn* here: a channel's message is not one."""
+    return bool(turn._directive_user_origin) and not turn._directive_channel_origin
+
+
+async def _subagents_pending(state: Any, session_key: str) -> bool:
+    """Whether *session_key* has sub-agent work running or queued; an error counts."""
+    from kiro_crew.dashboard.chat_folders import _subagent_work_pending
+
+    subs = getattr(state, "subagents", None)
+    try:
+        return subs is not None and await _subagent_work_pending(subs, session_key)
+    except Exception:  # noqa: BLE001 - fail closed: the session is kept as projected
+        return True
+
+
 async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     """Admit the turn onto its session: the admission wait, the dispatch lock, the bindings and the session claim."""
     from kiro_crew.dashboard import gateway_notice as gn
@@ -332,11 +349,14 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # restore/open/rebuild work after READY. Wait at the one dashboard turn
     # admission seam before expiring controls, resolving bindings,
     # allocating a provider or writing metadata. The turn's grace period
-    # is bounded; timeout and Stop leave the shared worker alive and
-    # retain queued intent until a later admitted turn.
+    # is unbounded: the turn runs once preparation finishes, and is refused only
+    # when preparation failed or stopped. Stop leaves the shared worker alive and
+    # retains queued intent until a later admitted turn.
     from kiro_crew.memory_startup import wait_for_memory_preparation
 
-    await wait_for_memory_preparation(lambda: getattr(state, "memory_startup_task", None))
+    await wait_for_memory_preparation(
+        lambda: getattr(state, "memory_startup_task", None), bounded=False
+    )
     turn_timing.mark("memory_ready")
     _memory_preparation_admitted = True
     turn._memory_preparation_admitted = _memory_preparation_admitted
@@ -595,6 +615,11 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
             "msg msg-err",
             meta=gn.gateway_notice_meta(gn.GATEWAY_NOTICE_CREW_NAME_UNDISPATCHABLE),
         )
+        return _Flow.END
+    # An app's session never runs as a Bot, whichever route stamped the name and
+    # whether or not a record already names it. Refused here, before the store is
+    # attached or a record is written.
+    if _refuse_app_bot_turn(slot, bindings):
         return _Flow.END
     # A session a palette command opened to run as its app's OWN agent runs the
     # app's registered spec and nothing else. Refuse the turn -- before any
@@ -1090,13 +1115,21 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # ``identity_checked``: this turn ran the account check itself above, as
     # the attended caller and before the switch-lock decision, so the claim
     # skips the unattended check the manager runs for every other acquire.
+    # A person's own turn marks its claims, so a ``cron:``-keyed KAS session it
+    # starts projects the folder agent's hooks (``kas_project_hooks.PERSON_TURN``).
+    from kiro_crew.agent_sdk.kas_project_hooks import person_turn_claim
+    from kiro_crew.agent_sdk.spec_hooks_reproject import reproject_person_turn
+
+    _person_turn = _is_person_turn(turn)
+
     async def _claim_session(wait_if_busy: bool) -> tuple[Any, bool, bool]:
-        return await state.sessions.get_or_create(
-            session_key,
-            wait_if_busy=wait_if_busy,
-            identity_checked=True,
-            **_allocation_kwargs,
-        )
+        with person_turn_claim(_person_turn):
+            return await state.sessions.get_or_create(
+                session_key,
+                wait_if_busy=wait_if_busy,
+                identity_checked=True,
+                **_allocation_kwargs,
+            )
 
     turn_timing.mark("claim_start")
     turn_timing.note(priority=getattr(_turn_priority, "value", _turn_priority))
@@ -1105,6 +1138,9 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
             client, is_new, resumed = await _claim_session(_wait_if_busy)
             turn.is_new = is_new
             turn.resumed = resumed
+            # Armed at the claim, before any await a Stop can interrupt: the
+            # claim consumed the one-shot resume, so every later exit owes it.
+            turn._slim_resume_pending = bool(is_new and resumed)
             turn.client = client
             break
         except SessionBusyError:
@@ -1128,11 +1164,27 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # directory kiro-cli is running in.
     _turn_project = selected_binding[1] or ""
     turn._turn_project = _turn_project
+    # Published for the summary, so a reload mid-reply names this directory
+    # rather than the chip's live pick.
+    slot._turn_project_pin = (slot._turn_generation, _turn_project, "")
     # The pre-claim reset is declined for a session another turn holds, and
     # this claim may have waited for exactly that turn. So the decision is made
     # again on the session this turn now holds, under its lease, before any of
-    # its tools run.
+    # its tools run. A person's turn on a scheduled run's batch is re-projected
+    # for them first, unless that session's sub-agent work still runs.
     try:
+        if _person_turn:
+            client, is_new, resumed = await reproject_person_turn(
+                state.sessions,
+                session_key,
+                kiro_agent or slot.agent or "",
+                (client, turn.is_new, turn.resumed),
+                lambda: _claim_session(True),
+                lambda: _subagents_pending(state, session_key),
+            )
+            turn.is_new = is_new
+            turn.resumed = resumed
+            turn.client = client
         client, is_new, resumed = await reproject_claimed_session(
             state.sessions,
             session_key,
@@ -1142,6 +1194,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
         )
         turn.is_new = is_new
         turn.resumed = resumed
+        turn._slim_resume_pending = bool(is_new and resumed)
         turn.client = client
     except BaseException:
         state.sessions.release(session_key)
@@ -1156,9 +1209,14 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     except BaseException:
         state.sessions.release(session_key)
         raise
+    _fell_back_from = ""
     if _fallback:
+        # The stored hidden scratch folder, kept on the pin so the summary can
+        # tell this fallback from a pick made over it later.
+        _fell_back_from = _turn_project
         _turn_project = _fallback
         turn._turn_project = _turn_project
+        slot._turn_project_pin = (slot._turn_generation, _turn_project, _fell_back_from)
     if not is_new and slot._pending_reset_history_key == session_key and client.cwd:
         # The deferred project reset is still armed for the session this
         # turn holds (attached sub-agents keep the process alive), so the
@@ -1166,6 +1224,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
         # pick. The turn describes that directory.
         _turn_project = client.cwd
         turn._turn_project = _turn_project
+        slot._turn_project_pin = (slot._turn_generation, _turn_project, _fell_back_from)
     if is_new and not resumed:
         # An observation this call CONSUMED, which is not the same as an
         # allocation this call made: a prewarmed session arms
@@ -1749,7 +1808,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
                 if _status == "blocked"
                 else f"size limit ({MAX_PROMPT_BYTES // 1000}KB)"
             )
-            slot.append("system", f"🔒 Prompt blocked — {label}.", "msg msg-info")
+            slot.append("system", f"Prompt blocked — {label}.", "msg msg-info")
             state.push_slots_update()
             # Append-only the session's log (flag-gated, fail-soft). This gate
             # returns before the normal emit block in _turn_dispatch_gates, so without

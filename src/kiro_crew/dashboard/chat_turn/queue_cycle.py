@@ -22,6 +22,7 @@ if TYPE_CHECKING:
         _log_task_exception,
         _note_mate_wakes,
         _run_chat,
+        _run_clock,
         chat_done_payload,
         effective_session_key,
         generate_session_summary,
@@ -358,7 +359,7 @@ async def _finish_queue_cycle(
             verdict == SYNTHESIS_CLEAR
             and not _drop_single_turn_synthesis(slot)
             and not teardown_hold_active(state, slot)
-            # Ultra Mode "Pause all" holds this session: the synthesis stays
+            # Conductor mode "Pause all" holds this session: the synthesis stays
             # armed, and the turn end after Resume all (or its Continue) fires it.
             and not crew_pause.holds_slot(slot)
         )
@@ -523,7 +524,27 @@ async def _send_chat_done(
     broadcast, so a coroutine never reaches the serializer."""
     if payload is None:
         payload = await chat_done_payload(state, slot, continuing=continuing, ends_turn=ends_turn)
+    _report_run_seconds(slot, payload)
     state.broadcast_ws("chat_done", payload)
+
+
+def _report_run_seconds(slot: _ChatSlot, payload: dict[str, Any]) -> None:
+    """Add ``run_seconds`` to the frame that ends a run, and start the next run clean.
+
+    A run is every turn from the first one the ``task`` setter stamped to the
+    completion that hands the floor back: a frame that ends a turn (it carries
+    ``turn``) and is not ``continuing``, or that pauses on a question. A
+    ``continuing`` frame, whose sub-agents, workflow, loop or queue still owe
+    work, and the deferred ``/compact`` acknowledgement, which ends no turn,
+    leave the stamp, so a long run that ends with a short turn is measured whole.
+    A run with no stamp, or whose stamp no turn passed the dispatch gates under,
+    reports no field, which the dashboard reads as unknown."""
+    if "turn" not in payload or (payload.get("continuing") and not payload.get("needs_input")):
+        return
+    started = slot._run_started_at
+    slot._run_started_at = None
+    if started is not None and slot._run_started_turns != slot._turns_started:
+        payload["run_seconds"] = _run_clock.seconds_since(started)
 
 
 async def _hand_off_queue(
@@ -542,6 +563,10 @@ async def _hand_off_queue(
     cancellable) and the cycle ends with its terminal ``chat_done``. The
     ``predecessor_*`` pair names the ending turn, so the drain marks its end
     unless the head is that turn's own recovery."""
+    from kiro_crew.tracing import work as trace_work
+
+    # Whatever comes next is not the work-ledger watch's turn, whether or not it bound.
+    trace_work.end_patrol_turn()
     # Steers outrank queued messages, so they go to the head before the drain.
     _requeue_unconsumed_steers(state, slot)
     if drain and slot._queue:
@@ -646,7 +671,9 @@ class _TurnExit:
     the tail needs: its depth, whether a provider saw it, the local slash
     command it is running, and -- at the top of the ``finally``, before anything
     there can be cancelled -- its outcome. The guard runs :func:`_end_turn_tail`
-    from it unless the turn already did."""
+    from it unless the turn already did. The guard also names it on the slot
+    (``_preparing_turn``) for the turn's length, which is how a Stop finds a
+    runner still preparing its turn and the task to cancel."""
 
     __slots__ = (
         "actor",
@@ -656,6 +683,7 @@ class _TurnExit:
         "outcome",
         "reached_provider",
         "responsive_owner",
+        "runner",
         "stop_reason",
         "turn_id",
     )
@@ -673,6 +701,10 @@ class _TurnExit:
         self.responsive_owner: Any = None
         # The terminal event's stop reason; None while the turn reached none.
         self.stop_reason: str | None = None
+        # The task running the exit guard, the one a Stop cancels
+        # (``turn_stop._cancel_preparing_runner``). Not always ``slot.task``: a
+        # bounded turn runs the guard in an inner task under ``asyncio.shield``.
+        self.runner: asyncio.Task[Any] | None = None
 
 
 def _end_browser_live_turn(slot: _ChatSlot) -> None:

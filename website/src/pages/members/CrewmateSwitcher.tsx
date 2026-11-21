@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { ChevronDown, FileUp, PanelLeft, Plus, Search } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
@@ -10,11 +10,22 @@ import type { AutomationRecord } from '../../monitoring/automation'
 import CrewmateRowBody from './CrewmateRowBody'
 import CrewmateStarButton from './CrewmateStarButton'
 import { Popover, PopoverContent, PopoverTrigger } from '../../components/ui/popover'
+import { useScrollEdgesY } from '../../hooks/useScrollEdges'
 import { fmtList } from '../../i18n/format'
 import { cn } from '../../lib/utils'
 import { rosterPopulation, rosterShows, type MemberSignals } from './rosterFilter'
 import { uiLocation } from '../../uiLocations/uiLocation'
 import CrewmateImportDialog from './CrewmateImportDialog'
+
+/** Bottom fade for the list while rows sit below the fold, the vertical cue
+ *  `MORE_BELOW_MASK` paints on the model and skill lists. Taller than that one:
+ *  the cap is eight 52px rows plus a few pixels, so a 20px fade falls on the
+ *  last row's padding and nothing visible changes. 44px reaches into the last
+ *  row's text and dims it towards the fold. Same floor, a third of full
+ *  opacity: a row faded to nothing reads as no row at all. Alpha only, so it
+ *  follows the theme, and a mask steals no pointer events. */
+const LIST_MORE_BELOW_MASK =
+  '[mask-image:linear-gradient(to_bottom,black_calc(100%-44px),rgba(0,0,0,0.35))] [-webkit-mask-image:linear-gradient(to_bottom,black_calc(100%-44px),rgba(0,0,0,0.35))]'
 
 /** How many faces the closed chip stacks. Three is enough to read as "a crew"
  *  without the chip growing with the roster; the open list says how many there
@@ -88,6 +99,7 @@ export default function CrewmateSwitcher({
   activeName,
   onPick,
   onCreate,
+  canImport = true,
   onShowRoster,
   onToggleStar,
   starPending,
@@ -106,6 +118,8 @@ export default function CrewmateSwitcher({
   onPick: (name: string) => void
   /** Opens the New crewmate dialog. Omitted while creation is held. */
   onCreate?: () => void
+  /** Whether Import from file is offered under New bot (it is the owner's alone). */
+  canImport?: boolean
   /** Pins the roster column back beside the thread. The page hides this chip
    *  while the column is open (it is the list the chip folds), so the action
    *  only ever shows; the column's own close lifts the pin. Omitted, the
@@ -178,6 +192,14 @@ export default function CrewmateSwitcher({
     const i = rows.findIndex((m) => m.name === activeName)
     return i > 0 ? [rows[i], ...rows.slice(0, i), ...rows.slice(i + 1)] : rows
   }, [members, q, activeName])
+  // The list caps its height and scrolls, and the scrollbar shows only while
+  // scrolling, so at rest nothing says more rows sit below: the last visible
+  // row against the footer divider read as the end of the roster. Fade the
+  // bottom while rows are below the fold (LIST_MORE_BELOW_MASK); the fade lifts
+  // at the bottom and never shows on a list that fits. A search changes the
+  // rows without resizing the box, so remeasure on every change to `shown`.
+  const [attachList, listEdges, remeasureList] = useScrollEdgesY<HTMLDivElement>()
+  useEffect(() => { remeasureList() }, [shown, remeasureList])
   // The OTHER crewmates lead the stack, in roster order: the open one is already
   // named by the identity pill beside this chip, and a second copy of its face
   // here read as a duplicate rather than as "the rest of the crew". It joins the
@@ -282,7 +304,13 @@ export default function CrewmateSwitcher({
             autoFocus
           />
         </label>
-        <div className="max-h-[min(60vh,420px)] overflow-y-auto" role="listbox" aria-label={t('pages.membersPage.title')}>
+        <div
+          ref={attachList}
+          className={cn('max-h-[min(60vh,420px)] overflow-y-auto', listEdges.bottom && LIST_MORE_BELOW_MASK)}
+          role="listbox"
+          aria-label={t('pages.membersPage.title')}
+          data-testid="crewmate-switcher-listbox"
+        >
           {shown.length === 0 ? (
             <div className="px-3 py-5 text-center text-[13px] text-muted" data-testid="crewmate-switcher-empty">
               {t('pages.membersPage.no_crewmate_match')}
@@ -305,7 +333,9 @@ export default function CrewmateSwitcher({
                     if (!on) onPick(m.name)
                   }}
                   className={cn(
-                    'flex items-center gap-2.5 w-full px-2.5 py-2 rounded-xl text-left transition-colors cursor-pointer',
+                    // The focus ring is drawn inside the row: the list scrolls, and its
+                    // scroller clips a ring drawn outside a full-width row.
+                    'flex items-center gap-2.5 w-full px-2.5 py-2 rounded-xl text-left transition-colors cursor-pointer focus-visible:outline-offset-[-2px]',
                     onToggleStar && 'pr-8',
                     on ? 'bg-accent-subtle' : 'hover:bg-bg-hover',
                   )}
@@ -363,7 +393,7 @@ export default function CrewmateSwitcher({
             {/* Import from file sits under New crewmate and is held with it:
                 both end in a new crewmate, and only the owner's press on the
                 import card creates one (rfc-crewmate-share.md §5.4). */}
-            {onCreate && (
+            {onCreate && canImport && (
               <button
                 type="button"
                 onClick={() => {

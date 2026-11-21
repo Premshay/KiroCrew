@@ -204,6 +204,10 @@ class SlackClientOps(ABC):
         """List pinned messages in a channel as [{ts, text}, ...]."""
         return []
 
+    async def get_permalink(self, channel: str, ts: str) -> str:
+        """A message's permalink (``chat.getPermalink``), or ``""`` when unavailable."""
+        return ""
+
     @abstractmethod
     async def upload_file(
         self,
@@ -212,8 +216,14 @@ class SlackClientOps(ABC):
         file: str,
         filename: str,
         title: str,
+        initial_comment: str | None = None,
     ) -> None:
-        """Upload a file to a Slack thread."""
+        """Upload a file to a Slack thread.
+
+        *initial_comment* is an optional message posted with the file as its
+        Slack ``initial_comment``; ``None`` (the default) carries no comment, so
+        callers that have none (voice replies, the outbox copy) are unchanged.
+        """
 
     @abstractmethod
     async def open_dm(self, user_id: str) -> str:
@@ -265,8 +275,17 @@ class SlackClientOps(ABC):
         """Append text to a streaming message. Returns True on success."""
         return False
 
-    async def stop_stream(self, channel: str, ts: str, final_text: str | None = None) -> bool:
-        """Stop a streaming message. Returns True on success."""
+    async def stop_stream(
+        self,
+        channel: str,
+        ts: str,
+        final_text: str | None = None,
+        blocks: list[dict] | None = None,
+    ) -> bool:
+        """Stop a streaming message. Returns True on success.
+
+        ``blocks`` render at the bottom of the finalized message.
+        """
         return False
 
     async def append_task(
@@ -693,6 +712,12 @@ class RealSlackClient(SlackClientOps):
                 pins.append({"ts": ts, "text": msg.get("text", "")})
         return pins
 
+    async def get_permalink(self, channel: str, ts: str) -> str:
+        kwargs: dict[str, Any] = {"channel": channel, "message_ts": ts}
+        self._inject_team(channel, kwargs)
+        resp = await self._web.chat_getPermalink(**kwargs)
+        return str(resp.get("permalink") or "")
+
     async def views_publish(self, user_id: str, view: dict) -> None:
         await self._web.views_publish(user_id=user_id, view=view)
 
@@ -703,16 +728,23 @@ class RealSlackClient(SlackClientOps):
         file: str,
         filename: str,
         title: str,
+        initial_comment: str | None = None,
     ) -> None:
         require_channel(channel)
         if turn_muted(channel, thread_ts):
             return
+        # initial_comment defaults to None, which files_upload_v2 treats as "no
+        # comment" -- the same call the comment-less callers (voice replies)
+        # rely on. Explicit kwargs, not a dict spread, because the SDK's kwargs
+        # are heterogeneously typed (list/bool/str), which mypy cannot check
+        # through a single dict[str, str].
         await self._web.files_upload_v2(
             channel=channel,
             thread_ts=thread_ts,
             file=file,
             filename=filename,
             title=title,
+            initial_comment=initial_comment,
         )
 
     async def open_dm(self, user_id: str) -> str:
@@ -946,12 +978,21 @@ class RealSlackClient(SlackClientOps):
             logger.debug("chat.appendStream task_update failed", exc_info=True)
             return False
 
-    async def stop_stream(self, channel: str, ts: str, final_text: str | None = None) -> bool:
+    async def stop_stream(
+        self,
+        channel: str,
+        ts: str,
+        final_text: str | None = None,
+        blocks: list[dict] | None = None,
+    ) -> bool:
         """Stop a streaming message via chat.stopStream.
 
         We intentionally do NOT call chat.update after stopping — the streamed
         content already has rich formatting (syntax-highlighted code blocks, etc.)
         that chat.update would downgrade to plain mrkdwn.
+
+        ``blocks`` (e.g. the timing footer) render at the bottom of the finalized
+        message. False means Slack did not take them either.
         """
         if turn_muted(channel, ts=ts):
             return False
@@ -959,6 +1000,8 @@ class RealSlackClient(SlackClientOps):
             # Each chunk is new content; see update_message.
             require_channel(channel)
             body: dict[str, Any] = {"channel": channel, "ts": ts}
+            if blocks:
+                body["blocks"] = blocks
             self._inject_team(channel, body)
             await self._web.api_call("chat.stopStream", json=body)
             return True

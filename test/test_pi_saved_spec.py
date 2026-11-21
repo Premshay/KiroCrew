@@ -199,9 +199,13 @@ def test_a_missing_member_spec_mounts_no_stub(agents_dir, tmp_path) -> None:
 
 
 def test_every_session_composition_uses_the_bound_roster() -> None:
-    source = (Path(client_start.__file__)).read_text(encoding="utf-8")
-    assert source.count("self._bound_session_mcp_servers") == 3
-    assert "self._pooled_mcp_servers" not in source
+    from kiro_crew.acp import client_claude_session
+
+    bind = "asyncio.to_thread(self._bound_session_mcp_servers)"
+    for module, expected in ((client_start, 2), (client_claude_session, 1)):
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        assert source.count(bind) == expected
+        assert "self._pooled_mcp_servers" not in source
     # The adapter for pi answers with pi's own array.
     from kiro_crew.acp.harness.pi import PiLaunch
 

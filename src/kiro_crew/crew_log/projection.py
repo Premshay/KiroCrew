@@ -388,6 +388,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.crew_log.projection_session_log import (  # noqa: F401
         _log_identity,
         _unit_log_identity,
+        fresh_log_identity,
         log_origin,
         open_session_log,
     )
@@ -613,6 +614,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         context_start,
         context_turn,
         context_turn_blocks,
+        context_turn_number,
         crew_blocks,
         crew_share,
         crew_split,
@@ -635,6 +637,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _WORK_BASELINE_FIELDS,
         _WORK_CLOSED_STATES,
         _WORK_CONDUCTOR_FIELDS,
+        _WORK_PEER_KEYS,
         _WORK_TEXT_LIMITS,
         _WORK_WORKER_FIELDS,
         WORK_AWAITING_REPORT,
@@ -653,6 +656,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _work_is_progress,
         _work_iso,
         _work_new_item,
+        _work_peer_report,
         _work_reason,
         _work_render,
         _work_reset_board,
@@ -732,6 +736,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _workstreams_bump,
         _workstreams_charged,
         _workstreams_copy,
+        _workstreams_decided_after,
         _workstreams_event,
         _workstreams_hour,
         _workstreams_item_state,
@@ -858,11 +863,13 @@ if TYPE_CHECKING:  # names it serves from outside the fold family, from their ho
         log_rank_of,
     )
     from kiro_crew.crew_log.store import (  # noqa: F401
+        ConsumedSpan,
         CrewLog,
         ReadCursor,
         ResumePoint,
         crew_log_dir,
         log_exception_text,
+        resolved_home_for_pass,
         segment_paths,
         session_units_by_slot,
         session_units_for_slot,
@@ -910,5 +917,7 @@ if TYPE_CHECKING:  # names it serves from outside the fold family, from their ho
         WorkBoardItem,
         WorkBoardView,
         coerce_ask,
+        coerce_discussion,
         coerce_retired_bindings,
+        waits_on_person,
     )

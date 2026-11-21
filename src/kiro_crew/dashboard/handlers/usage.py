@@ -136,6 +136,7 @@ def read_effective_model(source: object) -> str:
                 if isinstance(candidate, str) and candidate and candidate.strip().lower() != "auto":
                     return candidate
     except Exception:
+        # Attribution only: an unreadable chain reports no model.
         pass
     return ""
 
@@ -623,6 +624,10 @@ async def persist_token_record_async(
                 harness=harness,
                 trigger=trigger,
                 origin=origin,
+                # Trusted: Crew sets it from the slot's app at allocation. A
+                # shared-session subagent's provider carries none, so the row's
+                # own ownership stamp, ``app``, stands in for it.
+                owning_app=getattr(model_source, "owning_app", "") or app,
             )
         await asyncio.to_thread(_write_token_record, record, now)
     except Exception:
@@ -637,8 +642,12 @@ def _emit_turn_histogram(
     harness: str = HARNESS_UNKNOWN,
     trigger: str = TRIGGER_OTHER,
     origin: str | None = None,
+    owning_app: str = "",
 ) -> None:
     """Emit this turn's OTEL samples from a built record.
+
+    ``owning_app`` is the session's app for ``kirocrew.app.run_time``: the live
+    provider's ``owning_app``, else the row's ``app`` stamp.
 
     ``kirocrew.turn.duration`` plus the turn's usage family
     (``kirocrew.turn.tokens`` and whichever of ``kirocrew.turn.credits`` /
@@ -680,6 +689,7 @@ def _emit_turn_histogram(
         harness=harness,
         trigger=trigger,
         origin=origin,
+        owning_app=owning_app,
     )
     emit_turn_usage(
         input_tokens=record.get("input"),
@@ -882,6 +892,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
 if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew import model_registry, platform_compat  # noqa: F401
     from kiro_crew.agent_sdk.backends import (  # noqa: F401
+        ACP_BACKEND_ANTIGRAVITY,
         ACP_BACKEND_CLAUDE,
         ACP_BACKEND_CODEX,
         ACP_BACKEND_COPILOT,

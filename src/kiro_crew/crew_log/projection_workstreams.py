@@ -25,6 +25,7 @@ from kiro_crew.crew_log.projection_work import (
     _work_text,
 )
 from kiro_crew.crew_log.schema import Entry
+from kiro_crew.work_vocab import waits_on_person
 
 # workstreams -- every board this slot reaches, each task costed by its own worker
 # --------------------------------------------------------------------------- #
@@ -250,6 +251,15 @@ def _workstreams_new_item(item_id: str) -> dict[str, Any]:
         "worker_session_key": None,
         "round": 0,
         "status": None,
+        # The last report's `reason` and whether a conductor `decide` or a person's
+        # `steer` came after that report: the two facts `work_vocab.waits_on_person`
+        # needs. `asked` is whether the conductor's `ask` record came after that
+        # report (`work_vocab.ask_is_current`, in log order): with it, this fold's
+        # `needs_you` counts what the Board and sidebar count (`awaits_person`).
+        # Internal: none is emitted on a task row.
+        "reason": None,
+        "answered": False,
+        "asked": False,
         "summary": "",
         "pr": None,
         # WHEN THIS TASK LAST PRODUCED ANYTHING, so a reader can tell a worker that is
@@ -278,7 +288,8 @@ def _workstreams_new_item(item_id: str) -> dict[str, Any]:
         # ISO, not the millisecond pair ``last_report_at`` keeps beside it, because
         # nothing here COMPARES them: the opener is written once and the closer is
         # written from the item's own state, so neither needs the numeric guard a
-        # monotonic watermark does. ``_workstreams_item_span`` is the only writer.
+        # monotonic watermark does. ``_workstreams_span_opened`` and
+        # ``_workstreams_span_closed`` are the only writers.
         "created_at": "",
         "closed_at": "",
         # The conductor's latest ruling on this item, clamped -- see
@@ -433,6 +444,24 @@ def _workstreams_span_closed(item: dict[str, Any], data: Mapping[str, Any], stam
         item["closed_at"] = _work_stamp(data.get("closed_at"), stamp_ms)
 
 
+def _workstreams_decided_after(decided: object, reported: object) -> bool:
+    """Whether a baseline's ``decided_at`` is at or after its ``last_report_at``: the
+    ledger's own hand-back test, for an item first seen whole. An unreadable stamp
+    answers False, as in the ledger. A stamp without an offset also answers False here,
+    where the ledger reads it as host-local time: a fold must not depend on the host's
+    zone, and the ledger writes every stamp with an offset."""
+    if not isinstance(decided, str) or not decided:
+        return False
+    try:
+        at = datetime.fromisoformat(decided)
+        if not isinstance(reported, str) or not reported:
+            return at.tzinfo is not None
+        since = datetime.fromisoformat(reported)
+        return at.tzinfo is not None and since.tzinfo is not None and at >= since
+    except ValueError:
+        return False
+
+
 def _workstreams_work(state: dict[str, Any], entry: Entry) -> None:
     """Apply one work record to the board it names."""
     data = entry.data
@@ -476,6 +505,15 @@ def _workstreams_work(state: dict[str, Any], entry: Entry) -> None:
             stamp = data.get("last_report_at")
             if isinstance(stamp, str) and stamp:
                 item["last_report_at"] = _work_stamp(stamp, entry.time)
+            item["answered"] = _workstreams_decided_after(
+                data.get("decided_at"), data.get("last_report_at")
+            )
+            # The same stamp test for the conductor's ask record: one written at or
+            # after the newest report relays that report's question.
+            ask = data.get("ask")
+            item["asked"] = isinstance(ask, dict) and _workstreams_decided_after(
+                ask.get("written_at"), data.get("last_report_at")
+            )
     _workstreams_event(state, board["id"], item, entry)
     # The span's open end, before either party's field copy: it depends on no field
     # and must be set by whichever entry got here first, whoever wrote it.
@@ -491,7 +529,19 @@ def _workstreams_work(state: dict[str, Any], entry: Entry) -> None:
         for name in _WORK_WORKER_FIELDS:
             if name in data and name in item:
                 item[name] = _work_field(name, data[name])
+        if action == "report":
+            # Each report replaces the reason and asks afresh: an answer to the
+            # previous report does not answer this one.
+            item["reason"] = _work_field("reason", data.get("reason"))
+            item["answered"] = False
+            item["asked"] = False
         return
+    if action in ("decide", "steer"):
+        # In log order, so the newest report's answer is one folded after it.
+        item["answered"] = True
+    elif action == "ask":
+        # The conductor relayed the newest report's question to the person.
+        item["asked"] = True
     fields = _WORK_CONDUCTOR_FIELDS.get(action, ())
     for name in fields:
         if name not in data or name not in item:
@@ -835,8 +885,19 @@ def _workstreams_render(state: dict[str, Any]) -> dict[str, Any]:
                 accepted += 1
             # OPEN items only. A worker's last report outlives the conductor's close,
             # so a closed item can still carry the `question` or `blocked` it was
-            # closed over, and counting it asks the person about finished work.
-            if item["state"] == "open" and item["status"] in ("question", "blocked"):
+            # closed over, and counting it asks the person about finished work. Then
+            # the Board's own rule (`awaits_person`): a report naming a person, relayed
+            # by a later `ask`, not answered by a later `decide` or `steer`. The fold has no live
+            # session state, so `running` stays False: a worker mid-turn still counts
+            # here, where the Board drops it until its turn ends.
+            waits = (
+                item["state"] == "open"
+                and bool(item.get("asked"))
+                and waits_on_person(
+                    item["status"], item.get("reason"), answered=bool(item.get("answered"))
+                )
+            )
+            if waits:
                 needs_you += 1
             tasks.append(
                 {
@@ -844,6 +905,9 @@ def _workstreams_render(state: dict[str, Any]) -> dict[str, Any]:
                     "title": item["title"],
                     "state": item["state"],
                     "status": item["status"],
+                    # This row's share of `needs_you`, the Board's own field name, so
+                    # a page drawing rows agrees with the count it shows.
+                    "awaits_person": waits,
                     "summary": item["summary"],
                     "verdict": item["verdict"],
                     "pr": item["pr"],

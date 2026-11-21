@@ -11,11 +11,13 @@ consults is replaced, and nothing spawns a process or writes outside ``tmp_path`
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import stat
 import subprocess
 import sys
+import threading
 import types
 from typing import Any
 
@@ -149,6 +151,20 @@ def _read_only_tree(root, names=("a", "b")):
     return locked
 
 
+def _repair_parent_for_test(pcf, entry, root):
+    """Exercise the production retry's permission change without removing the fixture."""
+    root_fd, _ = pcf._open_root(os.fspath(root), None)
+    if root_fd is None:
+        return False
+    try:
+        pcf._retry_within_root(lambda *_args, **_kwargs: None, str(entry), os.fspath(root), root_fd)
+    except OSError:
+        return False
+    finally:
+        os.close(root_fd)
+    return True
+
+
 class TestRmtreeForceOnPosixReadOnlyDirectories:
     """Sweeps remove directories without their owner write bit."""
 
@@ -204,7 +220,11 @@ class TestRmtreeForceOnPosixReadOnlyDirectories:
 
         tree = tmp_path / "tree"
         locked = _read_only_tree(tree, names=tuple(f"f{i}" for i in range(5)))
-        monkeypatch.setattr(pcf, "_grant_owner_write_to_parent", lambda _path, _root: False)
+
+        def refuse_retry(*_args):
+            raise PermissionError(errno.EACCES, "denied")
+
+        monkeypatch.setattr(pcf, "_retry_within_root", refuse_retry)
         try:
             with caplog.at_level(logging.WARNING, logger=pc.logger.name):
                 assert pc.rmtree_force(tree) is False
@@ -215,7 +235,7 @@ class TestRmtreeForceOnPosixReadOnlyDirectories:
         assert len(warnings) == 1
         # five files and the subdirectory refused in the read-only directory, then
         # locked and tree themselves, which are left non-empty
-        assert warnings[0].startswith(f"Cannot remove 8 entries under {tree} (first: ")
+        assert warnings[0] == f"Cannot remove 8 entries under {tree}"
 
     @_POSIX_NON_ROOT
     def test_the_parent_is_never_changed_through_a_link(self, tmp_path):
@@ -226,7 +246,7 @@ class TestRmtreeForceOnPosixReadOnlyDirectories:
         link = tmp_path / "link"
         link.symlink_to(target)
         try:
-            assert pcf._grant_owner_write_to_parent(str(link / "entry"), tmp_path) is False
+            assert _repair_parent_for_test(pcf, link / "entry", tmp_path) is False
             assert stat.S_IMODE(target.stat().st_mode) == 0o500
         finally:
             target.chmod(0o700)
@@ -249,7 +269,7 @@ class TestRmtreeForceOnPosixReadOnlyDirectories:
             entry = root / "link" / "locked" / "entry"
         locked.chmod(0o500)
         try:
-            assert pcf._grant_owner_write_to_parent(str(entry), root) is False
+            assert _repair_parent_for_test(pcf, entry, root) is False
             assert stat.S_IMODE(locked.stat().st_mode) == 0o500
         finally:
             locked.chmod(0o700)
@@ -266,7 +286,7 @@ class TestRmtreeForceOnPosixReadOnlyDirectories:
         sibling.chmod(0o500)
         tmp_path.chmod(0o500)
         try:
-            assert pcf._grant_owner_write_to_parent(str(tmp_path / entry_name), root) is False
+            assert _repair_parent_for_test(pcf, tmp_path / entry_name, root) is False
             assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o500
             assert stat.S_IMODE(sibling.stat().st_mode) == 0o500
         finally:
@@ -296,7 +316,7 @@ class TestRmtreeForceOnPosixReadOnlyDirectories:
 
         monkeypatch.setattr(pcf.os, "open", swap_after_open)
         try:
-            assert pcf._grant_owner_write_to_parent(str(locked / "entry"), root) is True
+            assert _repair_parent_for_test(pcf, locked / "entry", root) is True
             assert moved.is_dir()
             assert stat.S_IMODE(moved.stat().st_mode) == 0o700
             assert stat.S_IMODE(outside.stat().st_mode) == 0o500
@@ -305,28 +325,15 @@ class TestRmtreeForceOnPosixReadOnlyDirectories:
             outside.chmod(0o700)
 
     @_POSIX_NON_ROOT
-    def test_a_parent_owned_by_another_user_is_left_alone(self, tmp_path, monkeypatch):
-        import kiro_crew.platform_compat_files as pcf
-
-        locked = tmp_path / "locked"
-        locked.mkdir(mode=0o500)
-        monkeypatch.setattr(pcf.os, "geteuid", lambda: os.getuid() + 1)
-        try:
-            assert pcf._grant_owner_write_to_parent(str(locked / "entry"), tmp_path) is False
-            assert stat.S_IMODE(locked.stat().st_mode) == 0o500
-        finally:
-            locked.chmod(0o700)
-
-    @_POSIX_NON_ROOT
-    def test_only_owner_write_and_search_are_added(self, tmp_path):
+    def test_only_owner_write_is_added(self, tmp_path):
         import kiro_crew.platform_compat_files as pcf
 
         locked = tmp_path / "locked"
         locked.mkdir(mode=0o750)
         locked.chmod(0o450)
         try:
-            assert pcf._grant_owner_write_to_parent(str(locked / "entry"), locked) is True
-            assert stat.S_IMODE(locked.stat().st_mode) == 0o750
+            assert _repair_parent_for_test(pcf, locked / "entry", tmp_path) is True
+            assert stat.S_IMODE(locked.stat().st_mode) == 0o650
         finally:
             locked.chmod(0o700)
 
@@ -682,12 +689,19 @@ class TestRestrictToOwner:
     def test_make_owner_only_dir_uses_the_dacl_on_windows(self, monkeypatch, tmp_path):
         called: list[Any] = []
         wrong: list[Any] = []
+        test_thread = threading.get_ident()
+
+        def _file_helper(p):
+            # This thread only: the SEL writer thread re-locks its non-empty log per append.
+            if threading.get_ident() == test_thread:
+                wrong.append(p)
+
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
         # Must be the DIRECTORY helper: restrict_to_owner's grants are
         # file-shaped (no (OI)(CI)), so files created inside would not inherit
         # the lockdown.
         monkeypatch.setattr(pc, "restrict_dir_to_owner", lambda p: called.append(p))
-        monkeypatch.setattr(pc, "restrict_to_owner", lambda p: wrong.append(p))
+        monkeypatch.setattr(pc, "restrict_to_owner", _file_helper)
         target = tmp_path / "secrets"
         pc.make_owner_only_dir(target)
         assert called and str(called[0]) == str(target)

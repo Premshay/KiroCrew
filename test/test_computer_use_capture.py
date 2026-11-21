@@ -31,9 +31,11 @@ import ast
 import importlib
 import inspect
 import os
+import threading
 from pathlib import Path
 
 import pytest
+from regex_structure_helpers import unbounded_repeat_bodies
 
 from kiro_crew import platform_compat
 from kiro_crew.computer_use import capture_macos, macos_ffi
@@ -240,9 +242,14 @@ def test_persist_restricts_the_file_to_the_owner(spool: Path, monkeypatch: pytes
     left standing between the frame and another local account.
     """
     seen: list[str] = []
-    monkeypatch.setattr(
-        capture_macos.platform_compat, "restrict_to_owner", lambda path: seen.append(str(path))
-    )
+    test_thread = threading.get_ident()
+
+    def _spy(path):
+        # This thread only: the SEL writer thread re-locks its non-empty log per append.
+        if threading.get_ident() == test_thread:
+            seen.append(str(path))
+
+    monkeypatch.setattr(capture_macos.platform_compat, "restrict_to_owner", _spy)
     path = capture_macos.persist_jpeg(_JPEG)
     assert seen == [path]
 
@@ -773,17 +780,25 @@ class TestFramePayloadRegexIsLinear:
     """
 
     def test_a_long_non_matching_run_is_rejected_promptly(self):
-        import time
-
         from kiro_crew.computer_use import screencast
 
+        # The search is one C call, so neither a clock nor an instruction count can
+        # see the backtracking; the pattern's structure decides it instead, and is
+        # checked BEFORE the hostile input so a regressed shape fails here by name
+        # rather than hanging on 200k characters. Backtracking blows up when an
+        # unbounded repeat can split the same run more than one way: a second
+        # unbounded repeat to trade characters with, or a body of varying width.
+        unbounded = unbounded_repeat_bodies(screencast._B64_RE.pattern)
+        assert len(unbounded) == 1, f"{len(unbounded)} unbounded repeats can trade characters"
+        (body,) = unbounded
+        low, high = body.getwidth()
+        assert low == high, f"the repeated body spans {low}..{high} chars, so each split is retried"
+        assert not unbounded_repeat_bodies(body), "an unbounded repeat nests inside another"
+
         # A long charset run that CANNOT complete the match — the worst case for the
-        # vulnerable shape. Generous bound: the linear form does 400k in ~4ms, so a
-        # second means the quadratic behaviour is back.
+        # vulnerable shape.
         hostile = "A" * 200_000 + "!"
-        start = time.monotonic()
         assert screencast._B64_RE.fullmatch(hostile) is None
-        assert time.monotonic() - start < 1.0
 
     def test_real_base64_still_matches(self):
         from kiro_crew.computer_use import screencast

@@ -68,6 +68,8 @@ from kiro_crew import security
 from kiro_crew.platform import context as platform_context
 from kiro_crew.platform.capability_bound import bind_capability_manager
 from kiro_crew.platform.defaults import DefaultCapabilityManager
+from kiro_crew.security import s3_direction as _s3_direction
+from kiro_crew.security.diagnostics import refusal_rule_id
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +104,27 @@ DENY_CLASS_PATH_UNVERIFIED = "path_unverified"
 #: command to run in their own terminal.
 DENY_CLASS_REMOTE_SCRIPT = "remote_script"
 
+#: An ``aws s3 cp|mv|sync`` the direction reader could not read on a line that
+#: LOOKS like a download (an ``s3://`` source, a local destination). The three
+#: ``credential-exfil-s3-*`` rows exist to stop an UPLOAD, so their
+#: :data:`DENY_CLASS_EXFIL_SHAPE` prose ("move a local file's contents off this
+#: host") misdescribes a download. The reader treats a shape it cannot parse as a
+#: possible upload and denies, so the actionable step is to write the download in
+#: a form the reader CAN read, not to hand the file to the user. Chosen only when
+#: the subject is download-shaped; an actual upload keeps the exfil-shape prose.
+DENY_CLASS_S3_UNREAD_DOWNLOAD = "s3_unread_download"
+
+#: The ``-d @`` file-body row (``data-exfil-curl-file-body``). The gate matches
+#: that text anywhere on the line, so it also stops a ``date`` epoch conversion or
+#: a search for the flag itself, and the exfil-shape prose names no form that
+#: passes. This class keeps the upload answer and adds the forms that do pass.
+#: Chosen only for the exfil GATE's refusal, by the rule id on its own diagnostic
+#: line. The regex tier's row for the same id matches ``curl`` with a ``--data @``
+#: form and has no inert-line carve-out, so a line this prose says passes can still
+#: meet it; its refusal keeps the exfil-shape prose.
+DENY_CLASS_FILE_BODY_TEXT = "file_body_text"
+_FILE_BODY_RULE_ID = "data-exfil-curl-file-body"
+
 #: Ordered (class, anchors) rules, matched case-insensitively as substrings of
 #: the refusal text. Order is precedence and is load bearing: a command can
 #: satisfy two classes at once (reading a credential file INTO an outbound
@@ -122,6 +145,7 @@ _CLASS_ANCHORS: tuple[tuple[str, tuple[str, ...]], ...] = (
         DENY_CLASS_AWS_CREDENTIAL,
         (
             ".aws",
+            # The full variable names are in _NAMED_PATTERN_ANCHORS below.
             "aws_secret",
             "aws_access",
             "aws_session",
@@ -166,6 +190,27 @@ _CLASS_ANCHORS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
 )
 
+#: Anchors matched against the pattern a refusal names (:func:`_named_identity`)
+#: only, never the rest of its text or the subject. Each one is checked at its
+#: class's place in :data:`_CLASS_ANCHORS`, so the precedence order is the same.
+#:
+#: The AWS credential variables are spelled in full because the end boundary
+#: refuses a following "_": a short form such as "aws_secret" can never match
+#: AWS_SECRET_ACCESS_KEY. Only the named pattern is read because other refusal
+#: text often quotes a command that names a variable without reading it. A SigV4
+#: upload (``curl --aws-sigv4 ... --user "$AWS_ACCESS_KEY_ID:..." -d @body.json``)
+#: names them in its title, and a governance refusal quotes the command it
+#: refused, under a rule that may deny ``aws`` itself; credential-read prose is
+#: false for both. A glob-tier or operator-pattern refusal names the variable as
+#: its pattern, and is classified.
+_NAMED_PATTERN_ANCHORS: Mapping[str, tuple[str, ...]] = {
+    DENY_CLASS_AWS_CREDENTIAL: (
+        "aws_secret_access_key",
+        "aws_access_key_id",
+        "aws_session_token",
+    ),
+}
+
 
 def _anchor_matcher(anchor: str, *, allow_plural: bool = False) -> re.Pattern[str]:
     """An anchor matcher whose edges cannot land in the middle of a word.
@@ -199,6 +244,12 @@ _CLASS_MATCHERS: tuple[tuple[str, tuple[re.Pattern[str], ...]], ...] = tuple(
     (deny_class, tuple(_anchor_matcher(anchor) for anchor in anchors))
     for deny_class, anchors in _CLASS_ANCHORS
 )
+
+#: Precompiled form of :data:`_NAMED_PATTERN_ANCHORS`.
+_NAMED_PATTERN_MATCHERS: Mapping[str, tuple[re.Pattern[str], ...]] = {
+    deny_class: tuple(_anchor_matcher(anchor) for anchor in anchors)
+    for deny_class, anchors in _NAMED_PATTERN_ANCHORS.items()
+}
 
 
 #: Built-in rule CATEGORY → the class its rules fall back to. Only the
@@ -549,6 +600,23 @@ REMEDIATION: dict[str, str] = {
         "shape, say that plainly and report it as an over-block instead of hunting "
         "for a form that slips past."
     ),
+    DENY_CLASS_FILE_BODY_TEXT: (
+        "This rule refuses a request body read from a local file: `-d @file`, "
+        "`--data @file` and the other `--data` forms. It matches that text anywhere "
+        "on the line, without knowing which program reads it, so a line that only "
+        "mentions it is refused too. If a local file's contents were meant to leave "
+        "this host, that is the refused action: do not re-spell it; name the file and "
+        "the destination and let the user send it themselves. If no file was going "
+        "anywhere, these forms pass: `date -u -d @<epoch>` as one plain command with "
+        "a literal epoch, once per epoch (a loop keeps a live `$` beside `-d @`, so "
+        "it stays refused); Python's `datetime.fromtimestamp` for many epochs at "
+        "once; and a search for the text with your file-search tool, or a line made "
+        "only of `grep`, `date`, `echo`, `cat`, `head`, `tail`, `wc` and read-only "
+        "`gh` search, view and list calls, with no `$`, no backtick and no redirect. "
+        "A line that names `curl` together with a `--data @` form is refused by a "
+        "second rule wherever that pair appears, so search for that pair with the "
+        "file-search tool."
+    ),
     DENY_CLASS_SELF_PROTECTION: (
         "This refusal is about what the action would DO — reach the product's own "
         "credential mint, or stop the supervisor that is running you — so it is not "
@@ -595,6 +663,26 @@ REMEDIATION: dict[str, str] = {
         "is what the user wants, say plainly that a safety rule stopped you, give "
         "them the exact command in a code block to run in their own terminal, and "
         "carry on with the part of the task that does not need it."
+    ),
+    DENY_CLASS_S3_UNREAD_DOWNLOAD: (
+        "This looks like an `aws s3` download, but the safety checker could not read "
+        "the whole call, so it treated the line as a possible upload and blocked it. "
+        "The block is on a SHAPE the checker could not parse, not on downloading. What "
+        "passes is a call that holds only `aws s3 cp`, `aws s3 mv` or `aws s3 sync` "
+        "downloads (an `s3://...` source and a local destination), written with "
+        "literal paths or with an unquoted `NAME=value` set once earlier in the same "
+        "call and before any `&&` or `||`, plus "
+        "at most plain `cat`, `echo`, `touch`, `mkdir`, `ls`, `cd` or `pwd` commands "
+        "with no `>` or `<` redirect. A download itself may carry `2>&1` or a "
+        "redirect to `/dev/null`, pipe into `tail`, `head`, `grep` or `wc`, or "
+        "start with `AWS_PROFILE=...` or `time`; a redirect to a file keeps the deny. "
+        "So run the downloads in their own call first, and do everything else -- "
+        "sourcing a file (`. env.sh`), a pipe, a redirect, a script or a here-document "
+        "fed to a "
+        "program -- in a separate call after it. If a download cannot be written that "
+        "way, run `aws s3api get-object --bucket <bucket> --key <key> <local-path>` "
+        "instead. If no local file is leaving the host at all, say so and report it "
+        "as an over-block."
     ),
 }
 
@@ -655,6 +743,63 @@ _hint_cache: str = ""
 _hint_cache_ts: float = 0.0
 
 
+#: The three ``aws s3 cp|mv|sync`` upload rows. A download the direction reader
+#: could not read lands on one of these, and its guidance differs from an upload's.
+_S3_VERBS = frozenset(("cp", "mv", "sync"))
+_S3_TRANSFER_RULE_IDS = frozenset(f"credential-exfil-s3-{v}" for v in _S3_VERBS)
+
+
+def _looks_like_s3_download(subject: str) -> bool:
+    """Whether *subject* reads as an s3 download: an ``s3://`` source, a local dest.
+
+    A light word split, not a parse: this only CHOOSES between two display prose
+    strings and can never make anything allowed, so an imperfect read costs at
+    most a less apt message. In each statement whose program is ``aws`` (any
+    path, so ``/usr/bin/aws`` too) with an ``s3 cp|mv|sync`` verb, the words after
+    the verb are read with the reader's flag table, so a flag's value is not an
+    operand. An ``s3://`` word in any operand after the first means the transfer
+    sends something TO s3 (an upload, or an s3-to-s3 copy), wherever trailing
+    flags, their values or a ``> log`` redirect sit, so the subject is NOT a download.
+    It is a download only when at least one statement is read as one (an ``s3://``
+    first operand): a statement this cannot read (``env aws …``, ``sudo aws …``,
+    an ``aws`` behind a pipe) never counts, so an unread subject keeps the upload prose.
+    """
+    text = subject or ""
+    if "s3://" not in text:
+        return False
+    saw_download = False
+    for sep in ("&&", "||", ";"):
+        text = text.replace(sep, "\n")
+    for statement in text.splitlines():
+        words = [w.strip("'\"") for w in statement.lower().split()]
+        if words and words[0] == "running:":
+            words = words[1:]
+        while words and "=" in words[0] and not words[0].startswith("-"):
+            words = words[1:]  # an inline ``NAME=value`` before the program
+        if not words or words[0].rsplit("/", 1)[-1] != "aws" or "s3" not in words:
+            continue
+        verb = next(
+            (i for i in range(words.index("s3") + 1, len(words)) if words[i] in _S3_VERBS), None
+        )
+        if verb is None:
+            continue
+        operands: list[str] = []
+        i = verb + 1
+        while i < len(words):
+            word = words[i]
+            if word.startswith("--"):
+                arity = _s3_direction._FLAGS.get(word)
+                i += 2 if arity == _s3_direction._VALUE else 1
+                continue
+            operands.append(word)
+            i += 1
+        if any(word.startswith("s3://") for word in operands[1:]):
+            return False
+        if operands and operands[0].startswith("s3://"):
+            saw_download = True
+    return saw_download
+
+
 def classify_deny(reason: str, subject: str = "") -> str:
     """The deny class named by *reason*, or "" when none applies.
 
@@ -677,7 +822,17 @@ def classify_deny(reason: str, subject: str = "") -> str:
     by the anchor scan alone, so a subject cannot pull a refusal off the class its
     own rule declares: ``aws s3 cp ./report.aws s3://bucket`` is an outbound
     transfer whose subject carries an AWS-credential anchor, and weighing that
-    subject would answer it with credential-read prose.
+    subject would answer it with credential-read prose. The full AWS credential
+    variable names are read only from the pattern *reason* names (see
+    :data:`_NAMED_PATTERN_ANCHORS`), because a transfer's title and a governance
+    refusal quote commands that name them without reading them.
+
+    The one place the subject refines a NAMED rule's class is the three
+    ``aws s3`` transfer rows: when the subject reads as a download the direction
+    reader could not parse (an ``s3://`` source, a local destination), the
+    exfil-shape prose misdescribes it, so :data:`DENY_CLASS_S3_UNREAD_DOWNLOAD`
+    replaces it. This only swaps display prose within the same refusal and, like
+    the subject read above, can never make anything allowed.
 
     "" is a first-class answer, not a failure: most denials (a destructive rm, a
     protected-branch push) are self-explanatory, and inventing guidance for them
@@ -693,14 +848,38 @@ def classify_deny(reason: str, subject: str = "") -> str:
         return DENY_CLASS_PATH_UNVERIFIED
     rule_class = _rule_class(reason)
     if rule_class is not None:
+        if (
+            rule_class == DENY_CLASS_EXFIL_SHAPE
+            and rule_id_for(reason) in _S3_TRANSFER_RULE_IDS
+            and _looks_like_s3_download(subject)
+        ):
+            return DENY_CLASS_S3_UNREAD_DOWNLOAD
         return rule_class
     text = f"{reason or ''} {subject or ''}".lower().strip()
     if not text:
         return ""
+    named = (_named_identity(reason) or "").lower()
     for deny_class, matchers in _CLASS_MATCHERS:
         if any(matcher.search(text) for matcher in matchers):
+            return _file_body_refinement(reason, deny_class)
+        if any(matcher.search(named) for matcher in _NAMED_PATTERN_MATCHERS.get(deny_class, ())):
             return deny_class
     return ""
+
+
+def _file_body_refinement(reason: str, deny_class: str) -> str:
+    """*deny_class*, or :data:`DENY_CLASS_FILE_BODY_TEXT` for the ``-d @`` row.
+
+    For the exfil gate, whose first line names no rule, so the anchor scan answers
+    it. Only an exfil-shape answer is refined, and only when the rule id on the
+    gate's own diagnostic line is that row's (the LAST such line, so a quoted one
+    in the refused command cannot choose it). A regex-tier refusal names its rule on
+    its first line and never reaches this. Display only: it picks prose and can
+    never make anything allowed.
+    """
+    if deny_class == DENY_CLASS_EXFIL_SHAPE and refusal_rule_id(reason) == _FILE_BODY_RULE_ID:
+        return DENY_CLASS_FILE_BODY_TEXT
+    return deny_class
 
 
 def remediation_for(reason: str, subject: str = "", *, credential_tool_hint: str = "") -> str:

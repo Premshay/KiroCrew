@@ -100,6 +100,51 @@ def validate_cron_expr(expr: str) -> bool:
     return len(parts) == 1 and expr.startswith("@")
 
 
+def _hash_random_item(item: str) -> str:
+    """``item`` with a croniter ``R`` token (``R``, ``R(0-29)``, ``R/15``) as ``H``.
+
+    Never a name such as ``mar``, ``thu`` or ``fri``: only an item that is ``R``
+    alone, or starts with ``R(`` or ``R/``, is random.
+    """
+    upper = item.upper()
+    if upper == "R" or upper.startswith(("R(", "R/")):
+        return "H" + item[1:]
+    return item
+
+
+def pin_random_cron_fields(expr: str, job_id: str) -> str:
+    """``expr`` with each croniter random (``R``) field replaced by its values for ``job_id``.
+
+    croniter draws a fresh value for an ``R`` field every time it reads the
+    expression, so a stored ``R 9 * * *`` fired at a different minute on each
+    check: some days never, some days twice, with a preview that changed on every
+    read. The pick is croniter's ``H`` hash of ``job_id`` instead, so the same job
+    always gets the same minute, every reader agrees on it, and two jobs with
+    the same expression still spread apart. An expression without ``R``, or one
+    croniter cannot expand, is returned unchanged.
+    """
+    if not isinstance(expr, str):
+        return expr
+    parts = expr.split()
+    if len(parts) != 5:
+        return expr
+    hashed = [",".join(_hash_random_item(item) for item in part.split(",")) for part in parts]
+    if hashed == parts:
+        return expr
+    if parts[2].upper() == "R":
+        # A bare random day of the month stays on a day every month has: a pick
+        # of 29-31 would skip short months, and 30 or 31 never fires in February.
+        hashed[2] = "H(1-28)"
+    try:
+        expanded = croniter.expand(" ".join(hashed), hash_id=job_id.encode())[0]
+    except (ValueError, KeyError, TypeError):
+        return expr
+    return " ".join(
+        ",".join(str(value) for value in values) if hashed[i] != part else part
+        for i, (part, values) in enumerate(zip(parts, expanded))
+    )
+
+
 def never_fires_warning(schedule: CronSchedule) -> str:
     """A one-line caveat for a cron schedule that matches no date, else ``""``.
 
@@ -123,6 +168,26 @@ def never_fires_warning(schedule: CronSchedule) -> str:
     except Exception:
         return ""
     return ""
+
+
+def raised_interval_warning(requested: object, schedule: CronSchedule) -> str:
+    """A one-line caveat when *schedule* runs less often than the interval asked for, else ``""``.
+
+    ``build_job`` raises an ``every`` interval below its minimum rather than refusing
+    it, because a stored job with such an interval must still load and save. The add
+    surfaces that clamp instead of refuse show this beside their success answer, so the
+    caller learns the rate the job actually runs at.
+    """
+    if schedule.kind != "every" or not schedule.every_secs:
+        return ""
+    if not isinstance(requested, int) or isinstance(requested, bool):
+        return ""
+    if schedule.every_secs == requested:
+        return ""
+    return (
+        f"an interval of {requested}s is below the {schedule.every_secs}s minimum, "
+        f"so this job runs every {schedule.every_secs}s"
+    )
 
 
 def runs_more_than_once_a_day(schedule: CronSchedule) -> bool:
@@ -191,6 +256,7 @@ def _humanize_cron(expr: str, tz_name: str = "") -> str:
                 result = f"At {local_time}, {desc.removeprefix('At ')}"
             return result
         except Exception:
+            # Falls back to the UTC description below.
             pass
 
     return desc
@@ -920,6 +986,7 @@ def _already_ran_by_wall_clock(job: CronJob, slot: datetime) -> bool:
         try:
             then = ZoneInfo(zone)
         except Exception:
+            # A zone name this host cannot load is skipped.
             continue
         occurrence = _cron_occurrence_ts(expr, last, then)
         # Only an occurrence the scheduler could have dispatched in this zone: the

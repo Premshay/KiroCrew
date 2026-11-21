@@ -48,6 +48,7 @@ DOMAIN_MODULES: tuple[str, ...] = (
     "server_request",
     "code_channels",
     "apps",
+    "resources",
     # Last: the tools installed apps declare. A core name always wins over an app's.
     "app_tools",
 )

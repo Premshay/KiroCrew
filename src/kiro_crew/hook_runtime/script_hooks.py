@@ -36,13 +36,14 @@ if TYPE_CHECKING:
         HOOK_EVENTS_KAS_ONLY,
         ScriptHook,
         _audit_governance_hook_decision,
+        _coerce_bool,
         _communicate_capped,
         _context_matches,
         _decode_capped,
         _governance_pinned_command_ids,
+        _hook_tool_matches,
         _read_capped_stream,
         _script_hooks_capability_denied,
-        _tool_matches,
         current_context,
         effective_denied_regexes_from_config,
         logger,
@@ -52,6 +53,45 @@ if TYPE_CHECKING:
         validate_hook_fields,
         webhooks,
     )
+
+
+def _script_hook_enabled_from(data: dict) -> bool:
+    """Read a stored ``enabled`` without the ``bool("false")`` trap (``ScriptHook.from_dict``).
+
+    hooks.json is hand-editable. A real bool and the ``_coerce_bool``
+    spellings (``"false"``, ``"off"``, ``"1"``, ...) map to their value. A
+    JSON integer maps like its string spelling (``0`` off, any other int on),
+    because a hand edit writes ``0`` as naturally as ``"0"``. ``null`` and an
+    empty string load off, as they did before (both were falsy). An absent
+    key keeps the long-standing default of enabled.
+
+    Anything else (``"ture"``, ``"y"``, ``[1]``, ``1.0``, and a whitespace-only
+    string such as ``"   "`` or a non-breaking space, which was truthy before)
+    loads ENABLED, with a warning naming the hook. Off is not a safe guess: a
+    PreToolUse hook is a deny gate, so reading a typo as off would silently
+    drop it. Refusing the entry is not safe either: the gateway's registered
+    store skips an entry it cannot load, so the gate would stop there too. On
+    keeps the gate running in every process, and it is not a privilege gain:
+    whoever can write hooks.json can write a real ``true``.
+    """
+    if "enabled" not in data:
+        return True
+    raw = data["enabled"]
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return raw != 0
+    if raw is None or raw == "":
+        return False
+    # ``_coerce_bool`` holds the one list of spellings; a value it does not
+    # recognise is the one whose answer depends on the default it is given.
+    value = _coerce_bool(raw, default=True)
+    if not value or _coerce_bool(raw, default=False):
+        return value
+    logger.warning(
+        "Script hook %r has an unrecognised 'enabled' value (%s); loading it enabled",
+        str(data.get("id", ""))[:64],
+        type(raw).__name__,
+    )
+    return True
 
 
 def _hook_subprocess_env(
@@ -1008,11 +1048,12 @@ class ScriptHookStore:
                 if event in (HOOK_EVENT_PRE_TOOL_USE, HOOK_EVENT_POST_TOOL_USE):
                     if extra_hooks_tool_names is not None and id(hook) in extra_ids:
                         if hook.matcher != "*" and not any(
-                            _tool_matches(hook.matcher, name) for name in extra_hooks_tool_names
+                            _hook_tool_matches(hook.matcher, name)
+                            for name in extra_hooks_tool_names
                         ):
                             continue
                     elif not any(
-                        _tool_matches(hook.matcher, name)
+                        _hook_tool_matches(hook.matcher, name)
                         for name in (tool_match_names or (tool_name,))
                     ):
                         continue
@@ -1074,7 +1115,11 @@ class ScriptHookStore:
                     "allowed",
                     "skills-only hook permitted",
                 )
-                skills_directive = " ".join(f"${s.rpartition('/')[2]}" for s in hook.skills)
+                from kiro_crew.skill_package_key import split_package_key
+
+                skills_directive = " ".join(
+                    f"${split_package_key(s.rpartition('/')[2])[1]}" for s in hook.skills
+                )
                 hook.last_run = time.time()
                 hook.last_status = "ok"
                 hook.last_error = ""

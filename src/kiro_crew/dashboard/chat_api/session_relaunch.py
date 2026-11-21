@@ -288,6 +288,11 @@ async def reload_slot_session(
                 teardown_incomplete = True
                 return True
 
+        # Read before the reset: the reset drops the resume pointer of a start
+        # no turn prompted (``forget_unused_start``), so the respawn below
+        # starts fresh instead of a resume prefetch that would find no pointer
+        # and start nothing.
+        unused_start = state.sessions.fresh_start_unclaimed(session_key) is True
         reloaded = await _reset()
         if not reloaded:
             provider = state.sessions.get_provider(session_key)
@@ -383,7 +388,7 @@ async def reload_slot_session(
     respawn = schedule_eager_spawn(
         state,
         slot,
-        allow_resume=True,
+        allow_resume=not unused_start,
         start_priority=start_priority,
         on_ended=lambda failure: _report_reload_respawn(state, slot, failure, notice_mid),
     )
@@ -721,6 +726,16 @@ async def api_chat_slot_project(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     if project:
+        # A NUL byte, or a lone surrogate the filesystem encoding cannot carry,
+        # makes expanduser/realpath raise ValueError; refuse it lexically first.
+        try:
+            unusable = b"\x00" in os.fsencode(project)
+        except UnicodeEncodeError:
+            unusable = True
+        if unusable:
+            return web.json_response(
+                {"error": "Not a directory", "code": "not_a_directory"}, status=400
+            )
         project = os.path.realpath(os.path.expanduser(project))
         if not os.path.isdir(project):
             return web.json_response({"error": "Not a directory"}, status=400)
@@ -828,6 +843,15 @@ async def api_chat_slot_project(request: web.Request) -> web.Response:
         # would erase it; a per-request identity token can.
         committed_project = _CommitToken(project)
         slot.project = committed_project
+        # A person's pick, the folder the slot already has included: a Bot worker
+        # keeps it instead of being moved to the Bot's worktree on its next turn
+        # (crewmate_worktree_scope). Set before any await, so a write that moves the
+        # folder meanwhile clears it and a rollback restores the flag with the
+        # directory. An app caller's write is not a person's pick and leaves the flag
+        # as it is. A clear hands the choice back.
+        if not request.get("app", "") and slot._project_picked != bool(project):
+            slot._project_picked = bool(project)
+            slot._dirty = True
         logger.info("Slot %s project set to %r", name, project)
         sel().log_api_access(
             caller=request.get("user", "dashboard"),
@@ -878,6 +902,7 @@ async def api_chat_slot_project(request: web.Request) -> web.Response:
                     },
                     status=409,
                 )
+            slot._dirty = True
             if not project:
                 state.sessions.retract_cwd(session_key)
             # Determine whether a start that captured the OLD cwd is already
@@ -886,7 +911,7 @@ async def api_chat_slot_project(request: web.Request) -> web.Response:
             # at the NEW project. A start carries the old cwd when:
             #   * a session is already registered under the key, or
             #   * a turn is in flight (running, or its admission reserved) whose
-            #     own get_or_create captured slot.project BEFORE this change and
+            #     own get_or_create captured slot.project BEFORE this switch and
             #     will register a session rooted at the old cwd, or
             #   * a cold start is already reserved under the key — a
             #     channel-linked turn (Slack/Discord) resuming on

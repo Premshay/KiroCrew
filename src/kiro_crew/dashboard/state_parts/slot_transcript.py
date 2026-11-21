@@ -44,11 +44,14 @@ from kiro_crew.dashboard.state_parts.transcript_rows import (
     durable_row_count,
     is_interruption_stale,
     is_turn_interrupted,
+    newest_error_is_sign_in,
     parse_cls_meta,
 )
 from kiro_crew.dashboard.system_notices import is_system_notice
 from kiro_crew.history import latest_transcript_ts, mint_row_mid, monotonic_transcript_ts
+from kiro_crew.option_marker_scan import option_labels
 from kiro_crew.shared_crew.attribution import with_request_author
+from kiro_crew.shared_crew.participants import note_author
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.state_parts.chat_slot import _ChatSlot
@@ -176,14 +179,13 @@ def _strip_options(text: str) -> str:
 
 
 def _parse_options(text: str) -> list[str]:
-    """Extract pipe-separated choices from the LAST [OPTIONS: A | B | C] in text."""
+    """The choices of the LAST ``[OPTIONS:]`` marker in *text*, split as the web splits them."""
     if _OPTIONS_HEAD not in text:
         return []
     matches = list(_OPTIONS_RE.finditer(text))
     if not matches:
         return []
-    parts = [p.strip() for p in matches[-1].group("labels").split("|")]
-    return [p for p in parts if p]
+    return option_labels(matches[-1].group("labels"))
 
 
 def init_transcript_fields(self: _ChatSlot) -> None:
@@ -269,7 +271,7 @@ def init_transcript_fields(self: _ChatSlot) -> None:
     # _disk_older_count) so a 5s flush is O(window), not O(file). The
     # (mtime, size) pair also doubles as the "did another process write this
     # file since we last saved?" signal that gates the cross-process
-    # foreign-append merge. See chat_persistence._save_*.
+    # foreign-append merge. See chat_persistence_parts.save_transaction._save_slot_to_history.
     self._frozen_prefix_cache = None
     # What the last committed save left on disk (path, file identity,
     # disk_older, metadata line, window digests, first file-change row), so
@@ -315,6 +317,7 @@ def append(
     retire_questions: bool = True,
     meta: dict | None = None,
     mint_mid: bool = True,
+    note_participant: bool = True,
 ) -> dict[str, Any]:
     # A durable row ends the segment a permission request held open, so the
     # reply's text lands above it. Cleared first: the cut appends a row too.
@@ -398,6 +401,11 @@ def append(
         # Shared Crew: a live user row written by a request handler names
         # that request's server-derived author unless it already names one.
         meta = with_request_author(meta)
+        # The row's author, if a person, joins the session's participants. A
+        # resume replaying stored rows live passes ``note_participant=False``:
+        # reopening a session is not writing in it.
+        if note_participant:
+            note_author(self, meta)
     if meta:
         msg["meta"] = meta
     # Stamp a per-row delivery identity. A client sees the SAME row through
@@ -698,6 +706,7 @@ def to_dict(
         parse_cls_meta=parse_cls_meta,
         is_turn_interrupted=is_turn_interrupted,
         is_interruption_stale=is_interruption_stale,
+        newest_error_is_sign_in=newest_error_is_sign_in,
         is_system_notice=is_system_notice,
         latest_transcript_ts=latest_transcript_ts,
         last_message_preview=_last_message_preview,

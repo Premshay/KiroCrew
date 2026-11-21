@@ -7,9 +7,11 @@ spawn; these pin the rules each half applies on its own.
 from __future__ import annotations
 
 import io
+import json
 import os
 import socket
 import sys
+import types
 import urllib.error
 import urllib.request
 
@@ -22,6 +24,9 @@ from kiro_crew.dashboard import agent_ipc
 from kiro_crew.mcp_gateway import STUB_MODULE
 from kiro_crew.mcp_gateway.hashing import STUB_FLAGS_FLAG, encode_target_args
 from kiro_crew.testing.ids import unallocatable_pids
+
+# The ``_set_non_dumpable`` tests below replace ``ctypes.CDLL``.
+pytestmark = pytest.mark.usefixtures("fresh_darwin_libc_handles")
 
 # Pids no live process can own, so nothing here can reach a real process.
 _ROOT_PID, _RESPAWNED_PID = unallocatable_pids(2)
@@ -81,6 +86,28 @@ def test_an_enforced_harness_gets_a_pickup_on_kirocrew_core_only(bound, backend)
     assert entry.runtime_pid() == _RESPAWNED_PID
 
 
+@pytest.mark.parametrize("backend", ["codex", "opencode", "goose", "pi"])
+def test_an_enforced_harness_gets_a_pickup_on_the_dashboard_server_too(bound, backend):
+    """Its tools reach the gateway as core's do, so its direct launch needs one."""
+    dashboard = {"name": "kirocrew-dashboard", "command": "kirocrew", "args": ["mcp"], "env": []}
+    (out,) = _issue([dashboard], backend=backend)
+    assert len(_env(out)[PICKUP_ENV]) == 64
+    (entry,) = bound._pickups.values()
+    assert entry.server == "kirocrew-dashboard" and entry.session_token == "tok"
+
+
+def test_a_broker_stub_for_the_dashboard_gets_no_pickup(bound):
+    stub = {
+        "name": "kirocrew-dashboard",
+        "command": sys.executable,
+        "args": ["-m", STUB_MODULE, "--server", "kirocrew-dashboard"],
+        "env": [],
+    }
+    (out,) = _issue([stub])
+    assert PICKUP_ENV not in _env(out) and GATEWAY_PID_ENV not in _env(out)
+    assert not bound._pickups
+
+
 @pytest.mark.parametrize(
     "args",
     [
@@ -125,23 +152,88 @@ def test_the_caller_array_is_not_mutated(bound):
 
 
 def test_the_runtime_session_path_issues_the_pickup():
-    """Sessions are built by the runtime's mirrored projection, so issuance is there."""
+    """Create and resume issue on the array they send, after the member appends."""
     import inspect
 
-    from kiro_crew.acp import runtime_session_setup
+    from kiro_crew.acp import runtime_session_create, runtime_session_load, runtime_session_setup
 
-    source = inspect.getsource(runtime_session_setup._mirrored_session_mcp)
+    for fn in (runtime_session_create.create_session, runtime_session_load.load_session):
+        assert "_with_runtime_ipc_pickups(self, mcp_servers, stub_token)" in inspect.getsource(fn)
+    source = inspect.getsource(runtime_session_setup._with_runtime_ipc_pickups)
     assert "with_ipc_pickups(" in source and "session_token=stub_token" in source
+
+
+def test_the_dashboard_server_redeems_its_pickup_before_it_serves(monkeypatch):
+    """An issued pickup nobody redeems leaves every dashboard tool refused."""
+    from kiro_crew import mcp_dashboard
+
+    assert "kirocrew-dashboard" in ipc_pickup.PICKUP_SERVERS
+    calls: list[str] = []
+    monkeypatch.setattr(agent_ipc_client, "redeem_at_startup", lambda _port: calls.append("redeem"))
+    monkeypatch.setattr(
+        mcp_dashboard, "run_mcp_stdio_loop", lambda *_a, **_k: calls.append("serve")
+    )
+    mcp_dashboard.run_mcp_server()
+    assert calls == ["redeem", "serve"]
 
 
 # --- the server side ---------------------------------------------------------------
 
 
 @pytest.fixture(autouse=True)
-def _fresh_client_state():
+def _fresh_client_state(_floor_monkeypatch):
+    # take_pickup makes the whole process non-dumpable, which nothing undoes; later
+    # tests on the worker then get EACCES on /proc/self/fd and fail their writes.
+    _floor_monkeypatch.setattr(agent_ipc_client, "_set_non_dumpable", lambda: None)
     agent_ipc_client._reset_for_tests()
     yield
     agent_ipc_client._reset_for_tests()
+
+
+# The fixture above stubs it for every test, so these call the real one through a
+# fake libc: the worker process itself is never made non-dumpable.
+_REAL_SET_NON_DUMPABLE = agent_ipc_client._set_non_dumpable
+
+
+class _FakeLibc:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def prctl(self, *args) -> int:
+        self.calls.append(args)
+        return 0
+
+
+def test_set_non_dumpable_calls_prctl_on_linux(monkeypatch):
+    import ctypes
+
+    libc = _FakeLibc()
+    monkeypatch.setattr(agent_ipc_client, "sys", types.SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(ctypes, "CDLL", lambda *a, **k: libc)
+    _REAL_SET_NON_DUMPABLE()
+    assert libc.calls == [(agent_ipc_client._PR_SET_DUMPABLE, 0, 0, 0, 0)]
+
+
+def test_set_non_dumpable_is_a_no_op_off_linux(monkeypatch):
+    import ctypes
+
+    def refuse(*_a, **_k):
+        raise AssertionError("libc must not be loaded off Linux")
+
+    monkeypatch.setattr(agent_ipc_client, "sys", types.SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(ctypes, "CDLL", refuse)
+    _REAL_SET_NON_DUMPABLE()
+
+
+def test_set_non_dumpable_swallows_a_libc_that_cannot_load(monkeypatch):
+    import ctypes
+
+    def fail(*_a, **_k):
+        raise OSError("no libc")
+
+    monkeypatch.setattr(agent_ipc_client, "sys", types.SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(ctypes, "CDLL", fail)
+    _REAL_SET_NON_DUMPABLE()
 
 
 def _held(gateway_pid: int = 777) -> dict[str, str]:
@@ -190,6 +282,25 @@ def test_a_refused_pickup_is_dropped(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_ipc_client, "unix_socket_urlopen", forbid)
     assert agent_ipc_client.current_capability(lambda: 1) == ("", "")
     assert agent_ipc_client._pickup == ""
+
+
+def _answer(monkeypatch, body: dict) -> None:
+    reply = io.BytesIO(json.dumps(body).encode())
+    monkeypatch.setattr(agent_ipc_client, "unix_socket_urlopen", lambda *_a, **_k: reply)
+
+
+def test_a_redeemed_pickup_becomes_the_capability_and_its_session(monkeypatch, tmp_path):
+    sock = tmp_path / "a.sock"
+    monkeypatch.setattr(agent_ipc_client, "agent_socket_path", lambda port: sock)
+    for name, value in _held().items():
+        monkeypatch.setenv(name, value)
+    _answer(monkeypatch, {"capability": "c" * 64})
+    agent_ipc_client.redeem_at_startup(lambda: 1)
+    assert agent_ipc_client.current_capability(lambda: 1) == ("c" * 64, str(sock))
+    _answer(monkeypatch, {"session_key": "chat-1"})
+    assert agent_ipc_client.capability_session_key() == "chat-1"
+    _answer(monkeypatch, {})
+    assert agent_ipc_client.capability_session_key() == ""
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="AF_UNIX transport")

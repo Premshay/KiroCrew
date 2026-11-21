@@ -1,4 +1,4 @@
-"""Ultra Mode "Pause all" / "Resume all": the pause record and the rules it drives.
+"""Conductor mode "Pause all" / "Resume all": the pause record and the rules it drives.
 
 Pause stops every running crew member at every depth and leaves one that waits on
 the person alone; while it stands the root and the stopped members start no turn,
@@ -23,6 +23,15 @@ from kiro_crew import crew_mode, crew_pause, platform_compat
 from kiro_crew.dashboard.handlers.office_slides import _KeyedLocks
 from kiro_crew.dashboard.turn_dispatch import mark_turn_unstarted
 from kiro_crew.testing.wait import until_parked
+
+
+def _yielding(serialize):
+    """The state's ``serialize_slots_yielding`` over a stub's synchronous rows."""
+
+    async def serialize_slots_yielding(**kwargs):
+        return serialize(**kwargs)
+
+    return serialize_slots_yielding
 
 
 @pytest.fixture(autouse=True)
@@ -196,7 +205,10 @@ def _state(rows: list[dict[str, Any]], slots: dict[str, Any] | None = None) -> A
 
     slots = slots if slots is not None else {r["key"]: _fake_slot(r["key"]) for r in rows}
     return SimpleNamespace(
-        serialize_slots=serialize_slots, get_slot=slots.get, push_slots_update=lambda: None
+        serialize_slots=serialize_slots,
+        serialize_slots_yielding=_yielding(serialize_slots),
+        get_slot=slots.get,
+        push_slots_update=lambda: None,
     )
 
 
@@ -237,6 +249,22 @@ def routes(monkeypatch):
         dash_state, "append_and_surface", lambda *a, **kw: calls["notice"].append(kw["meta"])
     )
     return SimpleNamespace(handler=handler, calls=calls)
+
+
+@pytest.mark.asyncio
+async def test_pause_and_resume_all_run_on_the_default_conductor(routes):
+    """Pause all / Resume all on a crew whose root runs conductor mode's default agent."""
+    assert crew_mode.DEFAULT_CREW_MODE_AGENT == "kirocrew-conductor"
+    tree = [dict(r) for r in _TREE]
+    tree[0]["agent"] = crew_mode.DEFAULT_CREW_MODE_AGENT
+    resp = await routes.handler.api_crew_pause(_req(_state(tree)))
+    assert resp.status == 200, resp.text
+    assert json.loads(resp.text)["stopped"] == ["w1", "w3"]
+    assert crew_pause.record("root")["stopped"] == ["root", "w1", "w3"]
+    resp = await routes.handler.api_crew_resume(_req(_state(tree)))
+    assert resp.status == 200, resp.text
+    assert sorted(routes.calls["continue"]) == ["root", "w1", "w3"]
+    assert crew_pause.record("root") is None
 
 
 @pytest.mark.asyncio
@@ -1147,21 +1175,23 @@ async def test_a_members_continue_after_resume_and_a_new_pause_still_continues_i
     assert not crew_pause.holds_turn("chat-w1")
 
 
-# ── Ultra Mode runs on the team lead ───────────────────────────────────────────
+# ── Conductor mode runs on the conductor ───────────────────────────────────────
 
 
-def test_ultra_mode_defaults_to_the_team_lead_and_a_set_key_keeps_its_value():
+def test_conductor_mode_defaults_to_the_conductor_and_a_set_key_keeps_its_value():
     from kiro_crew.config.loader_builders import _build_agent_config
     from kiro_crew.config.sections_agent import _CREW_MODE_AGENT_DEFAULT
 
-    assert crew_mode.DEFAULT_CREW_MODE_AGENT == "kirocrew-team-lead"
+    assert crew_mode.DEFAULT_CREW_MODE_AGENT == "kirocrew-conductor"
     assert _CREW_MODE_AGENT_DEFAULT == crew_mode.DEFAULT_CREW_MODE_AGENT
-    assert _build_agent_config({}).crew_mode_agent == "kirocrew-team-lead"
-    assert _build_agent_config({"crew_mode_agent": "kirocrew-conductor"}).crew_mode_agent == (
-        "kirocrew-conductor"
+    assert _build_agent_config({}).crew_mode_agent == "kirocrew-conductor"
+    assert _build_agent_config({"crew_mode_agent": "kirocrew-team-lead"}).crew_mode_agent == (
+        "kirocrew-team-lead"
     )
-    # The deprecated ledger alias still names the shipped conductor, not the default.
+    # The deprecated ledger alias still names the shipped conductor.
     assert crew_mode.CONDUCTOR_ALIASES["kirocrew-ledger-conductor"] == "kirocrew-conductor"
+    # The team lead stays a conductor template: a chat on it is still conductor mode.
+    assert "kirocrew-team-lead" in crew_mode.conductor_agents()
 
 
 # ── the goal stays current ─────────────────────────────────────────────────────
@@ -1187,7 +1217,18 @@ def test_the_lead_prompt_and_both_skills_carry_the_goal_first_rule():
         assert '"Done when ..." sentence' in flat, name
 
 
-def test_an_ultra_mode_board_turn_tells_the_lead_to_write_the_goal(monkeypatch):
+def test_the_conductor_prompt_carries_the_goal_first_rule():
+    """Conductor mode's default agent writes the goal first, so the Board's Overview
+    keeps following it; the five-part goal text is its ``goal_plan`` rule."""
+    from kiro_crew.agent_parts.spec_prompts import _CONDUCTOR_SYSTEM_PROMPT
+
+    flat = " ".join(_CONDUCTOR_SYSTEM_PROMPT.split())
+    assert _GOAL_FIRST in flat
+    assert "`new_goal=true` for a new goal" in flat
+    assert "Done when:" in flat
+
+
+def test_a_conductor_mode_board_turn_tells_the_lead_to_write_the_goal(monkeypatch):
     from kiro_crew import dashboard_agentic
 
     monkeypatch.setattr(
@@ -1429,7 +1470,7 @@ def test_a_released_root_blocks_only_held_members_and_the_record_ends():
 
 
 def test_a_chat_that_is_not_a_root_is_not_held_as_one():
-    """A record left for a chat that is not an Ultra Mode root never holds it as a
+    """A record left for a chat that is not a conductor mode root never holds it as a
     root; its held crew members stay held."""
     crew_pause.pause("r", ["w1"], ["w1"])
     assert crew_pause.holds_turn("r", lambda: True)

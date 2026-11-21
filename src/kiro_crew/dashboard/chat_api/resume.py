@@ -180,6 +180,7 @@ def _materialise_slot_from_history(
     disk_meta_observed: bool = True,
     broadcast_rows: bool = True,
     mint_missing_mids: bool = False,
+    keeps_mode: bool = True,
 ) -> _ChatSlot:
     """Build and hydrate a slot from a persisted history snapshot, UNPUBLISHED.
 
@@ -325,6 +326,7 @@ def _materialise_slot_from_history(
             disk_meta_observed=disk_meta_observed,
             broadcast_rows=broadcast_rows,
             mint_missing_mids=mint_missing_mids,
+            keeps_mode=keeps_mode,
         )
     except BaseException:
         # ``slot`` is None if ``get_or_create_slot`` itself raised (nothing was
@@ -366,6 +368,7 @@ def _hydrate_slot_from_history(
     disk_meta_observed: bool = True,
     broadcast_rows: bool = True,
     mint_missing_mids: bool = False,
+    keeps_mode: bool = True,
 ) -> None:
     """Apply persisted metadata to *slot* and hydrate its message window.
 
@@ -398,6 +401,7 @@ def _hydrate_slot_from_history(
             folder_checked_id=folder_checked_id,
             disk_meta_observed=disk_meta_observed,
             history_key=slot_history_key(slot),
+            keeps_mode=keeps_mode,
         ),
     )
     disk_total = len(all_messages)
@@ -450,9 +454,9 @@ def _hydrate_slot_from_history(
                 _redact_meta_for_role(role, m["meta"]) if isinstance(m.get("meta"), dict) else None
             ),
             mint_mid=mint_missing_mids,
+            note_participant=False,  # replayed history is not new writing
         )
-        # See the equivalent call in _rehydrate_slot_from_history: resume loads
-        # the window that the next save re-serializes.
+        # Resume loads the window the next save re-serializes (see _rehydrate_slot_from_history).
         carry_provenance(slot.messages[-1], m)
         remember_unknown_row_fields(slot, m)
         _attach_variants(slot, m)
@@ -539,24 +543,31 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
         return web.json_response(await _live_slot_resume_payload(state, outcome.slot))
     slot, total = outcome.slot, outcome.total
     recent = slot.messages[-200:] if len(slot.messages) > 200 else slot.messages
+    # `total` is the effective hydrated length (durable rows plus a recovered
+    # interruption row when one was appended), so this is the raw index the
+    # next older page starts from.
+    from kiro_crew.dashboard.display_floor import clip_page_off_loop
+
+    recent, next_before, floor_reached = await clip_page_off_loop(
+        state.conversation_log, slot_history_key(slot), recent, total - len(recent)
+    )
+    from kiro_crew.dashboard.responsive_chat import written_queue_ids
+
     return web.json_response(
         {
             "ok": True,
             "key": slot.key,
             "history_key": slot_history_key(slot),
-            # `total` is the effective hydrated length (durable rows plus a
-            # recovered interruption row when one was appended), so this is
-            # the raw index the next older page starts from.
-            "next_before": total - len(recent),
+            "next_before": next_before,
             "messages": _prepare_messages(
                 recent,
                 slot.running,
                 live_child=_live_child_instance(state, slot),
                 workspace=slot.workspace,
             ),
-            "queue": queue_view(slot._queue),
+            "queue": queue_view(slot._queue, written=written_queue_ids(slot)),
             "total": total,
-            "has_more": total > len(recent),
+            "has_more": next_before > 0 and not floor_reached,
             "memory_mode": slot.memory_mode,
             "mode": slot.mode,
             "surface": slot.mode,
@@ -1098,11 +1109,18 @@ async def _resume_slot_from_history_noted(
         _restored_agent_name, _resume_session_identity(state, history_key), meta
     )
     # The model restore needs the provider (config.json) and the effort marker
-    # (a file under the config dir). Both are disk reads, so they are taken here,
-    # off the loop, before the synchronous construction below.
+    # (a file under the config dir), and whether the saved mode is kept reads the
+    # app's install record. All are disk reads, so they are taken here, off the
+    # loop, before the synchronous construction below.
     _prefetched_effort = meta.get("reasoning_effort")
-    restore_cfg, effort_marker = await asyncio.to_thread(
-        lambda: (_load_restore_cfg(), _has_validated_effort_marker(_prefetched_effort))
+    from kiro_crew.apps.hidden_sessions import resume_keeps_mode
+
+    restore_cfg, effort_marker, keeps_mode = await asyncio.to_thread(
+        lambda: (
+            _load_restore_cfg(),
+            _has_validated_effort_marker(_prefetched_effort),
+            resume_keeps_mode(meta.get("mode")),
+        )
     )
     # Re-check after the await: a concurrent resume can publish the slot while we
     # are suspended, and the publish below would skip the ownership gate above.
@@ -1474,6 +1492,7 @@ async def _resume_slot_from_history_noted(
         # passed: a refused build is discarded, and frames already pushed for it
         # would describe a session that never appears.
         broadcast_rows=not reserved,
+        keeps_mode=keeps_mode,
     )
     if _member_binding is None:
         # Restore the protected choice read before construction, not the
@@ -1832,8 +1851,8 @@ async def _resume_slot_from_history_noted(
                     return ResumeOutcome(refusal=(await _discard()) or refusal)
             # The delete-and-recreate signature after the last await, SYNCHRONOUS
             # and lock-free, where nothing can run between it and the publish. A
-            # file read here would reopen the Windows transient this change moved
-            # off the loop (a just-rewritten file is briefly unopenable), so two
+            # file read here would reintroduce a Windows transient on the loop (a
+            # just-rewritten file is briefly unopenable), so two
             # in-memory witnesses stand in for it. A COMPLETED delete bumps the
             # invalidation generation under the file lock (``delete_session`` ->
             # ``_invalidate_cache`` after the unlink), while a transient file lock

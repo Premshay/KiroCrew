@@ -54,6 +54,7 @@ from kiro_crew.slack.code_channels.surface_store import store as surface_store
 from kiro_crew.slack.code_channels.workspace import git_ops
 from kiro_crew.slack.code_channels.workspace.store import WorkspaceStore
 from kiro_crew.testing.links import make_dir_link
+from kiro_crew.testing.synthetic_credentials import github_classic
 from kiro_crew.testing.wait import await_until
 
 
@@ -638,7 +639,9 @@ def test_agent_text_is_sanitized_by_the_shared_slack_display_sink() -> None:
     (a credential split by markup) reach the code channel's posts too."""
     import inspect
 
-    key = "AKIA" + "IOSFODNN7EXAMPLE"
+    from redaction_structured_cases import github_classic
+
+    key = github_classic(seed=120)
     split = f"key {key[:8]}**{key[8:]}**"
     for redact in (wrapup._redact, wrapup._redact_payload, tools._redact, tools._redact_payload):
         assert key not in redact(split).replace("*", "")
@@ -646,7 +649,7 @@ def test_agent_text_is_sanitized_by_the_shared_slack_display_sink() -> None:
     assert "re.compile" not in inspect.getsource(wrapup)
 
 
-_SPLIT = "ghp_" + "A" * 36  # a credential the redactor knows, only when whole
+_SPLIT = github_classic(seed=121)  # a credential the redactor knows, only when whole
 
 
 @pytest.mark.parametrize(
@@ -763,7 +766,7 @@ def test_html_views_and_bar_urls_are_not_mention_defanged(env: Any) -> None:
     mention there, so the defang would only break them, while credentials still go."""
     _bind(env)
     env.api.responses["agents.conversations.setView"] = {"ok": True, "view_id": "V1"}
-    secret = "ghp_" + "A" * 36
+    secret = github_classic(seed=122)  # a ghp_ without a valid checksum is no token
     page = f"<!DOCTYPE html><style>@media print {{}}</style><p>{secret}</p>"
     assert _run(env, tools.SET_VIEW, {"view_key": "r", "content": page}).ok
     sent = _calls(env, "agents.conversations.setView")[0]["content"]
@@ -990,7 +993,7 @@ def test_a_second_wrap_up_survives_the_first_ones_failed_delivery(
     calls: list[str] = []
     second: list[str] = []
 
-    async def deliver(_orch: Any, _r: Any, _e: Any, text: str, _u: Any) -> bool:
+    async def deliver(_orch: Any, _r: Any, _e: Any, text: str, _u: Any, **_kw: Any) -> bool:
         calls.append(text)
         if len(calls) == 1:
             # While the first is still being delivered, a second /wrap-up arrives.
@@ -1646,7 +1649,7 @@ def test_an_html_view_hiding_a_credential_in_character_references_is_refused(
 ) -> None:
     _bind(env)
     env.api.responses["agents.conversations.setView"] = {"ok": True, "view_id": "V1"}
-    secret = "ghp_" + "A" * 36
+    secret = github_classic(seed=122)  # a ghp_ without a valid checksum is no token
     content = f'<input value="{attr(secret)}">'
     out = _run(env, tools.SET_VIEW, {"view_key": "r", "content": content})
     assert not out.ok and "nothing was published" in out.text

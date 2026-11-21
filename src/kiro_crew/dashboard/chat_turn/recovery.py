@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
 from kiro_crew.dashboard.chat_utils import (
@@ -310,10 +311,29 @@ def _terminal_error_meta(exc: BaseException) -> dict[str, object] | None:
     contested = ambiguity_meta(exc)
     if contested is not None:
         return contested
+    if getattr(exc, "kiro_cli_sign_in", False) is True:
+        from kiro_crew.dashboard.chat_utils_injected_rows import KIRO_CLI_SIGN_IN_KIND
+
+        return {"kind": KIRO_CLI_SIGN_IN_KIND}
+    # The route is the one this error's own sign-in sentence names, so another
+    # chat's later spawn cannot pick the row kind.
+    relay_crew = (
+        _relay_takes_crew_sign_in(str(exc)) if getattr(exc, "auth_required", False) else None
+    )
+    if relay_crew is not None:
+        from kiro_crew.dashboard.chat_utils_injected_rows import KIRO_CLI_SIGN_IN_KIND
+
+        # kiro-cli's sign-in starts the relay; Crew's starts it too unless it is
+        # pinned to kiro-cli's launcher with no vault answer, so only then is the
+        # Sign in button left out.
+        meta: dict[str, object] = {"kind": KIRO_CLI_SIGN_IN_KIND}
+        if relay_crew:
+            meta["crew_sign_in"] = True
+        return {**meta, **_kas_signed_out_notice(str(exc))}
     if getattr(exc, "auth_required", False):
         return {"kind": AUTH_REQUIRED_KIND, **_kas_signed_out_notice(str(exc))}
     if getattr(exc, "usage_limit", False):
-        return {"kind": USAGE_LIMIT_KIND}
+        return {"kind": USAGE_LIMIT_KIND, **_limit_reset_meta(exc)}
     if getattr(exc, "image_dimension_wedge", False) is True:
         return {"kind": IMAGE_REPAIR_KIND}
     if getattr(exc, "context_overflow", False) is True:
@@ -349,6 +369,44 @@ def _terminal_error_meta(exc: BaseException) -> dict[str, object] | None:
     return None
 
 
+def _limit_reset_meta(exc: BaseException) -> dict[str, object]:
+    """``reset_at``, the ISO instant a usage limit opens again, for the card to show.
+
+    Empty unless the error read one (``AcpError.usage_limit_reset_at``), so a
+    limit row with no readable reset clause keeps exactly ``{"kind": ...}``.
+    """
+    at = getattr(exc, "usage_limit_reset_at", None)
+    if isinstance(at, bool) or not isinstance(at, (int, float)):
+        return {}
+    try:
+        return {"reset_at": datetime.fromtimestamp(at, tz=timezone.utc).isoformat()}
+    except (OverflowError, OSError, ValueError):
+        return {}
+
+
+def _relay_takes_crew_sign_in(text: str) -> bool | None:
+    """Whether the route *text* was written for is kiro-cli's relay, and if so
+    whether Crew's sign-in can start it (``agent_sdk.kas_bundle.relay_takes_crew_sign_in``).
+
+    The route is the one a KAS signed-out sentence names
+    (``host_auth.kas_sentence_route``): the failing runtime's own. Text that is no
+    such sentence reads the last KAS spawn in the process, as before.
+
+    ``None`` with no route and on the bundle route, where only Crew's sign-in
+    fixes it and the row keeps ``auth_required``.
+    """
+    from kiro_crew.agent_sdk import host_auth
+    from kiro_crew.agent_sdk.kas_bundle import (
+        last_relay_takes_crew_sign_in,
+        relay_takes_crew_sign_in,
+    )
+
+    route = host_auth.kas_sentence_route(text)
+    if route is host_auth.NOT_A_KAS_SENTENCE:
+        return last_relay_takes_crew_sign_in()
+    return relay_takes_crew_sign_in(route)
+
+
 def _kas_signed_out_notice(text: str) -> dict[str, object]:
     """The notice token for a KAS signed-out sentence, so the dashboard translates it.
 
@@ -360,8 +418,9 @@ def _kas_signed_out_notice(text: str) -> dict[str, object]:
     route = kas_signed_out_route(text)
     if route is None:
         return {}
-    # The route rides along so the translated copy names it: every KAS prompt
-    # names the real route (the recorded decision on choosing KAS's engine).
+    # The route rides along so the translated row text names it where the row is
+    # shown as text (a crew window, the CLI); the sign-in prompts name no route
+    # (the recorded decision on signed-out sign-in prompts).
     if not route:
         return gn.gateway_notice_meta(gn.GATEWAY_NOTICE_KAS_SIGNED_OUT)
     return gn.gateway_notice_meta(gn.GATEWAY_NOTICE_KAS_SIGNED_OUT, route=route)

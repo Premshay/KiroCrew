@@ -314,6 +314,10 @@ class SubagentManager:
         except AttributeError:
             pass  # test doubles without the setter
         self._tasks: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
+        # Actual outer task -> (run id, parent), retained until task completion.
+        # Independent of completed-record eviction and the pre-cleanup _tasks pop;
+        # task keys also keep overlapping recovery attempts of one id distinct.
+        self._run_task_owners: dict[asyncio.Task[None], tuple[str, str]] = {}
         # Teardown gates for runs whose terminal report has started, keyed by id and
         # OUTLIVING both dicts above. A "delivered" tombstone excludes a folder from
         # restart orphan reconciliation, so it must not be written while the child is
@@ -469,6 +473,15 @@ class SubagentManager:
         # fast-failing first member cannot fire the wave digest while later POSTs
         # are still in flight. Pruned by finalize_batch().
         self._batch_submitted: dict[str, list[int]] = {}
+        # batch_id -> the ``(app, parent session key)`` every counted submission
+        # was admitted under, or ``None`` when owner-only members span parents.
+        # Both counting sites check and claim synchronously: a conflicting
+        # submission involving an app is refused without counting, changing the
+        # owner or announcing into the wave. Written from what the route handed
+        # the gate, so an app token joins or reconciles only its own wave,
+        # whatever its members' state (queued, refused, finished, evicted).
+        # Pruned by finalize_batch.
+        self._batch_owner: dict[str, tuple[str, str] | None] = {}
         # batch_id -> last submission-progress time.monotonic(), for the reaper's
         # stuck-wave backstop (a wave with lost submissions and no progress is
         # force-reconciled). Pruned by finalize_batch.
@@ -913,6 +926,7 @@ class SubagentManager:
     _is_startup_stalled = _monitor_surface._is_startup_stalled
     _note_tool_dispatch = staticmethod(_monitor_surface._note_tool_dispatch)
     _note_tool_result = staticmethod(_monitor_surface._note_tool_result)
+    _note_tool_update = staticmethod(_monitor_surface._note_tool_update)
     _clear_tool_dispatch = staticmethod(_monitor_surface._clear_tool_dispatch)
     _retire_subagent_oracle = staticmethod(_monitor_surface._retire_subagent_oracle)
     _stall_verdict = _monitor_surface._stall_verdict
@@ -973,6 +987,7 @@ class SubagentManager:
     queued_count_for_async = _run_surface.queued_count_for_async
     published_queued_depths = _run_surface.published_queued_depths
     published_queued_labels = _run_surface.published_queued_labels
+    has_current_execution_for = _run_surface.has_current_execution_for
     has_in_memory_pending_work_for = _run_surface.has_in_memory_pending_work_for
     has_unfinished_report_for = _run_surface.has_unfinished_report_for
     queued_count_or_none_async = _run_surface.queued_count_or_none_async

@@ -25,6 +25,8 @@ import {
 vi.mock('../../api/client', () => ({
   api: {
     members: vi.fn(),
+    // The owner check behind Import from file (`useViewerIsNotOwner`): the owner.
+    viewerOwnerOk: vi.fn(() => Promise.resolve(true)),
     // The roster's team grouping reads the team list; "no teams" keeps the
     // list flat, which is the shape every case here was written against.
     teams: { list: vi.fn(() => Promise.resolve({ teams: [] })), create: vi.fn(), update: vi.fn(), remove: vi.fn() },
@@ -239,7 +241,7 @@ vi.mock('../../components/ChatPane', async () => {
     // Mount count: the New crewmate card must HIDE the pane, never unmount it.
     useEffect(() => { chatPaneMounts.count += 1 }, [])
     return (
-      <div data-testid="chat-pane-stub" data-agent-locked={agentLocked ? '1' : '0'} data-follow-content-width={followContentWidth ? '1' : '0'} data-busy-mode={busyMode ?? 'split'} data-top-inset={topInset ?? ''} data-crew-composer={composerInput === CrewComposerRef.current ? '1' : '0'} data-push-to-talk={rest.pushToTalk ? '1' : '0'}>
+      <div data-testid="chat-pane-stub" data-agent-locked={agentLocked ? '1' : '0'} data-follow-content-width={followContentWidth ? '1' : '0'} data-busy-mode={busyMode ?? 'split'} data-top-inset={topInset ?? ''} data-crew-composer={composerInput === CrewComposerRef.current ? '1' : '0'} data-push-to-talk={rest.pushToTalk ? '1' : '0'} data-find-in-chat={rest.findInChat ? '1' : '0'}>
         {slotKey}
         {/* A static opening card is gone: no host may pass one. */}
         {'assistantWelcome' in rest && <div data-testid="assistant-welcome-stub" />}
@@ -767,6 +769,52 @@ describe('MembersPage thread', () => {
     expect(screen.queryByText(/Could not open this bot's chat/i)).toBeNull()
   })
 
+  it('a relay teammate keeps New bot but finds no Import from file, which stays the owner\'s', async () => {
+    // `/api/auth/me` says this caller does not clear the owner gate, with the
+    // Shared Crew preview off: a relay teammate is admitted either way.
+    vi.mocked(api.viewerOwnerOk).mockResolvedValue(false)
+    try {
+      const teammateRow = { name: 'oncall', slug: 'oncall', dashboard_created: true, source: 'kirocrew' } as unknown as ReturnType<typeof row>
+      await renderPage([teammateRow])
+      await waitFor(() => expect(api.viewerOwnerOk).toHaveBeenCalled())
+      fireEvent.pointerDown(await screen.findByTestId('member-add'), { button: 0, ctrlKey: false, pointerType: 'mouse' })
+      const menu = await screen.findByTestId('member-add-menu')
+      expect(within(menu).getByTestId('member-add-crewmate')).not.toHaveAttribute('data-disabled')
+      await waitFor(() => expect(within(menu).queryByTestId('member-add-import')).toBeNull())
+    } finally {
+      // Back to the shared mock's owner answer, so later cases keep a passing check.
+      vi.mocked(api.viewerOwnerOk).mockResolvedValue(true)
+    }
+  })
+
+  it('a failed owner check holds Import from file and says so on the roster', async () => {
+    vi.mocked(api.viewerOwnerOk).mockRejectedValue(Object.assign(new Error('unavailable'), { status: 503 }))
+    try {
+      await renderPage([row()])
+      expect(await screen.findByTestId('member-roster-owner-check-error')).toHaveTextContent(
+        "Couldn't check whether you can import bots here, so Import from file is hidden.",
+      )
+      fireEvent.pointerDown(await screen.findByTestId('member-add'), { button: 0, ctrlKey: false, pointerType: 'mouse' })
+      const menu = await screen.findByTestId('member-add-menu')
+      expect(within(menu).getByTestId('member-add-crewmate')).not.toHaveAttribute('data-disabled')
+      expect(within(menu).queryByTestId('member-add-import')).toBeNull()
+    } finally {
+      vi.mocked(api.viewerOwnerOk).mockResolvedValue(true)
+    }
+  })
+
+  it('a failed owner check is said in the open chat while the roster is folded', async () => {
+    vi.mocked(api.viewerOwnerOk).mockRejectedValue(Object.assign(new Error('unavailable'), { status: 503 }))
+    try {
+      await renderPage([row()], 'kirocrew', { route: '/members?member=oncall' })
+      expect(await screen.findByTestId('member-thread-owner-check-error', undefined, PANE_READY)).toHaveTextContent(
+        "Couldn't check whether you can import bots here, so Import from file is hidden.",
+      )
+    } finally {
+      vi.mocked(api.viewerOwnerOk).mockResolvedValue(true)
+    }
+  })
+
   it('shows the concrete private memory refusal when opening a member conversation fails', async () => {
     // A remembered member drives the restore that fails here (a fresh visit
     // no longer auto-opens anyone, #11763); the failing POST is that restore.
@@ -831,6 +879,8 @@ describe('MembersPage thread', () => {
     // The DM is the page's only composer, so it owns the "Start Dictation
     // with a Key" binding the main chat owns there (#24967).
     expect(pane).toHaveAttribute('data-push-to-talk', '1')
+    // ...and ⌘F / Ctrl+F opens Find in chat over it, on the same terms (#39585).
+    expect(pane).toHaveAttribute('data-find-in-chat', '1')
     // The pin is an invariant of every member thread, so the header does NOT
     // announce it — no chip, no term for a state that cannot be otherwise.
     expect(screen.queryByTestId('member-pin-chip')).toBeNull()

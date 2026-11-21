@@ -152,6 +152,13 @@ GUIDE_NOT_SHOWN_NOTE = (
 )
 
 
+#: The instruction on every ``find_setting`` result. Some answers are not a
+#: Settings row (auto-approving one MCP tool on KAS is a ``permissions.yaml``
+#: rule), and the packaged docs say so where the registry cannot.
+_FIND_SETTING_NEXT = (
+    "If no row here is what was asked, it may not be a setting: call search_docs "
+    "with the same words before answering, and never suggest a config key from memory."
+)
 #: The instruction on a ``find_ui`` miss: search again with the control's words.
 _FIND_UI_RETRY_NOTE = (
     "No match for these words. Before answering, call find_ui again with only the "
@@ -671,10 +678,17 @@ def search_docs(query: str = "", page: str = "", offset: int = 0) -> dict[str, A
     for t in terms:
         df = sum(1 for *_rest, hits in matched if t in hits)
         rarity[t] = math.log(n / df) / math.log(n) if df and n > 1 else 1.0
+    total_rarity = sum(rarity.values())
     scored: list[tuple[int, str, str, list[str]]] = []
     for name, text, lower, hits in matched:
         if not hits:
             continue
+        # A page that misses a rare query word answers less of the question,
+        # so the word part shrinks by that word's share of the query's rarity.
+        # Its name matching other words ("task-runner" for "run a task in the
+        # background") then cannot outrank a page that holds every word, while
+        # a missed common word ("use") costs almost nothing.
+        held = sum(rarity[t] for t in hits) / total_rarity if total_rarity else 1.0
         lname = name.lower()
         # The page name, then its title and opening lines, say what it is about.
         head = lower[:_DOCS_HEAD_CHARS]
@@ -691,7 +705,7 @@ def search_docs(query: str = "", page: str = "", offset: int = 0) -> dict[str, A
             )
             n_whole = len(w.findall(lower))
             count += rarity[t] * (n_whole + 0.5 * (len(t.findall(lower)) - n_whole))
-        score = round(score) + min(round(count), 99)
+        score = round(score * held) + min(round(count), 99)
         lines = [
             ln.strip()[:_DOCS_LINE_CHARS]
             for ln in text.splitlines()
@@ -717,6 +731,9 @@ _LIVE_MAX_TARGETS = 16
 #: How long ``find_ui`` waits for the gateway to say which language the user's
 #: dashboard shows (an in-memory read; no tab is asked).
 _UI_LANG_WAIT_SECONDS = 1.0
+#: How long ``get_member_capabilities`` waits for its route: past the route's
+#: own 20 s deadline on the read (``_bounded_read.GET_TIMEOUT_SECS``).
+_MEMBER_CAPABILITIES_WAIT_SECONDS = 30.0
 
 
 def _dashboard_ui_lang() -> str | None:
@@ -983,11 +1000,19 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
     if name == "find_setting":
         query = urllib.parse.urlencode({"q": args.get("query") or ""})
         d = _get(f"/api/cards/agent/settings?{query}", session_key=sk)
-        return _error_for(name, d) or _render({"settings": d.get("settings") or []})
+        return _error_for(name, d) or _render(
+            {"settings": d.get("settings") or [], "next": _FIND_SETTING_NEXT}
+        )
 
     if name == "get_member_capabilities":
         query = urllib.parse.urlencode({"member": args.get("member") or ""})
-        d = _get(f"/api/cards/agent/capabilities?{query}", session_key=sk)
+        # Past the route's own deadline on the read, so a slow Bot answers with
+        # the route's timed-out explanation instead of a bare transport timeout.
+        d = _get(
+            f"/api/cards/agent/capabilities?{query}",
+            session_key=sk,
+            timeout=_MEMBER_CAPABILITIES_WAIT_SECONDS,
+        )
         return _error_for(name, d) or _render(d)
 
     if name == "diagnose_settings":

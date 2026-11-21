@@ -12,7 +12,9 @@ then fence it from every agent, the same two a core write-protected crew-home le
 * **The file-edit tool gate.** ``security.paths.sensitive_write_path_refusal`` refuses an
   agent tool's write under every declared directory, at both data-home prefixes and a
   relocated home, exactly as it refuses one under a ``_WRITE_PROTECTED_HOME_PATHS`` row.
-  Reads stay open, as for that row.
+  Reads stay open, as for that row. Where an installed app's declaration cannot be
+  read cleanly, the gate refuses writes under that app's whole data directory (both
+  places), and an ``apps/`` it cannot list refuses writes under ``apps/``.
 * **The OS sandbox, in every mode.** The sandbox seals each declared directory read-only
   as it seals a core ``READONLY`` crew-home leaf: a read-only bind on Linux (made first
   when absent, so the seal is never vacuous), a write and link deny on Seatbelt, with every
@@ -58,25 +60,29 @@ def declaration_errors(value: object) -> list[str]:
 
 
 def mask_conflict_errors(dirs: object, masks: object) -> list[str]:
-    """Errors for ``agentReadOnlyDirs`` entries at or beneath a ``credentialMasks`` file.
+    """Errors for ``agentReadOnlyDirs`` entries at or beneath a ``credentialMasks`` entry.
 
-    A credential mask names a FILE, and the sandbox creates an absent read-only directory
-    so it can seal it, so such an entry would put a directory where the mask expects a
-    file and refuse every sandboxed spawn. A directory that holds a masked file is fine:
-    the seal is placed first and the mask on top of it.
+    A credential mask file entry names a FILE, and the sandbox creates an absent read-only
+    directory so it can seal it, so such an entry would put a directory where the mask
+    expects a file and refuse every sandboxed spawn. A masked directory (``"state/"``)
+    already hides everything beneath it from every agent, so a read-only directory there
+    seals nothing an agent can see. A directory that holds a masked file is fine: the seal
+    is placed first and the mask on top of it.
     """
-    files = valid_entries(masks)
+    masked = [
+        (mask, credential_masks.entry_path(mask)) for mask in credential_masks.valid_entries(masks)
+    ]
     return [
-        f"{MANIFEST_KEY}[{index}] must not be or sit beneath a credentialMasks file ({mask})"
+        f"{MANIFEST_KEY}[{index}] must not be or sit beneath a credentialMasks entry ({mask})"
         for index, entry in enumerate(valid_entries(dirs))
-        for mask in files
-        if entry == mask or entry.startswith(mask + credential_masks.ENTRY_SEPARATOR)
+        for mask, path in masked
+        if entry == path or entry.startswith(path + credential_masks.ENTRY_SEPARATOR)
     ]
 
 
 def valid_entries(value: object) -> tuple[str, ...]:
     """The admissible entries of *value*, deduplicated in declaration order."""
-    return credential_masks.valid_entries(value)
+    return credential_masks.valid_entries(value, kind=KIND)
 
 
 def declared_dirs(*, builtin: bool = True, installed: bool = True) -> dict[str, tuple[str, ...]]:
@@ -112,13 +118,24 @@ def write_protected_home_paths() -> tuple[str, ...]:
 
     The shape of a ``_WRITE_PROTECTED_HOME_PATHS`` row, so the gate anchors and
     re-anchors them (``KIROCREW_HOME``) exactly as it does a core row.
+
+    The shipped built-ins' declarations, plus the installed apps' as the strict reader
+    gives them (:func:`kiro_crew.apps.credential_masks.tool_gate_crew_leaves`): where an
+    installed declaration cannot be read cleanly, that app's whole data directory (at
+    both places) is a row, and an ``apps/`` that cannot be listed is one.
     """
     # Imported at call time, so loading this module never loads the security package.
     from kiro_crew.security.paths_lists import _CREW_HOME_PREFIXES
 
-    return tuple(
-        f"{prefix}/{leaf}" for leaf in declared_crew_leaves() for prefix in _CREW_HOME_PREFIXES
+    installed = credential_masks.tool_gate_crew_leaves(KIND)
+    leaves = sorted(
+        {
+            *credential_masks.declared_crew_leaves(installed=False, kind=KIND),
+            *installed.declared,
+            *installed.unreadable,
+        }
     )
+    return tuple(f"{prefix}/{leaf}" for leaf in leaves for prefix in _CREW_HOME_PREFIXES)
 
 
 def remember_declaration(app: str) -> None:

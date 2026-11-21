@@ -695,6 +695,8 @@ class TestKiroPrerequisiteHandlers:
             assert body["probe_timed_out"] is False
             # Whether the host has unzip is host state too, redacted the same way.
             assert body["unzip_missing"] is False
+            # So is how the host is deployed (a workload identity).
+            assert body["container_boundary_hint"] is False
             # The pre-upgrade-tab shim is served to every caller, so the payload
             # shape does not vary by who asks.
             assert body["operation"]["status"] == "idle"
@@ -1060,7 +1062,7 @@ class TestKiroCrewNeverSetsUpKiroCli:
         self,
         tmp_path: Path,
     ) -> None:
-        # No operation exists any more, but a dashboard loaded BEFORE this change
+        # No operation is reported, but a dashboard tab loaded from an older build
         # reads status.operation.status unconditionally (its optional chain guards
         # `status`, not `operation`) in a callback that runs for EVERY user. A tab
         # open across a gateway upgrade must not throw on its next poll, so the

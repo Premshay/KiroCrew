@@ -33,18 +33,21 @@ from kiro_crew.messaging.cards import (
 from kiro_crew.messaging.renderer import display_safe_for
 from kiro_crew.messaging.transport import TransportCapabilities
 from kiro_crew.platform.context import redact_via_context
+from kiro_crew.testing import synthetic_credentials
 
 #: The module, not the ``render`` function the package exports under its name.
 render_mod = importlib.import_module("kiro_crew.messaging.cards.render")
 LIVE_MENTION = re.compile(r"<[!@#][A-Za-z]")
-KEY = "AKIAIOSFODNN7EXAMPLE"
+#: A Google API key by its published format (``AIza`` and 35 letters and digits),
+#: so no piece of it is markup; a bare 40-character run is no credential by itself.
+KEY = "AIza" + synthetic_credentials.synth(35, seed=17)
 HOSTILE = (
     f"key {KEY} here",
     "<!channel> and <!here> and <@U012ABC>",
     "@everyone look",
     "&amp;#65;&#x4B;&lt;b&gt;",
     "```closing fence``` and `` pairs",
-    f"**AKIA**{KEY[4:]}",
+    f"**{KEY[:4]}**{KEY[4:]}",
     "plain & simple <tag>",
 )
 NO_MENTIONS = TransportCapabilities(mention_grammars=False)
@@ -103,7 +106,7 @@ class TestRedactionProperty:
             assert all(shown[i + 1 : i + 2] == "\u200b" for i, c in enumerate(shown) if c == "@")
 
     def test_a_key_split_across_runs_is_redacted(self) -> None:
-        for s in _strings(render(_card("AKIAIOSF", "ODNN7EXAMPLE"), Platform.SLACK).blocks):
+        for s in _strings(render(_card(KEY[:8], KEY[8:]), Platform.SLACK).blocks):
             assert KEY not in s
 
     def test_a_broadcast_split_across_runs_is_defused(self) -> None:
@@ -239,7 +242,9 @@ class TestLimits:
         assert f"{field if field != 'block_id' else 'id'} too_long" in caplog.text
 
     def test_redaction_can_push_text_over_the_cap(self) -> None:
-        secret = f"x {KEY} y"
+        # A credential shorter than the placeholder, so redacting it grows the text.
+        short_key = "xoxb-" + "1234567890-0987"
+        secret = f"x {short_key} y"
         grown = display_safe_for(secret, TransportCapabilities(), redactor=redact_via_context)
         assert len(grown) > len(secret), "the placeholder must be longer than the key it replaces"
         text = "a" * (SLACK_LIMITS.section_text - len(secret)) + secret

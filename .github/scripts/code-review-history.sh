@@ -21,7 +21,8 @@
 #
 # Every network read happens in this script, which fails the step when a fetch
 # fails or any object of the four commits is still missing at the end. The
-# later steps read the commit graph and those four commits' files only, so
+# later steps read the commit graph, the trees of that history (the wheel-copy
+# drift guard compares two of them) and those four commits' files only, so
 # they never fetch. A fetch there that failed would read as an empty diff, and
 # a rule grep would pass.
 #
@@ -73,7 +74,7 @@ if ! retry fetch_history; then
     "fetched without credentials, so the repository must be public or readable without them."
   exit 1
 fi
-# A history still shallow here would give a wrong merge-base and commit count.
+# A history still shallow here would give a wrong merge-base.
 if [ "$(git rev-parse --is-shallow-repository)" != false ]; then
   echo "::error::The history of $BASE_TIP and $HEAD_SHA is still shallow after the fetch"
   exit 1

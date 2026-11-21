@@ -290,17 +290,71 @@ def _public_tunnel_provider(cfg: "KiroCrewConfig") -> "TunnelProvider":
     The no-op :class:`DefaultTunnelProvider`, unless ``tunnel.relay_enabled`` turns
     on the Kiro relay client. A companion composes its own context and its own
     provider, so it never reaches this choice. The relay client is imported only
-    when the setting is on, so a process composing the defaults with the relay off,
-    a short-lived hook among them, never loads it.
+    when a tunnel starts or its status is read (:class:`LazyRelayTunnelProvider`),
+    so a process composing the defaults, a short-lived hook among them, never
+    loads it.
     """
     from kiro_crew.edition_locks import relay_selected
 
     if not relay_selected(cfg):
         return DefaultTunnelProvider()
-    from kiro_crew.relay_client.provider import public_tunnel_provider
+    return LazyRelayTunnelProvider(cfg)
 
-    provider: "TunnelProvider" = public_tunnel_provider(cfg)
-    return provider
+
+class LazyRelayTunnelProvider:
+    """The Kiro relay client's provider, imported on its first ``start`` or status read.
+
+    The relay is on by default for a personal sign-in, and this root also backs
+    every short-lived process (a hook, an MCP server, a CLI command), which never
+    starts a tunnel. Until then it answers as the relay provider does with no
+    client: no status, no URL, ``disabled``.
+    """
+
+    #: Marks the Kiro relay's provider, as ``RelayTunnelProvider.kiro_relay`` does.
+    kiro_relay = True
+
+    def __init__(self, cfg: "KiroCrewConfig") -> None:
+        self._cfg = cfg
+        self._loaded: "TunnelProvider | None" = None
+        self._callbacks: dict[str, Any] = {}
+
+    def loaded(self) -> "TunnelProvider":
+        """The relay provider, built on first use."""
+        if self._loaded is None:
+            from kiro_crew.relay_client.provider import public_tunnel_provider
+
+            self._loaded = public_tunnel_provider(self._cfg)
+            if self._callbacks:
+                self._loaded.register_callbacks(**self._callbacks)
+        return self._loaded
+
+    async def start(self) -> None:
+        await self.loaded().start()
+
+    async def stop(self) -> None:
+        if self._loaded is not None:
+            await self._loaded.stop()
+
+    def public_url(self) -> str:
+        return self._loaded.public_url() if self._loaded is not None else ""
+
+    def enabled(self) -> bool:
+        # Built only once relay_selected said yes, which is what the provider's
+        # own settings answer (RelaySettings.from_config).
+        return True
+
+    def register_callbacks(self, **callbacks: Any) -> None:
+        self._callbacks = callbacks
+        if self._loaded is not None:
+            self._loaded.register_callbacks(**callbacks)
+
+    def status_snapshot(self) -> "dict[str, Any] | None":
+        return self.loaded().status_snapshot()
+
+    async def ensure_available(self, *, install: bool = True) -> str:
+        if self._loaded is None:
+            return "disabled"
+        return await self._loaded.ensure_available(install=install)
 
 
 def build_default_context(
@@ -386,9 +440,14 @@ def _refresh_stt_for_edition(cfg: "KiroCrewConfig") -> None:
     Best-effort: a failure leaves the built-in answer, which is a working
     (conservative) setting, rather than aborting boot.
     """
+    from kiro_crew.config.superseded_defaults import take_deferred_rows
     from kiro_crew.speech_providers import edition_changes_stt
 
-    if not edition_changes_stt():
+    # A pre-boot load that left the stt.language_code row unjudged needs this
+    # reload too, even when the edition keeps the built-in providers: the reload
+    # is the load that reports it.
+    deferred = take_deferred_rows()
+    if not edition_changes_stt() and not deferred:
         return
     try:
         from kiro_crew.config.loader import KiroCrewConfig, _invalidate_config_cache
@@ -552,6 +611,19 @@ def _unknown_verdict_reason(*, start: bool = False) -> str:
     return f"`{binary} acp --help` did not run"
 
 
+def _gap_reason(reason: str) -> str:
+    """A help gap *reason* with the run it was read from, so a fallback notice says why.
+
+    Stats only; never raises.
+    """
+    from kiro_crew.agent_sdk.drivers.acp import kiro_cli_spawn_binary
+
+    binary = kiro_cli_spawn_binary()
+    if binary is None:
+        return reason
+    return f"{reason} (read from the help `{binary} acp --help` printed)"
+
+
 def apply_kas_cli_floor(
     cfg: "KiroCrewConfig", *, kas_defaulted: bool = False, kiro_selected: bool = False
 ) -> str | None:
@@ -635,6 +707,7 @@ def apply_kas_cli_floor(
 
     offers_kas, reason = kas_engine_verdict()
     start_unknown = False
+    from_help = True
     if offers_kas:
         # The help lists v3 even where kiro-cli then refuses to run it. The user's
         # own pick moves only on proof the engine runs here (one start per kiro-cli
@@ -644,6 +717,7 @@ def apply_kas_cli_floor(
         if kiro_pick or started is False:
             offers_kas, reason = started, refusal
             start_unknown = started is None
+            from_help = False
     if offers_kas:
         # Positive evidence only: from here a Kiro CLI pick moves to the KAS path
         # (``KIRO_SELECTION_BACKEND``), including one the user makes later in this
@@ -667,7 +741,9 @@ def apply_kas_cli_floor(
         # session on KAS is refused at its own start; only a Kiro CLI pick's notice holds.
         if not kiro_pick:
             return None
-        notice = KAS_CLI_FLOOR_KIRO_NOTICE.format(reason=reason)
+        notice = KAS_CLI_FLOOR_KIRO_NOTICE.format(
+            reason=_gap_reason(reason) if from_help else reason
+        )
         logger.warning(notice)
         return notice
     if not kiro_pick and kas_bundle.kas_route().bundle:
@@ -678,15 +754,16 @@ def apply_kas_cli_floor(
         return None
     mark_backend_unservable(ACP_BACKEND_KAS, reason)
     agent.acp_backend = resolve_selected_backend(agent.acp_backend)
+    shown = _gap_reason(reason) if from_help else reason
     parts = []
     if kiro_pick:
-        parts.append(KAS_CLI_FLOOR_KIRO_NOTICE.format(reason=reason))
+        parts.append(KAS_CLI_FLOOR_KIRO_NOTICE.format(reason=shown))
     if kas_roles:
         # A Bot's KAS fallback is a default nobody stored, so it gets the default wording.
         template = (
             KAS_CLI_FLOOR_DEFAULT_NOTICE if kas_defaulted or not named else KAS_CLI_FLOOR_NOTICE
         )
-        parts.append(template.format(reason=reason))
+        parts.append(template.format(reason=shown))
     notice = " ".join(parts)
     logger.warning(notice)
     return notice

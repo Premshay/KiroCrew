@@ -13,7 +13,7 @@ import type { ChatSlot } from '../../../types'
 interface SessionRostersOptions {
   activeSlot: string | null
   activeSlotProject: string | undefined
-  refreshTrigger: number
+  catalogRefreshTrigger: number
   slots: ChatSlot[]
   pendingAgent: string
   dispatch: AppDispatch
@@ -26,8 +26,10 @@ interface SessionRostersOptions {
  * session: this machine's catalog. Also the agent picker's filter state and its
  * "set as default" write.
  */
-export function useSessionRosters({ activeSlot, activeSlotProject, refreshTrigger, slots, pendingAgent, dispatch, modelsBackend }: SessionRostersOptions) {
-  const { agents: installedAgents, displayAgents, choices: catalogChoices, displayChoices, defaultAgent } = useAgents(refreshTrigger, activeSlot ?? undefined, activeSlotProject)
+export function useSessionRosters({ activeSlot, activeSlotProject, catalogRefreshTrigger, slots, pendingAgent, dispatch, modelsBackend }: SessionRostersOptions) {
+  const { agents: installedAgents, displayAgents, choices: catalogChoices, displayChoices, defaultAgent } = useAgents(catalogRefreshTrigger, activeSlot ?? undefined, activeSlotProject)
+  // The picker's rows, unfolded, as the sidebar last loaded them: the session
+  // list marks a same-name pair's sessions from these (#19472).
   const sidebarChoices = displayChoices
   // What the chat sidebar tints its rows from: the last LOADED roster, so a
   // session switch (which empties `installedAgents` until the new slot's fetch

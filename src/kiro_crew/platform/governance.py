@@ -53,6 +53,7 @@ from typing import (
 
 from kiro_crew import edition
 from kiro_crew.config.paths import config_dir  # noqa: F401 - re-export
+from kiro_crew.constants import ENV_TRUTHY  # noqa: F401 - re-export
 from kiro_crew.mcp_provenance import is_marked
 from kiro_crew.platform.admission import (  # noqa: F401 - re-export
     canonical_signing_bytes,
@@ -77,7 +78,11 @@ from kiro_crew.platform.tool_paths import (  # noqa: F401 - re-export
     target_paths,
 )
 from kiro_crew.sel import sel
-from kiro_crew.session_environment import WORKSPACE_SERVER_NAME, WORKSPACE_TOOL_KINDS  # noqa: F401
+from kiro_crew.session_environment import (  # noqa: F401
+    CONNECTED_MCP_SERVER_PREFIX,
+    WORKSPACE_SERVER_NAME,
+    WORKSPACE_TOOL_KINDS,
+)
 
 # isort: split
 from kiro_crew import _facade_mirror
@@ -282,11 +287,33 @@ def may_skip_gate(ref: str, ceiling: Optional[GovernanceCeiling]) -> bool:
     # whole-server and wildcard grants that would bypass those same checks.
     if ref.split("/", 1)[0] == f"@{WORKSPACE_SERVER_NAME}":
         return False
+    # A connected computer's exposed local MCP server acts on the user's own
+    # computer, so its calls always meet the gate and its approval. With that
+    # preview off no such server exists, and a person's own
+    # `connected-computer-*` server keeps the answer it had before the preview.
+    if (
+        ref.split("/", 1)[0].startswith(f"@{CONNECTED_MCP_SERVER_PREFIX}")
+        and _connected_computers_may_run()
+    ):
+        return False
     if not ref.startswith("@") and _FLOOR_GATE_SCOPES.intersection(
         BUILTIN_TOOL_SCOPES.get(ref, ())
     ):
         return False
     return _ceiling_has_no_say(ref, ceiling)
+
+
+def _connected_computers_may_run() -> bool:
+    """Whether a ``connected-computer-*`` server may be a connected computer's here.
+
+    Read from the live snapshot only, since this runs on every tool call. With no
+    snapshot the answer is True, the side that keeps the gate.
+    """
+    from kiro_crew.config import live
+    from kiro_crew.connected_computers.flag import preview_on
+
+    snap = live.snapshot()
+    return snap is None or preview_on(snap)
 
 
 def _commands_only_pin_the_floor(control: object) -> bool:
@@ -1268,6 +1295,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     )
     from kiro_crew.platform.governance_parts.baseline import (  # noqa: F401
         _CAPABILITY_OFF,
+        _DECISION_PROVIDERS,
         _OFF,
         _OPEN,
         _PUBLISH_LISTS_OFF,
@@ -1282,6 +1310,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _AGENTCORE_POLICY_ONLY,
         _AGENTCORE_POSTURES,
         _AGENTCORE_SCOPE,
+        _POLICY_DISTRIBUTION_CACHE_ONLY_ENV,
         _POLICY_DISTRIBUTION_HEADERS_ENV,
         _POLICY_DISTRIBUTION_URL_ENV,
         _TELEMETRY_OTLP_ENDPOINT,
@@ -1324,6 +1353,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _SCOPE_ALIASES,
         CAPABILITY,
         COMMANDS_SCOPE,
+        RETIRED_SCOPES,
         RULESET,
         SCOPEDMAP,
         ScopeSpec,
@@ -1356,6 +1386,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _canonical_ip,
         _expand,
         _looks_like_host,
+        _Marker,
         _match_command,
         _match_denied_path,
         _match_host,
@@ -1409,7 +1440,6 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         policy_signing_payload,
     )
     from kiro_crew.platform.governance_parts.tiers import (  # noqa: F401
-        _POLICY_DISTRIBUTION_CACHE_ONLY_ENV,
         _POLICY_ENV,
         _POLICY_HOME_LEAF,
         _SLACK_CHANNEL_LEAF,
@@ -1454,6 +1484,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _KIND_FETCH,
         _KIND_READ,
         _NO_TARGET_ITEM,
+        _NO_WRITE_TARGET_ITEM,
         _PATH_ARG_KEYS,
         _READING_PREFIX,
         _RUNNING_PREFIX,

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from redaction_structured_cases import github_classic
 from subagent_persistence_helpers import (  # noqa: F401 -- the fixture is requested by name
     agent_root_fixture,
 )
@@ -213,7 +214,7 @@ class TestOrphanReconciliation:
         # straddles the 80-char boundary would otherwise be cut into a fragment too
         # short for the PAT rule, which the later whole-message redaction cannot
         # match, and its prefix would ship in the notice and the digest DM.
-        token = "ghp_" + "a" * 40
+        token = github_classic(seed=25)
         with patch.object(
             manager, "_try_inject_orphan_notification", AsyncMock(return_value=False)
         ):
@@ -558,10 +559,22 @@ class TestOrphanNotification:
     @pytest.mark.parametrize(
         "whole, has_result, header, outcome, tail",
         [
-            (True, True, "✅ finished before gateway restart", "ok", "Use the read tool"),
-            (True, False, "✅ finished before gateway restart", "ok", "without writing any text"),
-            (False, True, "⚠️ cut off mid-turn by gateway restart", "interrupted", "fragment"),
-            (False, False, "❌ lost to gateway restart", "failed", "No result was captured"),
+            (True, True, "completed: finished before gateway restart", "ok", "Use the read tool"),
+            (
+                True,
+                False,
+                "completed: finished before gateway restart",
+                "ok",
+                "without writing any text",
+            ),
+            (
+                False,
+                True,
+                "interrupted: cut off mid-turn by gateway restart",
+                "interrupted",
+                "fragment",
+            ),
+            (False, False, "failed: lost to gateway restart", "failed", "No result was captured"),
         ],
     )
     async def test_the_notice_follows_the_run_record(

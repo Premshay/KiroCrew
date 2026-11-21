@@ -15,7 +15,9 @@ import pathlib
 
 import pytest
 
+from kiro_crew import model_registry
 from kiro_crew.config import loader as L
+from kiro_crew.config import resolution as _resolution
 from kiro_crew.config.loader import KiroCrewConfig
 
 
@@ -91,6 +93,84 @@ def test_several_sections_at_once(cfg_home):
     assert d["agent"]["gone_a"] == 1
     assert d["session"]["gone_b"] == "two"
     assert d["telemetry"]["gone_c"] == {"nested": True}
+
+
+def test_repeated_loads_of_an_unchanged_file_log_each_line_once(cfg_home, caplog):
+    """The gateway loads config several times a second. An unchanged file names its
+    unmodelled keys, and an unregistered model id it sets, on the first load only;
+    a key set the file did not carry before is named when it appears."""
+    _write(
+        cfg_home,
+        {
+            "agent": {"fallback_model": "unregistered-model-for-this-test"},
+            "dashboard": {"legacy_toggle": True},
+            "agents": {"my-agent": {"model": "auto", "retired_flag": True}},
+        },
+    )
+    loggers = ("kiro_crew.config.loader", model_registry.__name__)
+
+    def lines() -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.name in loggers]
+
+    with caplog.at_level(logging.DEBUG, logger=loggers[0]):
+        with caplog.at_level(logging.DEBUG, logger=loggers[1]):
+            for _ in range(4):
+                KiroCrewConfig.load()
+            first = lines()
+            doc = json.loads(cfg_home.read_text(encoding="utf-8"))
+            doc["dashboard"]["another_toggle"] = 1
+            _write(cfg_home, doc)
+            KiroCrewConfig.load()
+            KiroCrewConfig.load()
+
+    assert (
+        first.count("config: preserving unmodelled dashboard key(s) on round-trip: legacy_toggle")
+        == 1
+    )
+    assert (
+        first.count(
+            "config: preserving unmodelled agents record key(s) on round-trip: my-agent.retired_flag"
+        )
+        == 1
+    )
+    assert (
+        first.count(
+            "Model 'unregistered-model-for-this-test' not in registry for provider acp; passing through"
+        )
+        == 1
+    )
+    assert (
+        lines()[len(first) :].count(
+            "config: preserving unmodelled dashboard key(s) on round-trip: another_toggle, legacy_toggle"
+        )
+        == 1
+    )
+
+
+def test_the_unmodelled_key_log_memory_is_bounded(monkeypatch, caplog):
+    """A config write can carry any key names, so neither the number of remembered key
+    sets nor the size of one can grow with the input."""
+    monkeypatch.setattr(_resolution, "_LOGGED_EXTRA_KEY_SETS_MAX", 2, raising=False)
+    cfg = KiroCrewConfig()
+    with caplog.at_level(logging.DEBUG, logger="kiro_crew.config.loader"):
+        for i in range(5):
+            _resolution.capture_extra_section_keys({"dashboard": {f"gone_{i}": 1}}, cfg)
+        _resolution.capture_extra_section_keys({"dashboard": {"k" * 100_000: 1}}, cfg)
+    assert 0 < len(_resolution._logged_extra_key_sets) <= 2
+    assert all(len(repr(entry)) < 200 for entry in _resolution._logged_extra_key_sets)
+
+
+def test_a_load_while_debug_is_off_does_not_silence_a_later_one(cfg_home, caplog):
+    """A gateway loads its config before it raises the log level, so a load the level
+    filtered out must not count as having named the keys."""
+    _write(cfg_home, {"dashboard": {"legacy_toggle": True}})
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
+        KiroCrewConfig.load()
+    with caplog.at_level(logging.DEBUG, logger="kiro_crew.config.loader"):
+        KiroCrewConfig.load()
+        KiroCrewConfig.load()
+    line = "config: preserving unmodelled dashboard key(s) on round-trip: legacy_toggle"
+    assert [r.getMessage() for r in caplog.records].count(line) == 1
 
 
 # ── What must NOT be captured ──────────────────────────────────────────────
@@ -407,6 +487,62 @@ def test_the_retired_conductor_skill_flag_is_purged(cfg_home):
     written = cfg.to_dict()["agent"]
     assert "conductor_skill" not in written
     assert written["subagent_max_turns"] == 42
+
+
+def _seed_retired_cpu_cost_and_layout_switch(cfgp) -> None:
+    _write(
+        cfgp,
+        {
+            "agent": {"subagent_cpu_cost_cores": 0.8, "subagent_max_turns": 42},
+            "dashboard": {"feature_previews": {"layout_harness": True, "explore": True}},
+        },
+    )
+
+
+def _assert_retired_cpu_cost_and_layout_switch_dropped(cfgp) -> dict:
+    written = json.loads(cfgp.read_text(encoding="utf-8"))
+    assert "subagent_cpu_cost_cores" not in written["agent"]
+    assert written["agent"]["subagent_max_turns"] == 42
+    assert written["dashboard"]["feature_previews"] == {"explore": True}
+    return written
+
+
+def test_the_retired_cpu_cost_and_layout_switch_load_and_drop_on_save(cfg_home, caplog):
+    """``agent.subagent_cpu_cost_cores`` sized nothing and the ``layout_harness``
+    preview switch gated nothing. A config that still carries them loads with no
+    warning and no degraded section, and the next save writes neither."""
+    _seed_retired_cpu_cost_and_layout_switch(cfg_home)
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
+        cfg = KiroCrewConfig.load()
+    assert cfg.degraded_sections == frozenset()
+    assert "agent" not in cfg._extra_keys
+    assert not hasattr(cfg.agent, "subagent_cpu_cost_cores")
+    assert cfg.dashboard.feature_previews == {"explore": True}
+    assert not [r for r in caplog.records if "subagent_cpu_cost_cores" in r.getMessage()]
+
+    cfg.save()
+    _assert_retired_cpu_cost_and_layout_switch_dropped(cfg_home)
+
+
+@pytest.mark.asyncio
+async def test_a_settings_patch_drops_the_retired_cpu_cost_and_layout_switch(cfg_home):
+    """The Settings PATCH edits the raw document, not through save()."""
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    from dashboard_owner_helpers import as_owner
+
+    from kiro_crew.dashboard.handlers import api_kirocrew_config_patch
+
+    _seed_retired_cpu_cost_and_layout_switch(cfg_home)
+    app = web.Application()
+    app.router.add_patch("/api/config/kirocrew", api_kirocrew_config_patch)
+    async with TestClient(TestServer(as_owner(app))) as c:
+        resp = await c.patch(
+            "/api/config/kirocrew",
+            json={"path": "dashboard.feature_previews.explore", "value": True},
+        )
+        assert resp.status == 200, await resp.text()
+    _assert_retired_cpu_cost_and_layout_switch_dropped(cfg_home)
 
 
 def test_the_retired_browser_keys_are_dropped_with_one_warning(cfg_home, caplog):

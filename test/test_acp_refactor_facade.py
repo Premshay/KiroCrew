@@ -30,6 +30,7 @@ from typing import Any, Callable
 from unittest import mock
 
 import pytest
+import source_corpus
 import test_acp_refactor_create_guard as create_guard
 
 import kiro_crew.acp as acp_package
@@ -243,6 +244,7 @@ _MOVED: dict[str, dict[str, tuple[str, ...]]] = {
             "_resolve_claude_acp_bin",
             "_resolve_claude_code_executable",
             "_claude_adapter_installed_version",
+            "_claude_adapter_known_version",
         ),
         "kiro_crew.acp.harness.opencode": (
             "_OPENCODE_LAUNCH",
@@ -1181,6 +1183,7 @@ def test_the_runtime_star_import_is_the_declared_list(tmp_path: Path) -> None:
         "AcpRuntimeDead",
         "AcpRequestTimeout",
         "AcpRuntimeOverloaded",
+        "AcpScopeAdmissionTimeout",
         "SessionStartGate",
         "StartCollector",
         "AcpRuntimeProtocol",
@@ -1737,16 +1740,17 @@ def _facade_patches() -> tuple[tuple[str, int, str, str, str], ...]:
     repo = _SRC.parents[2]
     roots = [repo / "test", *sorted((repo / "src" / "kiro_crew").rglob("tests"))]
     patches: list[tuple[str, int, str, str, str]] = []
-    for root in roots:
-        for path in sorted(root.rglob("*.py")):
-            text = path.read_text(encoding="utf-8")
-            if not create_guard._worth_parsing(text):
-                continue
-            relative = path.relative_to(repo).as_posix()
-            patches.extend(
-                (relative, line, where, facade, name)
-                for line, where, facade, name in _monkeypatch_targets(ast.parse(text))
-            )
+    with source_corpus.untraced():
+        for root in roots:
+            for path in sorted(root.rglob("*.py")):
+                text = path.read_text(encoding="utf-8")
+                if not create_guard._worth_parsing(text):
+                    continue
+                relative = path.relative_to(repo).as_posix()
+                patches.extend(
+                    (relative, line, where, facade, name)
+                    for line, where, facade, name in _monkeypatch_targets(ast.parse(text))
+                )
     return tuple(patches)
 
 
@@ -1779,6 +1783,10 @@ _THIS_FILE = Path(__file__).resolve().relative_to(_SRC.parents[2]).as_posix()
 _UNRESOLVED_FACADE_PATCHES: dict[tuple[str, str], int] = {
     ("test/acp_launch_capture.py", "_capture_runtime_served"): 2,
     ("test/acp_launch_capture.py", "_stub_common"): 4,
+    # The floor's loops over its binding tables; naming ``kiro_crew.acp.client`` in
+    # ``_KIRO_CLI_DIR_BINDINGS`` brings the whole file into this scan.
+    ("test/conftest_floor_home.py", "_hide_the_operators_kiro_cli"): 1,
+    ("test/conftest_floor_home.py", "_isolate_shared_kiro_paths"): 1,
     ("test/test_acp_pod_home_remap.py", "_remap_calls"): 1,
     ("test/test_facade_mirror_guards.py", "patch_reach_failures"): 2,
     ("test/test_harness_parity.py", "test_is_kiro_cli_is_positive"): 2,

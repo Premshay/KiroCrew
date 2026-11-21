@@ -72,7 +72,6 @@ class TestResolver:
             # A Crew bot chat could run here, but its workers could not carry their
             # kit (``worker_kit_backend_refusal``), so inheriting it would refuse
             # every worker the Crew bot opens.
-            "pi",
             "deepseek",
         ],
     )
@@ -80,6 +79,12 @@ class TestResolver:
         from kiro_crew.agent_sdk.backends import crewmate_inherited_backend
 
         assert crewmate_inherited_backend(harness) == ("kas", True)
+
+    def test_pi_carries_the_worker_kit_so_it_is_inherited(self):
+        """pi's worker capture landed (RFC 5.4), so a Settings harness of pi runs Bots on pi."""
+        from kiro_crew.agent_sdk.backends import crewmate_inherited_backend
+
+        assert crewmate_inherited_backend(acp_backends.ACP_BACKEND_PI) == ("pi", False)
 
 
 class TestLoadedField:
@@ -915,7 +920,7 @@ class TestColdStartRefresh:
 
         source = inspect.getsource(get_or_create._get_or_create_impl)
         refresh = source.index("await refresh_session_verdict(key)")
-        assert refresh < source.index("provider = factory(")
+        assert refresh < source.index("provider = build_provider()")
 
 
 class TestChatOnlyPin:
@@ -928,7 +933,7 @@ class TestChatOnlyPin:
         _floor_monkeypatch.setattr(crewmate_harness_notice, "_announced", set())
         _floor_monkeypatch.setattr(crewmate_harness, "_pin_fallback_logged", set())
 
-    @pytest.mark.parametrize("pinned", ["goose", "opencode", "strands", "pi", "deepseek"])
+    @pytest.mark.parametrize("pinned", ["goose", "opencode", "strands", "deepseek"])
     def test_chat_only_pins_keep_their_harness(self, pinned):
         from kiro_crew.crewmate_harness import crewmate_backend_pin, pinned_backend
 
@@ -937,7 +942,7 @@ class TestChatOnlyPin:
         assert pin is not None and pin.backend == pinned and not pin.harness_fallback
         assert pinned_backend(cfg, "atlas", "claude") == pinned
 
-    @pytest.mark.parametrize("pinned", ["claude", "codex", "kas"])
+    @pytest.mark.parametrize("pinned", ["claude", "codex", "kas", "pi"])
     def test_a_pin_bots_can_run_on_is_kept(self, pinned):
         from kiro_crew.crewmate_harness import crewmate_backend_pin
 

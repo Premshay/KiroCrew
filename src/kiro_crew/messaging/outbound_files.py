@@ -118,11 +118,12 @@ from kiro_crew.hooks import (
 from kiro_crew.messaging.raster import SNIFF_BYTES, sniff_raster_mime
 from kiro_crew.messaging.split import iter_fence_spans
 from kiro_crew.platform import binary_content_is_flagged
-from kiro_crew.platform_compat import is_link_or_junction
+from kiro_crew.platform_compat import is_link_or_junction, short_path_name
 from kiro_crew.security import (
     is_sensitive_path,
     redact_credentials,
     redact_exfiltration_urls,
+    refuses,
 )
 from kiro_crew.widget_parse import mask_inline_code
 
@@ -965,11 +966,21 @@ def containing_root(path: Path, within_root: str, scratch_root: str = "") -> App
     cannot land inside a root it names, and nothing here follows a link. The
     link cases belong to the read that follows, which is pinned to the root
     returned here and rechecks the opened descriptor's real path against it.
+
+    On Windows a reply may also spell the root by its 8.3 short name, which
+    ``GetFullPathNameW`` does not expand. The short spelling is asked of the
+    ROOT only, which comes from configuration, and only after the long compare
+    missed; a reply path is never probed. A reply that mixes long and short
+    components inside the root matches neither spelling and stays refused.
     """
     target = str(path)
     for root in approved_roots(within_root, scratch_root):
         if lexically_within(target, root.lexical, os.path):
             return root
+        if os.name == "nt":
+            short = short_path_name(root.lexical)
+            if short and short != root.lexical and lexically_within(target, short, os.path):
+                return root
     return None
 
 
@@ -1324,9 +1335,10 @@ def upload_filename(file: "OutboundFile", index: int = 0) -> str:
     stem = stem[: -len(Path(stem).suffix)] if Path(stem).suffix else stem
     stem = stem.strip("._")[:64]
     name = f"{stem or f'image_{index}'}.{ext}"
-    redacted, _ = redact_exfiltration_urls(name)
-    redacted, _ = redact_credentials(redacted)
-    return name if redacted == name else f"image_{index}.{ext}"
+    # A safety decision: it judges in full whatever the owner's redaction setting.
+    if refuses(name, lambda text: redact_credentials(redact_exfiltration_urls(text)[0])[0]):
+        return f"image_{index}.{ext}"
+    return name
 
 
 def extract_local_refs(

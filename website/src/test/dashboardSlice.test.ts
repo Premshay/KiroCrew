@@ -1,4 +1,6 @@
+import { configureStore } from '@reduxjs/toolkit'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { api } from '../api/client'
 import reducer, {
   sseStatus,
   setYoloDuration,
@@ -23,7 +25,6 @@ import reducer, {
 import type { StatusData, ChatSlot } from '../types'
 import { sharedItem } from './unreadStorageTestUtils'
 import { SHARED_UNREAD_FLUSH_MS, flushSharedUnread, relayedUnreadKeys } from '../store/dashboard/unread'
-import { crewModePreviewOn } from './crewModePreview'
 
 vi.mock('../api/client', () => ({
   api: { chatSlots: vi.fn(), chatMode: vi.fn() },
@@ -42,6 +43,25 @@ describe('dashboardSlice', () => {
     expect(initial.approvalMode).toBe('normal')
     expect(initial.refreshTrigger).toBe(0)
     expect(initial.unreadSlots).toEqual([])
+  })
+
+  it('fetchSlots leaves localStorage untouched', async () => {
+    vi.mocked(api.chatSlots).mockResolvedValue([slot1])
+    localStorage.setItem('sentinel', 'keep')
+    const getItem = vi.spyOn(Storage.prototype, 'getItem')
+    const setItem = vi.spyOn(Storage.prototype, 'setItem')
+    const removeItem = vi.spyOn(Storage.prototype, 'removeItem')
+    try {
+      const store = configureStore({ reducer: { dashboard: reducer } })
+      await store.dispatch(fetchSlots())
+      expect(getItem).not.toHaveBeenCalled()
+      expect(setItem).not.toHaveBeenCalled()
+      expect(removeItem).not.toHaveBeenCalled()
+    } finally {
+      getItem.mockRestore()
+      setItem.mockRestore()
+      removeItem.mockRestore()
+    }
   })
 
   describe('sseStatus', () => {
@@ -302,6 +322,34 @@ describe('dashboardSlice', () => {
         // chat-1 is listed again, so it counts again.
         state = reducer(state, sseSlots([slot1, slot2]))
         expect(lastCount()).toBe(2)
+      } finally {
+        if (realParent) Object.defineProperty(window, 'parent', realParent)
+      }
+    })
+
+    it('an embedded instance recounts when the Slack list setting stamps or unstamps a row', () => {
+      const posted: Array<{ type?: string; count?: number }> = []
+      const realParent = Object.getOwnPropertyDescriptor(window, 'parent')
+      Object.defineProperty(window, 'parent', {
+        value: { postMessage: (m: { type?: string; count?: number }) => { posted.push(m) } },
+        configurable: true,
+      })
+      try {
+        const channel = { ...slot1, key: 'slack_1.1', title: 'Slack thread' }
+        const lastCount = () => posted.filter(m => m.type === 'mc-unread-slots').at(-1)?.count
+        let state = reducer(initial, sseSlotsPartial(false))
+        state = reducer(state, sseSlots([slot1, channel]))
+        state = reducer(state, markSlotUnread('slack_1.1'))
+        expect(lastCount()).toBe(1)
+
+        // Turned off: no unread entry moves and no hold exists, yet the count drops.
+        state = reducer(state, sseSlots([slot1, { ...channel, slack_list_hidden: true }]))
+        expect(state.unreadSlots).toEqual(['slack_1.1'])
+        expect(lastCount()).toBe(0)
+
+        // Turned back on: the kept entry counts again.
+        state = reducer(state, sseSlots([slot1, channel]))
+        expect(lastCount()).toBe(1)
       } finally {
         if (realParent) Object.defineProperty(window, 'parent', realParent)
       }
@@ -1056,6 +1104,3 @@ describe('dashboardSlice per-slot unread teardown', () => {
     expect(next.unreadSlots).toEqual(['chat-1'])
   })
 })
-
-// Last, after the file's own hooks that clear localStorage: Crew Mode is a feature preview.
-crewModePreviewOn()

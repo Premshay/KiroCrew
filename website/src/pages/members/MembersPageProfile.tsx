@@ -29,6 +29,7 @@ import workerPoseB from '../../assets/ghost-poses/pose-6.svg'
 import { api, type MemberRosterRow } from '../../api/client'
 import { isNotFoundError } from '../../api/apiError'
 import { CREW_BOARD_POLL_MS, crewBoardQueryKey } from '../../api/crewBoard'
+import { timedPoll, usePollRule } from '../../lib/pollRule'
 import { retryPolicy } from '../../api/queryClient'
 import { crewDisplayName } from '../../components/AgentSelector'
 import { AUTONUDGE_LOOPS_QUERY_KEY } from '../../components/autoNudgeLoop'
@@ -484,12 +485,13 @@ function CrewPatrolRow({ loop, slotKey, nowTs, onBusyChange }: {
   onBusyChange?: (busy: boolean) => void
 }) {
   const queryClient = useQueryClient()
+  const boardInterval = usePollRule(`crew-board:${slotKey}`, CREW_BOARD_POLL_MS, true, crewBoardQueryKey(slotKey))
   const boardQuery = useQuery({
     queryKey: crewBoardQueryKey(slotKey),
-    queryFn: () => api.crewBoard(slotKey),
+    queryFn: () => timedPoll(`crew-board:${slotKey}`, () => api.crewBoard(slotKey)),
     enabled: !!slotKey,
     // Items close while the tab is open; the count follows at the board's cadence.
-    refetchInterval: CREW_BOARD_POLL_MS,
+    refetchInterval: boardInterval,
     retry: (failureCount, error) => !isNotFoundError(error) && retryPolicy(failureCount, error),
   })
   const openTasks = boardQuery.data
@@ -564,7 +566,7 @@ export function MembersPageProfileCard({
   const { isRunning, activeView } = rosterView
   const { activeSlot, freshStart, askFreshStart, confirmedSlot } = thread
   const {
-    profileCardW, openCrewView, activeMemberKey, drivingSessions,
+    profileCardW, openCrewView, activeMemberKey, drivingSessions, openSessionInPanel,
   } = sidePanel
   const {
     schedAgentField, profileGoalsQuery, schedulesCountQuery, schedulesForActive, setSchedDraftDirty,
@@ -588,6 +590,15 @@ export function MembersPageProfileCard({
     : patrolLoop
       ? <CrewPatrolRow key={patrolSlot} loop={patrolLoop} slotKey={patrolSlot} nowTs={nowTs} onBusyChange={setPatrolBusy} />
       : null
+  // What wakes this crewmate without being a schedule row: its goal check-ins
+  // (listed on the Goals tab) and its Heartbeat or patrol (rows above the list).
+  // Both empty lines below say so rather than "nothing wakes this bot".
+  const goalSchedules = profileGoalsQuery.data?.schedules
+  const heartbeatOn = !!goalSchedules?.heartbeat
+  const checkInsOn = !!(goalSchedules?.daily || goalSchedules?.weekly || goalSchedules?.monthly)
+  const schedulesEmptyLine = checkInsOn
+    ? t('pages.membersPage.schedule_none_check_ins')
+    : heartbeatOn || selfBody ? t('pages.membersPage.schedule_none_self_waking') : t('pages.membersPage.schedules_empty')
   // Notes — the crewmate's own standing notes, read-only (no editor:
   // see CrewNotesTab). Its briefing read is gated on the tab being on
   // screen, like the work log's reads.
@@ -622,6 +633,7 @@ export function MembersPageProfileCard({
         // name made every such crewmate read as having no schedules and hid
         // a job the moment it was created here. See `wakesCrew`.
         memberId={activeSlug}
+        memberStore={activeView?.memory_store}
         // The job's `agent` field, which has to be passed: `JobForm` falls back
         // to `''`, so omitting it persisted a created schedule with no agent at
         // all and `/schedule` labelled this crewmate's own job as the default
@@ -647,7 +659,7 @@ export function MembersPageProfileCard({
         dense
         heading={t('pages.membersPage.schedules_heading')}
         blurb={t('pages.membersPage.schedules_blurb')}
-        emptyLine={t('pages.membersPage.schedules_empty')}
+        emptyLine={schedulesEmptyLine}
         // The create form's pinned-crew hint names the crew EDITOR; this
         // page is the crewmate's Profile, so it says so in its own noun.
         pinnedHint={t('pages.membersPage.schedules_pinned_hint')}
@@ -658,8 +670,8 @@ export function MembersPageProfileCard({
     </div>
   ) : null
   // The card's Sessions tab: every session this crewmate dispatched, at any
-  // depth, in the Crew panel's groups. A click expands the row in place and
-  // shows its recap from records only; it never leaves the page.
+  // depth, in the Crew panel's groups. A click opens that session in the side
+  // panel's Sessions tab, so the two lists lead to one place.
   const sessionsEmpty = (
     // A first-time reader has no model for why a crewmate would open
     // sessions at all, so the empty box explains the mechanism in plain
@@ -687,6 +699,7 @@ export function MembersPageProfileCard({
         liveSlots={drivingSessions}
         slotsLoaded={slotsLoaded}
         empty={sessionsEmpty}
+        onOpen={(w) => openSessionInPanel(w.key)}
       />
     </div>
   )
@@ -751,7 +764,8 @@ export function MembersPageProfileCard({
       onOpenScheduleJob={(id) => { const destination = `/schedule?job=${encodeURIComponent(id)}`; leave(() => navigate(destination), destination) }}
       newScheduleBody={schedulesBody}
       heartbeatBody={activeSlug && activeMemberName ? <CrewHeartbeatRow slug={activeSlug} member={activeMemberName} onBusyChange={onHeartbeatBusyChange} /> : null}
-      heartbeatOn={!!profileGoalsQuery.data?.schedules?.heartbeat}
+      heartbeatOn={heartbeatOn}
+      checkInsOn={checkInsOn}
       heartbeatBusy={heartbeatBusy || patrolBusy}
       sessionsBody={sessionsBody}
       notesBody={notesBody}

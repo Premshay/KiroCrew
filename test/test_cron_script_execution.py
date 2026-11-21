@@ -18,6 +18,7 @@ from cron_script_helpers import (  # noqa: F401 -- the autouse fixtures register
     _cron_caller_is_named,
     _crons_dir_tracks_patched_home,
 )
+from redaction_structured_cases import github_classic
 
 from kiro_crew import platform_compat as pc
 from kiro_crew.cron_script import (
@@ -28,6 +29,9 @@ from kiro_crew.cron_script import (
 )
 
 pytestmark = pytest.mark.usefixtures("command_crons_run_here")
+
+#: A 40-char credential every redaction pass removes (an AWS key ID is kept visible).
+_SECRET = github_classic(seed=25)
 
 
 class TestResolveScriptPath:
@@ -133,6 +137,18 @@ class TestRunCommandSandboxed:
         result = run_command_sandboxed("echo err >&2; exit 1")
         assert "err" in result["output"]
 
+    def test_nonzero_exit_with_only_stderr_has_no_blank_run(self):
+        """An empty stdout is left out, not rendered as empty lines before stderr."""
+        result = run_command_sandboxed("printf '\\n\\nmissing\\n\\n' >&2; exit 127")
+        assert result["output"] == "Warning: Exit code 127\n\nstderr:\nmissing"
+        assert result["stdout"] == ""
+        assert result["stderr"] == "missing"
+
+    def test_nonzero_exit_reports_streams_apart(self):
+        result = run_command_sandboxed("printf '\\nhalf\\n\\n'; echo bad >&2; exit 2")
+        assert result["output"] == "Warning: Exit code 2\n\nhalf\n\nstderr:\nbad"
+        assert (result["stdout"], result["stderr"]) == ("half", "bad")
+
     def test_large_output_truncated(self):
         # Generate >64KB output
         result = run_command_sandboxed("head -c 70000 /dev/zero | tr '\\0' 'x'")
@@ -160,12 +176,14 @@ class TestRunCommandSandboxed:
         longer matches and the raw tail reaches the cron result.
         """
         # Built at runtime so no credential-shaped literal lands in the repo.
-        fake_key = "AKIA" + "B" * 16  # matches the AWS access-key-id pattern
+        fake_key = _SECRET
         # Sized so the 1000-char tail window starts 2 chars into the credential:
-        # a slice-then-redact order keeps "IA" + all 16 B's but drops the
-        # "AK" prefix, so the pattern does not match and the tail leaks.
-        padding = "p" * 100
-        trailing = "e" * 982
+        # a slice-then-redact order keeps all but the token's first 2 chars,
+        # so the pattern does not match and the tail leaks.
+        # Spaces bound the token: a GitHub token glued to more word characters
+        # is not read as the token.
+        padding = "p" * 99 + " "
+        trailing = " " + "e" * 961
         stderr_text = padding + fake_key + trailing
         assert len(stderr_text) - 1000 == len(padding) + 2
         mock_proc = MagicMock()
@@ -174,7 +192,7 @@ class TestRunCommandSandboxed:
         with patch("subprocess.Popen", return_value=mock_proc):
             result = run_command_sandboxed("boom")
         assert result["status"] == "error"
-        assert "B" * 16 not in result["output"]
+        assert fake_key[2:] not in result["output"]
         assert fake_key not in result["output"]
         # Positive proof the payload flowed through redaction (not a vacuous
         # pass on an empty result): the marker's tail survives the tail slice.
@@ -598,13 +616,13 @@ class TestRunScriptSandboxed:
             "import sys\n"
             'sys.stderr.write("W" * 900 + "\\n")\n'
             "sys.stderr.flush()\n"
-            'raise RuntimeError("boom AKIAIOSFODNN7EXAMPLE")\n',
+            f'raise RuntimeError("boom {_SECRET}")\n',
         )
         with patch("pathlib.Path.home", return_value=tmp_path):
             result = run_script_sandboxed(script_path + ":run", "test-job-id")
 
         assert result["status"] == "error"
-        assert "AKIAIOSFODNN7EXAMPLE" not in result["error"]
+        assert _SECRET not in result["error"]
         assert "[REDACTED" in result["error"]
 
     def test_a_credential_straddling_the_bound_does_not_leak_a_fragment(self, tmp_path):
@@ -614,17 +632,17 @@ class TestRunScriptSandboxed:
         so it would reach logs and ``last_error`` unmasked.
 
         Byte layout (written verbatim, ``os._exit`` so no traceback shifts
-        it): 300 noise + a 20-char AWS key + 481 trailing chars = 801 total.
-        The -500 cut lands ONE character into the key, so slice-then-redact
-        leaks the 19-char fragment ``KIAIOSFODNN7EXAMPLE``; redact-then-slice
-        replaces the whole key with the tag, whose tail stays in the report.
+        it): 300 noise + a 40-char token + 461 trailing chars = 801 total.
+        The -500 cut lands ONE character into the token, so slice-then-redact
+        leaks its 39-char tail; redact-then-slice replaces the whole token
+        with the tag, whose tail stays in the report.
         """
         script_path = self._write_script(
             tmp_path,
             "import os, sys\n"
             'sys.stderr.write("W" * 300)\n'
-            'sys.stderr.write("AKIAIOSFODNN7EXAMPLE")\n'
-            'sys.stderr.write("X" * 481)\n'
+            f'sys.stderr.write("{_SECRET}")\n'
+            'sys.stderr.write("X" * 461)\n'
             "sys.stderr.flush()\n"
             "os._exit(2)\n",
         )
@@ -632,10 +650,10 @@ class TestRunScriptSandboxed:
             result = run_script_sandboxed(script_path + ":run", "test-job-id")
 
         assert result["status"] == "error"
-        assert "AKIAIOSFODNN7EXAMPLE" not in result["error"]
+        assert _SECRET not in result["error"]
         # The discriminator: the exact fragment the slice-then-redact order
         # leaves behind. Absent under redact-then-slice; present under the bug.
-        assert "KIAIOSFODNN7EXAMPLE" not in result["error"]
+        assert _SECRET[1:] not in result["error"]
         assert "credential]" in result["error"]
 
     def test_ok_status(self, tmp_path):

@@ -17,6 +17,10 @@ What it does, in order:
 5. writes ``<root>/out.json``: per probe server what value it saw, which decoys
    started, and the tool bytes of the largest model request.
 
+With ``PROBE_TOOLLESS=1`` step 1 writes a spec that mounts nothing instead (a
+tool-less helper, ``client_mcp_array.spec_is_toolless``), and step 4 skips the
+mount wait: the run then measures only which decoys a helper starts.
+
 Probe servers in the spec:
 
 =============  ================================  =================================
@@ -56,6 +60,7 @@ SESSION_KEY = "dashboard:probe-1"
 #: How long to wait for the spec's probe servers to start. A harness that mounts
 #: none of them (pi without a gateway) spends all of it.
 MOUNT_WAIT_S = float(os.environ.get("PROBE_MOUNT_WAIT_S", "20"))
+TOOLLESS = os.environ.get("PROBE_TOOLLESS") == "1"
 
 
 def _server(name: str, env: dict) -> dict:
@@ -76,6 +81,9 @@ def write_spec() -> None:
         "tools": ["*"],
         "allowedTools": [],
     }
+    if TOOLLESS:
+        servers = {}
+        spec = {**spec, "mcpServers": servers, "tools": [], "includeMcpJson": False}
     agents = HOME / ".kiro" / "agents"
     agents.mkdir(parents=True, exist_ok=True)
     (agents / "kirocrew.json").write_text(json.dumps(spec, indent=1), encoding="utf-8")
@@ -246,6 +254,9 @@ async def wait_for_mounts(bound: float = MOUNT_WAIT_S) -> None:
     gateway) is the bounded case, and the checks read what did start."""
     from kiro_crew.testing.wait import async_wait_until
 
+    if TOOLLESS:
+        return
+
     def all_started() -> bool:
         state = probe_state()
         return all(state.get(name, {}).get("starts") for name in SPEC_PROBES)
@@ -254,6 +265,36 @@ async def wait_for_mounts(bound: float = MOUNT_WAIT_S) -> None:
         await async_wait_until(all_started, timeout=bound, off_loop=True)
     except AssertionError:
         pass
+
+
+#: codex-acp's own session/new knob: hold the reply until every requested MCP
+#: server has finished starting (or failed), up to this many ms. Without it the
+#: first turn goes out with whichever servers are up, and a slow kirocrew-core
+#: leaves its tools off the measured request.
+CODEX_MCP_STARTUP_AWAIT_MS = 60_000
+
+
+def await_codex_mcp_startup(harness) -> None:
+    """Make codex's ``session/new`` wait for every MCP server it was handed.
+
+    ``wait_for_mounts`` can only see the probe servers, which write a start line;
+    Crew's own servers do not, so codex's own startup signal is the one that covers
+    them. Product code does not send this meta, so it is added here, on this
+    driver's *harness* object, through ``session_request``: the seam every
+    ``session/new`` passes through just before it goes out."""
+    from kiro_crew.acp.types import METHOD_SESSION_NEW
+
+    own = harness.session_request
+
+    def with_startup_wait(method, params, agent, **kwargs):
+        params, agent = own(method, params, agent, **kwargs)
+        if method == METHOD_SESSION_NEW:
+            meta = {**(params.get("_meta") or {})}
+            meta["mcpStartupAwaitTimeoutMs"] = CODEX_MCP_STARTUP_AWAIT_MS
+            params = {**params, "_meta": meta}
+        return params, agent
+
+    harness.session_request = with_startup_wait
 
 
 async def drive_client(turn_s: float = 120.0) -> dict:
@@ -281,6 +322,8 @@ async def drive_runtime(turn_s: float = 120.0) -> dict:
     from kiro_crew.acp.runtime import AcpRuntime
 
     rt = AcpRuntime(work_dir=WORK, acp_backend=BACKEND)
+    if BACKEND == "codex":
+        await_codex_mcp_startup(rt._harness)
     rec: dict = {}
     try:
         await asyncio.wait_for(rt.spawn(), timeout=180)

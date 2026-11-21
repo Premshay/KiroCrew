@@ -25,10 +25,12 @@ import { FolderPickerItems } from '../components/FolderMoveSubmenu'
 import { folderBreadcrumb } from '../utils/artifactFolderTree'
 // Artifact body renderers, extracted here so the chat side panel shares them.
 import { artifactAssetUrl } from '../components/ArtifactBody'
+import { canvasDocument, discardCanvas, flushCanvas } from '../components/canvas/canvasPending'
 import { api } from '../api/client'
 import { downloadUrl, isAndroidWebView } from '../utils/download'
 import { useArtifactPopouts } from '../hooks/useArtifactPopouts'
 import { USER_SELECTABLE_KINDS } from '../lib/artifactKinds'
+import { COMPARE_NONE, compareChoices, isComparableKind, stateLabel } from '../lib/artifactCompare'
 import type { Artifact } from '../types'
 
 import { i18nT } from '../i18n/t'
@@ -184,7 +186,9 @@ export function useArtifactDetailPageMenu({
     // the text actually reached the clipboard. Gate the confirmation on it so a
     // `false` shows the failure glyph instead of a tick over an unchanged
     // clipboard. (A `.catch` here would be unreachable dead code.)
-    copyToClipboard(artifact?.content ?? '')
+    // A live canvas copies what its editor shows, waiting edits included.
+    const liveCanvas = artifact?.kind === 'canvas' ? canvasDocument(artifact.slug) : null
+    copyToClipboard(liveCanvas ?? artifact?.content ?? '')
       .then((ok) => {
         if (attempt !== copyAttemptRef.current) return
         setCopyStatus(ok ? 'copied' : 'failed')
@@ -210,7 +214,12 @@ export function useArtifactDetailPageMenu({
     slug,
     active: !editing,
     onSend: sendNav,
-    beforeSend: guardSendToSession,
+    // Sending leaves the page, so a canvas's waiting save lands first; one that
+    // fails stays on the page with its notice instead of being dropped.
+    beforeSend: (proceed) => {
+      if (artifact?.kind !== 'canvas') { guardSendToSession(proceed); return }
+      void flushCanvas(slug).then(ok => { if (ok) guardSendToSession(proceed) })
+    },
     onError: setSendToSessionError,
   })
 
@@ -229,15 +238,19 @@ export function useArtifactDetailPageMenu({
       document.body.removeChild(a)
       return
     }
-    const isMarkdownLike = artifact.kind === 'markdown' || artifact.kind === 'text' || artifact.kind === 'json' || artifact.kind === 'svg'
-    const blobBody = exportSrcdoc ?? artifact.content ?? ''
+    const isMarkdownLike = artifact.kind === 'markdown' || artifact.kind === 'text' || artifact.kind === 'json' || artifact.kind === 'svg' || artifact.kind === 'canvas'
+    // A live canvas exports what its editor shows: an autosave may still be waiting.
+    const liveCanvas = artifact.kind === 'canvas' ? canvasDocument(artifact.slug) : null
+    const blobBody = liveCanvas ?? exportSrcdoc ?? artifact.content ?? ''
     const mime = isMarkdownLike
-      ? (artifact.kind === 'json' ? 'application/json' : artifact.kind === 'svg' ? 'image/svg+xml' : 'text/plain')
+      ? (artifact.kind === 'json' || artifact.kind === 'canvas' ? 'application/json' : artifact.kind === 'svg' ? 'image/svg+xml' : 'text/plain')
       : 'text/html'
+    // A canvas downloads as its own file type, the one Add Artifact imports back.
     const ext = artifact.kind === 'markdown' ? 'md'
       : artifact.kind === 'json' ? 'json'
       : artifact.kind === 'svg' ? 'svg'
       : artifact.kind === 'text' ? 'txt'
+      : artifact.kind === 'canvas' ? 'canvas'
       : 'html'
     const safeName = artifact.name.replace(/[^a-zA-Z0-9-_ ]/g, '')
     const filename = `${safeName || artifact.slug}-v${effectiveVersion}.${ext}`
@@ -293,7 +306,7 @@ export function ArtifactDetailPageHeader({
 }) {
   const {
     slug, navigate, confirm, renaming, nameDraft, setNameDraft, selectedVersion,
-    setSelectedVersion, editing, previewDuringEdit, setPreviewDuringEdit, readingWidth, toggleReadingWidth,
+    setSelectedVersion, compareWith, setCompareWith, editing, previewDuringEdit, setPreviewDuringEdit, readingWidth, toggleReadingWidth,
     saving, saveConflict, showPublish, setShowPublish, addingTag, setAddingTag, newTag, setNewTag, ime,
     refocusAddTagRef, addTagButtonRef,
   } = stateRead
@@ -325,6 +338,10 @@ export function ArtifactDetailPageHeader({
     i18nT('pages.artifactDetailPage.live'),
     ...versionsDesc.map((v) => i18nT('pages.artifactDetailPage.version_label', { version: fmtNumber(v, { useGrouping: false }) })),
   ]
+  // What the "Compare with" select can offer for the state on screen. Hidden
+  // while editing (the buffer is not a saved state) and for kinds with no text.
+  const compareKeys = !editing && isComparableKind(artifact.kind) ? compareChoices(selectedVersion, versions) : []
+  const compareValue = compareKeys.includes(compareWith) ? compareWith : COMPARE_NONE
   return (
     <div className="sticky top-0 z-10 bg-bg border-b border-border">
       <PageHeader
@@ -358,7 +375,10 @@ export function ArtifactDetailPageHeader({
       <div className="px-4 md:px-6 py-2 flex flex-wrap items-center gap-2">
         {!popout && (
           <Btn onClick={async () => {
-            if (dirty && !(await confirm({
+            // A canvas saves itself, so `dirty` never covers it: send what is
+            // waiting, and ask only when a save could not land.
+            const canvasSaved = await flushCanvas(artifact.slug)
+            if ((dirty || !canvasSaved) && !(await confirm({
               title: i18nT('pages.artifactDetailPage.discard_unsaved_changes'),
               confirmLabel: i18nT('pages.artifactDetailPage.discard_changes_button'),
             }))) return
@@ -505,10 +525,14 @@ export function ArtifactDetailPageHeader({
             optionLabels={versionOptionLabels}
             value={selectedVersion === null ? 'live' : String(selectedVersion)}
             onChange={async (raw) => {
-              if (dirty && !(await confirm({
+              const canvasSaved = await flushCanvas(artifact.slug)
+              if ((dirty || !canvasSaved) && !(await confirm({
                 title: i18nT('pages.artifactDetailPage.discard_unsaved_changes'),
                 confirmLabel: i18nT('pages.artifactDetailPage.discard_changes_button'),
               }))) return
+              // The canvas stays mounted across a version switch, so its edits
+              // are dropped here rather than with the page.
+              if (!canvasSaved) discardCanvas(artifact.slug)
               // A typed comment draft is lost with the toolbar the switch unmounts.
               await guardCommentDraft(() => {
                 endEditing()
@@ -520,6 +544,31 @@ export function ArtifactDetailPageHeader({
               })
             }}
           />
+          {compareKeys.length > 0 && (
+            <SimpleSelect
+              aria-label={i18nT('pages.artifactDetailPage.compare_with')}
+              className={TOOLBAR_SELECT_CLASS}
+              options={[COMPARE_NONE, ...compareKeys]}
+              optionLabels={[
+                i18nT('pages.artifactDetailPage.compare_with'),
+                ...compareKeys.map((key) => i18nT('pages.artifactDetailPage.compare_with_state', {
+                  state: stateLabel(key),
+                })),
+              ]}
+              value={compareValue}
+              onChange={async (key) => {
+                if (key !== COMPARE_NONE) {
+                  const canvasSaved = await flushCanvas(artifact.slug)
+                  if (!canvasSaved && !(await confirm({
+                    title: i18nT('pages.artifactDetailPage.discard_unsaved_changes'),
+                    confirmLabel: i18nT('pages.artifactDetailPage.discard_changes_button'),
+                  }))) return
+                  if (!canvasSaved) discardCanvas(artifact.slug)
+                }
+                setCompareWith(key)
+              }}
+            />
+          )}
           {/* No hand-off: editor buffer editedContent may be dirty */}
           <ErrorNotice
             variant="inline"

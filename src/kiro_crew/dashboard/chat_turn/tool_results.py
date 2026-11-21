@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_turn.tool_rows import (
         _persist_tool_result_rows,
         _tcid_identity_key,
+        _withdraw_read_path_arg,
     )
     from kiro_crew.dashboard.chat_turn.turn_entry import _directive_producer_is_channel
     from kiro_crew.dashboard.chat_turn.turn_ledgers import (
@@ -218,8 +219,8 @@ async def _on_tool_result(turn: _ChatTurn, event) -> None:
             result_digest=event.tool_output_digest,
             result_bytes=event.tool_output_bytes,
         )
-        # A dispatched worker's report the harness never delivered (KAS answers a
-        # name it cannot resolve without calling the server): record it beside the
+        # A dispatched worker's report the harness never delivered (KAS, pi,
+        # OpenCode and Claude answer a name they cannot resolve without calling the server): record it beside the
         # worker's item so its conductor and the board learn the report did not
         # arrive, instead of reading the silence as a stall.
         if turn._undelivered_watch is not None:
@@ -297,7 +298,7 @@ async def _on_tool_result(turn: _ChatTurn, event) -> None:
         # is all the claim needs to be attributable after a restart.
         # This does NOT clear `_dirty` -- only the flush passes do --
         # so the `mcp_app_lead` flag written further below is still
-        # owed to the periodic flush exactly as before.
+        # owed to the periodic flush.
         persist_rows=lambda: _persist_tool_result_rows(state, slot),
     )
     _out = _render.text
@@ -765,6 +766,9 @@ async def _on_tool_result(turn: _ChatTurn, event) -> None:
     # tool entries (🔧 pre-approval + ✅ post-approval) with the same
     # tool_call_id, and both pills should reflect the same output.
     if _tcid:
+        # A read that ended without completing read no file: its rows preview none.
+        if _tool_terminal and (event.refusal is not None or not event.tool_final):
+            _withdraw_read_path_arg(state, slot, _tcid)
         for m in slot.messages:
             if m.get("role") == "tool" and m.get("meta", {}).get("tool_call_id") == _tcid:
                 _meta = m.setdefault("meta", {})

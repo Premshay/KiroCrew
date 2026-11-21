@@ -15,14 +15,17 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
+import functools
 import gc
 import logging
+import operator
 import sys
 import threading
 import time
 import warnings
 
 import pytest
+from conftest_floor_guards import floor_guard
 
 
 def _join_install_receipt_workers() -> None:
@@ -62,6 +65,41 @@ def _live_telemetry_consent_workers() -> list:
     return [
         t for t in threading.enumerate() if t.name == _TELEMETRY_CONSENT_THREAD and t.is_alive()
     ]
+
+
+def _join_node_compile_prewarm(join_secs: float) -> "BaseException | None":
+    """Join the engine's compile-cache prewarm before this test's pins lift.
+
+    ``acp.node_compile_cache.ensure_engine_bundle_cache`` runs on every spawn of
+    Crew's own engine and hands the prewarm to a daemon thread, which creates the
+    cache directory under the data home and runs the engine once. A test that
+    reaches that spawn path with a stubbed bundle starts the thread and returns; left
+    alone, its ``mkdir`` lands after the test, under the next test's home. Joined here
+    for the reason on :func:`_join_telemetry_consent_worker`, and the per-build
+    "already started" set is emptied so one test's build does not silence the next
+    test's prewarm. The module is looked up, never imported, so a run that does not
+    spawn the engine pays nothing. Each thread gets *join_secs* (the conftest passes
+    its own ``_EXECUTOR_JOIN_SECS``, which tests patch there); one still alive after
+    that is RETURNED as the failure to raise after the yield.
+    """
+    mod = sys.modules.get("kiro_crew.acp.node_compile_cache")
+    if mod is None:
+        return None
+    workers = [
+        t for t in threading.enumerate() if t.name == mod.PREWARM_THREAD_NAME and t.is_alive()
+    ]
+    for worker in workers:
+        worker.join(join_secs)
+    with mod._prewarm_lock:
+        mod._prewarm_started.clear()
+    still_alive = [t.name for t in workers if t.is_alive()]
+    if not still_alive:
+        return None
+    return AssertionError(
+        f"a node compile cache prewarm {still_alive} is still running "
+        f"{join_secs:.0f}s after this test ended; its cache directory would "
+        "land under the next test's KIROCREW_HOME. See _join_node_compile_prewarm."
+    )
 
 
 def _resume_crew_log_eager_fold() -> None:
@@ -248,7 +286,7 @@ def _stop_leaked_exporter(thread) -> None:
         )
 
 
-@pytest.fixture(autouse=True)
+@floor_guard
 def _no_leaked_telemetry_exporter():
     """Fail the test that leaves an OTel exporter thread alive, then clean up.
 
@@ -310,7 +348,7 @@ def _live_embed_evictors() -> set:
     return {t for t in threading.enumerate() if t.name == _EMBED_EVICTOR_THREAD and t.is_alive()}
 
 
-@pytest.fixture(autouse=True)
+@floor_guard
 def _no_leaked_embed_evictor():
     """Fail the test that leaves an embedding model's idle evictor running, then stop it.
 
@@ -351,7 +389,7 @@ def _no_leaked_embed_evictor():
 # ── the logging record factory goes back after every test ─────────────
 
 
-@pytest.fixture(autouse=True)
+@floor_guard
 def _restore_log_record_factory():
     """Put ``logging``'s record factory back, so one test cannot rewrite every later record.
 
@@ -413,7 +451,7 @@ def _restore_log_record_factory():
 # ── the CLI log queue listener goes back after every test ────────────
 
 
-@pytest.fixture(autouse=True)
+@floor_guard
 def _restore_log_queue_listener():
     """Stop the ``QueueListener`` a test leaves running, so no later test inherits it.
 
@@ -526,7 +564,7 @@ def _restore_log_queue_listener():
 # ── the hooks system's process-wide dispatcher goes back after every test ──
 
 
-@pytest.fixture(autouse=True)
+@floor_guard
 def _restore_hooks_integration_globals():
     """Put ``hooks_integration._lifecycle_dispatcher`` / ``_route_registry`` back.
 
@@ -574,21 +612,44 @@ def _restore_hooks_integration_globals():
 # ── the relay client's published dashboard ingress goes back after every test ──
 
 
-@pytest.fixture(autouse=True)
-def _restore_relay_gateway_ingress():
-    """Put ``relay_client.provider._gateway_ingress`` back.
+#: Module globals production assigns once at boot and never clears: ``(module, attribute)``.
+#: Every entry starts life as ``None``.
+_BOOT_WIRED_GLOBALS: tuple[tuple[str, str], ...] = (
+    # ``_start_aea_tunnel`` publishes the dashboard app's relay ingress.
+    ("kiro_crew.relay_client.provider", "_gateway_ingress"),
+    # ``DashboardState.__init__`` installs these three. Each callable closes over the
+    # state (or its ``sessions``), so the last state a worker built -- usually a
+    # ``MagicMock``-backed one, with every call it recorded -- lived until the next
+    # test built another: up to ~300 MiB for the 2,000-slot scale tests.
+    ("kiro_crew.acp.chat_runtime_sharing", "_tree_root_reader"),
+    # The FACADE, not ``subagent_parts.agent_policy``: ``_facade_compose`` rebinds the
+    # composed setter and reader onto ``kiro_crew.subagent``'s globals, so that is the
+    # dict ``set_parent_project_resolver`` writes. The part module's copy stays ``None``.
+    ("kiro_crew.subagent", "_parent_project_resolver"),
+    ("kiro_crew.decisions.impl_llm", "_runner_factory"),
+)
 
-    ``_start_aea_tunnel`` publishes the dashboard app's relay ingress there, and a
-    gateway sets it once at boot, so every test that builds the real dashboard app
-    would otherwise hand the next test its app's ingress. Reached through
-    ``sys.modules`` for the same reason as the hooks floor above.
+
+@floor_guard
+def _restore_boot_wired_globals():
+    """Put back the module globals production wires once at boot (``_BOOT_WIRED_GLOBALS``).
+
+    A gateway sets each one once, so every test that builds the real dashboard app or a
+    ``DashboardState`` would otherwise hand the next test its ingress or its state. The
+    next test sees the wrong object, and the worker keeps the whole state alive. Reached
+    through ``sys.modules`` for the same reason as the hooks floor above. A module first
+    imported during the test is put back to ``None``, the value it started with.
     """
-    provider = sys.modules.get("kiro_crew.relay_client.provider")
-    before = getattr(provider, "_gateway_ingress", None) if provider is not None else None
+    before = {
+        entry: getattr(sys.modules[entry[0]], entry[1], None)
+        for entry in _BOOT_WIRED_GLOBALS
+        if entry[0] in sys.modules
+    }
     yield
-    provider = sys.modules.get("kiro_crew.relay_client.provider")
-    if provider is not None:
-        provider._gateway_ingress = before
+    for entry in _BOOT_WIRED_GLOBALS:
+        module = sys.modules.get(entry[0])
+        if module is not None:
+            setattr(module, entry[1], before.get(entry))
 
 
 # ── logger levels go back after every test ──────────────────────────
@@ -618,7 +679,60 @@ def _logger_levels() -> dict[str, tuple[int, bool]]:
     return snapshot
 
 
-@pytest.fixture(autouse=True)
+class _LoggerCensus:
+    """The ``Logger`` objects of one ``loggerDict``, as of one reading of it."""
+
+    __slots__ = ("logger_dict", "keys", "values", "names", "loggers")
+
+    def __init__(self, logger_dict: dict) -> None:
+        # One C-level copy, as ``_logger_levels`` takes: a thread a test left running
+        # can create a logger while a Python-level loop walks the live dict.
+        items = list(logger_dict.items())
+        self.logger_dict = logger_dict
+        self.keys = [name for name, _ in items]
+        self.values = [obj for _, obj in items]
+        loggers = [(name, obj) for name, obj in items if isinstance(obj, logging.Logger)]
+        self.names = [name for name, _ in loggers]
+        self.loggers = [obj for _, obj in loggers]
+
+    def current(self) -> bool:
+        """Whether ``loggerDict`` is this dict and holds these entries, in this order."""
+        logger_dict = logging.Logger.manager.loggerDict
+        # By identity, never ``==``: an entry replaced by an object that compares equal
+        # to the one it replaced is still a different logger to read.
+        return (
+            logger_dict is self.logger_dict
+            and len(logger_dict) == len(self.values)
+            and all(map(operator.is_, logger_dict.values(), self.values))
+            and list(logger_dict) == self.keys
+        )
+
+
+#: The last census taken, reused for as long as it is current.
+_LOGGER_CENSUS: _LoggerCensus | None = None
+
+
+def _logger_census() -> _LoggerCensus:
+    """The census of the live ``loggerDict``: the last one if still current, else a new one."""
+    global _LOGGER_CENSUS
+    census = _LOGGER_CENSUS
+    if census is None or not census.current():
+        census = _LOGGER_CENSUS = _LoggerCensus(logging.Logger.manager.loggerDict)
+    return census
+
+
+def _put_logger_levels_back(before: dict[str, tuple[int, bool]]) -> None:
+    """Restore every live logger to *before*; a name missing from it goes to pristine."""
+    for name, after in _logger_levels().items():
+        level, disabled = before.get(name, _PRISTINE_LOGGER)
+        if after == (level, disabled):
+            continue
+        logger = logging.getLogger(name)
+        logger.setLevel(level)
+        logger.disabled = disabled
+
+
+@floor_guard
 def _restore_logger_levels():
     """Put every logger's level and ``disabled`` flag back after each test.
 
@@ -661,20 +775,150 @@ def _restore_logger_levels():
     ``test_cli_logging.py``'s own ``_pristine_logging`` fixture is what absorbs it today,
     by clearing both handler lists at setup rather than by trusting its inheritance.
 
-    Measured cost: ~30us per snapshot at ~450 live loggers, so ~60us per test.
+    The levels are read through ``_logger_census``: the list of live ``Logger`` objects,
+    kept while ``loggerDict`` holds the same entries, so a test that leaves every level
+    as it found it costs two list reads on each side and no per-name work. Anything
+    else -- a changed level, a logger created or replaced during the test -- goes
+    through ``_put_logger_levels_back`` with the same "before" mapping a full
+    snapshot would have produced.
     """
     before_disable = logging.Logger.manager.disable
-    before = _logger_levels()
+    census = _logger_census()
+    levels = [logger.level for logger in census.loggers]
+    disabled = [logger.disabled for logger in census.loggers]
+    root = logging.getLogger()
+    root_before = (root.level, root.disabled)
     yield
-    for name, after in _logger_levels().items():
-        level, disabled = before.get(name, _PRISTINE_LOGGER)
-        if after == (level, disabled):
-            continue
-        logger = logging.getLogger(name)
-        logger.setLevel(level)
-        logger.disabled = disabled
+    root = logging.getLogger()
+    unchanged = (
+        _logger_census() is census
+        and [logger.level for logger in census.loggers] == levels
+        and [logger.disabled for logger in census.loggers] == disabled
+        and (root.level, root.disabled) == root_before
+    )
+    if not unchanged:
+        before = dict(zip(census.names, zip(levels, disabled)))
+        before[""] = root_before
+        _put_logger_levels_back(before)
     if logging.Logger.manager.disable != before_disable:
         logging.disable(before_disable)
+
+
+#: Ceiling for joining a closed loader's ``skill-catalog-refresh`` worker; it exits on
+#: its next wake, which ``close()`` triggers.
+_SKILL_CATALOG_JOIN_SECS = 5.0
+
+
+def _live_skills_loaders() -> list:
+    """Every ``SkillsLoader`` alive in this process, read from production's weak registry.
+
+    Empty until something has imported ``kiro_crew.skill_live_loaders``, which is also
+    the only way a loader can exist, so a test that never touches skills pays one dict
+    lookup.
+    """
+    live = sys.modules.get("kiro_crew.skill_live_loaders")
+    if live is None:
+        return []
+    with live._LIVE_LOCK:
+        return list(live._LIVE)
+
+
+def close_skills_loaders_opened_since(before: "set[int]") -> int:
+    """Close every open loader whose ``id`` is not in *before*; return how many it closed.
+
+    ``close()`` releases the skill search index (``skill_search_index.sqlite3`` with its
+    ``-wal`` and ``-shm``: three descriptors) and wakes the catalog worker. The workers
+    share one ``_SKILL_CATALOG_JOIN_SECS`` budget, best-effort: a build still walking when
+    its share runs out keeps its index handle, which the index pass then closes. An
+    ``id`` reused by a loader built after an older one was collected is missed, never
+    over-closed.
+    """
+    opened = [
+        loader
+        for loader in _live_skills_loaders()
+        if id(loader) not in before and not loader._closed
+    ]
+    for loader in opened:
+        loader.close()
+    workers = [loader._catalog_worker for loader in opened]
+    workers = [worker for worker in workers if worker is not None]
+    for worker in workers:
+        worker.join(timeout=_SKILL_CATALOG_JOIN_SECS / len(workers))
+    return len(opened)
+
+
+#: Every ``SkillSearchIndex`` built since the current test's floor fixture set up, held
+#: strongly so an index whose loader was already collected can still be closed.
+_SKILL_INDEXES_BUILT: list = []
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _record_skill_search_indexes():
+    """Record every ``SkillSearchIndex`` built in this session, for the per-test close.
+
+    The live-loader registry is weak, so a loader the test dropped is gone from it by
+    teardown, while its index's connection, a reference cycle, still holds its
+    descriptors. Recording the index itself is what lets the floor close that
+    connection. Patched once per session, through ``MonkeyPatch.context`` so it is put
+    back at the end.
+    """
+    from kiro_crew.skill_search_index import SkillSearchIndex
+
+    original = SkillSearchIndex.__init__
+
+    @functools.wraps(original)
+    def _recording_init(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        _SKILL_INDEXES_BUILT.append(self)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(SkillSearchIndex, "__init__", _recording_init)
+        yield
+    _SKILL_INDEXES_BUILT.clear()
+
+
+def close_skill_indexes_built_this_test() -> int:
+    """Close every recorded index that still has a connection, and forget them all.
+
+    ``close()`` is idempotent and takes the index's own lock, and a closed index answers
+    later calls as unusable, so closing one whose loader is still building is safe.
+    """
+    built = list(_SKILL_INDEXES_BUILT)
+    _SKILL_INDEXES_BUILT.clear()
+    open_indexes = [index for index in built if index._conn is not None]
+    for index in open_indexes:
+        index.close()
+    return len(open_indexes)
+
+
+@floor_guard
+def _close_skills_loaders_the_test_opened(_isolate_kirocrew_home, _record_skill_search_indexes):
+    """Close every ``SkillsLoader`` this test built, wherever it was built.
+
+    A loader holds an open SQLite connection, and an unclosed ``sqlite3.Connection`` is
+    a reference cycle on CPython 3.11+, so a dropped loader keeps its three descriptors
+    until the cyclic collector happens to run. Loaders come from test bodies, helpers,
+    function fixtures and production defaults the test only drives
+    (``ContextBuilder``'s ``SkillsLoader()``, the dashboard's standalone loader), so a
+    per-module opt-in cannot reach them all. Measured on macOS, where the default soft
+    ``ulimit -n`` is 256: one xdist worker ended a backend shard with up to 335 such
+    descriptors open, and from the 256th on every test on that worker failed with
+    ``EMFILE``. GitHub's macOS runners allow 10240, which is why CI never showed it.
+
+    Two passes: the loaders still alive are closed and their catalog workers joined,
+    then every search index built during the test is closed, which also reaches the
+    index of a loader the test dropped before teardown.
+
+    The snapshot is taken after every broader-scoped fixture is set up, so a loader a
+    module or session fixture shares across tests stays open. Depending on
+    ``_isolate_kirocrew_home`` orders the teardown before that pin lifts, so the joined
+    worker finishes under this test's data home.
+    """
+    before = {id(loader) for loader in _live_skills_loaders()}
+    _SKILL_INDEXES_BUILT.clear()
+    yield
+    close_skills_loaders_opened_since(before)
+    close_skill_indexes_built_this_test()
 
 
 def _drain_windows_proactor_finalizers() -> None:

@@ -17,6 +17,7 @@ from aiohttp import web
 from kiro_crew import arc_brief, arcs
 from kiro_crew.dashboard.arc_delivery import deliver_entry
 from kiro_crew.dashboard.handlers.session_ledger import _resolve_ledger_key
+from kiro_crew.security.exfil import redact_flagged_urls
 from kiro_crew.security.text_redaction import redact
 from kiro_crew.validation import ARC_ENTRY_ROUTE_SCHEMA, ValidationError, validate_tool_args
 
@@ -44,14 +45,19 @@ def _error_response(exc: Exception, operation: str) -> web.Response:
     raise exc
 
 
+def _redact_entry_text(text: str) -> str:
+    # MERGE-REVIEW: Arc entries reach other sessions and can render clickable links.
+    return redact(redact_flagged_urls(text))
+
+
 def _public(entry: dict[str, Any]) -> dict[str, Any]:
     """An entry as a model may see it: every free-text field redacted."""
     out = dict(entry)
     for name in _ENTRY_TEXT_FIELDS:
         if isinstance(out.get(name), str):
-            out[name] = redact(out[name])
+            out[name] = _redact_entry_text(out[name])
     if isinstance(out.get("checked"), list):
-        out["checked"] = [redact(str(c)) for c in out["checked"]]
+        out["checked"] = [_redact_entry_text(str(c)) for c in out["checked"]]
     return out
 
 

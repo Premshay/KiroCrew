@@ -118,11 +118,13 @@ and tolerate an ImportError so a partial checkout cannot break collection.
 
 from __future__ import annotations
 
+import array
 import asyncio
 import contextlib
 import gc
 import importlib
 import importlib.util
+import inspect
 import linecache
 import os
 import pathlib
@@ -223,6 +225,7 @@ def monkeypatch(_floor_monkeypatch):
 # copy of this file shares one module object per part. No bytecode is written for them, since
 # this runs before ``pytest_configure`` moves bytecode off the checkout.
 _FLOOR_PARTS = (
+    "conftest_floor_guards",
     "conftest_floor_home",
     "conftest_floor_tmp",
     "conftest_floor_configure",
@@ -232,6 +235,7 @@ _FLOOR_PARTS = (
     "conftest_floor_determinism",
     "conftest_floor_reporting",
     "conftest_floor_git",
+    "conftest_floor_read_budget",
 )
 
 
@@ -256,6 +260,8 @@ def _load_floor_part(stem: str):
     return module
 
 
+# The guard runner both conftests' guard sets are built on; not a part of either.
+_load_floor_part("per_test_guards")
 for _stem in _FLOOR_PARTS:
     _load_floor_part(_stem)
 
@@ -266,6 +272,7 @@ from conftest_floor_configure import (  # noqa: E402,F401 -- bound for pytest an
     _hide_the_hosts_companion_plugins,
     _pin_crew_log_off_for_the_process,
     _pin_the_profile_standalone_for_the_process,
+    _put_the_real_node_first_on_path,
     _put_the_tree_under_test_first_on_child_paths,
     _redirect_bytecode_cache,
     _redirect_hypothesis_database,
@@ -309,6 +316,21 @@ from conftest_floor_git import (  # noqa: E402,F401 -- bound for pytest and for 
     _load_git_maintenance_helpers,
 )
 
+# The fixtures that run the per-test floors; ``seal_floor_guards`` at the end of
+# this file sorts the floors bound here into them.
+from conftest_floor_guards import (  # noqa: E402,F401 -- bound for pytest and for tests
+    FLOOR_SEGMENT_FIXTURES,
+    FLOORS,
+    _c_floors,
+    _f_floors,
+    _isolate_b_floors,
+    _isolate_l_floors,
+    _j_floors,
+    _rest_floors,
+    floor_guard,
+    seal_floor_guards,
+)
+
 # Data home: the import-time floor and the per-test home, SEL and ~/.kiro pins.
 from conftest_floor_home import (  # noqa: E402,F401 -- bound for pytest and for tests
     _AGENT_SPEC_HOOKS,
@@ -319,6 +341,7 @@ from conftest_floor_home import (  # noqa: E402,F401 -- bound for pytest and for
     _TMP_ROOT_PREFIX,
     _agent_spec_seam_modules,
     _breadcrumb_guard,
+    _hide_the_operators_kiro_cli,
     _isolate_agent_spec_home,
     _isolate_kiro_sessions_dir,
     _isolate_kirocrew_home,
@@ -358,18 +381,21 @@ from conftest_floor_restores import (  # noqa: E402,F401 -- bound for pytest and
     _EXECUTOR_JOIN_SECS,
     _TELEMETRY_CONSENT_THREAD,
     _cancel_session_tree_checkpoints,
+    _close_skills_loaders_the_test_opened,
     _drain_windows_proactor_finalizers,
     _join_install_receipt_workers,
+    _join_node_compile_prewarm,
     _join_test_loop_executor,
     _live_embed_evictors,
     _live_telemetry_consent_workers,
     _no_leaked_embed_evictor,
     _no_leaked_telemetry_exporter,
+    _record_skill_search_indexes,
+    _restore_boot_wired_globals,
     _restore_hooks_integration_globals,
     _restore_log_queue_listener,
     _restore_log_record_factory,
     _restore_logger_levels,
-    _restore_relay_gateway_ingress,
     _resume_crew_log_eager_fold,
     _retire_crew_log_eager_fold,
 )
@@ -402,6 +428,7 @@ from conftest_floor_services import (  # noqa: E402,F401 -- bound for pytest and
     _SERVICE_MANAGERS,
     _block_host_service_mutation,
     _fail_on_refused_real_reclaim_write,
+    _no_engine_install_at_gateway_start,
     _no_real_cgroup_reclaim_write,
     _no_systemd_user_session,
     _refusal_reason,
@@ -428,8 +455,19 @@ from conftest_floor_tmp import (  # noqa: E402,F401 -- bound for pytest and for 
 if _TMP_PER_TEST:
     from conftest_floor_tmp import _isolate_tempfile_base_per_test  # noqa: E402,F401
 
+# The crew-log read-budget check, and its fixture only when the switch is on.
+from conftest_floor_read_budget import (  # noqa: E402,F401 -- bound for pytest and for tests
+    _READ_BUDGET_ENV,
+    _READ_BUDGET_RAISE,
+    KNOWN_OVER_BUDGET_SITES,
+    check_read_budget,
+)
 
-@pytest.fixture(autouse=True)
+if _READ_BUDGET_RAISE:
+    from conftest_floor_read_budget import _crew_log_read_budget_check  # noqa: E402,F401
+
+
+@floor_guard
 def _scrub_inherited_preload_env(_floor_monkeypatch):
     """Hide the entries ``name_grant`` refuses as inherited preloads, then restore them.
 
@@ -521,6 +559,29 @@ _TESTS_SINCE_LINECACHE_CLEAR = 0
 #: the few hundred objects the interpreter had already frozen on its own.
 _FROZEN_AT_COLLECTION: int | None = None
 
+#: This process's RSS when pytest finished configuring, its VmHWM when collection
+#: finished, and how many items it collected before deselection, in KiB and items;
+#: ``None`` where ``/proc/self`` cannot be read. ``test_worker_memory_retention.py`` budgets the
+#: difference per collected item, so a change that makes every item heavier fails
+#: there instead of surfacing as a worker that no longer fits.
+_RSS_AT_CONFIGURE_KIB: int | None = None
+_HWM_AT_COLLECTION_KIB: int | None = None
+_ITEMS_AT_COLLECTION = 0
+#: Items ``-k``/``-m`` (or any plugin, through ``pytest_deselected``) dropped after that.
+_DESELECTED_AT_COLLECTION = 0
+
+
+def _proc_status_kib(field: str) -> int | None:
+    """One ``kB`` field of ``/proc/self/status``, or ``None`` off Linux."""
+    try:
+        with open("/proc/self/status", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith(field + ":"):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        return None
+    return None
+
 
 #: Module nodeids whose COLLECTION built the process-global metrics recorder.
 #:
@@ -606,9 +667,11 @@ def pytest_configure(config: pytest.Config) -> None:
     _redirect_bytecode_cache()
     _install_determinism_audit_hook()
     _put_the_tree_under_test_first_on_child_paths()
+    _put_the_real_node_first_on_path()
     _gate_pytest_asyncio_fixture_scan()
     _hide_the_hosts_companion_plugins()
-    global _SESSION_CWD
+    global _SESSION_CWD, _RSS_AT_CONFIGURE_KIB
+    _RSS_AT_CONFIGURE_KIB = _proc_status_kib("VmRSS")
     try:
         _SESSION_CWD = os.getcwd()
     except OSError:  # pragma: no cover - pytest could not have started here
@@ -656,11 +719,105 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     before this runs, so a bare "is anything frozen" assertion passes with this hook
     deleted.
     """
-    global _FROZEN_AT_COLLECTION
+    global _FROZEN_AT_COLLECTION, _HWM_AT_COLLECTION_KIB
+    _HWM_AT_COLLECTION_KIB = _proc_status_kib("VmHWM")
     gc.collect()
     before = gc.get_freeze_count()
     gc.freeze()
     _FROZEN_AT_COLLECTION = gc.get_freeze_count() - before
+
+
+#: One canonical object per distinct fixture lookup, shared by every collected item.
+#: Keys hold ``id()`` of FixtureDefs the fixture manager keeps alive for the session.
+_SHARED_FIXTUREDEF_TUPLES: dict[tuple, tuple] = {}
+_SHARED_INITIALNAMES: dict[tuple, tuple] = {}
+_SHARED_NAME2FIXTUREDEFS: dict[bytes, dict] = {}
+_SHARED_NAMES_CLOSURES: dict[tuple, list] = {}
+_COMPACTED_FIXTUREINFO: set[int] = set()
+
+
+def compact_collected_item(item: pytest.Item) -> None:
+    """Share one item's fixture bookkeeping with every item that resolved the same fixtures.
+
+    Every test here resolves ~130 fixtures, most of them autouse floors, and pytest
+    stores that resolution per item: a fresh ``(FixtureDef,)`` tuple per name per test
+    function, a ``name2fixturedefs`` dict per function, and a COPY of that dict in the
+    ``TopRequest`` each item gets at construction. Measured over a full collection
+    (283,605 items, 186,161 distinct test functions, ``--collect-only -n0``), those
+    structures are 2,971 MiB of a 5,295 MiB worker, and every xdist worker holds
+    its own copy.
+
+    Three steps, each leaving pytest's view unchanged:
+
+    * The per-item ``TopRequest`` is dropped by setting ``item._request = False``,
+      the state ``_pytest.runner.runtestprotocol`` leaves after every test, and which it
+      re-initialises at the start of the next protocol (the path pytest-rerunfailures
+      relies on). The request is rebuilt from ``name2fixturedefs`` just before setup.
+    * Identical value tuples and ``initialnames`` tuples are interned: equal elements
+      by identity, so lookups return the same FixtureDefs in the same order.
+    * Identical ``name2fixturedefs`` dicts are shared. Only collection writes them
+      (direct parametrization, before ``pytest_itemcollected``); at run time pytest
+      writes only the per-request copy.
+
+    * Identical ``names_closure`` lists are shared, and each item's ``fixturenames``
+      (the same list) is pointed at the shared one, for every test that is not an
+      asyncio test. pytest-asyncio inserts ``event_loop`` into ``item.fixturenames`` at
+      setup of an ``asyncio``-marked test, so a coroutine test or one with the mark
+      keeps its own list. Nothing else writes the list after collection.
+
+    Runs per item, not at collection finish, so the discarded copies are freed while
+    collection is still allocating and the worker's PEAK falls with them: 5,295 ->
+    2,957 MiB VmHWM on the same collection.
+    """
+    if getattr(item, "_request", None):
+        item._request = False  # type: ignore[attr-defined]
+    info = getattr(item, "_fixtureinfo", None)
+    if info is None:
+        return
+    if id(info) in _COMPACTED_FIXTUREINFO:
+        # A parametrized sibling: its ``fixturenames`` was the same list as the first
+        # item's, so it follows that list to the shared copy.
+        if getattr(item, "fixturenames", None) is not info.names_closure:
+            item.fixturenames = info.names_closure  # type: ignore[attr-defined]
+        return
+    _COMPACTED_FIXTUREINFO.add(id(info))
+    lookup = info.name2fixturedefs
+    for name, defs in lookup.items():
+        lookup[name] = _SHARED_FIXTUREDEF_TUPLES.setdefault((name, *map(id, defs)), defs)
+    # FuncFixtureInfo is a frozen dataclass; these replace fields with equal values.
+    object.__setattr__(
+        info, "initialnames", _SHARED_INITIALNAMES.setdefault(info.initialnames, info.initialnames)
+    )
+    # Key: the ids of the interned values, packed 8 bytes each. They stay unique because
+    # the interning table keeps every value alive, and every FixtureDef in
+    # ``lookup[name]`` has ``argname == name``, so the ids fix the names and their order.
+    # A ``(name, id)`` tuple per name kept a tuple and an int per fixture alive for
+    # every distinct dict: 347 MiB of a full collection. (A value may be a list, so the
+    # values themselves cannot be the key.)
+    key = array.array("Q", map(id, lookup.values())).tobytes()
+    object.__setattr__(info, "name2fixturedefs", _SHARED_NAME2FIXTUREDEFS.setdefault(key, lookup))
+    closure = info.names_closure
+    if (
+        getattr(item, "fixturenames", None) is closure
+        and item.get_closest_marker("asyncio") is None
+        and not inspect.iscoroutinefunction(getattr(item, "obj", None))
+    ):
+        shared = _SHARED_NAMES_CLOSURES.setdefault(tuple(closure), closure)
+        object.__setattr__(info, "names_closure", shared)
+        item.fixturenames = shared  # type: ignore[attr-defined]
+
+
+def pytest_itemcollected(item: pytest.Item) -> None:
+    # Counted here, before ``-k``/``-m`` deselect anything: VmHWM pays for every
+    # collected item, so the per-item budget must divide by all of them.
+    global _ITEMS_AT_COLLECTION
+    _ITEMS_AT_COLLECTION += 1
+    compact_collected_item(item)
+
+
+def pytest_deselected(items) -> None:
+    global _DESELECTED_AT_COLLECTION
+    _DESELECTED_AT_COLLECTION += len(items)
 
 
 def pytest_runtest_logfinish(nodeid: str, location) -> None:
@@ -902,6 +1059,11 @@ def pytest_runtest_protocol(item, nextitem):
         item.ihook.pytest_runtest_logreport(report=report)
         if _pytest.runner.check_interactive_exception(call, report):
             item.ihook.pytest_exception_interact(node=item, call=call, report=report)
+    # The escape skipped runtestprotocol's own last step; without it the item keeps
+    # its rebuilt request and fixture values for the rest of the worker.
+    if hasattr(item, "_request"):
+        item._request = False
+        item.funcargs = None
     item.ihook.pytest_runtest_logfinish(nodeid=item.nodeid, location=item.location)
     outcome.force_result(True)
 
@@ -964,6 +1126,7 @@ def pytest_runtest_teardown(item, nextitem):
     # itself call ``get_recorder()`` and schedule a consent re-read, and a worker
     # scheduled by teardown must still be joined under this test's pins.
     wedged_consent_worker = _join_telemetry_consent_worker()
+    wedged_prewarm = _join_node_compile_prewarm(_EXECUTOR_JOIN_SECS)
     resolved_real_home = (
         _resolved_real_default_home() if item.stash.get(_HOME_PIN_ARMED, False) else None
     )
@@ -984,6 +1147,8 @@ def pytest_runtest_teardown(item, nextitem):
         raise wedged_eager_fold
     if wedged_consent_worker is not None:
         raise wedged_consent_worker
+    if wedged_prewarm is not None:
+        raise wedged_prewarm
     if refused_network is not None:
         raise refused_network
 
@@ -1048,8 +1213,8 @@ def _publish_runner_timeout(seconds: float | None) -> None:
     sees it. The module is imported here once its package is loaded, which is cheap
     (only ``wait`` itself and ``kiro_crew.loop_lock``) and lets a test that imports
     ``wait`` inside its body see its own timeout. The package itself is never
-    imported here: its ``__init__`` loads the gateway harness, which must not happen
-    under one test's pinned home. A test in a suite that never loaded
+    imported here, so a suite that does not use the helpers loads none of them.
+    A test in a suite that never loaded
     ``kiro_crew.testing`` waits on the module's fallback instead.
 
     The module captures the clocks it waits with when it is first imported, so a test
@@ -1195,14 +1360,14 @@ def _check_pool_leftovers(item) -> None:
             )
 
 
-@pytest.fixture(autouse=True)
+@floor_guard
 def _kiro_crew_package_attr_floor(request):
     """Restore the ``kiro_crew`` module graph a test inherited; report the test that changed it.
 
     Compares, at teardown, every ``kiro_crew.*`` entry of ``sys.modules`` the test
     inherited and its parent package's attribute (plus the root package's own globals,
     which an in-process ``importlib.reload(kiro_crew)`` rebinds) with what they were at
-    setup, using C-level ``map`` comparisons; only a change takes the slow path. A
+    setup, read through one C-level multi-key read per dict; only a change takes the slow path. A
     module the test imported for the first time is checked too: one left in
     ``sys.modules`` without its parent attribute is bound back. Reports by default and
     fails under ``KIROCREW_PKG_ATTR_STRICT=1``; restores either way. A module- or
@@ -1293,6 +1458,8 @@ def _determinism_audit_hook(event: str, args: tuple) -> None:
         return
     state = _AUDIT
     if not state.active:
+        return
+    if state.thread is not None and state.thread != threading.get_ident():
         return
     try:
         if os.getpid() != state.pid:
@@ -1819,3 +1986,6 @@ def pytest_terminal_summary(
             f"{_MAX_ANNOTATED_FAILURES} are annotated. The remaining {hidden} are in "
             "this job's short test summary."
         )
+
+
+seal_floor_guards(globals())

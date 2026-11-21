@@ -31,6 +31,7 @@ from kiro_crew.dashboard import change_cards as cards
 from kiro_crew.dashboard.change_cards import CardStore
 from kiro_crew.dashboard.handlers import change_cards as routes
 from kiro_crew.dashboard.handlers.undo_identity_guard import REQ_CARD_UNDO_CREWMATE_EXPECT
+from kiro_crew.testing.synthetic_credentials import github_classic
 
 world = change_cards_helpers.world
 
@@ -48,7 +49,7 @@ BUNDLE = {
     "goals": {"longTerm": "Ship clean releases", "keyResults": [{"text": "zero rollbacks"}]},
     "crons": [{"name": "weekly", "message": "Check in", "cron_expr": "0 9 * * 1"}],
 }
-_FAKE_TOKEN = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
+_FAKE_TOKEN = github_classic(seed=402)
 _SCRIPT_CRON = {"name": "s", "cron_expr": "0 9 * * 1", "script": "a.py:run"}
 
 
@@ -188,6 +189,9 @@ def test_import_shares_the_create_state_read_and_partial_line():
         line
         == "Created Bot “Q” without its goal or anything after it. Undo removes the Bot and what was saved"
     )
+    shown = {"name": "Q", "goal": "g", "dashboard_template": "builtin:standup"}
+    line = catalog.result_summary("crewmate.import", shown, "partial", "t", failed_step=2)
+    assert line.startswith("Created Bot “Q” without its dashboard or anything after it")
 
 
 def test_propose_writes_only_a_card_under_the_app_key_and_the_press_creates(

@@ -59,6 +59,18 @@ SHARED_BINDINGS_CHECKS = (
 #: Member -> (kind, coroutine, signature digest, owning module). Frozen at the split: the
 #: kind, coroutine flag and signature are BASE's; the owner is where the member lives now.
 _MEMBERS: dict[str, tuple[str, object, str, str]] = {
+    "_create_session_with_harness_state": (
+        "function",
+        True,
+        "e3d37eb50120",
+        "runtime_session_create",
+    ),
+    "_load_session_with_harness_state": (
+        "function",
+        True,
+        "56b8e5999417",
+        "runtime_session_load",
+    ),
     "_DESCENDANT_RESCAN_DELAY": ("data", False, "", "runtime_class"),
     "_EXIT_DRAIN_GRACE": ("data", False, "", "runtime_class"),
     "_EXIT_DRAIN_MAX": ("data", False, "", "runtime_class"),
@@ -74,7 +86,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     # and ``native_skill_projection``: off for the warm mint process, whose specs sit in ``run/``,
     # ``harness_pin``: the session's own Bot pin, which KAS's route rule 2 reads,
     # and ``governance_scope``: the (session key, app) its KAS projection meets the profiles of.
-    "__init__": ("function", False, "ba95ca809a11", "runtime_class"),
+    "__init__": ("function", False, "1681866382dc", "runtime_class"),
     "_activate_mode_bracketed": ("function", True, "3dc699e8b0af", "runtime_mode_activation"),
     "_activates_agent_by_mode": ("function", False, "a6632a57e602", "runtime_mode_activation"),
     "_adopt_skill_projection": ("function", False, "5c4748bee6c5", "runtime_mode_activation"),
@@ -94,7 +106,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     # Both take ``request_identity``: the vault identity the ``session/new`` went out
     # under, for the KAS catalog recorder (``kas_model_catalog``), and ``zero_tools``:
     # the mirror's ``"tools": []`` answer the handle refuses every permission request on.
-    "_collect_late_start": ("function", False, "06d7a01b4c51", "runtime_session_create"),
+    "_collect_late_start": ("function", False, "e0ab5550353e", "runtime_session_create"),
     "_compose_death_summary": ("function", False, "d296f1f5d821", "runtime_liveness"),
     "_confirm_member_projection": ("function", True, "c694d7c95d1b", "runtime_session_setup"),
     "_copy_native_launch_sources": ("function", False, "b4bc0bbb71ed", "runtime_session_setup"),
@@ -105,14 +117,15 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_exit_reason": ("function", False, "5ea8f751c789", "runtime_liveness"),
     "_exit_watch_loop": ("function", True, "b60c5fea256e", "runtime_liveness"),
     "_failed_start_cleanup": ("function", True, "b60c5fea256e", "runtime_spawn_launch"),
-    "_finish_create_session": ("function", True, "37a8d853eba4", "runtime_session_create"),
+    "_finish_create_session": ("function", True, "6318c3a7d165", "runtime_session_create"),
     "_finish_session_init": ("function", False, "eb69f6ac3aa6", "runtime_session_registry"),
     "_flush_dropped_frames": ("function", False, "bc10f150ea47", "runtime_frame_accounting"),
     "_flush_roster_overflow": ("function", False, "bc10f150ea47", "runtime_frame_accounting"),
     "_guard_unresolved_mcp_refs": ("function", False, "417a1661421e", "runtime_session_setup"),
     "_handshake_client_capabilities": ("function", True, "16d9fe32838b", "runtime_spawn_launch"),
     "_harness": ("property", False, "482ead03a978", "runtime_class"),
-    "_initialize_handshake": ("function", True, "9a2155299a08", "runtime_spawn_launch"),
+    # Takes ``timeout``: the budget scope admission left of the cold-start window.
+    "_initialize_handshake": ("function", True, "f47102811505", "runtime_spawn_launch"),
     "_is_stale": ("function", True, "f21e39ec5ffb", "runtime_liveness"),
     "_issue_skill_projection_generation": (
         "function",
@@ -131,12 +144,13 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
         "ead9c31b8aca",
         "runtime_session_setup",
     ),
-    "_mirrored_session_mcp": ("function", True, "2db14e85d828", "runtime_session_setup"),
+    "_mirrored_session_mcp": ("function", True, "1a8f8533ecff", "runtime_session_setup"),
     "_mirrored_spec_check_needed": ("function", False, "3cd7cb3cf81a", "runtime_session_setup"),
     "_mode_available": ("staticmethod", False, "08e0d5cbf178", "runtime_mode_activation"),
     "_mount_member_panel": ("function", True, "bcc6c7135aaa", "runtime_session_setup"),
     "_note_announced_child": ("function", False, "ae18ce00a59d", "runtime_frame_accounting"),
-    "_note_dropped_frame": ("function", False, "65da3cb3ad9e", "runtime_frame_accounting"),
+    # Takes ``replay``: a load's own replayed turn, counted apart from ``update``.
+    "_note_dropped_frame": ("function", False, "cead0de215d9", "runtime_frame_accounting"),
     "_note_reaped": ("function", False, "65a401984277", "runtime_liveness"),
     "_note_reaped_after_kill": ("function", False, "0d4bde9dbb0a", "runtime_liveness"),
     "_note_roster_overflow": ("function", False, "72f2430f414f", "runtime_frame_accounting"),
@@ -217,7 +231,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "agent_version": ("property", False, "bb418bb7ece8", "runtime_class"),
     "begin_mcp_reattempt": ("function", False, "dc7c165669b1", "runtime_host_requests"),
     "begin_mcp_sign_in": ("function", False, "dc7c165669b1", "runtime_host_requests"),
-    "create_session": ("function", True, "155a6120083d", "runtime_session_create"),
+    "create_session": ("function", True, "17d59b6340ea", "runtime_session_create"),
     "death_summary": ("function", False, "f21e39ec5ffb", "runtime_liveness"),
     "entitlement_probe_result_at": ("property", False, "59162e39f6f1", "runtime_class"),
     "evict_session": ("function", True, "c284282f8a1d", "runtime_session_registry"),
@@ -229,7 +243,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "is_cloud_sandbox": ("property", False, "a6632a57e602", "runtime_class"),
     "keep_record_on_teardown": ("function", False, "4f730038263e", "runtime_session_registry"),
     "kill": ("function", True, "4f9ced5c4b86", "runtime_tree_kill"),
-    "load_session": ("function", True, "4f88ef29453b", "runtime_session_load"),
+    "load_session": ("function", True, "433d97354b93", "runtime_session_load"),
     "mark_turn_active": ("function", False, "a3b3a732c817", "runtime_session_registry"),
     "mcp_sign_in_holds": ("function", False, "dc7c165669b1", "runtime_host_requests"),
     "pid": ("property", False, "8dc15be1dfda", "runtime_class"),
@@ -987,6 +1001,7 @@ _INIT_HINTS = {
     "acp_backend": str,
     "agent": str,
     "agent_env": dict[str, str] | None,
+    "background_qos": bool,
     "crew_agent": str,
     "expect_mcp_reports": bool,
     "extra_env": dict[str, str] | None,

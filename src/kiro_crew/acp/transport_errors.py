@@ -6,6 +6,12 @@ import importlib as _importlib
 import sys as _sys
 
 from kiro_crew import _facade_mirror
+from kiro_crew.acp.proxy_refusal import (  # noqa: F401 - re-exported
+    PROXY_REFUSAL_TEXT,
+    _is_proxy_refusal,
+    _proxy_refusal_line,
+    drop_proxy_refusal_lines,
+)
 from kiro_crew.acp.transport_error_classification import (  # noqa: F401 - facade compatibility surface
     _5XX_SEP,
     _COMPACTION_DETAIL_KEYS,

@@ -14,6 +14,12 @@ Three parts, each in its own module, wired here:
   archive that follows a click.
 * :mod:`.agent_picker` -- the kickoff's agent picker and ``/kirocrew agent``,
   which switch the channel's session through the dashboard's agent switch.
+* :mod:`.actions` -- the context bar's Create PR and Stop buttons
+  (``code_channel_action``), each running the path its command or button runs.
+* :mod:`.comments` -- plan-canvas comments read back into the session.
+* :mod:`.views` -- the view tabs at Slack's five-tab cap.
+* :mod:`.tabs` -- the channel's own tabs: native pull-request tabs and the
+  interactive Workers tab; :mod:`.worker_stop` answers its Stop button.
 
 Everything here is inert while the code-channel gate
 (:func:`.binding.code_channels_on`) is shut: the hooks fire only for a bound
@@ -24,12 +30,14 @@ and the tools refuse.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
+from kiro_crew import redaction_seams
 from kiro_crew.sel import sel
 from kiro_crew.slack.code_channels.store import Binding, store
 from kiro_crew.slack.code_channels.surface_client import SurfaceClient
@@ -46,7 +54,7 @@ def install(slack_provider: Callable[[], Any]) -> None:
     _slack_provider = slack_provider
     if _INSTALLED:
         return
-    from kiro_crew.slack.code_channels import commands, hooks, wrapup
+    from kiro_crew.slack.code_channels import commands, comments, hooks, wrapup
 
     hooks.on_turn_start(commands.on_turn_start)
     # First: a /wrap-up arriving while a turn starts must see that turn as earlier.
@@ -54,6 +62,8 @@ def install(slack_provider: Callable[[], Any]) -> None:
     # Before every other start hook: the new turn's stop mark is set first.
     hooks.on_turn_start(note_turn_start, first=True)
     hooks.on_turn_end(wrapup.on_turn_end)
+    hooks.on_turn_end(comments.on_turn_end)
+    comments.start_poll()
     _INSTALLED = True
 
 
@@ -289,6 +299,11 @@ def display_text(text: str, *, mentions: bool = True) -> str:
     active platform context (an installation's own patterns apply), and, with
     *mentions*, Slack's mention grammar defanged. ``mentions=False`` is for text
     no Slack message parses (a dashboard transcript row).
+
+    The channel output seam (``redaction_seams.CHANNELS``): with the owner's
+    redaction setting off the credential pass stands down and the text stays as
+    written. A caller whose result reaches a sink that stays redacted (an SEL row)
+    calls it inside ``redaction_switch.always_scan``.
     """
     from dataclasses import replace
 
@@ -299,7 +314,8 @@ def display_text(text: str, *, mentions: bool = True) -> str:
     capabilities = (
         SLACK_CAPABILITIES if mentions else replace(SLACK_CAPABILITIES, mention_grammars=False)
     )
-    return display_safe_for(text, capabilities, redactor=redact_via_context)
+    with redaction_seams.output_seam(redaction_seams.CHANNELS):
+        return display_safe_for(text, capabilities, redactor=redact_via_context)
 
 
 def policy_gated_handlers() -> tuple[tuple[Any, int], ...]:
@@ -317,7 +333,10 @@ def policy_gated_handlers() -> tuple[tuple[Any, int], ...]:
     worktree). ``_bind_channel`` (also reached by a new channel's creation)
     checks before it cuts the worktree and before it binds the session. The
     only writes outside both clients are a slash
-    command's fixed-text replies to its own invoker (``response_url``). A new
+    command's fixed-text replies to its own invoker (``response_url``) and the
+    Approval mode confirmation's fixed line that replaces the clicker's own private
+    message (``approval_picker._settle_confirm``, which asks the same ``channels``
+    policy first). A new
     handler belongs on this list; its test
     (``test_every_policy_gated_handler_checks_at_entry_and_at_its_commit_point``)
     holds the counts.
@@ -335,11 +354,13 @@ def policy_gated_handlers() -> tuple[tuple[Any, int], ...]:
     a grant away: Normal is never held back at its commit, a Reject is.
     """
     from kiro_crew.slack.code_channels import (
+        actions,
         agent_picker,
         commands,
         routing,
         tools,
         worker_approvals,
+        worker_stop,
         wrapup,
     )
 
@@ -348,14 +369,171 @@ def policy_gated_handlers() -> tuple[tuple[Any, int], ...]:
         (agent_picker._sync_gates, 1),  # every owner control's commit fence
         (worker_approvals.handle_click, 1),  # a worker card's Reject at its commit
         (worker_approvals.relay, 1),  # a worker's card, right before it posts
-        (commands.handle_slash, 2),  # /summarize, /wrap-up, /create-pr
+        # /summarize, /wrap-up, /create-pr and the bar's Create PR (handle_slash and
+        # the action both run their gates and effects through run_command)
+        (commands.run_command, 2),
         (routing.deliver_directed, 2),  # the bind, then the turn a command runs
         (routing._refuse_bind_if_policy_refuses, 1),  # in _bind_channel: cut, then session
         (wrapup.handle_archive_click, 3),  # the Archive button (and its recovery)
         (wrapup._post_wrap_up, 2),  # the wrap-up message (tool and /wrap-up fallback)
         (tools._run_tool, 1),  # every agent tool, incl. the context bar
         (commands.sync_commands, 2),  # the channel's command set, at turn start
+        # Every channel button's entry (the context bar's and the Workers tab's)
+        (actions.admit, 1),
+        # The Workers tab's Stop: its last await, then its synchronous final gate
+        (worker_stop._handle, 1),
+        (worker_stop._channel_still_admitted, 1),
     )
+
+
+async def write_refusal(
+    channel_id: str,
+    binding: Binding | None = None,
+    *,
+    activation: bool = False,
+    scope: Callable[[], bool] | None = None,
+) -> str:
+    """THE write gate for this package's Slack writes: ``""`` when one may go out NOW.
+
+    Otherwise why not: ``channels_policy`` (the ``channels`` governance policy
+    denies Slack), ``archived``, ``stopped`` (:func:`channel_stopped`: a Stop of
+    the channel's turn, or of the work this context admitted), with *activation* (needs
+    *binding*) ``rebound`` (the channel is bound to another session now) or
+    ``channel_off`` (code channels are off, the code channel or its origin is
+    Off or in Review, or the config cannot be read), or
+    ``out_of_scope`` (*scope*, the board's scope check for a write that carries
+    worker content).
+
+    Its one await, the policy read, comes FIRST and every other condition is read
+    after it synchronously, so a caller that sends right after awaiting this has
+    no await between the decision and the write: nothing that changes meanwhile
+    (a policy deny, an archive, a Stop, an Off) can slip through.
+    """
+    if not await outbound_permitted():
+        return "channels_policy"
+    return write_refusal_now(channel_id, binding, activation=activation, scope=scope)
+
+
+def write_refusal_now(
+    channel_id: str,
+    binding: Binding | None = None,
+    *,
+    activation: bool = False,
+    scope: Callable[[], bool] | None = None,
+) -> str:
+    """:func:`write_refusal` without the policy read (it must run just before). Fails closed."""
+    return _fences_now(
+        channel_id, binding, stop=True, activation=activation, scope=scope, toggle=activation
+    )
+
+
+async def act_refusal(
+    channel_id: str,
+    binding: Binding | None,
+    *,
+    team: str | None = None,
+    stop: bool = True,
+    scope: Callable[[], bool] | None = None,
+) -> str:
+    """THE gate for an inbound side effect: ``""`` when it may happen NOW.
+
+    For what this package does on Slack's behalf after an await: starting a
+    turn (a canvas comment's feedback, a context-bar click's command), marking
+    canvas comments seen, arming a wrap-up. The same fences as
+    :func:`write_refusal` with the inbound policy in place of the outbound one:
+    ``channels_policy`` (the ``channels`` policy denies inbound Slack),
+    ``workspace`` (*team* is not an admitted workspace), ``channel_policy``
+    (the per-channel ceiling refuses the channel), ``archived``,
+    ``rebound`` (the channel is bound to another session now), ``stopped``
+    (with *stop*: :func:`channel_stopped`, for what nobody asked for just now; a
+    person's click passes ``stop=False``), ``channel_off`` (code channels are
+    off, or the channel or its origin is Off or in Review) or ``out_of_scope``.
+
+    Same shape as :func:`write_refusal`: the one await first, everything else
+    read synchronously after it, so the caller acts right after with no await
+    between. A refused item is left as it was (not routed, not marked seen).
+    """
+    from kiro_crew.messaging.identity import channel_inbound_permitted
+    from kiro_crew.slack.channel_policy import channel_refusal
+
+    channel = channel_id
+    try:
+        # The pair every Slack inbound gate makes: the channels ceiling and the
+        # per-channel one, read again (its entry gate audited the first read).
+        if not (
+            await channel_inbound_permitted("slack") and not channel_refusal(channel, audit=False)
+        ):
+            return "channel_policy" if channel_refusal(channel, audit=False) else "channels_policy"
+    except Exception:
+        logger.debug("code channel %s: inbound policy read failed", channel_id, exc_info=True)
+        return "error"
+    try:
+        if team is not None and not workspace_admitted(team):
+            return "workspace"
+    except Exception:
+        return "error"
+    return _fences_now(channel_id, binding, stop=stop, activation=True, scope=scope, toggle=True)
+
+
+def _fences_now(
+    channel_id: str,
+    binding: Binding | None,
+    *,
+    stop: bool,
+    activation: bool,
+    scope: Callable[[], bool] | None,
+    toggle: bool = False,
+) -> str:
+    """The synchronous fences both gates read after their one await. Fails closed."""
+    try:
+        if archived_now(channel_id, binding):
+            return "archived"
+        if toggle and binding is not None and _rebound(binding):
+            return "rebound"
+        if stop and channel_stopped(channel_id):
+            return "stopped"
+        if activation:
+            from kiro_crew.slack.code_channels.binding import code_channels_on, live_config
+
+            cfg = live_config()  # read now, after the policy await
+            if binding is None or cfg is None:
+                return "channel_off"
+            if toggle and not code_channels_on(cfg):
+                return "channel_off"
+            if not channel_admits(cfg, binding):
+                return "channel_off"
+        if scope is not None and not scope():
+            return "out_of_scope"
+    except Exception:
+        logger.debug("code channel %s: write gate failed", channel_id, exc_info=True)
+        return "error"
+    return ""
+
+
+def _rebound(binding: Binding) -> bool:
+    """The channel's binding as stored now names another session (or is gone)."""
+    loaded = store().loaded_bindings()
+    if loaded is None:
+        return False  # not loaded: unknown here, as for the archive stamp
+    for current in loaded:
+        if current.channel_id == binding.channel_id:
+            return current.session_key != binding.session_key
+    return True
+
+
+def archived_now(channel_id: str, binding: Binding | None = None) -> bool:
+    """Archived by this process, or stamped on the binding as it stands now.
+
+    The stamp is read from the store's loaded bindings (in memory, no disk),
+    not only from the caller's copy, which may predate the archive: the
+    in-process fence is lifted once the stamp is written.
+    """
+    if channel_id in _archived_here or (binding is not None and binding.archived_at):
+        return True
+    for loaded in store().loaded_bindings() or ():
+        if loaded.channel_id == channel_id:
+            return bool(loaded.archived_at)
+    return False
 
 
 def channel_admits(cfg: Any, binding: Binding) -> bool:
@@ -379,6 +557,13 @@ def channel_admits(cfg: Any, binding: Binding) -> bool:
 # (:func:`admit`, a context variable that every await below it inherits). Work
 # admitted before a later stop of its channel writes nothing more to Slack:
 # ``SurfaceClient._call`` re-checks right before every send.
+#
+# A Stop stops the helper agents' running turns too, but holds nothing, so they
+# can run again and the board keeps following them. So the board's own passes (:func:`own_pass`: the workspace refresh and its
+# watch) are fenced by the admission alone: one in flight at the press writes
+# nothing more and arms one re-publish in a clean context (``board.settle``),
+# and the next helper-agent event republishes too: the board and its needs-you
+# alerts.
 
 _stop_seq = 0
 _stopped_at: dict[str, int] = {}
@@ -386,6 +571,36 @@ _turn_started_at: dict[str, int] = {}
 _ADMITTED: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "code_channel_admitted", default=None
 )
+_OWN_PASS: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "code_channel_own_pass", default=False
+)
+
+
+@contextlib.contextmanager
+def own_pass() -> Iterator[None]:
+    """Run the block as a pass that is no turn (the board's, the comment poll's;
+    see :func:`channel_stopped`)."""
+    mark = _OWN_PASS.set(True)
+    try:
+        yield
+    finally:
+        _OWN_PASS.reset(mark)
+
+
+@contextlib.contextmanager
+def outside_passes() -> Iterator[None]:
+    """Run the block outside any pass, admission or send fence of the caller.
+
+    For a route that may start a turn: the turn's task copies this context, and
+    it must be fenced by its own start only, never by the pass that routed it.
+    """
+    marks = (_OWN_PASS.set(False), _ADMITTED.set(None), _SEND_FENCE.set(None))
+    try:
+        yield
+    finally:
+        _SEND_FENCE.reset(marks[2])
+        _ADMITTED.reset(marks[1])
+        _OWN_PASS.reset(marks[0])
 
 
 def mark_stopped(channel_id: str) -> None:
@@ -434,6 +649,45 @@ def commit_if_not_stopped(channel_id: str) -> bool:
     return not channel_stopped(channel_id)
 
 
+_SEND_FENCE: contextvars.ContextVar[Callable[[], str] | None] = contextvars.ContextVar(
+    "code_channel_send_fence", default=None
+)
+
+
+@contextlib.contextmanager
+def send_fence(refusal: Callable[[], str]) -> Iterator[None]:
+    """Ask *refusal* at the client's commit point of every send in the block.
+
+    *refusal* is synchronous: ``""`` admits, anything else is the code the send
+    is refused with. ``SurfaceClient._call`` reads it after its outbound await,
+    right before the send, so an Off or Review, a rebind or a scope change that
+    lands while a site's own gate's await or the client's runs is still seen.
+    Nested fences all apply, outer first.
+    """
+    outer = _SEND_FENCE.get()
+
+    def both() -> str:
+        return (outer() if outer is not None else "") or refusal()
+
+    mark = _SEND_FENCE.set(both)
+    try:
+        yield
+    finally:
+        _SEND_FENCE.reset(mark)
+
+
+def send_refusal_now() -> str:
+    """The block's :func:`send_fence` answer now (``""`` with none). Fails closed."""
+    fence = _SEND_FENCE.get()
+    if fence is None:
+        return ""
+    try:
+        return str(fence() or "")
+    except Exception:
+        logger.debug("code channel send fence failed", exc_info=True)
+        return "error"
+
+
 async def note_turn_start(binding: Binding, _event: Any) -> None:
     """A turn hook: the channel's new turn is not stopped by an earlier Stop."""
     _turn_started_at[binding.channel_id] = _stop_seq
@@ -443,12 +697,17 @@ def channel_stopped(channel_id: str) -> bool:
     """Whether Slack's Stop silenced a turn of *channel_id* that is still unwinding.
 
     Slack's rule after ``agent_session_stopped``: no further posts and no
-    ``agents.*`` calls for that context. True when the stop fence says the
-    current turn or the admitted work was stopped, or a thread-session fence
-    scope for the channel is stopped.
+    ``agents.*`` calls for that context -- the stopped turn and the work it
+    admitted. True when the stop fence says the current turn or the admitted
+    work was stopped, or a thread-session fence scope for the channel is
+    stopped. In the board's own pass (:func:`own_pass`) only the admitted work
+    counts: that pass is no turn of the channel, and the helper agents it shows
+    can run again after a Stop.
     """
     if admitted_work_stopped(channel_id):
         return True
+    if _OWN_PASS.get():
+        return False
     started = _turn_started_at.get(channel_id)
     if started is not None and _stopped_since(channel_id, started):
         return True

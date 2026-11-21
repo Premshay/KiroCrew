@@ -84,11 +84,11 @@ def _find_server_spec_anywhere(name: str) -> dict | None:
         # owned keys so the scope copy holds only what the sources hold; the
         # next rebuild re-projects the live client into the spec regardless.
         from kiro_crew.connections.oauth_clients import (  # noqa: PLC0415
-            provider_for_server,
+            projected_provider_for_server,
             strip_preregistered_oauth_client,
         )
 
-        if provider_for_server(name, found) is not None:
+        if projected_provider_for_server(name, found) is not None:
             found = strip_preregistered_oauth_client(found)
         return found
     for path in (
@@ -166,7 +166,8 @@ def _set_kirocrew_entry(
 
     Returns a short label describing what happened: ``"added"``, ``"enabled"``,
     ``"disabled"``, ``"ambiguous"``, ``"noop"`` or ``"corrupt"``, and with
-    ``existing_only`` also ``"absent"``.
+    ``existing_only`` also ``"absent"``. A spec aimed at a ``"type": "registry"``
+    pointer writes nothing and answers ``"registry"``.
     """
     data = _load_config_for_update(_kirocrew_mcp_json())
     if data is None:
@@ -180,6 +181,32 @@ def _set_kirocrew_entry(
     existing = existing if isinstance(existing, dict) else None
     if existing_only and existing is None:
         return "absent"
+    # A stub entry (``{"disabled": true}``, ``{"disabledTools": [...]}``, ``{}``)
+    # has no command or url, so the spec lookup cannot see it and a caller with a
+    # spec (a registry install) means to put one there. The spec owns how the
+    # server is launched (the plan the user consented to); the stub keeps only its
+    # own overrides. Otherwise the noop below kept the stub and the install
+    # answered ok for a server that could never launch.
+    # A registry pointer has no command either, but it is a whole entry the
+    # admin's catalog launches, not a stub: a spec must not replace it.
+    from kiro_crew.mcp_cleanup import mcp_entry_is_registry_governed
+
+    if existing is not None and spec and mcp_entry_is_registry_governed(existing):
+        return "registry"
+    filled = False
+    if existing is not None and spec and not (existing.get("command") or existing.get("url")):
+        # The launch keys come from the spec as a set: one the spec leaves out
+        # (a stale ``type: "sse"`` under a URL-only spec) would pick the wrong
+        # transport, so it goes.
+        launch_keys = ("command", "args", "url", "type")
+        for k in launch_keys:
+            existing.pop(k, None)
+        for k, v in spec.items():
+            if k in launch_keys:
+                existing[k] = v
+            elif k != "disabled":
+                existing.setdefault(k, v)
+        filled = True
 
     if enabled:
         if existing is None and spec is None:
@@ -195,6 +222,8 @@ def _set_kirocrew_entry(
             if mcp_entry_is_muted(existing):
                 existing.pop("disabled", None)
                 action = "enabled"
+            elif filled:
+                action = "added"
             else:
                 return "noop"
     else:
@@ -204,7 +233,7 @@ def _set_kirocrew_entry(
             entry["disabled"] = True
             servers[name] = entry
             action = "disabled"
-        elif existing.get("disabled") is True:
+        elif existing.get("disabled") is True and not filled:
             # The literal, not the predicate: a non-boolean already mutes the
             # entry, but the write below repairs it into the boolean the schema
             # wants, so only a real ``true`` is a no-op.
@@ -402,6 +431,16 @@ def _set_tool_overrides(name: str, tool_overrides: dict[str, bool]) -> list[str]
     removes them.  Creates the entry if absent (sourcing full spec from
     any scope so the server keeps loading).
 
+    The entry is the one key :func:`_resolve_key_from_read` resolves from this
+    call's own read, so the ``playwright-mcp`` row edits a raw
+    ``npm:@playwright/mcp`` entry in place; a name that is the alias of several
+    entries changes nothing. The raw entry is edited only while it is what the
+    rebuild mounts under the row's name: when the Kiro global or a provider global
+    declares ``playwright-mcp`` itself, that declaration is the mounted server and
+    the raw key mounts beside it as ``playwright-mcp-2``, so the overrides go on a
+    ``playwright-mcp`` store entry, seeded from that declaration, which the rebuild
+    merges onto that mount.
+
     Returns a list of tool names whose state changed. A store that exists but is
     not a readable MCP config changes nothing and is not written, since writing
     back an empty read would drop every other server in it.
@@ -413,10 +452,29 @@ def _set_tool_overrides(name: str, tool_overrides: dict[str, bool]) -> list[str]
         logger.warning("tool overrides for %r not applied: store mcp.json unreadable", name)
         return []
     servers = data.setdefault("mcpServers", {})
-    entry = servers.get(name)
+    try:
+        key = _resolve_key_from_read(servers, name)
+    except AmbiguousServerKey:
+        return []
+    declared: Any = None
+    if key is not None and key != name:
+        # The rebuild projects a raw key's list onto its alias only when no scope
+        # declares the alias itself (``mcp_aliases.raw_tools_project_onto_alias``).
+        shared = (_GLOBAL_MCP_JSON, *[s.global_json for s in _extra_mcp_scopes()])
+        scopes = (_load_json_or_empty(path).get("mcpServers") for path in shared)
+        declaring = [scope[name] for scope in scopes if isinstance(scope, dict) and name in scope]
+        if declaring:
+            key, declared = None, declaring[0]
+    entry = servers.get(key) if key is not None else None
     if not isinstance(entry, dict):
-        # Seed from the best-available spec so the server keeps its config.
-        base = _find_server_spec_anywhere(name) or {}
+        # Seed from the best-available spec so the server keeps its config. A
+        # declaration the redirect above found is read from its own scope: until
+        # the next rebuild the rendered spec may still mount the raw key's program
+        # under the alias, and a store copy of that would outrank the declaration.
+        if isinstance(declared, dict) and (declared.get("command") or declared.get("url")):
+            base = declared
+        else:
+            base = _find_server_spec_anywhere(name) or {}
         entry = {k: v for k, v in base.items() if k != "disabled"}
         servers[name] = entry
 

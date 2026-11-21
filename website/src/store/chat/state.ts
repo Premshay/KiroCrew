@@ -41,13 +41,20 @@ export const persistActivityOpen = (slot: string | null, open: boolean): void =>
 /** Whether `slot` has a saved panel open/closed choice: the panel was opened or
  *  closed in that chat at least once. */
 export const hasSavedActivityOpen = (slot: string): boolean => safeGetItem(ACTIVITY_OPEN_PREFIX + slot) !== null
+/** The page draws its phone form: `data-layout-form`, which `useIsMobile` keeps
+ *  on <html>. An embed frame is never in it. */
+const phoneForm = (): boolean => typeof document !== 'undefined' && document.documentElement.dataset.layoutForm === 'phone'
 /** The panel state a chat is entered with: its own saved choice (closed when it
  *  has none), or open while Keep side panel open is on and the entry CHANGES the
  *  chat. Re-entering the chat already shown (a return to the chat page, a switch
  *  that fell back to it) keeps that state, so a panel the user closed stays
- *  closed until a chat switch. */
+ *  closed until a chat switch. On a phone an entry that changes the chat lands
+ *  on the chat: the panel is a sheet over it there, so an open sheet is a
+ *  per-visit choice (as the Members page keeps its phone overlay), and a chat
+ *  left with its sheet up does not come back covered. A press that opens the
+ *  panel after the switch still opens it. */
 export const entryActivityOpen = (state: ChatState, changesChat: boolean, cached: { activityOpen?: boolean } | undefined): boolean =>
-  (state.sidePanelAlwaysOpen && changesChat) || (cached?.activityOpen ?? false)
+  (state.sidePanelAlwaysOpen && changesChat) || (!(changesChat && phoneForm()) && (cached?.activityOpen ?? false))
 /** Put every chat's panel back on its own saved choice. Keep side panel open
  *  saves no choice, but a chat entered while it was on holds `true` in its
  *  in-memory bucket, and would reopen with it until the next reload. */
@@ -95,6 +102,10 @@ export interface SideMessage {
   is_error?: boolean
   /** Injected into a turn that was already running, not asked from idle. */
   steer?: boolean
+  /** A finished answer's blocked-link records, raw from its final frame or the
+   *  restore read (`link_blocks`): the links its bubble draws as a Blocked link
+   *  card. Validated where they are drawn. */
+  link_blocks?: unknown
   /** Shown before the server confirmed it, so it can be found again by identity.
    *  Position is not usable: an in-flight turn's frames interleave, and both the
    *  reconcile and the rollback used to guess this row was simply the last one. */
@@ -336,6 +347,11 @@ export interface ChatState {
    *  onto a session this tab saw closed (#14762). Cleared by the next
    *  `switchSlot.pending` or the notice's dismiss. */
   switchSlotGone: { name: string; kind: 'gone' | 'failed' | 'closed'; report?: ErrorReport } | null
+  /** The key whose last open failed transiently and stayed selected with an
+   *  empty pane (`switchSlot.rejected`), until a load of it lands. Unlike
+   *  `switchSlotGone` a notice dismiss does not clear it: the sidebar row reads
+   *  it so a click on that open chat retries instead of toggling the panel. */
+  slotOpenFailed: string | null
   loadingOlder: boolean
   /** Last older-history fetch was rejected; surfaced on the top-of-transcript bar. */
   slotOlderError: boolean
@@ -476,6 +492,8 @@ export interface ChatState {
   voiceBusy: boolean
   /** A speech request for the active slot is waiting for its first audio. */
   voicePreparing: boolean
+  /** The listener paused the reading; the position is held until they resume or stop. */
+  voicePaused: boolean
   voiceAudio: string | null  // base64 stitched MP3 for replay
   subagents: Record<string, SubagentActivity>
   /** Aggregate "waiting to start" count per slot — agents accepted but queued
@@ -762,7 +780,9 @@ export interface ChatState {
   // rest of the session (see FOLDER_SUGGESTION_MAX_TURNS). Ignoring a suggestion
   // IS an answer — the user who keeps typing has declined by conduct — and the
   // backend needs no telling because it never re-offers this slot anyway.
-  folderSuggestions: Record<string, { folderId: string; folderName: string; breadcrumb: string; ts: number; turns: number }>
+  // `applied`: the backend already filed the session (auto-apply), so the card
+  // reports the move and offers an undo instead of asking.
+  folderSuggestions: Record<string, { folderId: string; folderName: string; breadcrumb: string; ts: number; turns: number; applied?: boolean }>
   // The active slot, while it has a locally-started turn awaiting server
   // confirmation. While set, the slots-sync ignores a server running=false for
   // it (the snapshot may predate the send). Cleared on server confirmation or
@@ -797,10 +817,11 @@ export const initialState: ChatState = {
   slotOldestIndex: 0,
   slotCursorKey: null,
   slotSwitchRequestId: null,
-  slotSwitchLatestRequestId: null,
   slotSwitchTarget: null,
+  slotSwitchLatestRequestId: null,
   slotSwitchOrigin: null,
   switchSlotGone: null,
+  slotOpenFailed: null,
   loadingOlder: false,
   slotOlderError: false,
   lastChunkSeq: undefined,
@@ -829,6 +850,7 @@ export const initialState: ChatState = {
   voicePlaying: false,
   voiceBusy: false,
   voicePreparing: false,
+  voicePaused: false,
   voiceAudio: null,
   subagents: {},
   subagentQueued: {},

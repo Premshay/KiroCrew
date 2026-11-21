@@ -116,6 +116,8 @@ def orch(monkeypatch: pytest.MonkeyPatch, http: _Http, drafts: Any, gate: AsyncM
     o = _make_orch()
     monkeypatch.setattr(ix, "_orch", o)
     monkeypatch.setattr(ix, "is_owner", lambda uid: uid == OWNER)
+    # A requester is someone the bot still admits (the owner or a shared user).
+    monkeypatch.setattr(ix, "is_allowed_user", lambda uid: bool(uid))
     return o
 
 
@@ -783,6 +785,19 @@ class TestReviewReviseSubmit:
         assert sh._review_drafts_get(DRAFT_KEY) == ("", "")
         assert _outcomes(audit) == [("slack.review_revise_submit", "allowed")]
         assert f"Review revision requested by {REQUESTER} in C1" in _messages(caplog)
+
+    @pytest.mark.asyncio
+    async def test_the_revision_turn_follows_a_configured_auto_mode(
+        self,
+        orch: MagicMock,
+        audit: MagicMock,
+        turns: AsyncMock,
+    ) -> None:
+        orch._approval_mode = None
+        orch._cfg.agent.approval_mode = "auto"
+        sh._review_drafts_set(DRAFT_KEY, "the first draft", REQUESTER)
+        assert len(await _submit_and_join(_revise_submission(REQUESTER, "shorter"))) == 1
+        assert turns.await_args.kwargs["approval_mode"] == sh.APPROVAL_AUTO
 
     @pytest.mark.asyncio
     async def test_a_failing_revision_turn_is_audited_as_an_error(

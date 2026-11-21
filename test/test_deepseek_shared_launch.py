@@ -10,7 +10,7 @@ import pytest
 from kiro_crew.acp.client import AcpClient
 from kiro_crew.acp.harness import deepseek as native
 from kiro_crew.acp.harness.base import SpawnContext, SpawnPlan
-from kiro_crew.acp.harness.deepseek_shared import DeepseekHarness
+from kiro_crew.acp.harness.deepseek import DeepseekHarness
 from kiro_crew.acp.transport_errors import AcpToolGateUnroutable
 
 
@@ -23,18 +23,16 @@ async def test_shared_launch_supplies_the_native_preparation_surface(tmp_path, m
 
     async def prepare(ctx):
         session = ctx.session
-        assert isinstance(session, AcpClient)
+        assert isinstance(session, native._RuntimeProbeSession)
         assert callable(session._prepare_session_mcp)
         assert callable(session._agent_env_for_spawn)
-        assert session.backend == harness.backend
-        assert session._agent == "reviewer"
+        assert ctx.agent == "reviewer"
         assert session._spawn_work_dir == str(tmp_path)
         assert session._extra_env == {"TEST_ROUTE": "local"}
-        assert session._process is None
         seen.append(session)
         return SpawnPlan(argv=["dsh", "acp"], spawn_label="dsh acp", stderr_label="dsh")
 
-    monkeypatch.setattr(harness._launch, "resolve_spawn", prepare)
+    monkeypatch.setattr(native.DeepseekLaunch, "resolve_spawn", AsyncMock(side_effect=prepare))
     plan = await harness.resolve_spawn(
         SpawnContext(
             agent="reviewer",

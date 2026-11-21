@@ -2,8 +2,8 @@ import { useContext, useEffect, useRef, useState, type KeyboardEvent, type React
 import { createPortal } from 'react-dom'
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
-import { fmtList } from '../../i18n/format'
-import { Check, Cpu, Gauge, Loader2, Puzzle, SendHorizontal, Shield, SlidersHorizontal, Sparkles, Users } from 'lucide-react'
+import { fmtList, fmtPercent, joinSentences } from '../../i18n/format'
+import { Check, Cpu, Gauge, Layers, Loader2, Puzzle, SendHorizontal, Shield, SlidersHorizontal, Sparkles, Users } from 'lucide-react'
 import { api, type MemberRosterRow } from '../../api/client'
 import { ApiError } from '../../api/apiError'
 import { MEMBERS_ROSTER_QUERY_KEY } from '../../api/membersQuery'
@@ -19,19 +19,28 @@ import { GuideTrustRootRegion } from '../../guide/trustRoot'
 import { useGuideRevealScope } from '../../guide/GuideRevealScope'
 import { cn } from '../../lib/utils'
 import { ProfilePagePushContext } from './CrewProfilePanel'
+import { harnessManagedNoteBackend } from '../../components/chat-input/autoCompact'
 import { Row, RowGroup, RowStatic, type TONE } from './profileRow'
 
 /** The approval modes a crewmate's record may pin, in label order; YOLO is process-global. */
 const MODES = ['normal', 'trust_reads', 'trust'] as const
-type Setting = 'approval_mode' | 'acp_backend' | 'model' | 'reasoning_effort' | 'worker_model' | 'worker_reasoning_effort'
+type Setting = 'approval_mode' | 'acp_backend' | 'model' | 'reasoning_effort' | 'worker_model' | 'worker_reasoning_effort' | 'max_workers' | 'autocompact_pct'
 /** The record's "workers run the crewmate's own" spelling for both worker fields. */
 const SAME_AS_CREWMATE = ''
 /** A REAL worker-model pin, unlike the crewmate's own `model` where it means
  *  inherit: dispatched sessions run on the backend's default. */
 const WORKER_AUTO = 'auto'
+/** The worker limit the record spells as "no limit" (`max_workers: 0`). The
+ *  picker offers it first, then a few steps up to the server's ceiling of 32. */
+const NO_WORKER_LIMIT = '0'
+const MAX_WORKERS_OPTIONS = [NO_WORKER_LIMIT, '1', '2', '3', '4', '6', '8', '12', '16', '24', '32']
 
 /** The record's "inherit the install's harness" spelling for `acp_backend`. */
 const INHERIT_HARNESS = ''
+
+/** The "Auto-compact at" picks, in percent; '' inherits `session.autocompact_pct`
+ *  (the record stores 0). Inside the 5-90 range the server holds the field to. */
+const AUTOCOMPACT_PCTS = ['', '20', '30', '40', '50', '60', '70', '80', '90']
 
 /** One choice on a picker page. */
 interface Option { value: string; label: string; desc?: string }
@@ -50,6 +59,8 @@ interface Picker {
   options: Option[]
   /** The line under the page's list: what the current pick resolves to or trades. */
   caption?: string
+  /** A control under the caption for something the list itself cannot change. */
+  pageAction?: ReactNode
 }
 
 type TFn = ReturnType<typeof useTranslation>['t']
@@ -148,6 +159,8 @@ export default function CrewProfileSettings({ member, slotKey, waiting = false }
     reasoning_effort: String(member.reasoning_effort || ''),
     worker_model: String(member.worker_model || SAME_AS_CREWMATE),
     worker_reasoning_effort: String(member.worker_reasoning_effort || SAME_AS_CREWMATE),
+    max_workers: String(member.max_workers ?? NO_WORKER_LIMIT),
+    autocompact_pct: member.autocompact_pct ? String(member.autocompact_pct) : '',
   }
   const value = (k: Setting) => draft[k] ?? stored[k]
   const mode = value('approval_mode')
@@ -157,6 +170,16 @@ export default function CrewProfileSettings({ member, slotKey, waiting = false }
   // The model the crewmate itself runs on, named: its pin, else what Inherited resolves to.
   const ownModel = model === INHERIT_MODEL ? resolved?.model : model
   const effortCapable = modelSupportsEffort(ownModel)
+  // The Bot's thread's own threshold: the global the Inherited pick follows, and
+  // an override of the thread's own, which outranks this record.
+  // Re-read on every mount: the global it reports changes in Settings -> Chat,
+  // and nothing else invalidates this key.
+  const { data: threadCompact, error: threadCompactError, refetch: refetchThreadCompact } = useQuery({
+    queryKey: ['chat-slot-autocompact', slotKey],
+    queryFn: () => api.chatSlotAutocompact(slotKey as string),
+    enabled: !!slotKey,
+    refetchOnMount: 'always',
+  })
   // A crewmate pinned to a harness picks from THAT harness's models, never the
   // install's: a model only another harness serves is refused at save.
   const harness = value('acp_backend')
@@ -255,7 +278,9 @@ export default function CrewProfileSettings({ member, slotKey, waiting = false }
     setNotice('')
     setSaved('')
     // The record spells "inherit" as ''; the picker spells it INHERIT_MODEL.
-    const wire = key === 'model' && next === INHERIT_MODEL ? '' : next
+    const wire: string | number = key === 'model' && next === INHERIT_MODEL
+      ? ''
+      : key === 'autocompact_pct' ? Number(next || 0) : next
     try {
       // The permission is compare-and-set: the server applies it only if the
       // record still holds what this card read, so a stale card can never
@@ -275,7 +300,8 @@ export default function CrewProfileSettings({ member, slotKey, waiting = false }
       }
       const body = key === 'approval_mode'
         ? { approval_mode: wire, expected_approval_mode: String(member.approval_mode ?? '') }
-        : { [key]: wire, ...resetModels }
+        // The worker limit is a number on the record; every other field is a string.
+        : { [key]: key === 'max_workers' ? Number(wire) : wire, ...resetModels }
       try {
         await api.updateKirocrewAgent(member.name, body)
       } catch (e) {
@@ -305,14 +331,14 @@ export default function CrewProfileSettings({ member, slotKey, waiting = false }
         return
       }
       queryClient.setQueryData<MemberRosterRow[]>(MEMBERS_ROSTER_QUERY_KEY, (rows) =>
-        rows?.map((r) => (r.name === member.name ? { ...r, [key]: wire } : r)))
+        rows?.map((r) => (r.name === member.name ? { ...r, [key]: key === 'max_workers' ? Number(wire) : wire } : r)))
       // The server applied the permission to the live thread in the same step
       // (PUT /api/agents/{name}). Model and effort still follow from here; if
       // that write fails the error says so, and the next thread uses the record.
       // The worker pair touches no thread: it is read when the crewmate next
       // opens a session, so the record is the whole write.
-      if (slotKey && key === 'model') await api.chatSlotModel(slotKey, wire)
-      else if (slotKey && key === 'reasoning_effort') await api.chatSlotReasoningEffort(slotKey, wire)
+      if (slotKey && key === 'model') await api.chatSlotModel(slotKey, String(wire))
+      else if (slotKey && key === 'reasoning_effort') await api.chatSlotReasoningEffort(slotKey, String(wire))
     } catch (e) {
       setDraft((d) => ({ ...d, [key]: undefined }))
       setError(e instanceof Error ? e.message : String((e as { message?: string })?.message ?? e))
@@ -370,22 +396,42 @@ export default function CrewProfileSettings({ member, slotKey, waiting = false }
       if (!names.some((n) => n !== 'auto')) return undefined
       served = new Set(names.map(modelKey))
     }
-    return [
+    return joinSentences([
       modelPinned ? (served.has(modelKey(pinnedModel))
         ? t('pages.membersPage.profile_harness_keeps_model', { model: pinnedModel })
         : t('pages.membersPage.profile_harness_model_resets')) : '',
       workerPinned ? (served.has(modelKey(pinnedWorker))
         ? t('pages.membersPage.profile_harness_keeps_worker', { model: pinnedWorker })
         : t('pages.membersPage.profile_harness_worker_resets', { name })) : '',
-    ].filter(Boolean).join(' ')
+    ])
   }
-  const joinDesc = (...parts: (string | undefined)[]) => parts.filter(Boolean).join(' ') || undefined
+  const joinDesc = (...parts: (string | undefined)[]) => joinSentences(parts) || undefined
   // The known limits of a harness, under its label, before it is picked.
   const harnessLimit = (h: string) => {
     if (harnessUnavailable(h)) return t('pages.membersPage.profile_harness_cannot_start')
     if (workerHarnesses && !workerHarnesses.includes(h)) return t('pages.membersPage.profile_harness_no_workers', { name })
     return undefined
   }
+  const workerCapLabel = (n: string) => (n === NO_WORKER_LIMIT ? t('pages.membersPage.profile_worker_cap_none') : n)
+  const autocompact = value('autocompact_pct')
+  // What Inherited leaves in force. On a harness that compacts on its own (KAS)
+  // the global is not used, so the hint names the harness, as the chat
+  // composer's meter does. Asked as if neither the record nor the thread held
+  // a value, since this describes picking Inherited on the record alone.
+  const inheritedCompactHint = (ac: NonNullable<typeof threadCompact>) => {
+    const managed = harnessManagedNoteBackend({ ...ac, pct: null, agent_pct: null })
+    return managed
+      ? t('pages.membersPage.profile_autocompact_inherited_harness', { backend: acpBackendName({ id: managed }) })
+      : t('pages.membersPage.profile_autocompact_inherited_hint', { pct: fmtPercent(ac.global_pct / 100) })
+  }
+  // The thread's own threshold outranks every pick here, and the Bot's thread
+  // has no context meter to clear it from, so the page offers the clear itself.
+  const clearThreadCompact = useMutation({
+    mutationFn: () => api.setChatSlotAutocompact(slotKey as string, null),
+    onSuccess: () => { void refetchThreadCompact() },
+  })
+  const threadOverride = typeof threadCompact?.pct === 'number' && !!slotKey
+  const autocompactLabel = (p: string) => (p === '' ? t('pages.kiroCrewAgentsPage.inherited') : fmtPercent(Number(p) / 100))
   const workerModelLabel = (m: string) => (
     m === SAME_AS_CREWMATE ? t('pages.membersPage.profile_worker_same_as', { name }) : m === WORKER_AUTO ? t('pages.membersPage.profile_worker_auto') : m
   )
@@ -471,7 +517,7 @@ export default function CrewProfileSettings({ member, slotKey, waiting = false }
       icon: <Users size={16} />, tone: 'info',
       value: workerModel, valueLabel: workerModelLabel(workerModel),
       options: workerModelOptions.map((m) => ({ value: m, label: workerModelLabel(m) })),
-      caption: [
+      caption: joinSentences([
         workerModel === SAME_AS_CREWMATE
           ? t('pages.membersPage.profile_worker_same_hint', { name, model: ownModelNoun })
           : workerModel === WORKER_AUTO
@@ -480,7 +526,7 @@ export default function CrewProfileSettings({ member, slotKey, waiting = false }
         // Says what is true when the effort row folds: the setting does not apply
         // to that model. Never "no reasoning", which reads as a downgrade.
         workerEffortRowShown ? '' : t('pages.membersPage.profile_worker_no_effort_hint'),
-      ].filter(Boolean).join(' '),
+      ]),
     },
     ...(workerEffortRowShown ? [{
       // '' means "the crewmate's own level" only while the workers run the
@@ -502,6 +548,47 @@ export default function CrewProfileSettings({ member, slotKey, waiting = false }
           ? (ownEffort ? t('pages.membersPage.profile_worker_effort_same_hint', { name, effort: effortLabel(ownEffort) }) : undefined)
           : t('pages.membersPage.profile_worker_effort_default_hint', { name, effort: ownEffort ? ` (${effortLabel(ownEffort)})` : '' }),
     }] : []),
+    {
+      // The owner's limit on how many workers the Bot keeps open at once.
+      // Only this card writes it: no Bot tool does, so the Bot cannot raise it.
+      key: 'max_workers',
+      label: t('pages.membersPage.profile_worker_cap'),
+      icon: <Layers size={16} />, tone: 'info',
+      value: value('max_workers'), valueLabel: workerCapLabel(value('max_workers')),
+      options: withCurrent(MAX_WORKERS_OPTIONS, value('max_workers')).map((n) => ({ value: n, label: workerCapLabel(n) })),
+      caption: t('pages.membersPage.profile_worker_cap_hint', { name }),
+    },
+    {
+      // How full the crewmate's chats may get before they compact. Its thread
+      // has no context meter of its own (CrewComposer), so this is where the
+      // person bounds what each wake re-sends.
+      key: 'autocompact_pct',
+      label: t('pages.membersPage.profile_autocompact'),
+      icon: <SlidersHorizontal size={16} />, tone: 'accent',
+      value: autocompact, valueLabel: autocompactLabel(autocompact),
+      options: withCurrent(AUTOCOMPACT_PCTS, autocompact).map((p) => ({
+        value: p, label: autocompactLabel(p),
+        // Without a read the number is unknown, but where it comes from is not.
+        desc: p === '' ? (threadCompact ? inheritedCompactHint(threadCompact) : t('pages.membersPage.profile_autocompact_inherited_default')) : undefined,
+      })),
+      caption: joinSentences([
+        t('pages.membersPage.profile_autocompact_hint', { name }),
+        typeof threadCompact?.pct === 'number'
+          ? t('pages.membersPage.profile_autocompact_thread_override', { pct: fmtPercent(threadCompact.pct / 100) })
+          : '',
+      ]),
+      pageAction: threadOverride ? (
+        <div className="flex flex-col items-start gap-2 px-3.5">
+          <Btn type="button" onClick={() => clearThreadCompact.mutate()} disabled={clearThreadCompact.isPending}
+            data-testid="crew-profile-settings-autocompact-clear-thread">
+            {t('pages.membersPage.profile_autocompact_clear_thread')}
+          </Btn>
+          {/* No hand-off: this page may sit beside an unsent draft to this Bot. */}
+          <ErrorNotice variant="inline" message={clearThreadCompact.isError ? t('pages.membersPage.profile_autocompact_clear_failed') : null}
+            testId="crew-profile-settings-autocompact-clear-error" />
+        </div>
+      ) : undefined,
+    },
   ]
   // The page last shown keeps painting through the card's exit slide. When its
   // row folded (the pick made on it cleared a stale level, so the row left
@@ -543,7 +630,12 @@ export default function CrewProfileSettings({ member, slotKey, waiting = false }
   useGuideRevealScope('members.settings', open)
 
   const openSettings = () => setOpen(true)
-  const openPage = (key: Setting) => { setPage(key); setShown(key) }
+  const openPage = (key: Setting) => {
+    setPage(key)
+    setShown(key)
+    // The global the Inherited pick names may have moved since the card opened.
+    if (key === 'autocompact_pct' && slotKey) void refetchThreadCompact()
+  }
   const busy = saving || waiting || leaving
   // The Settings row's reading: the ceiling and what runs. Not the worker pick:
   // "Same as Kiro" beside Kiro's own name read as a riddle on the card.
@@ -557,6 +649,15 @@ export default function CrewProfileSettings({ member, slotKey, waiting = false }
       <ErrorNotice
         message={resolvedError ? (resolvedError instanceof Error ? resolvedError.message : String(resolvedError)) : null}
         testId="crew-profile-settings-resolve-error"
+      />
+      <ErrorNotice
+        message={page === 'autocompact_pct' && threadCompactError ? t('pages.membersPage.profile_autocompact_read_failed') : null}
+        actions={(
+          <button type="button" onClick={() => { void refetchThreadCompact() }} data-testid="crew-profile-settings-autocompact-retry">
+            {t('pages.membersPage.profile_autocompact_retry')}
+          </button>
+        )}
+        testId="crew-profile-settings-autocompact-error"
       />
       <ErrorNotice
         message={(harness ? harnessModels.isError : (models.error || models.isDegraded)) ? t('pages.chatSidebar.model_list_failed') : null}
@@ -672,6 +773,7 @@ export default function CrewProfileSettings({ member, slotKey, waiting = false }
             })}
           </div>
         </RowGroup>
+        {p.pageAction}
         {notices}
       </div>
     )

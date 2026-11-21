@@ -157,6 +157,7 @@ CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     "session_summary",
     "read_slack_history",
     "session_queue",
+    "session_run_queued",
     # The fan-out verb, blocked for the reason `session_send` is and then some: one
     # call reaches every session the caller created, so a channel agent acting on
     # words from a thread other people are in would relay them into the user's
@@ -167,6 +168,7 @@ CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     # whoever is in that thread -- the same exfiltration `session_read_message` is
     # blocked for, one step shallower.
     "session_status",
+    "crew_list",
     "session_create",
     "work_dispatch",
     "session_fork",
@@ -464,6 +466,7 @@ class ChannelAgent:
     # titles and request-body patterns are LLM-influenced and never scope a
     # grant. Set while ``_approval_future`` is pending, cleared with it.
     _pending_approval_command: str = field(default="", repr=False)
+    _pending_approval_person_only: bool = field(default=False, repr=False)
     # The provider's text when the last lost-session verdict was a credential
     # failure ("" otherwise), so the recovery notices can name the real cause.
     _credential_error: str = field(default="", repr=False)

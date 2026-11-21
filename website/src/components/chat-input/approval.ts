@@ -1,5 +1,6 @@
 import { createElement, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Trans } from 'react-i18next'
+import { useQueryClient } from '@tanstack/react-query'
 import { shallowEqual } from 'react-redux'
 import { useAppSelector, type useAppDispatch } from '../../store'
 import { pendingQuestionFor, resolveApprovalRow, resolveShownApprovalRow, openActivityToTool, openActivityToTab, selectSlotMessages, selectSlotPendingApproval, selectSlotPendingSpawnApprovals, selectSlotSubagents, isSpawnApprovalGone, markSubagentApproving, markSubagentApprovalGone, reconcileGoneSubagent, sseSubagentDone } from '../../store/chatSlice'
@@ -26,6 +27,8 @@ import { isUnknownPrincipal } from '../../api/sharedCrewUi'
 import { useResolvedElsewhere } from './useResolvedElsewhere'
 import { useRaisedBy } from '../../pages/chat/shared-crew/useRaisedBy'
 import { REJECT_APPROVAL_EVENT } from '../../pages/chat/composerFocus'
+import { refusalText } from '../../utils/toolGrantRefusal'
+import { stripToolCallLead } from '../../lib/toolRowContract'
 
 /* The slot's approval chrome as state: the pending tool approval (its
    decision submit, the approval-mode discovery hint and nudge, the ghost
@@ -46,7 +49,7 @@ type AppDispatch = ReturnType<typeof useAppDispatch>
  *  `approvalIsUnattended`), so the Trust controls are withheld and only
  *  Allow once / Reject are offered. Kept in sync with the backend's
  *  `_BACKGROUND_APPROVAL_SOURCES` minus `autonudge`, which does run in-session. */
-const TRUST_DECISIONS = ['trust_command', 'trust_base', 'trust', 'trust_reads']
+const TRUST_DECISIONS = ['trust_command', 'trust_base', 'trust', 'trust_reads', 'always_allow_tool']
 
 export const UNATTENDED_APPROVAL_SOURCES = new Set(['cron', 'heartbeat', 'taskrunner'])
 
@@ -69,6 +72,7 @@ export function useToolApproval({ slotId, slotApprovalChrome, approvalMode, disp
   approvalMode?: string
   dispatch: AppDispatch
 }) {
+  const qc = useQueryClient()
   const pendingApprovalRaw = useAppSelector(s => selectSlotPendingApproval(s, slotId), shallowEqual)
   // Suppressed at the READ so every consumer (bar, ghost, pill, rounded-corner
   // class) follows one judgment instead of each render site re-deciding.
@@ -168,6 +172,12 @@ export function useToolApproval({ slotId, slotApprovalChrome, approvalMode, disp
   // never be promoted into grant authority by a frontend fallback.
   const approvalTrustCommandGrantable = approvalMeta?.trust_command_grantable === '1'
   const approvalTrustBaseGrantable = approvalMeta?.trust_base_grantable === '1'
+  /** Set when the command-scoped grant is a browser SITE grant: `full_command`
+   *  is then a host, and this says whether the grant covers reading its pages
+   *  (`read`) or acting on them too (`act`). Server word only. */
+  const browserTrustClass = approvalMeta?.browser_trust_class
+  const approvalBrowserTrustClass: '' | 'read' | 'act' = browserTrustClass === 'read' || browserTrustClass === 'act'
+    ? browserTrustClass : ''
   /** Server proof that the SESSION-wide grant ("trust all tools") can be
    *  recorded for this card. Read separately from the command-scoped bit above
    *  because the session grant names no command: it auto-approves whatever this
@@ -176,6 +186,11 @@ export function useToolApproval({ slotId, slotApprovalChrome, approvalMode, disp
    *  a card that could still take a session grant offered allow-once and reject
    *  alone. */
   const approvalTrustAllGrantable = approvalMeta?.trust_grantable === '1'
+  /** "Always allow this tool": the verified `@server/tool` the server says this
+   *  card may grant for good, or the code saying why not. Server facts only. */
+  const approvalAlwaysAllowRef = approvalMeta?.always_allow_tool_grantable === '1' && typeof approvalMeta?.always_allow_tool_ref === 'string'
+    ? approvalMeta.always_allow_tool_ref : ''
+  const approvalAlwaysAllowRefusal = refusalText(typeof approvalMeta?.always_allow_tool_refusal === 'string' ? approvalMeta.always_allow_tool_refusal : '')
   /** Server word that a reason typed with a rejection reaches the model (the
    *  backend reads one). Without it the reject menu asks for none. */
   const approvalTakesReason = approvalMeta?.rejection_reason_accepted === '1'
@@ -202,7 +217,7 @@ export function useToolApproval({ slotId, slotApprovalChrome, approvalMode, disp
     // reconstruct path carries no `source`), so fall back to the `[source]`
     // prefix the card was written with rather than silently treating a
     // reloaded cron card as an ordinary in-session one.
-    || (pendingApproval?.content || '').match(/^(?:🔧\s*)?\[([a-z_]+)\]/)?.[1]
+    || stripToolCallLead(pendingApproval?.content).match(/^\[([a-z_]+)\]/)?.[1]
     || ''
   const approvalIsUnattended = UNATTENDED_APPROVAL_SOURCES.has(approvalSource)
   /** True when a standing Trust grant can actually be RECORDED for this card.
@@ -222,7 +237,7 @@ export function useToolApproval({ slotId, slotApprovalChrome, approvalMode, disp
     && approvalTarget?.origin === 'native'
   const simplified = useSimplifiedToolNames()
   const uiLang = useLanguage().resolved
-  const approvalLabelRaw = sanitizeLlmOutput(pendingApproval?.content || '').replace(/^🔧\s*/, '')
+  const approvalLabelRaw = stripToolCallLead(sanitizeLlmOutput(pendingApproval?.content || ''))
 
   const approvalToolCallId = (approvalMeta?.tool_call_id as string) || null
 
@@ -408,7 +423,10 @@ export function useToolApproval({ slotId, slotApprovalChrome, approvalMode, disp
       const extra: Record<string, string | number> = { request_id: approvalTarget.id, origin: 'native', request_mid: approvalTarget.mid, response_id: responseId }
       if (pattern) extra.pattern = pattern
       if (ttlSeconds !== undefined) extra.ttl_seconds = ttlSeconds
-      api.approveChatSlot(activeSlot, decision, extra).then(finish).catch(fail)
+      api.approveChatSlot(activeSlot, decision, extra).then(() => {
+        if (decision === 'always_allow_tool') void qc.invalidateQueries({ queryKey: ['mcp-tool-grants'] })
+        finish()
+      }).catch(fail)
     } else if (reason && decision !== 'approved' && activeSlot && approvalTarget.origin === 'native' && !approvalIsUnattended) {
       // A rejection's reason travels only on the slot route, the one the server
       // takes it on, bound to the row this card showed like every other decide.
@@ -419,7 +437,7 @@ export function useToolApproval({ slotId, slotApprovalChrome, approvalMode, disp
     } else {
       api.decideApproval(approvalTarget, toApiDecision(decision), responseId).then(finish).catch(fail)
     }
-  }, [approvalId, approvalTarget, approvalMeta, pendingApproval, pendingApprovalIndex, activeSlot, approvalIsUnattended, approvalSource, approvalMode, approvalFullCommand, approvalBaseCommand, dispatch, teamAttribution, viewerId, markSettled])
+  }, [approvalId, approvalTarget, approvalMeta, pendingApproval, pendingApprovalIndex, activeSlot, approvalIsUnattended, approvalSource, approvalMode, approvalFullCommand, approvalBaseCommand, dispatch, teamAttribution, viewerId, markSettled, qc])
 
   // The reject-approval chord reaches this pane's bar as an event on its action
   // row (`rejectPendingApproval`). State, not a ref: the row mounts with the
@@ -438,6 +456,7 @@ export function useToolApproval({ slotId, slotApprovalChrome, approvalMode, disp
     approvalNotice, setApprovalNotice, approvalNoticeKind, showApprovalError, showApprovalStatus,
     approvalToolInput, approvalIsReadOnly, approvalFullCommand, approvalBaseCommand, approvalIsShell, approvalTakesReason, approvalMid,
     approvalTrustCommandGrantable, approvalTrustBaseGrantable, approvalTrustAllGrantable, approvalIsUnattended, approvalTrustGrantable,
+    approvalBrowserTrustClass, approvalAlwaysAllowRef, approvalAlwaysAllowRefusal,
     approvalDenyRule, approvalDenyDetail, approvalDenyFamily, approvalDenyCommand,
     approvalLabelRaw, approvalToolCallId, approvalPurpose, approvalTs, approvalLabel, approvalRaisedBy, showGhost, showInChat, handleApprovalAction,
     approvalActionsRef,

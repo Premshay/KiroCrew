@@ -43,6 +43,7 @@ import CronFolderHeader from '../components/CronFolderHeader'
 import CronBatchActionsMenu from '../components/CronBatchActionsMenu'
 import { useScheduleBatchActions, BatchRunConfirmDialog } from './SchedulePageBatchActions'
 import ScheduleCrewmateRosterNotice from './ScheduleCrewmateRosterNotice'
+import { JobRunText } from './SchedulePageJobRunText'
 import CronRowActions from '../components/CronRowActions'
 import AddJobSplitButton from '../components/AddJobSplitButton'
 import {
@@ -79,11 +80,11 @@ const SCHEDULE_COLUMNS = 10
 
 /**
  * The jobs table's declared min-width in px: the number in its
- * `min-w-[1194px]` class. It exists as a constant only so a user's column
+ * `min-w-[1210px]` class. It exists as a constant only so a user's column
  * resize can move it (`JOBS_TABLE_MIN_WIDTH + jobCols.extra`); the class stays
  * the default, and `SchedulePage.columnContract.test.ts` holds the two equal.
  */
-const JOBS_TABLE_MIN_WIDTH = 1194
+const JOBS_TABLE_MIN_WIDTH = 1210
 
 /**
  * The user-resizable jobs columns. Each `base` restates that column's
@@ -105,8 +106,10 @@ const JOB_COLUMNS = {
   type: { base: 116, min: 64, max: 480 },
   schedule: { base: 180, min: 80, max: 480 },
   status: { base: 104, min: 60, max: 240 },
-  lastRun: { base: 82, min: 56, max: 240 },
-  nextRun: { base: 92, min: 56, max: 240 },
+  // Wide enough for the label plus the sort arrow: the jobs open sorted by
+  // Next Run, and a narrower column ellipsized its own header ("Next R…").
+  lastRun: { base: 94, min: 56, max: 240 },
+  nextRun: { base: 96, min: 56, max: 240 },
 } satisfies Record<string, TableColumnSpec>
 
 const JOB_COLUMNS_STORAGE_KEY = 'kc:schedule:jobs-column-widths'
@@ -170,9 +173,9 @@ const fmtAgo = (ts?: number) => {
   if (!ts) return '—'
   const s = Math.floor((Date.now() / 1000) - ts)
   if (s < 60) return i18nT('pages.schedulePage.just_now')
-  if (s < 3600) return i18nT('pages.schedulePage.m_ago', { n: Math.floor(s / 60) })
-  if (s < 86400) return i18nT('pages.schedulePage.h_ago', { n: Math.floor(s / 3600) })
-  return i18nT('pages.schedulePage.d_ago', { n: Math.floor(s / 86400) })
+  // The locale words the past offset in the largest unit that fits, so a run a
+  // year ago reads `1y ago`, not `400d ago`, and matches the Next-run column.
+  return fmtRelative(ts * 1000, { numeric: 'always' })
 }
 
 const fmtIn = (ts?: number | null) => {
@@ -271,13 +274,14 @@ export function EmptyFolderChip({ folder, onRename, onDelete, error }: { folder:
       {confirming && (
         <div className="flex items-center gap-3 px-3 py-1.5 mb-1.5 text-sm rounded-md bg-danger/5 border border-danger/20">
           <span className="text-text">{i18nT('pages.schedulePage.cronFolders.confirm_delete_folder', { name: folder.name })}</span>
-          <Btn danger onClick={() => { setConfirming(false); onDelete() }}>
+          {/* The stock Btn is transparent, so on the danger tint it has no edge until hovered. */}
+          <Btn danger onClick={() => { setConfirming(false); onDelete() }} className="border-border-strong bg-bg-elevated">
             {i18nT('pages.schedulePage.cronFolders.delete_folder_named', { name: folder.name })}
           </Btn>
           {/* Cancel unmounts the row and itself with it, which would drop
               focus to the page: hand it back to the trigger, as the rename
               editor does, a frame later so the row has gone. */}
-          <Btn onClick={() => {
+          <Btn className="border-border-strong bg-bg-elevated" onClick={() => {
             setConfirming(false)
             requestAnimationFrame(() => triggerRef.current?.focus({ preventScroll: true }))
           }}>
@@ -550,6 +554,8 @@ export default function SchedulePage() {
   const handleMoveJob = useCallback(async (jobId: string, folderId: string) => {
     try {
       await api.updateCron(jobId, { folder_id: folderId })
+      // Only this job's own refusal: the slot is shared with other rows' errors.
+      setActionError(prev => (prev?.id === jobId ? null : prev))
       // Auto-expand the target folder so moved job stays visible
       if (folderId) {
         setCollapsedFolders(prev => {
@@ -610,7 +616,7 @@ export default function SchedulePage() {
   }), [sanitizedJobs, cronFilter, activeCrewmate, roster])
   const filterActive = !!cronFilter || !!activeCrewmate
   const scheduleComparators = useMemo(() => ({
-    name: (a: CronJob, b: CronJob) => a.name.localeCompare(b.name),
+    name: (a: CronJob, b: CronJob) => compareText(a.name, b.name),
     // Clock time first, so `9:00 AM` precedes `1:00 PM` -- the label sorts wrongly
     // as text. Rows with no clock (raw fallback, intervals) go last, then by label.
     schedule: (a: CronJob, b: CronJob) => {
@@ -919,6 +925,7 @@ export default function SchedulePage() {
                         setActionError({ id: 'batch-move', msg: i18nT('pages.schedulePage.cronFolders.batch_move_failed', { count: failedIds.length, total: ids.length }) })
                       } else {
                         setSelectedIds(new Set())
+                        setActionError(prev => (prev?.id === 'batch-move' ? null : prev))
                       }
                       if (folderId) {
                         setCollapsedFolders(prev => {
@@ -1013,7 +1020,7 @@ export default function SchedulePage() {
                 column, and restates the rule above mechanically: the px
                 columns moved by `extra`, so min-width moves by the same
                 amount and Message keeps its floor. */}
-            <Table className="table-fixed min-w-[1194px]" style={jobCols.extra ? { minWidth: JOBS_TABLE_MIN_WIDTH + jobCols.extra } : undefined} aria-label={i18nT('pages.schedulePage.jobs_table')} {...uiLocation('schedule.job-list', attachJobsTable)}>
+            <Table className="table-fixed min-w-[1210px]" style={jobCols.extra ? { minWidth: JOBS_TABLE_MIN_WIDTH + jobCols.extra } : undefined} aria-label={i18nT('pages.schedulePage.jobs_table')} {...uiLocation('schedule.job-list', attachJobsTable)}>
               <TableHeader>
                 <TableRow className="hover:bg-transparent">
                   <TableHead className="w-[36px] px-2 text-center">
@@ -1039,8 +1046,8 @@ export default function SchedulePage() {
                   <SortableTableHead label={i18nT('pages.schedulePage.schedule')} sortKey="schedule" sort={schedSort} onToggle={toggleSchedSort} className="w-[180px] relative" style={jobCols.style('schedule')} resizer={jobCols.resizer('schedule')} />
                   <TableHead>{i18nT('pages.schedulePage.message')}</TableHead>
                   <SortableTableHead label={i18nT('pages.schedulePage.status')} sortKey="status" sort={schedSort} onToggle={toggleSchedSort} className="w-[104px] relative" style={jobCols.style('status')} resizer={jobCols.resizer('status')} />
-                  <SortableTableHead label={i18nT('pages.schedulePage.last_run')} sortKey="lastRun" sort={schedSort} onToggle={toggleSchedSort} className="w-[82px] relative" style={jobCols.style('lastRun')} resizer={jobCols.resizer('lastRun')} />
-                  <SortableTableHead label={i18nT('pages.schedulePage.next_run')} sortKey="nextRun" sort={schedSort} onToggle={toggleSchedSort} className="w-[92px] relative" style={jobCols.style('nextRun')} resizer={jobCols.resizer('nextRun')} />
+                  <SortableTableHead label={i18nT('pages.schedulePage.last_run')} sortKey="lastRun" sort={schedSort} onToggle={toggleSchedSort} className="w-[94px] relative" style={jobCols.style('lastRun')} resizer={jobCols.resizer('lastRun')} />
+                  <SortableTableHead label={i18nT('pages.schedulePage.next_run')} sortKey="nextRun" sort={schedSort} onToggle={toggleSchedSort} className="w-[96px] relative" style={jobCols.style('nextRun')} resizer={jobCols.resizer('nextRun')} />
                   {/* 176px, not 164: under `table-fixed` a column width is a
                       CONTRACT, so a cell whose controls need more than it spills
                       OUT of the table instead of widening it. The three inline
@@ -1654,9 +1661,11 @@ export function JobSecretsPanel({ job, onSaved }: { job: CronJob; onSaved: () =>
             >
               {i18nT('pages.schedulePage.secrets_approve')}
             </SendBtn>
+            {/* The stock Btn is transparent, so on the warn tint it has no edge until hovered. */}
             <Btn
               danger
               disabled={busy}
+              className="border-border-strong bg-bg-elevated"
               onClick={() =>
                 act({
                   deny_pending: true,
@@ -1860,54 +1869,7 @@ function JobDetailDialog({ job, prefill, prefillWrites, agents, defaultAgent, ro
             <ErrorNotice message={panelError} testId="schedule-job-panel-error" />
             {job?.script && <ScriptSourcePanel jobId={job.id} />}
             {job && job.script && <JobSecretsPanel job={job} onSaved={onSaved} />}
-            {/* The run's persisted `last_error` is an error by origin (the job
-                FAILED), so it takes the shared surface with the 'Last Error'
-                label as its title. `whitespace-pre-wrap` on the notice body
-                keeps the log's line structure; `font-mono` keeps it reading as
-                output rather than prose.
-
-                NOT gated on `script`: a `command` job fails the same way and
-                carries the same `last_error`, and gating the only in-page
-                surface on the job's TYPE left that reader with the row's
-                `title=` tooltip alone -- invisible on touch, unreadable to a
-                screen reader, and no hand-off. The failure decides the
-                surface, never the shape of the job that produced it. */}
-            {job?.last_error && (
-              <>
-                {/* No hand-off: JobForm draft */}
-                {/* A `last_error` is often a multi-frame Python traceback. The
-                    cap is viewport-relative (`min(45vh, 420px)`), not a fixed
-                    200px: a 200px window crushes a traceback to a few lines
-                    that scroll under the fold, so the one line naming the
-                    failure is the half the reader loses. 45vh uses the dialog's
-                    own `max-h-[86vh]` height, the 420px ceiling stops it
-                    dominating a tall screen, and it still scrolls internally
-                    for anything longer.
-
-                    `shrink-0` is load-bearing: this notice is a direct
-                    `overflow-y-auto` flex child of the column-flex DialogBody,
-                    which gives it an automatic `min-height: 0`, so the column
-                    squeezes it to its content's min-content height (~16px, one
-                    line) regardless of `max-height`. Measured in a running
-                    instance: without `shrink-0` the box renders 16px against a
-                    499px traceback; with it, the full height the cap allows. */}
-                <ErrorNotice
-                  title={i18nT('pages.schedulePage.last_error')}
-                  message={job.last_error}
-                  className="shrink-0 max-h-[min(45vh,420px)] overflow-y-auto font-mono"
-                  testId="schedule-job-last-error"
-                />
-              </>
-            )}
-            {job && !job.last_error && job.last_result && (
-              <div className="flex flex-col gap-1.5">
-                <div className="text-[12px] text-muted font-medium">{i18nT('pages.schedulePage.last_output')}</div>
-                {/* Same viewport-relative cap as the Last Error notice above
-                    (#21061): a fixed 200px left most of a long output behind
-                    the inner scrollbar. */}
-                <pre data-testid="schedule-job-last-output" className="text-[12px] font-mono whitespace-pre-wrap break-words rounded border px-2.5 py-2 shrink-0 max-h-[min(45vh,420px)] overflow-y-auto bg-bg-elevated border-border text-text">{job.last_result}</pre>
-              </div>
-            )}
+            {job && <JobRunText job={job} />}
             {job?.last_run_ts && (
               <div className="flex flex-col gap-1.5">
                 <div className="text-[12px] text-muted font-medium">{i18nT('pages.schedulePage.last_run')}</div>

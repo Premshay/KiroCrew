@@ -83,17 +83,26 @@ class SectionReader:
         result = coerce(value, default, *bounds, **options)
         plain = unclamped or (coerce if bounds or options else None)
         if plain is not None and key in self._data and result != plain(value, default):
-            seen = (self._dto, key, repr(value))
-            if seen not in _REPORTED_CLAMPS:
-                _REPORTED_CLAMPS.add(seen)
-                logger.warning(
-                    "Config: %s.%s = %r is outside its allowed range; using %r",
-                    self._dto.__name__,
-                    key,
-                    value,
-                    result,
-                )
+            _report_clamp(self._dto, key, value, result)
         return result
+
+
+def _report_clamp(dto: type, key: str, stored: Any, used: Any) -> None:
+    """Warn, once per disk read of the config files, that *stored* loads as *used*.
+
+    The one wording of a clamp report, for ``SectionReader.read`` and for a value that
+    is not a section key (an entry of a list) and so is clamped outside ``read``.
+    """
+    seen = (dto, key, repr(stored))
+    if seen not in _REPORTED_CLAMPS:
+        _REPORTED_CLAMPS.add(seen)
+        logger.warning(
+            "Config: %s.%s = %r is outside its allowed range; using %r",
+            dto.__name__,
+            key,
+            stored,
+            used,
+        )
 
 
 DEFAULT_MODEL = "auto"
@@ -145,7 +154,7 @@ DEFAULT_POOL_SIZE = 0
 # Per-session process-tree RSS ceiling (MiB) the cleanup watchdog recycles an
 # idle session at; 0 disables it. An agent with six MCP servers measured ~1.4 GB
 # of tree RSS thirteen seconds after start and workflow trees read 2.4-2.6 GB, so
-# the old 1536 default recycled ordinary sessions after one heavy turn. 4096
+# a 1536 ceiling recycles ordinary sessions after one heavy turn. 4096
 # sits above those healthy sizes and still bounds a runaway tree, which with no
 # ceiling at all grows until the host runs out of memory. A recycled session
 # keeps its history and restarts on its next message. No fixed figure sits above
@@ -154,8 +163,8 @@ DEFAULT_POOL_SIZE = 0
 # ceiling is held at that footprint instead (``session_rss_rebound``).
 DEFAULT_WATCHDOG_RSS_MAX_MB = 4096
 # session.reconcile_max_kills — root candidates the runtime reconciler may signal
-# the tree of in one pass. Defaults to the budget the arm already ships with, so an
-# unconfigured host behaves exactly as before; the field's ceiling equals that same
+# the tree of in one pass. Defaults to the budget the arm ships with, so an
+# unconfigured host keeps that budget; the field's ceiling equals that same
 # value, which makes the knob purely SUBTRACTIVE -- it can withhold signals and
 # cannot authorize any the product does not already authorize.
 #

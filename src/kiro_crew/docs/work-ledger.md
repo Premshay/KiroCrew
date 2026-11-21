@@ -29,7 +29,7 @@ a conductor would only add overhead.
 
 To start one, open a session on the **`kirocrew-conductor`** agent (see
 [Agents](agents.md) for the per-session, per-thread and per-cron selectors), which
-is what an Ultra Mode chat runs on, and give it the goal. Its operating procedure ships as the `goal-conductor` skill.
+is what a conductor mode chat runs on, and give it the goal. Its operating procedure ships as the `goal-conductor` skill.
 `kirocrew-ledger-conductor` is a deprecated alias of the same spec, kept for one
 release so an existing session or cron that names the old string keeps resolving.
 
@@ -52,6 +52,7 @@ An item is the unit of dispatch. It holds:
 | `summary` | worker | the worker's own account, up to 500 chars |
 | `artifacts` | worker | pointers to what it produced |
 | `pr` | worker | a pull-request number it produced |
+| `discussion` | worker | only when it hosts a discussion: where it stands, shown on the goal board as a discussing row |
 
 The conductor writes its half with `work_ledger_record` (one action per call:
 `goal`, `create`, `bind`, `decide`, `verdict`, `accept`, `close`) and reads the
@@ -108,7 +109,10 @@ else's already-green pull request.
 Limits: 32 open items per conductor (an item in a terminal state -- accepted,
 rejected, abandoned -- does not count toward the open cap). There is no limit on
 how many items a board creates over its life. Every item stays on the board, listed
-and readable. The crew log's fold, which feeds a crew's status and the pipeline
+and readable. In a conductor mode chat's Milestones list you can hide a milestone
+that was not done (the Hide button on its row): that hides its row in your browser
+only, the list's count and Recap still count it, "Show again" under the list brings
+it back, and the board itself keeps the item. The crew log's fold, which feeds a crew's status and the pipeline
 board, keeps open items and
 the 32 most recently closed items whole and only counts older closed ones, so it is
 bounded by what is open, not by history. Those counts (the conductor header's
@@ -193,13 +197,15 @@ any choice that fits none, so a worker with a recommendation reports
 `question` without it. A wait on a build, service or other item
 carries no reason. It is refused on `progress` and `done`, and every report
 replaces it. When every open item waits on a person (`approval` or
-`needs_human`) and nothing on the ledger changed since the conductor's last
-turn, the conductor's `work-ledger` watch holds: no turns, no extension, and
-the goal popover says it is waiting on you. A worker's new report releases it;
-the conductor's own writes do not.
+`needs_human`), the conductor relayed each with a current `ask` record
+(`work_ask_record`), and nothing on the ledger changed since the conductor's
+last turn, the conductor's `work-ledger` watch holds: no turns, no extension,
+and the goal popover says it is waiting on you. A worker's new report releases
+it, and so does a `decide` or `close` (both clear the `ask`); the conductor's
+other writes do not.
 
 **`wake_at` says a `progress` report is a wait until a known time.** The item is
-not flagged `stale` before that time, so the Ultra Mode sidebar does not call the
+not flagged `stale` before that time, so the conductor mode sidebar does not call the
 worker stalled; once it passes, the staleness window runs from it. The exception is
 a worker whose own loop is active but cannot fire (held on an unanswered approval,
 or past its budget or cycle cap): its `wake_at` is ignored and the normal window
@@ -210,6 +216,8 @@ on any other status (`wake_at_requires_progress`): a longer wait is a `blocked`
 report. Every report replaces it. Nothing wakes the conductor at that time yet; a
 worker still idle one window after it is flagged `stale` like any other. A
 remote-dispatch report does not carry it to the hub's board yet.
+
+**`discussion` is where a discussion the worker hosts stands.** It is an object: `phase` (`talking`, `checking`, `asking` or `done`), `round`, `minutes`, `direction` (up to 200 chars), `agreed` (up to 8 lines), `disputed` (up to 5 `{point, sides}`), `checking` (up to 3 lines), `recent` (up to 6 `{who, text}`), `rounds` (up to 6 `{round, lines}`, `round` 1 to 99, `lines` up to 4 `{who, text}` with `who` up to 20 chars and `text` up to 120: the talk so far, one short line a participant each round) and `thread` (up to 512 chars), an http(s) URL or an `/artifacts`, `/chat`, `/schedule`, `/capabilities` or `/settings` path to the full back-and-forth. The worker sends the whole object every time; each report replaces it, and one without it clears it. A part over its cap, malformed or unknown is refused whole (`field_too_long` or `invalid_value`), and the refusal's `field` names the part, such as `discussion.agreed[3]`: nothing is cut. It rides the `work/recorded` entry and the work fold, so `work_ledger_read` and the goal board read it. The goal board shows an open item that carries one as "Discussing", with its counts on the row and the rest behind a toggle; the conductor mode Board draws `rounds` there as the talk, round by round, and marks the row live while `phase` is `talking` or `checking` and the host's turn runs. A question for the person still goes through `status: question` and the board's needs-you band.
 
 **A report is the only thing that wakes a conductor.** `blocked`, `question`
 and `done` (and `reply`, while `work_ledger.remote_dispatch` is on) pull its
@@ -235,6 +243,32 @@ ledger write: the next `work_brief` or `work_report` call that gets through
 clears it. A conductor that sees it checks the worker's session and pull request
 and tells you what it finds, rather than calling the worker stalled.
 
+**A change of the host's posture wakes it too.** The host posture is the worse
+of memory (`ample`, `tight`, `critical`, as `resource_status` reads it) and disk
+(a temp root low on space or inodes is `tight`, under 3% space or 200 inodes
+`critical`). When it changes, every conductor with an active `work-ledger`
+patrol is woken once, with the reading:
+`[work-ledger wake] host posture is tight (memory 3.1 GB free; /tmp LOW on space, 6% space free, 40% inodes free (90000 inodes))`.
+A patrol held because every open item waits on a person is released by a
+posture change too, so the wake still reaches the conductor.
+The same posture again wakes nobody, and `ample` wakes nobody until a worse
+posture was seen. While it stays `tight`, one more wake comes each time free
+memory falls another 1 GB, or the worst temp root another 2 points of free space,
+below the reading at the last posture wake (under `critical`, 0.5 GB and 1 point);
+a recovery wakes nobody and becomes the new reference:
+`[work-ledger wake] host posture still tight and worse (memory 2.9 GB free, was 4.0 GB at the last wake)`.
+These share the posture's hourly wake budget, so a value that flaps cannot keep
+waking it. A worker bound to an open item also wakes it when its process tree
+first holds a quarter of host memory (again only after it drops below a fifth),
+or, while the host is `tight` or `critical`, grows 2 GB since the last wake about it:
+`[work-ledger wake] worker it_1a2b3c4d grew to 16.2 GB (27% of RAM; +3.1 GB since the last wake)`.
+That wake is charged to the item's own budget. It reads the sizes the session
+watchdog already measures, so it is off when `session.watchdog_rss_max_mb` is 0,
+and `resource_status` then says so. For a conductor, `resource_status` also lists each worker
+bound to an open item on its own board, by item id: its memory, process count,
+largest test run, whether a turn is running, and the free space of its working
+volume. No other session is shown.
+
 Reports belong at real milestones, not on a timer.
 `summary` is capped at 500 characters.
 A longer one is **cut to the cap, not refused**: the stored value carries a note
@@ -253,7 +287,7 @@ at the cap still reads.
 
 An item can carry a `steer` event: the time, actor `person`, and the person's own
 text, redacted and cut to 500 characters. It records that the person typed into
-the crew member (the worker session) that holds the item, from an Ultra Mode chat.
+the crew member (the worker session) that holds the item, from a conductor mode chat.
 It is also written, with fixed text and nothing from the tool call, when the
 person answers a tool approval in that crew member's chat while the item's last
 report is `blocked` or `question` with reason `approval` and nobody has answered
@@ -262,9 +296,9 @@ report, so the Board, the sidebar count and goal-board stop showing the item as
 needing you once the approval it asked for is answered.
 `work_ledger_read` shows it in the item's events. A steer moves no field: status,
 acceptance and verdict stay where they were, and acceptance stays the evaluator's.
-A person's steer outranks the conductor's decision. The ledger write
-(`work_ledger_worker.record_person_steer_result`) is here; the way to type into a
-crew member, which calls it, lands with the Crew panel.
+A person's steer outranks the conductor's decision. It is written when your
+message reaches the crew member, whether you typed it in the side panel's steer
+box or in the crew member's own chat.
 
 ## Why `done` is a claim
 
@@ -316,7 +350,8 @@ unfinished work — a stub written before the real content, a pull request green
 before the last commit.
 
 A conductor stops patrolling only when every item is terminal (accepted,
-rejected or abandoned), or when the user says stop, in words or through a round
+rejected or abandoned) and nothing is queued (a queued item has no ledger row
+yet), or when the user says stop, in words or through a round
 or time budget they set. An item that fails acceptance three times is closed
 `rejected` and the rest keep going. A decision that needs a person parks only
 that item: the conductor asks about it and keeps patrolling the others. The
@@ -326,8 +361,10 @@ spend, an irreversible step or deleting someone's work, a costly preference
 they cannot infer, or a choice the person said they want to make.
 
 Parallel work is bounded in code, not only in the prompt. Each goal may hold at
-most `concurrency_cap` items open at once. The default is 6; a `goal` write sets
-it (`concurrency_cap`, 1 to 32). A `create` past it is refused
+most `concurrency_cap` items open at once. `resource_status` decides the wave;
+a bound the user set is `concurrency_cap`, written by a `goal` write (1 to 32).
+With none set it is 32, the store's own open bound, which refuses first with
+`item_cap_exceeded`. A `create` past a lower cap is refused
 `goal_concurrency_cap_reached`, and the board writes nothing. That is not a
 stop: the next item that lands frees a seat, and the conductor waits for it
 rather than asking to raise the cap. Closed items never count toward it.
@@ -401,6 +438,23 @@ its reports any more. For such an item the board offers **Stop current turn**,
 which cancels the worker's running turn and keeps its session, branch and
 reports. There is no take-over. To ask where a goal stands, you can still ask the
 conductor session — it answers from the record.
+
+### When a run is done
+
+A conductor ends its run by sending you one final report and then stopping its
+patrol loop. The board reads that: once it has items and no loop is active on the
+conductor's session, the run is **done** when every item is closed and **stopped**
+when some are still open. A rejected or abandoned item counts as closed but not
+done. Nothing is stored for this, so a new goal, a re-armed patrol or a new item
+puts the run back to working on the next read; the board read also waits for a
+new goal's first item before it calls anything settled. The board read
+(`GET /api/crew-board`) and the conductor mode chat's Sessions row both carry this
+as `run` (`settled`, `open`, `accepted`, `not_done`, `at_limit`, `patrol_on`; the row only once
+the board has an item); the code is `dashboard/conductor_mode_run.py`. A stop the
+conductor made and one you made look the same to the board, so it never says who
+stopped the run. `at_limit` marks a patrol that ended at its time or budget bound,
+and `patrol_on` whether the loop is on: a new goal that waits on its first item with
+no loop on is not shown as working.
 
 ## Cleaning up finished ledgers
 

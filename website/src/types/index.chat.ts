@@ -5,7 +5,7 @@
 // content blocks; notifications and their channels; approvals; history session
 // rows. Consumers import them from `types/index.ts`.
 import type { WebAppMetadata } from './index.artifacts'
-import type { SessionAttribution } from './index.sharedCrew'
+import type { PublicPrincipal, SessionAttribution } from './index.sharedCrew'
 import type { SourceProviderId } from './index.sources'
 
 /** One open ledger item that does not name a person (`crew_work.items`). */
@@ -20,6 +20,21 @@ export interface CrewWorkItemFacts {
   looping?: boolean
 }
 
+/** A conductor mode board's settled verdict (`dashboard/conductor_mode_run.py`):
+ *  `done` (items, every one closed, no patrol loop on), `stopped` (items open, no
+ *  patrol loop on), else `''`. */
+export interface ConductorModeRun {
+  settled: '' | 'done' | 'stopped'
+  open: number
+  accepted: number
+  not_done: number
+  /** A stop at the patrol's time or budget bound. */
+  at_limit: boolean
+  /** The conductor's patrol loop is on. An unsettled run without it (a new goal
+   *  with no item yet) is waiting on the conductor's next step, not working. */
+  patrol_on: boolean
+}
+
 /** A conductor's work ledger in brief (`crew_work` on its slot row). */
 export interface CrewWorkFacts {
   open: number
@@ -31,6 +46,9 @@ export interface CrewWorkFacts {
   /** The conductor itself holds a live loop (its patrol), which picks a stalled
    *  item up; absent from a gateway that predates it. */
   conductor_looping?: boolean
+  /** The board's settled verdict; absent for a board with no item yet, and from a
+   *  gateway that predates it. */
+  run?: ConductorModeRun
   items: CrewWorkItemFacts[]
 }
 
@@ -60,6 +78,10 @@ export interface TodoList {
   completed: number
   total: number
   current: string
+  /** True on a list the harness keeps itself (an ACP `plan`, e.g. Claude Code's
+   * checklist): no click can reach it, so the pill shows it read-only and the
+   * gateway refuses a tick with `todo_read_only`. Absent on a `todo_list` list. */
+  read_only?: boolean
 }
 
 /**
@@ -110,6 +132,14 @@ export interface McpSessionReport {
    * Optional because an older gateway sends no such key.
    */
   restart_to_load?: string[]
+  /**
+   * The servers in ``restart_to_load`` because a config write changed them after
+   * the session started, not because a credential was missing. Optional because
+   * an older gateway sends no such key.
+   */
+  reload_pending?: string[]
+  /** Advisory: remote servers Crew's credential-free probe saw ask for a sign-in (opencode). Never a reason to call a server unusable. */
+  sign_in_suspected?: string[]
   /**
    * The servers this session cannot use right now, by what is true of each.
    * Optional: a gateway or an agent backend that does not report it sends no
@@ -247,6 +277,9 @@ export interface ChatDonePayload extends TurnIdentityFields {
   slot: string
   continuing?: boolean
   needs_input?: boolean
+  /** Whole seconds from the run's first turn to this frame; only on a frame
+   *  that ends the run, and only when the gateway saw the run start. */
+  run_seconds?: number
 }
 
 export interface ChatSlot extends TurnIdentityFields {
@@ -272,7 +305,7 @@ export interface ChatSlot extends TurnIdentityFields {
    *  deliberately kept when withheld, so this must not drive a write. */
   model_withheld?: boolean | null
   /** Whether this session's turns ask Jev which model tier to run on -- the chat
-   *  picker's `Auto (Jev)` entry (`lib/jevRoute.ts`, `decisions/points/model_route.py`).
+   *  picker's `Auto (decision model)` entry (`lib/jevRoute.ts`, `decisions/points/model_route.py`).
    *
    *  Shipped on every slot, so "the owner picked a model by hand" is a positive
    *  value rather than an absent key. Unlike `model_withheld` and `served_model`
@@ -322,6 +355,8 @@ export interface ChatSlot extends TurnIdentityFields {
   /** Of those, the restored cards no drain starts on its own (`readyQueueDepth`).
    *  Absent on an older gateway. */
   queue_held_depth?: number
+  /** The ISO instant this chat will resume by itself after its usage limit resets; present only while that wait is armed. */
+  limit_continue_at?: string
   /** Set when this session is a Slack code channel's (see `CodeChannelInfo`). */
   code_channel?: CodeChannelInfo
   /** Code channels are on but not read yet, so this Slack-linked row may still
@@ -329,7 +364,7 @@ export interface ChatSlot extends TurnIdentityFields {
   code_channel_pending?: boolean
   /** The crew's work-ledger summary (see `WorkAggregate`); null with no workers. */
   work_aggregate?: WorkAggregate | null
-  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_scope?: string; trust_reads?: boolean; folder_id?: string; pinned?: boolean; /** Place in the gateway's pinned order, or null when it has none. */ pin_rank?: number | null; /** Revision of the pinned order the rank belongs to. */ pin_rev?: number; /** Place in the gateway's manual order (sort "Manual"), or null when it has none. */ manual_rank?: number | null; /** Revision of the manual order the rank belongs to. */ manual_rev?: number; tags?: string[]; tags_revision?: string; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; /** The Slack thread a Slack-born session lives in (not a mirror; slack_linked stays false). */ slack_origin_channel?: string; slack_origin_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; project?: string; forked_from?: string | null; source_links?: { provider: SourceProviderId; number: number; url: string; label?: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; ciPending?: string; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue'; identity?: string }[]; source_links_total?: number
+  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_scope?: string; trust_reads?: boolean; folder_id?: string; pinned?: boolean; /** Place in the gateway's pinned order, or null when it has none. */ pin_rank?: number | null; /** Revision of the pinned order the rank belongs to. */ pin_rev?: number; /** Place in the gateway's manual order (sort "Manual"), or null when it has none. */ manual_rank?: number | null; /** Revision of the manual order the rank belongs to. */ manual_rev?: number; /** Newest read the gateway stores for this session (any device), or null when none is stored. */ last_read_ts?: string | null; /** The gateway read store's creation: no reply at or before it badges from a slot list, and it never clears a badge. Null until stored. */ read_epoch?: string | null; tags?: string[]; tags_revision?: string; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; /** The Slack thread a Slack-born session lives in (not a mirror; slack_linked stays false). */ slack_origin_channel?: string; slack_origin_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; project?: string; forked_from?: string | null; source_links?: { provider: SourceProviderId; number: number; url: string; label?: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; ciPending?: string; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue'; identity?: string }[]; source_links_total?: number
   /** Provenance bucket from the backend `SlotOrigin` ("user" | "app" | "cron"
    * | "system"; absent/"" for untagged background slots). The session-pulse
    * survey shows only on a "user" slot, so an imported Slack thread, a
@@ -347,6 +382,11 @@ export interface ChatSlot extends TurnIdentityFields {
   /** Shared Crew creator (`shared_crew.attribution`), public shape. Display only. */
   attribution?: SessionAttribution | null
   created_by?: string
+  /** Shared Crew: the people who have written here, creator first, then most
+   *  recent (`shared_crew.participants`), public shape. Display only. */
+  participants?: PublicPrincipal[]
+  /** How many people the gateway's capped `participants` list dropped. */
+  participants_dropped?: number
   /** True on a Crew Mode root: a root session running a conductor template
    *  (`crew_mode.stamp_rows`). The session list styles and filters on it. */
   crew_mode_root?: boolean
@@ -359,6 +399,11 @@ export interface ChatSlot extends TurnIdentityFields {
    *  chat shows its pending approvals and question cards, and the mate's
    *  Sessions tab lists such rows. Absent elsewhere. */
   mate_root?: string
+  /** True on a conversation that started in Slack while
+   *  `slack.show_in_session_list` is off (`dashboard/slack_session_list.py`).
+   *  The person's session lists leave it out unless it is the open session
+   *  (`crewModeView`), and its unread entry adds to no count. Absent otherwise. */
+  slack_list_hidden?: boolean
   /** The conductor the chat runs in Crew Mode (`crew_mode_agent` on the slot), "" when
    *  it never turned on: it marks the chat as Crew Mode until the gateway moves it onto
    *  the configured `agent.crew_mode_agent`. */
@@ -410,7 +455,7 @@ export interface ChatSlot extends TurnIdentityFields {
   /** Metadata for kind="webapp" artifacts (deploy state, architecture, costs). */
   webapp_metadata?: WebAppMetadata
   // Board fields
-  has_options?: boolean; options_ts?: string; options?: string[]; pending_approval_info?: PendingApproval | null; last_activity_ts?: string; last_agent_ts?: string; waiting_for_input?: boolean; prompt_preview?: string; subagents_running?: boolean
+  has_options?: boolean; options_ts?: string; options?: string[]; pending_approval_info?: PendingApproval | null; last_activity_ts?: string; last_agent_ts?: string; unread_ts?: string; unread_failed?: boolean; waiting_for_input?: boolean; prompt_preview?: string; subagents_running?: boolean
   /** The sub-agent queued depth the gateway last published for this session —
    * the same value as its newest `subagent_queued` frame. Read only to
    * reconcile `chat.subagentQueued` on a `slots` push; absent from a
@@ -431,11 +476,21 @@ export interface ChatSlot extends TurnIdentityFields {
    * button. Always false while `running`. Lets the sidebar stop rendering a
    * goal-loop session as actively working when it is actually stalled. */
   interrupted?: boolean
+  /** The interrupted turn ended on a sign-in error with nothing after it
+   * (`newest_error_is_sign_in`), so the sidebar row names the sign-in first. */
+  interrupted_by_sign_in?: boolean
   /** A loop wake is opening the running turn and its row is not in the
    * transcript yet (a structured monitor writes it only once the runner
    * accepts the turn). Only ever true while `running`; absent from an older
    * gateway. */
   wake_starting?: boolean
+  /** The directory the running turn's process works in. `project` follows a
+   * pick made mid-reply at once; this does not. Null when no turn has claimed
+   * its session yet, absent from an older gateway. */
+  turn_project?: string | null
+  /** `turn_project` is the default folder a hidden scratch project fell back
+   * to, not a pick. Absent from an older gateway. */
+  turn_project_fallback?: boolean
   // Soft-stop state machine
   stop_state?: 'idle' | 'soft_pending' | 'killing'
   /** An automatic context compaction holds the session right now. Not a turn,
@@ -555,7 +610,7 @@ export interface SideSnapshot {
   last_run_id?: string
   /** A side turn is in flight, so a submit would steer or queue. */
   running?: boolean
-  messages?: Array<{ id: string; run_id?: string; role: 'user' | 'assistant'; content: string; ts: string; steer?: boolean; is_error?: boolean }>
+  messages?: Array<{ id: string; run_id?: string; role: 'user' | 'assistant'; content: string; ts: string; steer?: boolean; is_error?: boolean; link_blocks?: unknown }>
   /** `rev` counts the entry's edits, as the edit frame reports it, so a reader
    *  can tell which of two copies of the entry is newer. */
   queue?: Array<{ id: string; content: string; ts: string; rev?: number }>
@@ -568,7 +623,7 @@ export interface ChatMessage {
   /** Structured metadata for role-specific data (e.g. tool_input for permission messages). */
   meta?: Record<string, unknown>
   /** Regenerated variants of an assistant message (most recent last). */
-  variants?: { content: string; ts?: string; blocked_links?: unknown; redactions?: unknown }[]
+  variants?: { content: string; ts?: string; link_blocks?: unknown; redactions?: unknown }[]
   /** Which variant index is currently active. */
   variant_idx?: number
   /** Counter for consecutive identical tool message deduplication. */
@@ -583,7 +638,7 @@ export interface ChatMessage {
   /** Gateway process generation that numbered `seq` (folded snapshot rows). */
   gen?: string
   /** One skill-selection decision the gateway stamped on the row that ends the
-   *  turn, when the Decisions (Jev) seam answered for it. Typed `unknown`
+   *  turn, when the Decisions seam answered for it. Typed `unknown`
    *  because the shape is validated at the read, by
    *  `pages/chat/decisionRecord.ts` — the strip draws nothing for a record it
    *  cannot check. The gateway stamps it under `meta` on both doors, and this
@@ -614,6 +669,10 @@ export interface ChatSlotDetailResponse extends TurnIdentityFields {
   context_pct?: number
   context_used_tokens?: number
   context_window_tokens?: number
+  /** Incremental-read cursor, present when the read asked for one (`cursor=1`). */
+  cursor?: unknown
+  /** Set on a response that carries only the rows after the echoed cursor. */
+  delta?: unknown
 }
 
 export interface SubagentActivity {
@@ -674,6 +733,7 @@ export interface SubagentActivity {
    *  while `stalled` holds there is by definition no activity to reset it. */
   stalledAt?: number
   retrying?: boolean      // transient-backend retry (or cancel auto-continue) in flight
+  parentStopped?: boolean  // parent turn was stopped; agent still runs but is orphaned
   approval_id?: string
   /** The coordinator request a pending spawn waits on (types/approvalTarget). */
   approval_target?: CoordinatorApprovalTarget

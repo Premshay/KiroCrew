@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from redaction_structured_cases import github_classic
 
 from kiro_crew import mcp_core, session_directive
 from kiro_crew.dashboard import handlers
@@ -391,15 +392,14 @@ class TestCheckpointSlotProjection:
 
     def test_checkpoint_milestone_also_updates_the_redacted_timeline(self) -> None:
         slot = _ChatSlot("checkpoint")
-        slot.set_session_checkpoint(
-            _checkpoint(milestone="Recorded AKIAIOSFODNN7EXAMPLE in a draft.")
-        )
+        credential = github_classic(seed=17)
+        slot.set_session_checkpoint(_checkpoint(milestone=f"Recorded {credential} in a draft."))
 
         timeline = slot.session_timeline_payload()
         assert timeline[0]["source"] == "checkpoint"
         assert timeline[0]["kind"] == "checkpoint"
         assert timeline[0]["priority"] == 100
-        assert "AKIAIOSFODNN7EXAMPLE" not in timeline[0]["text"]
+        assert credential not in timeline[0]["text"]
         assert "[REDACTED: credential]" in timeline[0]["text"]
         assert timeline[0]["timestamp"]
 

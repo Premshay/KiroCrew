@@ -25,6 +25,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 from chat_test_helpers import _make_state
 from dashboard_owner_helpers import as_owner
+from redaction_structured_cases import github_classic
 
 from kiro_crew import remote_dispatch_mailbox as mailbox
 from kiro_crew import work_ledger as wl
@@ -305,7 +306,10 @@ async def test_a_decision_on_a_closed_item_is_refused(state, preview):
 
 
 @pytest.mark.asyncio
-async def test_a_duplicate_item_id_is_refused_and_leaves_no_second_slot(state, preview):
+@pytest.mark.parametrize("restored", [False, True], ids=["before-restore", "after-restore"])
+async def test_a_duplicate_item_id_is_refused_and_leaves_no_second_slot(state, preview, restored):
+    # A live worker keeps its item whether or not the startup restore has run.
+    state.open_slots_restored = restored
     status, first = await _call(state, "POST", "/api/chat/slots", {"work_item": _work_item()})
     assert status == 200
     slots_before = set(state._slots)
@@ -316,6 +320,24 @@ async def test_a_duplicate_item_id_is_refused_and_leaves_no_second_slot(state, p
     assert set(state._slots) == slots_before
     # The first worker keeps its binding.
     assert wl.read_binding(first["key"]) == (f"hub:{HUB_CONDUCTOR}", "it_0000abcd")
+
+
+@pytest.mark.asyncio
+async def test_an_item_bound_to_a_slot_that_never_came_back_is_dispatched_again(state, preview):
+    # What a create cut off between the bind and the birth line leaves: the item
+    # stored and bound to a worker key no slot holds.
+    mailbox.open_mailbox(mailbox.parse_work_item(_work_item()), "chat-cut-off")
+
+    # Before the startup restore has run, a missing slot may still be on its way back.
+    status, body = await _call(state, "POST", "/api/chat/slots", {"work_item": _work_item()})
+    assert status == 409 and body["code"] == wl.CODE_DUPLICATE_ITEM, body
+    assert wl.read_binding("chat-cut-off") == (f"hub:{HUB_CONDUCTOR}", "it_0000abcd")
+
+    state.open_slots_restored = True
+    status, body = await _call(state, "POST", "/api/chat/slots", {"work_item": _work_item()})
+    assert status == 200, body
+    assert wl.read_binding(body["key"]) == (f"hub:{HUB_CONDUCTOR}", "it_0000abcd")
+    assert wl.read_binding("chat-cut-off") is None
 
 
 @pytest.mark.asyncio
@@ -555,7 +577,7 @@ async def test_the_get_reply_redacts_a_planted_credential_and_stays_json(
 ):
     _, created = await _call(state, "POST", "/api/chat/slots", {"work_item": _work_item()})
     slot = created["key"]
-    planted = "AKIA" + "ABCDEFGHIJKLMNOP"
+    planted = github_classic(seed=32)
     await _report(slot, {"status": "progress", "summary": f"key {planted}"})
     status, body = await _call(state, "GET", f"/api/chat/slots/{slot}/work-item")
     assert status == 200
@@ -594,7 +616,7 @@ async def test_a_dirty_mailbox_is_not_read(state, preview):
 async def test_the_get_reply_redacts_artifact_keys_too(state, preview, worker_routes):
     _, created = await _call(state, "POST", "/api/chat/slots", {"work_item": _work_item()})
     slot = created["key"]
-    planted = "AKIA" + "ABCDEFGHIJKLMNOP"
+    planted = github_classic(seed=32)
     await _report(slot, {"status": "progress", "summary": "s", "artifacts": {planted: "v"}})
     status, body = await _call(state, "GET", f"/api/chat/slots/{slot}/work-item")
     assert status == 200
@@ -602,7 +624,9 @@ async def test_the_get_reply_redacts_artifact_keys_too(state, preview, worker_ro
 
 
 @pytest.mark.asyncio
-async def test_a_cancelled_bind_finishes_its_write_before_the_cancellation_lands(monkeypatch):
+async def test_a_cancelled_bind_finishes_its_write_before_the_cancellation_lands(
+    monkeypatch, preview
+):
     """The unwind then sees the binding it must undo, and the discard removes it."""
     import asyncio
 
@@ -612,7 +636,7 @@ async def test_a_cancelled_bind_finishes_its_write_before_the_cancellation_lands
     async def _gated(fn: Any, *args: Any, **kwargs: Any) -> Any:
         # The write is held on the loop, not on a pool thread, until the
         # cancellation has been delivered. Every other off-loop read runs at once.
-        if fn is not mailbox.open_mailbox:
+        if fn is not remote_dispatch_headroom.bind_if_room:
             return fn(*args, **kwargs)
         entered.set()
         await asyncio.wait_for(gate.wait(), _BOUND_SECS)

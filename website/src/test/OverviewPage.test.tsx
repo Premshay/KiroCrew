@@ -44,6 +44,8 @@ const usageToday = vi.hoisted(() => ({ sessions: 3, messages: 42, toolCalls: 5 }
 const todayKey = vi.hoisted(() => '2026-11-11')
 // Whether the provider reports usage; one test turns it off.
 const usageCaps = vi.hoisted(() => ({ usageBilling: true }))
+// The plan's used share; one test sets a nearly-full plan.
+const billingShare = vi.hoisted(() => ({ pct: 42 }))
 
 // Usage summary card goes through the provider seam.
 vi.mock('../providers', () => ({
@@ -60,7 +62,7 @@ vi.mock('../providers', () => ({
         avgMsgsPerSession: 12,
         dailyHistory: [],
       },
-      billing: { plan: 'Pro', percentUsed: 42, unit: 'tokens' },
+      billing: { plan: 'Pro', percentUsed: billingShare.pct, unit: 'tokens' },
       // 30-day totals; the Today line reads today's bucket below instead.
       tokens: { total: 900_000 },
       costUsd: 99,
@@ -221,8 +223,8 @@ describe('OverviewPage — mission control', () => {
     expect(screen.getByTestId('edition-panel')).toBeInTheDocument()
   })
 
-  // The Kiro sign-in card serves the KAS backend only, so it lives under the
-  // switch that picks KAS, on Settings > Agent Harness. On the landing page
+  // The Kiro sign-in card lives on its own Settings > Kiro account tab. On the
+  // landing page
   // its provider chooser read as a required step to every user, first-run
   // installs included. Asserted so it is not re-added: neither the card nor a
   // read of its status belongs here.
@@ -237,7 +239,7 @@ describe('OverviewPage — mission control', () => {
 
   it('carries no "sign-in moved" signpost either, whichever backend is selected', async () => {
     const { api } = await import('../api/client')
-    // The time-boxed pointer to Settings > Agent Harness is retired: the page
+    // The time-boxed pointer to the sign-in card is retired: the page
     // neither renders it nor reads the backend to decide whether to.
     const first = renderWithProviders(<OverviewPage />, { store: statusStore() })
     expect(await screen.findByText('Memory')).toBeInTheDocument()
@@ -301,10 +303,12 @@ describe('OverviewPage — whole-sentence lines', () => {
   })
 
   it('puts the uptime where the language puts it, and says running in German', async () => {
-    await act(async () => { await i18next.changeLanguage('hi') })
-    const hindi = renderWithProviders(<OverviewPage />, { store: statusStore() })
-    expect(screen.getByText(line('DIV', '2h 30m से चालू · v0.1.0'))).toBeInTheDocument()
-    hindi.unmount()
+    // Bengali puts the uptime first. Hindi no longer does: there it would sit
+    // right before the postposition से, which is also its seconds unit (#36385).
+    await act(async () => { await i18next.changeLanguage('bn') })
+    const bengali = renderWithProviders(<OverviewPage />, { store: statusStore() })
+    expect(screen.getByText(line('DIV', '2h 30m ধরে চালু · v0.1.0'))).toBeInTheDocument()
+    bengali.unmount()
 
     await act(async () => { await i18next.changeLanguage('de') })
     renderWithProviders(<OverviewPage />, { store: statusStore() })
@@ -322,6 +326,16 @@ describe('OverviewPage — whole-sentence lines', () => {
     await act(async () => { await i18next.changeLanguage('de') })
     renderWithProviders(<OverviewPage />, { store: statusStore() })
     expect(await screen.findByText(line('SPAN', '42\u00a0%'))).toBeInTheDocument()
+  })
+
+  it('does not round a nearly-full plan up to 100%', async () => {
+    billingShare.pct = 99.96
+    try {
+      renderWithProviders(<OverviewPage />, { store: statusStore() })
+      expect(await screen.findByText(line('SPAN', '99.9%'))).toBeInTheDocument()
+    } finally {
+      billingShare.pct = 42
+    }
   })
 
   it('keeps the WakaTime total styled inside its sentence', async () => {

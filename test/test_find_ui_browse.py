@@ -20,6 +20,7 @@ pins it): every mapped location below is generated or curated.
 
 from __future__ import annotations
 
+import functools
 import json
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ from typing import Any
 import pytest
 
 from kiro_crew import mcp_guide, ui_index
+from kiro_crew.ui_index_load import parse_index_text
 from kiro_crew.validation import ValidationError
 
 
@@ -266,7 +268,8 @@ TASK_LOCATION: dict[str, str] = {
     "Artifact comments": "artifacts.detail.comments",
     # Indexed, but in a RELATED area of the one the corpus names (the listing
     # names that area under `related`): Settings -> Customize, Connections ->
-    # Settings (its Agent Harness tab holds the model sign-in), Shell -> Sessions (the
+    # Settings (its Agent Harness tab holds the model provider sign-in, its Kiro
+    # account tab the Kiro sign-in), Shell -> Sessions (the
     # built-in browser is a view of a chat's side panel, not shell chrome).
     "Install skill": "skills.add",
     "Provider authentication": "settings.tab.agent",
@@ -321,6 +324,19 @@ def _reachable(area: str, lang: str) -> set[str]:
     return ids
 
 
+@functools.lru_cache(maxsize=None)
+def _recall_reach(area: str, lang: str) -> frozenset[str]:
+    """:func:`_reachable` once per ``(area, lang)`` for the recall params below.
+
+    Over a hundred ``(task, lang)`` params share a few dozen areas, and each listing is
+    a full page walk of the real index. Every one of those params reads it in the same
+    state (the autouse fixture's empty auto tier, the default page cap), so the answer
+    for an area cannot differ between them. Tests that change the cap call
+    :func:`_listing` directly and never read this.
+    """
+    return frozenset(_reachable(area, lang))
+
+
 # ------------------------------------------------------------ corpus coverage
 
 
@@ -338,12 +354,12 @@ def test_each_indexed_task_is_in_its_corpus_area_listing(task: str, lang: str) -
     as related."""
     area = _tasks()[task]
     target = TASK_LOCATION[task]
-    reach = _reachable(area, lang)
+    reach = _recall_reach(area, lang)
     if task in RELATED_ONLY:
         via = RELATED_ONLY[task]
         assert target not in reach, (task, "now listed directly: drop it from RELATED_ONLY")
         assert via in ui_index.browse_ui(area, lang).get("related", []), (task, area, via)
-        assert target in _reachable(via, lang), (task, via)
+        assert target in _recall_reach(via, lang), (task, via)
     else:
         assert target in reach, (task, area)
 
@@ -466,8 +482,8 @@ def test_related_areas_and_area_titles_name_real_things() -> None:
         assert set(area.related) | set(area.exclude) <= set(ui_index.AREAS), name
         assert area.title is None or area.title in idx.by_id, name
         assert all(a in idx.by_id for a in area.anchors), name
-    # The model sign-in lives on Settings' Agent Harness tab, which Connections
-    # names as related.
+    # The model provider sign-in lives on Settings' Agent Harness tab (the Kiro
+    # sign-in on its Kiro account tab), which Connections names as related.
     assert ui_index._loc_label(idx, "settings.tab.agent", "en") == "Agent Harness"
     assert "settings" in ui_index.AREAS["connections"].related
     # The tool description lists the same vocabulary.
@@ -476,7 +492,7 @@ def test_related_areas_and_area_titles_name_real_things() -> None:
 
 def _auto_file(tmp_path: Path) -> Path:
     """A build-time auto tier against the REAL committed index: two Sessions-page entries."""
-    real = json.loads(ui_index.INDEX_PATH.read_text(encoding="utf-8"))
+    real = parse_index_text(ui_index.INDEX_PATH.read_text(encoding="utf-8"))
     labels = {"k.t.reindex": "Reindex sources", "k.t.back": "Back"}
     zh = {"k.t.reindex": "重新索引来源", "k.t.back": "返回"}
     auto = {
@@ -537,7 +553,7 @@ def test_auto_entries_come_last_marked_and_one_word_ones_are_counted_out(tmp_pat
 def _settings_tab_auto_file(tmp_path: Path) -> Path:
     """A build-time auto tier against the REAL committed index: one one-word
     auto control ("Save") on the Settings > Chat tab."""
-    real = json.loads(ui_index.INDEX_PATH.read_text(encoding="utf-8"))
+    real = parse_index_text(ui_index.INDEX_PATH.read_text(encoding="utf-8"))
     labels = {"k.t.save": "Save"}
     auto = {
         "schema_version": 1,

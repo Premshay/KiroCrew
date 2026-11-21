@@ -30,10 +30,10 @@ EXTERNAL_TERMINAL_APPS: tuple[str, ...] = (
 # The local editors the Markdown panel's "Open in <editor>" row can target
 # (``dashboard.remote_editor.editor``). Each id is the URL scheme of an editor
 # that keeps the ``vscode-remote`` authority, so the row's link is
-# ``<id>://vscode-remote/ssh-remote+<host><absolute path>``. The dashboard's own list,
+# ``<id>://vscode-remote/ssh-remote+<host><absolute path>:1``. The dashboard's own list,
 # with each editor's name, is ``REMOTE_EDITORS`` in
 # ``website/src/utils/remoteEditorUrl.ts``; keep the two equal.
-REMOTE_EDITOR_IDS: tuple[str, ...] = ("vscode",)
+REMOTE_EDITOR_IDS: tuple[str, ...] = ("vscode", "kiro")
 # ``dashboard.remote_editor.host``: a DNS name or ``~/.ssh/config`` alias, the
 # grammar the desktop app's editor-link check takes (``HOSTNAME_RE`` in
 # ``website/electron/validation.js``). Nothing that adds URL structure after
@@ -52,22 +52,29 @@ REMOTE_EDITOR_HOST_PATTERN = (
 # the browser's copy as a cache of this section, and
 # test_feature_previews_config.py pins the two lists equal.
 FEATURE_PREVIEW_FLAGS: tuple[str, ...] = (
+    # Has server behavior: kiro_crew.apps.browser_sdk.preview_on gates ctx.browser
+    # and every permissions.browser verb.
+    "app_browser_sdk",
     "artifact_deploy",
     "bridge_approvals",
     "chat_runtime_sharing",
-    "crew_mode",
+    # Has server behavior: kiro_crew.connected_computers.flag gates enrollment,
+    # the connector socket, the chat choice and every start on it.
+    "connected_computers",
     "crew_oauth",
     "dashboard_stale_fields",
     "dashboard_stale_wake",
     "explore",
     "folder_conductor",
-    "layout_harness",
-    "mate_sessions",
     "remote_crew_chat",
-    "secrets_vault",
     "session_environments",
     "session_harness",
+    "visual_refresh",
     "webhooks",
+    # Has server behavior: kiro_crew.widgets_preview gates `widgets` on
+    # dashboard_save (schema, tool and save route) and the guide agents read.
+    "widgets",
+    "worker_grill",
 )
 
 
@@ -255,6 +262,27 @@ class DashboardConfig:
             "Use the background model to update session-owned HTML cards after activity. "
             "Off by default. One call at a time, at most one per session every two minutes "
             "and 60 per gateway hour. Live status and native decisions work without it.",
+        ),
+    )
+    audit_secret_reads: bool = field(
+        default=False,
+        metadata=_meta(
+            "Audit secret reads",
+            "Write a security log row when the gateway reads a vault secret: the secret's "
+            "name, the module that read it and the function that asked (unknown when the "
+            "read runs on a worker thread with no calling code of its own), never the value. "
+            "Repeat reads of one secret by one caller share a row per 10 minutes, which "
+            "counts them. Off by default. Takes effect on the next read; no restart (within "
+            "30 seconds in the MCP gateway process).",
+        ),
+    )
+    turn_cache_estimate: bool = field(
+        default=False,
+        metadata=_meta(
+            "Estimate cache rebuilds",
+            'Mark a reply in its footer as "Cache likely rebuilt" when the backend reports '
+            "no cache counts and the turn started after a pause longer than the model keeps "
+            "the conversation cached. Backends that report cache counts are unaffected.",
         ),
     )
     crewmate_threads: bool = field(
@@ -460,7 +488,7 @@ class DashboardConfig:
             "Raise it on a host that does heavy subprocess work (long builds, "
             "test suites, many child reaps), which can wedge the loop briefly "
             "without being genuinely dead. Clamped to 10s..300s. The desktop app's "
-            "liveness probe kills at roughly 20s independently, so a value "
+            "liveness probe kills after about a minute independently, so a value "
             "above that only takes effect for a headless gateway — the desktop "
             "probe wins first and the stack dump is lost.",
             restart=True,
@@ -518,11 +546,10 @@ class DashboardConfig:
     new_chat_crew_mode: bool = field(
         default=False,
         metadata=_meta(
-            "Start new chats in Ultra Mode",
-            "Open each new dashboard chat with Ultra Mode already on. It can "
+            "Start new chats in conductor mode",
+            "Open each new dashboard chat with conductor mode already on. It can "
             "still be turned off before the first message. Applies only where "
-            "Ultra Mode is offered: a Persistent chat on the default agent, "
-            "with the Ultra Mode preview on.",
+            "conductor mode is offered: a Persistent chat on the default agent.",
         ),
     )
     widget_density: str = field(
@@ -706,6 +733,18 @@ class DashboardConfig:
             "closed, and show it each time the panel opens. A panel opened for "
             "something specific, such as a file, still shows that. Works only "
             "while session summaries are on.",
+        ),
+    )
+    auto_open_conductor_board: bool = field(
+        default=True,
+        metadata=_meta(
+            "Auto-open the Board in the side panel",
+            "Open the right side panel on the Board tab the first time you open a "
+            "conductor mode chat. With this off, a conductor mode chat opens like "
+            "any other chat: its panel stays closed unless Keep the side panel "
+            "open is on, and the Board is still the panel's first tab. Turning "
+            "conductor mode on in a chat still opens the Board. This setting "
+            "does not apply on a phone.",
         ),
     )
     # Default TRUE: the chip strip shipped unconditionally before this switch
@@ -944,9 +983,29 @@ class DashboardConfig:
         default="",
         metadata=_meta(
             "Theme Mode",
-            "Dashboard color mode preference: 'dark', 'light', or 'system'. "
-            "Empty = unset (frontend falls back to localStorage or 'system').",
-            enum=["", "dark", "light", "system"],
+            "Dashboard color mode preference: 'dark', 'light', 'system', or "
+            "'schedule' (light from theme_schedule_light, dark from "
+            "theme_schedule_dark). Empty = unset (frontend falls back to "
+            "localStorage or 'system').",
+            enum=["", "dark", "light", "system", "schedule"],
+        ),
+    )
+    theme_schedule_light: str = field(
+        default="",
+        metadata=_meta(
+            "Theme Schedule Light",
+            "24-hour HH:MM at which the 'schedule' theme mode turns light, read in "
+            "the time zone of the device showing the dashboard. Empty = never set "
+            "(07:00).",
+        ),
+    )
+    theme_schedule_dark: str = field(
+        default="",
+        metadata=_meta(
+            "Theme Schedule Dark",
+            "24-hour HH:MM at which the 'schedule' theme mode turns dark, read in "
+            "the time zone of the device showing the dashboard. Empty = never set "
+            "(19:00).",
         ),
     )
     sso_login_flags: str = field(
@@ -966,6 +1025,16 @@ class DashboardConfig:
             "Theme Color",
             "Dashboard color theme slug (e.g. 'kiro', 'emerald', 'monokai'). "
             "Empty = unset (frontend falls back to localStorage or 'kiro').",
+        ),
+    )
+    instance_label: str = field(
+        default="",
+        metadata=_meta(
+            "Instance Label",
+            "A short name for this gateway (e.g. 'pod-a', 'Lab box'), shown in the "
+            "browser tab title and favicon and sent as the origin of a session "
+            "transferred to another instance. Empty = unset (the tab title and "
+            "icon stay as they are and a transfer names the host).",
         ),
     )
     language: str = field(
@@ -1002,6 +1071,16 @@ class DashboardConfig:
             "Open the Command Bar launcher on the quick-search shortcut (Cmd+K or "
             "Ctrl+K). Off opens the search palette instead, which also searches "
             "knowledge, skills and prompts.",
+        ),
+    )
+    channels_enabled: bool = field(
+        default=False,
+        metadata=_meta(
+            "Channels Enabled",
+            "Show Channels, where several agents work a problem together in one shared "
+            "room, in the sidebar and in Search Everywhere. Off by default; off only "
+            "hides the sidebar row and the search result, so the channels you made "
+            "and the Channels page itself are kept.",
         ),
     )
     # Literal enum rather than FOLDER_SORT_MODES: that constant lives in
@@ -1045,6 +1124,21 @@ class DashboardConfig:
                 "name-desc",
                 "manual",
             ],
+        ),
+    )
+    # Default FALSE: unfiled sessions below the folders is the layout every
+    # install has drawn. A config that never mentions the key must render it.
+    unfiled_sessions_above_folders: bool = field(
+        default=False,
+        metadata=_meta(
+            "Unfiled sessions above folders",
+            "Where the chat sidebar draws sessions that are not filed in any folder: "
+            "above the folder list when on, below it when off. Applies to the list "
+            "view's folder tree and to each board column; flat view draws no folders "
+            "and is unaffected. In the list view, dropping a session on the unfiled "
+            "area removes it from its folder either way. New sessions start unfiled, "
+            "so with many folders turning this on keeps the ones still to sort on "
+            "screen instead of below the last folder.",
         ),
     )
     update_nudge: dict = field(
@@ -1109,6 +1203,18 @@ class DashboardConfig:
             "dashboard's notice version is higher, the chapter is shown once more "
             "at the next dashboard load, but only while local recording is on. "
             "Written by the Privacy chapter and by kirocrew telemetry enable.",
+        ),
+    )
+    kiro_telemetry_ack_version: int = field(
+        default=0,
+        metadata=_meta(
+            "Kiro Telemetry Notice Version Acknowledged",
+            "The privacy notice version the user acknowledged while its text named "
+            "the built-in Kiro telemetry destination (0 = none). Product usage "
+            "metrics go to that destination only once this is at least the version "
+            "that names it, or a start with no dashboard printed the line naming it "
+            "on a terminal. Written by the Privacy chapter and by kirocrew telemetry "
+            "enable.",
         ),
     )
     crewmates_onboarded: bool = field(
@@ -1189,6 +1295,15 @@ class DashboardConfig:
         metadata=_meta(
             "Folder Suggestions Enabled",
             "Offer to file a newly-titled, unfiled chat session into a matching folder.",
+        ),
+    )
+    folder_suggestions_auto_apply: bool = field(
+        default=False,
+        metadata=_meta(
+            "Folder Suggestions Auto Apply",
+            "While folder suggestions are on, file the session into the suggested "
+            "folder instead of asking first; the card then says where it went, with "
+            "an undo. Ignored while folder suggestions are off.",
         ),
     )
     project_tags_enabled: bool = field(

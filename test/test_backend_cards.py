@@ -360,9 +360,10 @@ def test_core_counts_per_harness_are_pinned() -> None:
         for card in _every_card()
     }
     assert counts == {
+        "antigravity": 3,
         "claude": 7,
         "codex": 6,
-        "copilot": 2,
+        "copilot": 4,
         "deepseek": 6,
         "goose": 7,
         "kas": 7,
@@ -724,4 +725,5 @@ def test_the_payload_is_json_native() -> None:
     import json
 
     for backend in sorted(sdk_backends.ACP_BACKENDS_KNOWN):
-        json.dumps(cards_mod.card_payload(backend))
+        payload = cards_mod.card_payload(backend)
+        assert json.loads(json.dumps(payload)) == payload, backend

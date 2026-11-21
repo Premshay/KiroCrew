@@ -93,7 +93,8 @@ class ScopeSpec:
 # Built-in catalog.
 #
 # APPEND-ONLY CONTRACT: add a row, or retire one — never RENAME a scope in place.
-# Two things depend on it. A policy naming a retired scope fails closed at boot, so
+# Two things depend on it. A policy naming a retired scope fails closed at boot
+# (unless ``RETIRED_SCOPES`` lists it, with the row that covers it), so
 # a rename is a visible migration on the ceiling; and a PROFILE naming an
 # unregistered ``capabilities.*`` child that declares ``enabled: true`` is
 # deliberately TOLERATED (skipped + recorded on ``Profile.unknown_scopes``, see
@@ -121,6 +122,12 @@ SCOPE_CATALOG: Dict[str, ScopeSpec] = {
         profile_always_permitted=("trust", "trust_reads"),
     ),
     "mcp": ScopeSpec(RULESET, matcher="mcp"),
+    # Which KGL web terms (``web_fetch``, ``web_search``) a KAS permission request
+    # may be approved for with no person asked: trust, YOLO or any other
+    # auto-approve. The LTS policy fetch denies a term an ``ask`` rule names, so
+    # that request always reaches the approval card (``kiro_crew.web_ask_rule``).
+    # An absent scope permits both (unchanged behavior).
+    "unattended_web_tools": ScopeSpec(RULESET, matcher="identifier"),
     "apps": ScopeSpec(RULESET, matcher="identifier"),
     # Which app versions may be installed and loaded, as ``<app>@<version>``
     # (``{"mode": "allow", "allow": ["file-explorer@1.*"]}``). Asked by
@@ -189,11 +196,12 @@ SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     "agent_backend": ScopeSpec(RULESET, matcher="identifier"),
     # Which inbound webhook sources may start work (RFC crew-lts-edition,
     # appendix rows "Incoming webhooks" and Red "Webhooks by source"). Members are
-    # source ids: ``agent`` (``POST /api/hooks/agent``) and ``ops-mission-control``
-    # (that app's signal webhook), e.g. ``{"webhooks": {"mode": "allow", "allow":
-    # ["agent"]}}``. Asked by ``kiro_crew.webhook_sources.source_refusal`` at each
-    # source's entry, policy layer only (a request carries no session). An absent
-    # scope leaves each source to its own switch.
+    # source ids: ``agent`` (``POST /api/hooks/agent``) and the name of each app
+    # whose manifest declares ``permissions.webhookSource`` (that app's own inbound
+    # route), e.g. ``{"webhooks": {"mode": "allow", "allow": ["agent"]}}``. Asked by
+    # ``kiro_crew.webhook_sources.source_refusal`` at each source's entry, policy
+    # layer only (a request carries no session). An absent scope leaves each source
+    # to its own switch.
     "webhooks": ScopeSpec(RULESET, matcher="identifier"),
     # Capabilities (registered defaults — see the CAPABILITY-DEFAULT CONTRACT above):
     "capabilities.spawn": ScopeSpec(
@@ -504,7 +512,9 @@ SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     # hosted provider, each local preset id, ``sagemaker``). ``capability.provider_id``
     # names the configured one, and every check that reads this row for the configured
     # provider asks it too, so a refused model is neither selectable nor used. ``none``
-    # is never asked, and neither is an endpoint the owner wrote by hand.
+    # is never asked, and neither is an endpoint the owner wrote by hand. An LTS
+    # build refuses hosted Jev and every hand-written endpoint in code, whatever
+    # this list says (``capability.edition_refuses``).
     "capabilities.decisions": ScopeSpec(
         CAPABILITY,
         capability_default=True,
@@ -558,10 +568,19 @@ SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     # (capability_default=False), like messaging and publish. Data row only --
     # CONTRACT_VERSION and the evaluator are untouched.
     "capabilities.kiro_cloud_sessions": ScopeSpec(CAPABILITY, capability_default=False),
-    # Opt-in: on a host whose policy governs any scope, only ``enabled: true`` here
-    # lets the owner turn Files-view credential redaction off
-    # (``redaction_switch.owner_may_disable``, policy layer only). Data row only.
+    # Opt-in: on a host whose policy governs any scope, credential redaction stays on
+    # unless the top policy tier enables this row (``redaction_switch.owner_may_disable``,
+    # policy layer only). The row of the owner's one setting, on every path. Data row only.
     "capabilities.credential_redaction_off": ScopeSpec(CAPABILITY, capability_default=False),
+}
+
+#: Retired scopes a policy or profile may still name, each with the row that governs
+#: what it did. A grant of a retired row (``{"enabled": true}``) grants nothing; any
+#: other value is read as a deny of the successor, so retiring a row never loosens a
+#: ceiling. Either way a warning names it, and the policy still loads.
+RETIRED_SCOPES: Dict[str, str] = {
+    # Governed the output-seams switch, which is now part of the one redaction setting.
+    "capabilities.credential_redaction_seams_off": "capabilities.credential_redaction_off",
 }
 
 

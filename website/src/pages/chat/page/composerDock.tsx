@@ -7,6 +7,7 @@ import { FolderGit2 } from 'lucide-react'
 
 import ErrorNotice from '../../../components/ErrorNotice'
 import { Glass } from '../../../components/Glass'
+import { COMPOSER_RADIUS } from '../../../components/composerRadius'
 import { setMovedSlot, useMovedSlot } from '../../../hooks/useMoveSlotToFolder'
 import { pathBasename } from '../../../utils/pathBasename'
 import { TipCard, type useTipTrigger } from '../../../components/TipCard'
@@ -35,6 +36,8 @@ interface ComposerAboveBandOptions {
   /** Whether the sidebar (and its folder-order banner) is on this screen. */
   sidebarOnScreen: boolean
   folderSuggestionAccept: (folderId: string) => void
+  /** Undo an auto-applied filing. */
+  folderSuggestionUndo: () => void
   folderSuggestionDecline: () => void
   /** The active session's folder and project, for the folder-project hint. */
   slotFolderId: string | undefined
@@ -57,6 +60,7 @@ export function useComposerAboveBand({
   activeSlot,
   sidebarOnScreen,
   folderSuggestionAccept,
+  folderSuggestionUndo,
   folderSuggestionDecline,
   slotFolderId,
   slotProject,
@@ -134,8 +138,8 @@ export function useComposerAboveBand({
        input box and an options row sits above it. */}
       {folderDir && (
         <div className="pt-1.5" key="folder-project-hint">
-          <Glass variant="chip" radius={6} role="status" data-testid="folder-project-hint"
-            className="glass-accent glass-shadow w-full flex flex-wrap items-center gap-x-2.5 gap-y-1.5 px-4 py-2 rounded-md text-xs">
+          <Glass variant="chip" radius={COMPOSER_RADIUS} role="status" data-testid="folder-project-hint"
+            className="glass-accent glass-shadow w-full flex flex-wrap items-center gap-x-2.5 gap-y-1.5 px-4 py-2 text-xs">
             <FolderGit2 size={14} className="shrink-0" aria-hidden="true" style={{ color: 'var(--accent)' }} />
             <span className="flex-1 text-[12px] leading-tight min-w-0 break-words" style={{ color: 'var(--text)' }}>
               {i18nT('components.folderProjectHint.differs', { current: pathBasename(slotProject || '') || '—', folder: pathBasename(folderDir) })}
@@ -200,7 +204,9 @@ export function useComposerAboveBand({
               folders={chatFolders}
           folderSortMode={folderSortMode}
               onAccept={folderSuggestionAccept}
+              onUndo={folderSuggestionUndo}
               onDecline={folderSuggestionDecline}
+              applied={folderSuggestion.applied}
             />
           </div>
         ) : activeTip && (
@@ -211,5 +217,5 @@ export function useComposerAboveBand({
       </AnimatePresence>
     </>
     )
-  }, [showImageHint, sessionControlsError, sessionControlStatusError, chatFoldersError, sessionControls.length, folderSuggestion, activeSlot, chatFolders, folderSortMode, folderSortError, sidebarOnScreen, folderSuggestionAccept, folderSuggestionDecline, folderDir, slotProject, setProject, projectLocked, activeTip, dismissTip, langGen, onSendNow])
+  }, [showImageHint, sessionControlsError, sessionControlStatusError, chatFoldersError, sessionControls.length, folderSuggestion, activeSlot, chatFolders, folderSortMode, folderSortError, sidebarOnScreen, folderSuggestionAccept, folderSuggestionUndo, folderSuggestionDecline, folderDir, slotProject, setProject, projectLocked, activeTip, dismissTip, langGen, onSendNow])
 }

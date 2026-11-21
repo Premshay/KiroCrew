@@ -31,7 +31,12 @@ from kiro_crew.mcp_tools.catalog.messaging import (  # noqa: F401
     schemas,
 )
 from kiro_crew.platform import redact_via_context as redact
-from kiro_crew.security import BINARY_MIME_ALLOWLIST, redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import (
+    BINARY_MIME_ALLOWLIST,
+    redact_credentials,
+    redact_exfiltration_urls,
+    refuses,
+)
 from kiro_crew.validation import _SLACK_TS_RE, CHANNEL_ID_RE, CHANNEL_MAX_LEN
 
 #: Options that exist only in Slack's protocol: a Block Kit layout, a Slack
@@ -278,17 +283,19 @@ def send_message(name: str, args: dict[str, Any]) -> str:
     # which defaults to Slack) so the caller can detect the miss and retry
     # instead of reading a success string for a notification-only send.
     if session == "slack":
-        return "⚠️ Slack unavailable — delivered as dashboard notification only (NOT in Slack)."
+        return (
+            "Warning: Slack unavailable — delivered as dashboard notification only (NOT in Slack)."
+        )
     if session in _CHANNEL_SESSIONS:
         return (
-            f"⚠️ {session} unavailable (not connected, or no configured DM target) — "
+            f"Warning: {session} unavailable (not connected, or no configured DM target) — "
             f"delivered as dashboard notification only (NOT in {session})."
         )
     if session:
         return "Session injection unavailable — delivered as notification."
     if is_cron:
         return (
-            "⚠️ Cron send reached the dashboard notification only — NOT posted to Slack "
+            "Warning: Cron send reached the dashboard notification only — NOT posted to Slack "
             "(owner DM unavailable: no Slack client or owner_id). Verify Slack delivery."
         )
     return "Notification delivered."
@@ -606,9 +613,31 @@ def _describe_slack_skip(reason: str) -> str:
     return f" (Slack upload skipped: {reason}; the file is available in the dashboard)"
 
 
+def _caption_not_sent(refusal: str) -> str:
+    """The suffix for a file delivered without its too-long preamble.
+
+    *refusal* is the endpoint's ``too_long_for_channel`` error, which names the
+    leg, the cap and its unit. The note goes through ``send_message``, never a
+    second ``file_send``: that would add another outbox copy and dashboard card.
+    """
+    return f" (description not sent: {refusal}; send the note with send_message)"
+
+
 def file_send(name: str, args: dict[str, Any]) -> str:
     src = Path(args.get("path", ""))
+    # The preamble. Redacted on the way in, exactly like the legacy description, so
+    # a report's note cannot carry a credential or an exfiltration URL to any
+    # audience. ONE field, every leg: the Slack leg posts it as the file's
+    # ``initial_comment`` and the native-channel leg as its ``send_document``
+    # caption — both read ``description`` by the same name, so they cannot drift.
+    # This is the first of two redactions: each endpoint re-applies its own
+    # display-form floor (redact_for_display) on top of this literal one, so the
+    # legs stay defence-in-depth rather than relying on a single scrub.
     desc = redact(args.get("description", ""))
+    # The result string is a one-line summary, not the preamble itself: cap what
+    # the caller sees so a long preamble does not balloon the tool result. The
+    # legs still receive the full ``desc`` above.
+    echo_desc = desc if len(desc) <= 120 else desc[:117] + "..."
     try:
         raw = safe_read_file_bytes(str(src))
     except FileTooLargeError as e:
@@ -630,7 +659,7 @@ def file_send(name: str, args: dict[str, Any]) -> str:
         )
         return f"Error: file not found or access denied: {src}"
     clean_name = src.name
-    if redact(clean_name) != clean_name:
+    if refuses(clean_name, redact):
         mcp_core.sel().log_tool_invocation(
             session_key="mcp_core",
             source="mcp",
@@ -714,10 +743,27 @@ def file_send(name: str, args: dict[str, Any]) -> str:
             {"file_path": str(dest), "filename": dest.name, "description": desc},
             session_key=strict_key,
         )
+        caption_note = ""
+        if channel_resp.get("code") == "too_long_for_channel":
+            # The linked chat is where the reader is, so the file still goes there,
+            # once more without the caption: the outbox copy and the dashboard card
+            # already exist, so a resend from the agent would duplicate both.
+            # Falling through to Slack would deliver where the reader is not looking.
+            caption_note = _caption_not_sent(str(channel_resp["error"]))
+            channel_resp = mcp_core._post(
+                "/api/channel/upload-file",
+                {"file_path": str(dest), "filename": dest.name, "description": ""},
+                session_key=strict_key,
+            )
+            if not channel_resp.get("delivered"):
+                failed = channel_resp.get("error") or channel_resp.get("skipped") or "not delivered"
+                return f"Error: {failed}"
         if channel_resp.get("delivered"):
             via = channel_resp.get("channel_type") or "channel"
-            msg = f"File sent: {dest.name} ({desc})" if desc else f"File sent: {dest.name}"
-            return f"{msg} (delivered to {via})"
+            msg = (
+                f"File sent: {dest.name} ({echo_desc})" if echo_desc else f"File sent: {dest.name}"
+            )
+            return f"{msg} (delivered to {via}){caption_note}"
         if channel_resp.get("error"):
             channel_warning = f" (channel upload failed: {channel_resp['error']})"
         elif channel_resp.get("skipped"):
@@ -764,15 +810,19 @@ def file_send(name: str, args: dict[str, Any]) -> str:
             "the dashboard.)"
         )
     else:
-        slack_resp = mcp_core._post(
-            "/api/slack/upload-file",
-            {
-                "file_path": str(dest),
-                "filename": dest.name,
-                "thread_ts": thread_ts,
-                "channel": args.get("channel", ""),
-            },
-        )
+        slack_body = {
+            "file_path": str(dest),
+            "filename": dest.name,
+            "thread_ts": thread_ts,
+            "channel": args.get("channel", ""),
+            "description": desc,
+        }
+        slack_resp = mcp_core._post("/api/slack/upload-file", slack_body)
+        slack_caption_note = ""
+        if slack_resp.get("code") == "too_long_for_channel":
+            # Same rule as the linked chat above: deliver once, without the caption.
+            slack_caption_note = _caption_not_sent(str(slack_resp["error"]))
+            slack_resp = mcp_core._post("/api/slack/upload-file", {**slack_body, "description": ""})
         if slack_resp.get("error"):
             slack_warning = f" (Slack upload failed: {slack_resp['error']})"
         elif slack_resp.get("skipped"):
@@ -783,8 +833,8 @@ def file_send(name: str, args: dict[str, Any]) -> str:
             # ok-without-skipped means the endpoint actually delivered, for
             # every resolved identity (owner DM, session-map thread, tracked
             # channel) — not just Slack-linked threads.
-            slack_warning = " (delivered to Slack)"
-    msg = f"File sent: {dest.name} ({desc})" if desc else f"File sent: {dest.name}"
+            slack_warning = " (delivered to Slack)" + slack_caption_note
+    msg = f"File sent: {dest.name} ({echo_desc})" if echo_desc else f"File sent: {dest.name}"
     return msg + channel_warning + slack_warning
 
 

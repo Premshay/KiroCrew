@@ -276,9 +276,10 @@ class _WorkflowSessionWorker:
         """Cheap clean slate before REUSE — fresh conversation on the warm process.
 
         Uses ``provider.new_conversation()``, which skips the expensive
-        spawn+initialize on a backend served through the shared runtime (kiro, KAS,
-        Codex) and on claude's own ``AcpClient``. Any other backend on its own
-        ``AcpClient`` has no such reset and raises ``NotImplementedError``. On that, or
+        spawn+initialize on a backend served through the shared runtime (kiro, KAS)
+        and on claude's own ``AcpClient``. Codex, whose closed session leaves its MCP
+        servers running, and any other backend on its own ``AcpClient`` have no such
+        reset and raise ``NotImplementedError``. On that, or
         any other failure, fall back to a hard ``SessionManager.reset`` so a
         reused worker can NEVER carry prior-task context into the next task
         (correctness over speed on the fallback path).
@@ -313,6 +314,12 @@ class _WorkflowSessionWorker:
                     self._key,
                     exc_info=True,
                 )
+            # A worker keeps one claim across tasks, so a stricter agent.sandbox
+            # reaches it here, at its task boundary, as a fresh process.
+            if await self._sessions.recycle_if_sandbox_tightened(self._key):
+                self._provider = None
+                await self.start()
+                return
             try:
                 await new_conv()
                 await self._reapply_effort()
@@ -555,13 +562,11 @@ def build_pooled_agent_fn(
             step_incomplete = True
             raise
         finally:
-            # Best-effort teardown. An exception raised from this ``finally``
-            # would REPLACE the step's real outcome: a successful ``result``
-            # would vanish behind a session error, and the body's own exception
-            # (provider failure, a scope ``validate()`` rejection) would be
-            # swallowed. So a teardown failure is logged and dropped; the body's
-            # outcome always wins. ``CancelledError`` is a BaseException and is
-            # deliberately NOT caught, so a cancel still propagates.
+            # Best-effort teardown: a raise from this ``finally`` would REPLACE
+            # the step's outcome (hide a good ``result`` or swallow the body's
+            # own exception). So a teardown failure is logged and dropped.
+            # ``CancelledError`` is a BaseException and is NOT caught, so a
+            # cancel still propagates.
             #
             # Log the exception TYPE only (no message, no traceback): session
             # error text can carry restricted conversation content.

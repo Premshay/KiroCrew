@@ -20,6 +20,10 @@ A managed server that only ran out of time starting is the other failure a secon
 attempt can cure: :func:`is_start_timeout_failure` reads it, and the KAS readiness
 barrier (``session_handle_mcp.wait_mcp_ready``) re-attempts such a server once,
 while the session start is still waiting for it.
+
+:func:`is_sse_fallback_failure` reads the one failure KAS reports for a remote OAuth
+server it holds no grant for, the error its legacy SSE fallback gets back; the
+KAS sign-in probe (``session_handle_mcp._probe_mcp_sign_in``) runs only on it.
 """
 
 from __future__ import annotations
@@ -65,6 +69,40 @@ def is_recoverable_auth_failure(error_message: object) -> bool:
     return is_auth_failure_output(error_message)
 
 
+# KAS's wording for a refresh the token endpoint answered with a client error
+# and no OAuth error code. Anchored on the closing parenthesis: the engine names
+# a code there only for ``server_error`` and ``temporarily_unavailable``, and a
+# 5xx or an unreachable endpoint may answer the same tokens later.
+_REFRESH_REFUSED = re.compile(r"could not be refreshed \(token endpoint answered (4\d\d)\)")
+# Timeouts, early-data refusals and throttling do not reject the saved sign-in.
+_TRANSIENT_REFRESH_STATUSES = frozenset({408, 425, 429})
+# An OAuth error code as the whole message: KAS reports a token endpoint's own
+# ``error`` that way when it is neither one it drops the tokens for nor one it
+# reads as passing.
+_OAUTH_ERROR_CODE = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)+")
+_PASSING_OAUTH_ERRORS = frozenset({"server_error", "temporarily_unavailable"})
+
+
+def is_refused_sign_in(error_message: object) -> bool:
+    """Whether a failed server's error says its OAuth server refused the saved sign-in.
+
+    KAS deletes a remote server's tokens, and reports ``failedAuthorization``,
+    only for ``invalid_grant``, ``invalid_client`` and ``unauthorized_client``.
+    Any other refusal of a refresh keeps the tokens and reports the server
+    ``failed`` with one of the two shapes read here, so signing in again is the
+    only cure. An answer a later attempt may reverse (a 5xx, an unreachable
+    endpoint, ``server_error``) is not one: a sign-in reset drops the tokens.
+    """
+    if not isinstance(error_message, str) or not error_message:
+        return False
+    if match := _REFRESH_REFUSED.search(error_message):
+        return int(match.group(1)) not in _TRANSIENT_REFRESH_STATUSES
+    return (
+        _OAUTH_ERROR_CODE.fullmatch(error_message) is not None
+        and error_message not in _PASSING_OAUTH_ERRORS
+    )
+
+
 # A host's own connect timeout ("connection timed out after 60000ms" from KAS).
 # Word-bounded so a config error that merely names a "timeout" does not qualify.
 _TIMED_OUT = re.compile(r"\btimed\s+out\b", re.IGNORECASE)
@@ -83,3 +121,17 @@ def is_start_timeout_failure(error_message: object) -> bool:
     if INITIALIZE_DEADLINE_REASON in error_message:
         return True
     return _TIMED_OUT.search(error_message) is not None
+
+
+#: How the legacy SSE transport reports a stream request answered with anything but
+#: 200; the status code follows in parentheses.
+_SSE_NON_200 = "SSE error: Non-200 status code"
+
+
+def is_sse_fallback_failure(error_message: object) -> bool:
+    """Whether a failed server's error is its legacy SSE fallback's non-200 answer.
+
+    KAS reports a remote OAuth server it holds no grant for this way
+    (``SSE error: Non-200 status code (405)``), with any status code.
+    """
+    return isinstance(error_message, str) and _SSE_NON_200 in error_message

@@ -35,6 +35,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import deny_notice_checks
 import pytest
+from redaction_structured_cases import github_classic
 
 from kiro_crew import llm_helpers, subagent
 from kiro_crew.agent_sdk.spec_hooks import TurnSpecHooks
@@ -235,11 +236,10 @@ async def test_eval_audit_lands_before_the_steer(monkeypatch):
 @pytest.mark.asyncio
 async def test_eval_gate_reason_is_redacted_before_it_reaches_the_model(monkeypatch):
     provider = _Provider(title="Run: aws s3 ls")
-    await _run_eval_turn(
-        provider, monkeypatch, gate_reason="denied: token AKIAIOSFODNN7EXAMPLE1234 in args"
-    )
+    key = github_classic(seed=1)
+    await _run_eval_turn(provider, monkeypatch, gate_reason=f"denied: token {key} in args")
     (notice,) = provider.steered
-    assert "AKIAIOSFODNN7EXAMPLE1234" not in notice
+    assert key not in notice
 
 
 # ── Behavioural: eval judge ──────────────────────────────────────────────────
@@ -592,6 +592,8 @@ _RUNNER_SITES = (
     _Site('outcome="rejected_hook_deny"', "host"),
     _Site('"rejected_sensitive" if target else "rejected_no_path"', "host"),
     _Site('outcome="rejected",', "host"),
+    # An organisation's web ``ask`` (``web_ask_rule``): an eval run has nobody to ask.
+    _Site('error="web_ask_rule"', "host"),
 )
 #: ``eval/judge.py`` denies inline at its one site.
 _JUDGE_SITES = (_Site('source="eval_judge"', "host"),)
@@ -754,3 +756,36 @@ def test_the_answer_scan_flags_the_wire_ports_own_answers():
         "async def f(wire, ask):\n    await wire.allow(ask)\n    await wire.refuse(ask, None)\n"
     )
     assert _answer_calls_in(source) == [2, 3]
+
+
+class _WebAskProvider(_Provider):
+    """A KAS web fetch the organisation's ``ask`` rule holds (``web_ask_rule``)."""
+
+    async def stream(self, message: str):
+        yield LLMEvent(
+            kind=EVENT_PERMISSION_REQUEST,
+            title="WorkspaceSearch",
+            request_id=self._request_id,
+            harness_tool_id="web_fetch",
+            kas_builtin_ids=True,
+            kas_managed_ask=True,
+        )
+        yield LLMEvent(kind=EVENT_COMPLETE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("edition", ["lts", "oss"])
+async def test_an_org_ask_on_a_kas_web_call_steers_the_surface_cause(monkeypatch, edition):
+    """``web_ask_rule``: an eval run has nobody to ask, so in LTS it refuses KAS's ask
+    on an organisation's web rule even for a call it would approve as safe."""
+    from types import SimpleNamespace
+
+    from kiro_crew import web_ask_rule
+
+    monkeypatch.setattr(web_ask_rule, "edition", SimpleNamespace(is_lts=lambda: edition == "lts"))
+    provider = _WebAskProvider()
+    await _run_eval_turn(provider, monkeypatch, gate_reason=None)
+    if edition == "lts":
+        _assert_steered_then_rejected(provider, _SURFACE_CLAUSE, "policy asks before web fetch")
+    else:
+        assert provider.calls == ["approve"]

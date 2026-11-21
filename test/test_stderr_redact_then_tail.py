@@ -30,6 +30,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from redaction_structured_cases import github_classic
 from test_theme_clone_stderr_redact_before_bound import _find_slice_before_redact_offenders
 
 import kiro_crew.apps.builtins.dev_fleet.gateway_service as gateway_service
@@ -45,7 +46,8 @@ from kiro_crew.hooks import (
 )
 
 # Built at runtime so no credential-shaped literal lands in the repo.
-_FAKE_KEY = "AKIA" + "B" * 16  # matches the AWS access-key-id pattern
+_FAKE_KEY = github_classic(seed=50)  # a GitHub classic token with a valid checksum
+_KEY_RIGHT = _FAKE_KEY[4:]  # the key without its ``ghp_`` prefix
 _MARKER = "[REDACTED:"
 _MARKER_TAIL = "credential]"  # the redaction marker ends "...: credential]"
 
@@ -53,12 +55,12 @@ _MARKER_TAIL = "credential]"  # the redaction marker ends "...: credential]"
 def _straddling(bound: int) -> str:
     """A stream whose last *bound* chars begin 4 chars INTO the fake key.
 
-    A raw ``[-bound:]`` keeps ``"B" * 16 + tail``: no ``AKIA`` prefix, so the
+    A raw ``[-bound:]`` keeps the key without its ``ghp_`` prefix, so the
     fragment matches nothing and leaks; the same is true after a slice-then-
     redact reorder. Redact-then-slice yields the marker's tail instead.
     """
-    tail = "e" * (bound - 16)
-    return "p" * 40 + _FAKE_KEY + tail
+    tail = " " + "e" * (bound - len(_KEY_RIGHT) - 1)
+    return "p" * 40 + " " + _FAKE_KEY + tail
 
 
 def _two_markers(bound: int) -> str:
@@ -68,7 +70,7 @@ def _two_markers(bound: int) -> str:
 
 def _assert_straddle_redacted(excerpt: str, bound: int) -> None:
     assert _FAKE_KEY not in excerpt
-    assert "B" * 16 not in excerpt, excerpt  # the raw right half must not survive
+    assert _KEY_RIGHT not in excerpt, excerpt  # the raw right half must not survive
     # Positive proof the payload flowed through redaction (not a vacuous pass on
     # an empty excerpt): the tail window opens INSIDE the replacement marker, so
     # the marker's tail, not the key's, is what survives the cut.
@@ -414,7 +416,8 @@ def test_chat_runner_hook_excerpts_anchor_by_exit_semantics() -> None:
     """
     block = _hook_fire_block()
     assert block.count("r.stdout[:200]") == 1
-    assert block.count("r.stderr[:200] if r.stderr else") == 2  # BLOCKED payload + warning log
+    # BLOCKED payload + warning log
+    assert block.count("r.stderr[:HOOK_DENY_REASON_MAX_CHARS] if r.stderr else") == 2
     assert block.count("r.stderr[:100] if r.stderr else") == 1  # BLOCKED activity event
     assert "r.stderr[-200:] if r.stderr else" in block  # fail-closed crash detail
     assert block.rstrip().endswith("r.stderr[-200:])")  # non-gating crash warning

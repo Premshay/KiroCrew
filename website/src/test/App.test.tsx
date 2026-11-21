@@ -2,7 +2,7 @@
 // layout contract and the shell. App.topbarAndShortcuts.test.tsx covers the rest
 // with the same mocks: the top bar's readouts, the global shortcuts and two
 // App.tsx source contracts.
-import { afterAll, afterEach, beforeEach, describe, it, expect, vi } from 'vitest'
+import { afterAll, afterEach, beforeEach, describe, it, expect, onTestFinished, vi } from 'vitest'
 import { readFileSync, readdirSync } from 'node:fs'
 import { MOBILE_BREAKPOINT } from '../hooks/useIsMobile'
 import { join } from 'node:path'
@@ -18,7 +18,7 @@ import SegmentedControl from '../components/SegmentedControl'
 import { safeSetItem } from '../utils/safeStorage'
 import { FEATURE_REQUEST_PROMPT_FALLBACK } from '../prompts/featureRequest'
 import { consumeChatHandoff } from '../utils/errorReport'
-import { ApiError } from '../api/apiError'
+import { MORE_BELOW_MASK } from '../components/ModelEffortDropdown'
 
 /** Chrome the side tracks never get: the header's own `pl-2 pr-3` (20px) plus the
  *  two 12px track gaps. Subtracted before reasoning about a group's width —
@@ -104,13 +104,14 @@ vi.mock('../api/client', () => ({
       import_onboarded: true,
     }),
     updateThemeConfig: vi.fn().mockResolvedValue({}),
+    // The owner check behind first run (`useViewerIsNotOwner`): the owner.
+    viewerOwnerOk: vi.fn().mockResolvedValue(true),
     onboardingImportScan: vi.fn().mockResolvedValue({
       sources: [],
       skipped: [],
       merge_only: true,
     }),
     onboardingImportState: vi.fn().mockResolvedValue({}),
-    // The Privacy chapter reads both status routes to say whether usage data is on.
     collectionStatus: vi.fn().mockResolvedValue({ enabled: false, env_pinned: false }),
     beaconStatus: vi.fn().mockResolvedValue({
       enabled: true,
@@ -225,9 +226,6 @@ describe('App routing', () => {
       expect(api.updateThemeConfig).toHaveBeenCalledWith({
         onboarded: true,
         import_onboarded: true,
-        // A finished legacy first run implies the disclosure is behind the user.
-        // Persisted server-side so the gateway's first-heartbeat gate can see it.
-        privacy_acked: true,
       })
       expect(localStorage.getItem('mc-import-onboarded')).toBe('1')
     })
@@ -261,20 +259,17 @@ describe('App routing', () => {
     })
   })
 
-  // ── First-run chapter order: Import setup → Privacy → Customize ───────────
-  // Privacy is MANDATORY, so these cover the two ways out of chapter 1: it
-  // completing with nothing to import, and "Skip all".
-  describe('first-run Privacy chapter', () => {
-    // The chapter's buttons wait for the two status reads.
-    const keepOnWhenReady = async (dialog: HTMLElement) => {
-      const button = within(dialog).getByRole('button', { name: 'Keep on' })
-      await waitFor(() => expect(button).toBeEnabled(), { timeout: 5000 })
-      return button
-    }
+  // ── First-run chapter order: Import setup → Customize ─────────────────────
+  // There is no Privacy chapter: usage data is on by default and Settings >
+  // Privacy is where it is turned off. These cover the ways out of chapter 1:
+  // it completing with nothing to import, "Skip all" and Escape.
+  describe('first-run chapters', () => {
     const freshFirstRun = async () => {
       const { api } = await import('../api/client')
       localStorage.clear()
       vi.mocked(api.updateThemeConfig).mockClear()
+      vi.mocked(api.collectionStatus).mockClear()
+      vi.mocked(api.beaconStatus).mockClear()
       vi.mocked(api.themeBoot).mockResolvedValue({
         mode: '',
         color: '',
@@ -283,96 +278,65 @@ describe('App routing', () => {
       } as never)
       return api
     }
+    const codexScan = {
+      sources: [{
+        id: 'codex',
+        name: 'Codex',
+        detected: true,
+        detail: '~/.codex',
+        categories: [{
+          id: 'instructions',
+          label: 'Instructions',
+          count: 2,
+          description: 'Agent instructions',
+        }],
+      }],
+      skipped: [],
+      merge_only: true,
+    }
 
     afterAll(async () => {
       // Restore the default fully-onboarded mock so subsequent describe blocks
-      // don't inherit a first-run state that renders the Privacy chapter.
+      // don't inherit a first-run state.
       const { api } = await import('../api/client')
       vi.mocked(api.themeBoot).mockResolvedValue({
         mode: '',
         color: '',
         onboarded: true,
         import_onboarded: true,
-        privacy_acked: true,
       } as never)
     })
 
-    it('opens after Import setup and gates the Customize chapter', async () => {
-      await freshFirstRun()
-      // Nothing to import: the import chapter completes itself, and Privacy is
-      // still shown rather than skipped along with it.
-      renderWithProviders(<App />, { route: '/chat' })
-
-      // Privacy mounts only at the end of a real async chain: the import
-      // chapter's scan query resolves, an effect fires its auto-complete
-      // mutation (`api.onboardingImportState`), and `onSuccess` flips the
-      // parent's state. findBy*'s 1000ms default polls that whole chain and
-      // loses under load, so the wait names the boundary and gives it room.
-      const dialog = await screen.findByRole('dialog', { name: 'Privacy' }, { timeout: 5000 })
-      // Recording is off in this mock, so the chapter names the heartbeat only.
-      // The heading follows two status queries, so wait for it.
-      expect(
-        await within(dialog).findByRole('heading', { name: 'A daily heartbeat is on' }, { timeout: 5000 }),
-      ).toBeInTheDocument()
-      expect(within(dialog).getByText('Anonymous daily heartbeat')).toBeInTheDocument()
-      // Mandatory: no way past it but forward.
-      expect(within(dialog).queryByRole('button', { name: /skip/i })).not.toBeInTheDocument()
-      // The Customize chapter must not be reachable behind it.
-      expect(screen.queryByText('Pick your look')).not.toBeInTheDocument()
-
-      fireEvent.click(await keepOnWhenReady(dialog))
-
-      expect(await screen.findByText('Pick your look')).toBeInTheDocument()
-      expect(localStorage.getItem('mc-privacy-acked')).toBe('1')
-      // Persisted SERVER-side too, not just locally: the gateway withholds the
-      // very first heartbeat until `dashboard.privacy_acked` is true, and it
-      // cannot read localStorage. A local-only mark would leave the beacon
-      // permanently silent on an install whose user did pass this chapter.
-      const { api: clientApi } = await import('../api/client')
-      await waitFor(() => {
-        // Recording is off in this mock (heartbeat only), so no notice version.
-        expect(clientApi.updateThemeConfig).toHaveBeenCalledWith({ privacy_acked: true })
-      })
-    })
-
-    it('"Skip all" from the Customize chapter ends first run without re-showing Privacy', async () => {
+    it('opens Customize right after Import setup, with no Privacy chapter', async () => {
       const api = await freshFirstRun()
       renderWithProviders(<App />, { route: '/chat' })
 
-      // Chapter 1 (nothing to import) → Privacy → Customize. Same
-      // auto-complete mutation chain as above sits in front of this dialog.
-      const dialog = await screen.findByRole('dialog', { name: 'Privacy' }, { timeout: 5000 })
-      fireEvent.click(await keepOnWhenReady(dialog))
-      expect(await screen.findByText('Pick your look')).toBeInTheDocument()
+      // Nothing to import: the import chapter completes itself through a real
+      // async chain (its scan query, then the auto-complete mutation), so the
+      // wait names the boundary and gives it room.
+      expect(await screen.findByText('Pick your look', {}, { timeout: 5000 })).toBeInTheDocument()
+      expect(screen.queryByRole('dialog', { name: 'Privacy' })).not.toBeInTheDocument()
+      // No acknowledgement is written, and no usage status is read for one.
+      expect(api.updateThemeConfig).not.toHaveBeenCalledWith(expect.objectContaining({ privacy_acked: true }))
+      expect(api.collectionStatus).not.toHaveBeenCalled()
+      expect(api.beaconStatus).not.toHaveBeenCalled()
+    })
+
+    it('"Skip all" from the Customize chapter ends first run', async () => {
+      const api = await freshFirstRun()
+      renderWithProviders(<App />, { route: '/chat' })
+      expect(await screen.findByText('Pick your look', {}, { timeout: 5000 })).toBeInTheDocument()
 
       fireEvent.click(screen.getByRole('button', { name: 'Skip all setup and onboarding' }))
 
-      // Privacy is already behind the user, so the skip lands in the product.
       await waitFor(() =>
         expect(api.updateThemeConfig).toHaveBeenCalledWith({ onboarded: true }))
-      expect(screen.queryByRole('dialog', { name: 'Privacy' })).not.toBeInTheDocument()
       expect(screen.queryByText('Pick your look')).not.toBeInTheDocument()
     })
 
-    it('"Skip all" still lands on Privacy, then ends first run', async () => {
+    it('"Skip all" in Import setup ends first run there', async () => {
       const api = await freshFirstRun()
-      vi.mocked(api.onboardingImportScan).mockResolvedValueOnce({
-        sources: [{
-          id: 'codex',
-          name: 'Codex',
-          detected: true,
-          detail: '~/.codex',
-          categories: [{
-            id: 'instructions',
-            label: 'Instructions',
-            count: 2,
-            description: 'Agent instructions',
-          }],
-        }],
-        skipped: [],
-        merge_only: true,
-      } as never)
-
+      vi.mocked(api.onboardingImportScan).mockResolvedValueOnce(codexScan as never)
       renderWithProviders(<App />, { route: '/chat' })
 
       const importDialog = await screen.findByRole('dialog', { name: 'Import agent setup' })
@@ -380,62 +344,35 @@ describe('App routing', () => {
         within(importDialog).getByRole('button', { name: 'Skip all setup and onboarding' }),
       )
 
-      const dialog = await screen.findByRole('dialog', { name: 'Privacy' })
-      // Skipping everything does not skip the disclosure — but nothing follows it.
-      expect(api.updateThemeConfig).not.toHaveBeenCalledWith({ onboarded: true })
-
-      fireEvent.click(await keepOnWhenReady(dialog))
-
       await waitFor(() =>
         expect(api.updateThemeConfig).toHaveBeenCalledWith({ onboarded: true }))
+      expect(screen.queryByRole('dialog', { name: 'Privacy' })).not.toBeInTheDocument()
       expect(screen.queryByText('Pick your look')).not.toBeInTheDocument()
     })
 
-    // Escape IS "Skip all" — same routing, from a keystroke instead of the
-    // header control. Asserted end-to-end because the two halves live apart:
-    // the flow reports a skip, and App is what owes the user Privacy first.
-    it('Escape in Import setup lands on Privacy, then ends first run', async () => {
+    // Escape IS "Skip all": same routing, from a keystroke instead of the
+    // header control.
+    it('Escape in Import setup ends first run there', async () => {
       const api = await freshFirstRun()
-      vi.mocked(api.onboardingImportScan).mockResolvedValueOnce({
-        sources: [{
-          id: 'codex',
-          name: 'Codex',
-          detected: true,
-          detail: '~/.codex',
-          categories: [{
-            id: 'instructions',
-            label: 'Instructions',
-            count: 2,
-            description: 'Agent instructions',
-          }],
-        }],
-        skipped: [],
-        merge_only: true,
-      } as never)
-
+      vi.mocked(api.onboardingImportScan).mockResolvedValueOnce(codexScan as never)
       renderWithProviders(<App />, { route: '/chat' })
       await screen.findByRole('dialog', { name: 'Import agent setup' })
 
       fireEvent.keyDown(document, { key: 'Escape' })
 
-      const dialog = await screen.findByRole('dialog', { name: 'Privacy' })
-      expect(api.updateThemeConfig).not.toHaveBeenCalledWith({ onboarded: true })
-
-      fireEvent.click(await keepOnWhenReady(dialog))
-
-      // Escape skipped the REST of first run, so Customize never opens.
       await waitFor(() =>
         expect(api.updateThemeConfig).toHaveBeenCalledWith({ onboarded: true }))
+      expect(screen.queryByRole('dialog', { name: 'Privacy' })).not.toBeInTheDocument()
       expect(screen.queryByText('Pick your look')).not.toBeInTheDocument()
     })
 
-    // -- An existing user and a changed notice --
-    const existingUser = async (version: number) => {
+    // An existing user whose stored acknowledgement is older than any notice a
+    // previous build showed: nothing opens, whatever is on.
+    const existingUser = async () => {
       const { api } = await import('../api/client')
       localStorage.clear()
       localStorage.setItem('mc-onboarded', '1')
       localStorage.setItem('mc-import-onboarded', '1')
-      localStorage.setItem('mc-privacy-acked', '1')
       vi.mocked(api.updateThemeConfig).mockClear()
       vi.mocked(api.collectionStatus).mockClear()
       vi.mocked(api.themeBoot).mockResolvedValue({
@@ -444,160 +381,131 @@ describe('App routing', () => {
         onboarded: true,
         import_onboarded: true,
         privacy_acked: true,
-        privacy_ack_version: version,
+        privacy_ack_version: 0,
       } as never)
       return api
     }
 
-    it('shows the changed notice once to an existing user, and Keep on closes it', async () => {
-      const api = await existingUser(0)
+    it('opens nothing for an existing user with an older stored acknowledgement', async () => {
+      const api = await existingUser()
       vi.mocked(api.collectionStatus).mockResolvedValue({ enabled: true, env_pinned: false } as never)
-      renderWithProviders(<App />, { route: '/chat' })
-
-      const dialog = await screen.findByRole('dialog', { name: 'Privacy' }, { timeout: 5000 })
-      expect(within(dialog).getByRole('heading', { name: 'Performance metrics are on' })).toBeInTheDocument()
-      fireEvent.click(await keepOnWhenReady(dialog))
-
-      await waitFor(() =>
-        expect(api.updateThemeConfig).toHaveBeenCalledWith({ privacy_acked: true, privacy_ack_version: 2 }))
-      await waitFor(() =>
-        expect(screen.queryByRole('dialog', { name: 'Privacy' })).not.toBeInTheDocument())
-      // An existing user is not sent back through the tour.
-      expect(screen.queryByText('Pick your look')).not.toBeInTheDocument()
-      expect(api.updateThemeConfig).not.toHaveBeenCalledWith({ onboarded: true })
-      vi.mocked(api.collectionStatus).mockResolvedValue({ enabled: false, env_pinned: false } as never)
-    })
-
-    it('does not re-show the notice to an existing user with only the heartbeat on', async () => {
-      // The changed text is the one that says recording is on; nothing new to tell.
-      const api = await existingUser(0)
-      renderWithProviders(<App />, { route: '/chat' })
-
-      await waitFor(() => expect(api.collectionStatus).toHaveBeenCalled())
-      await act(async () => {})
-      await act(async () => {})
-      expect(screen.queryByRole('dialog', { name: 'Privacy' })).not.toBeInTheDocument()
-    })
-
-    // What the gateway answers once the dashboard sign-in has run out.
-    const signInRefused = () => new ApiError(403, 'Token required', '', true)
-    // Put back here, not at the end of a test body, so a test that fails cannot
-    // hand its status reads to the next one.
-    afterEach(async () => {
-      const { api } = await import('../api/client')
-      vi.mocked(api.collectionStatus).mockReset().mockResolvedValue({ enabled: false, env_pinned: false } as never)
-    })
-
-    it('does not show the notice to an existing user when the status cannot be read', async () => {
-      const api = await existingUser(0)
-      vi.mocked(api.collectionStatus).mockRejectedValue(new Error('502'))
-      renderWithProviders(<App />, { route: '/chat' })
-
-      await waitFor(() => expect(api.collectionStatus).toHaveBeenCalled())
-      await shellSettled()
-      await act(async () => {})
-      expect(screen.queryByRole('dialog', { name: 'Privacy' })).not.toBeInTheDocument()
-      // A read that did not answer stores nothing.
-      expect(api.updateThemeConfig).not.toHaveBeenCalled()
-    })
-
-    it('does not show the notice when the sign-in had run out and stays refused', async () => {
-      const api = await existingUser(0)
-      vi.mocked(api.collectionStatus).mockRejectedValue(signInRefused())
-      renderWithProviders(<App />, { route: '/chat' })
-
-      // The first read and the one more try.
-      await waitFor(() => expect(api.collectionStatus).toHaveBeenCalledTimes(2))
-      await shellSettled()
-      await act(async () => {})
-      expect(screen.queryByRole('dialog', { name: 'Privacy' })).not.toBeInTheDocument()
-      expect(api.updateThemeConfig).not.toHaveBeenCalled()
-    })
-
-    it('reads once more when the sign-in had run out, and stays closed on an "off" answer', async () => {
-      const api = await existingUser(0)
-      vi.mocked(api.collectionStatus).mockRejectedValueOnce(signInRefused())
-      renderWithProviders(<App />, { route: '/chat' })
-
-      await waitFor(() => expect(api.collectionStatus).toHaveBeenCalledTimes(2))
-      await shellSettled()
-      await act(async () => {})
-      expect(screen.queryByRole('dialog', { name: 'Privacy' })).not.toBeInTheDocument()
-      expect(api.updateThemeConfig).not.toHaveBeenCalled()
-    })
-
-    it('shows the changed notice from the second read when the first was refused', async () => {
-      const api = await existingUser(0)
-      vi.mocked(api.collectionStatus)
-        .mockRejectedValueOnce(signInRefused())
-        .mockResolvedValue({ enabled: true, env_pinned: false } as never)
-      renderWithProviders(<App />, { route: '/chat' })
-
-      const dialog = await screen.findByRole('dialog', { name: 'Privacy' }, { timeout: 5000 })
-      // Opened by a read that answered, so it says what is on from its first frame.
-      expect(within(dialog).getByRole('heading', { name: 'Performance metrics are on' })).toBeInTheDocument()
-    })
-
-    it('still shows the chapter on a first run whose status cannot be read', async () => {
-      const api = await freshFirstRun()
-      vi.mocked(api.collectionStatus).mockRejectedValue(new Error('502'))
-      renderWithProviders(<App />, { route: '/chat' })
-
-      const dialog = await screen.findByRole('dialog', { name: 'Privacy' }, { timeout: 5000 })
-      expect(
-        await within(dialog).findByRole('heading', { name: 'What can be collected' }, { timeout: 5000 }),
-      ).toBeInTheDocument()
-      expect(within(dialog).getByText(/Could not check what is on right now/)).toBeInTheDocument()
-    })
-
-    it('never shows the notice to an existing user whose usage data is already off', async () => {
-      const api = await existingUser(0)
-      vi.mocked(api.beaconStatus).mockResolvedValueOnce({
-        enabled: false, would_send: false, reason: 'disabled', reason_code: 'disabled',
-        endpoint_configured: true, env_override: false, env_var: 'KIROCREW_TELEMETRY_DISABLED',
-      } as never)
-      vi.mocked(api.collectionStatus).mockResolvedValueOnce({ enabled: false, env_pinned: false } as never)
-      renderWithProviders(<App />, { route: '/chat' })
-
-      await waitFor(() => expect(api.collectionStatus).toHaveBeenCalled())
-      // Flush the query resolution and the latch effect, then require "no".
-      await act(async () => {})
-      await act(async () => {})
-      expect(screen.queryByRole('dialog', { name: 'Privacy' })).not.toBeInTheDocument()
-    })
-
-    it('does not show the notice again once the current version is acknowledged', async () => {
-      const api = await existingUser(2)
+      onTestFinished(() => {
+        vi.mocked(api.collectionStatus).mockResolvedValue({ enabled: false, env_pinned: false } as never)
+      })
       renderWithProviders(<App />, { route: '/chat' })
 
       await waitFor(() => expect(api.themeBoot).toHaveBeenCalled())
-      await act(async () => {})
+      await shellSettled()
       await act(async () => {})
       expect(screen.queryByRole('dialog', { name: 'Privacy' })).not.toBeInTheDocument()
-      // Nothing to decide, so the status routes are not even asked.
-      expect(api.collectionStatus).not.toHaveBeenCalled()
+      expect(screen.queryByText('Pick your look')).not.toBeInTheDocument()
+      expect(api.updateThemeConfig).not.toHaveBeenCalled()
     })
 
-    // A tree whose import chapter was completed by a build that PREDATES the
-    // Privacy chapter: `mc-import-onboarded` is set, `mc-privacy-acked` is not.
-    // The tour is seeded from localStorage BEFORE theme boot resolves, so this
-    // holds boot pending — the window in which the derive effect cannot yet
-    // correct anything, and the only thing standing between "Done" and the end
-    // of first run is the guard on the completion path itself.
-    it('cannot end first run from the pre-boot tour when Privacy is unacknowledged', async () => {
-      const api = await freshFirstRun()
-      localStorage.setItem('mc-import-onboarded', '1')
-      // Boot never resolves for the duration of this test.
-      vi.mocked(api.themeBoot).mockReturnValueOnce(new Promise(() => {}) as never)
+    // A relay teammate's window loads the host's dashboard, whose first-run
+    // writes are owner-only: the chapters are the owner's to answer. The window
+    // is a fresh partition, so it has no local flags of its own either.
+    describe('in a tab that is not the owner', () => {
+      afterEach(async () => {
+        const { api } = await import('../api/client')
+        vi.mocked(api.viewerOwnerOk).mockReset().mockResolvedValue(true)
+      })
 
-      renderWithProviders(<App />, { route: '/chat' })
+      it('never opens first run for a relay teammate on a host that has not finished it', async () => {
+        const api = await freshFirstRun()
+        vi.mocked(api.viewerOwnerOk).mockResolvedValue(false)
+        renderWithProviders(<App />, { route: '/chat' })
 
-      // The seed must NOT put Customize on screen ahead of the disclosure.
-      expect(screen.queryByText('Pick your look')).not.toBeInTheDocument()
-      // And nothing may have marked first run complete.
-      expect(api.updateThemeConfig).not.toHaveBeenCalledWith({ onboarded: true })
-      // The one query still fetching is the held-open boot.
-      return shellSettled(1)
+        await waitFor(() => expect(api.viewerOwnerOk).toHaveBeenCalled())
+        await shellSettled()
+        await act(async () => {})
+        expect(screen.queryByRole('dialog', { name: 'Import agent setup' })).not.toBeInTheDocument()
+        expect(screen.queryByText('Pick your look')).not.toBeInTheDocument()
+        expect(api.updateThemeConfig).not.toHaveBeenCalled()
+      })
+
+      it('does not seed the Customize tour from local flags while the owner check is unanswered', async () => {
+        const { api } = await import('../api/client')
+        localStorage.clear()
+        // This browser finished Import but not the tour.
+        localStorage.setItem('mc-import-onboarded', '1')
+        vi.mocked(api.themeBoot).mockResolvedValue({
+          mode: '', color: '', onboarded: false, import_onboarded: true,
+        } as never)
+        vi.mocked(api.viewerOwnerOk).mockImplementation(() => new Promise(() => {}))
+        renderWithProviders(<App />, { route: '/chat' })
+
+        await waitFor(() => expect(api.themeBoot).toHaveBeenCalled())
+        // The owner read never answers, so it is the one fetch still held.
+        await shellSettled(1)
+        await act(async () => {})
+        expect(screen.queryByText('Pick your look')).not.toBeInTheDocument()
+      })
+
+      it('keeps a tour /onboarding opened before the owner check answered open once it answers', async () => {
+        // An owner who finished first run replays it while /api/auth/me is still out.
+        const api = await existingUser()
+        let answerOwner: (ok: boolean) => void = () => {}
+        vi.mocked(api.viewerOwnerOk).mockImplementation(() => new Promise<boolean>(resolve => { answerOwner = resolve }) as never)
+        renderWithProviders(<App />, { route: '/chat' })
+
+        await waitFor(() => expect(api.themeBoot).toHaveBeenCalled())
+        await waitFor(() => expect(api.viewerOwnerOk).toHaveBeenCalled())
+        act(() => { window.dispatchEvent(new CustomEvent('mc-start-import', { detail: { continueOnboarding: true } })) })
+        // Chain: the replay -> the importer -> its empty scan passes by itself -> Customize.
+        expect(await screen.findByText('Pick your look', {}, { timeout: 5000 })).toBeInTheDocument()
+
+        await act(async () => { answerOwner(true) })
+        // Past the settled shell, the chapters' derive has run on the answer.
+        await shellSettled()
+        await act(async () => {})
+        expect(screen.getByText('Pick your look')).toBeInTheDocument()
+      })
+
+      it('says a failed owner check holds first run, and Try again opens it once the owner answers', async () => {
+        const api = await freshFirstRun()
+        vi.mocked(api.viewerOwnerOk).mockRejectedValueOnce(new Error('502')).mockResolvedValue(true)
+        renderWithProviders(<App />, { route: '/chat' })
+
+        const notice = await screen.findByTestId('first-run-owner-check-error')
+        expect(within(notice).getByText(/Couldn't confirm this is your Crew/)).toBeInTheDocument()
+        expect(screen.queryByRole('dialog', { name: 'Import agent setup' })).not.toBeInTheDocument()
+
+        fireEvent.click(within(notice).getByRole('button', { name: 'Try again' }))
+        await waitFor(() => expect(screen.queryByTestId('first-run-owner-check-error')).not.toBeInTheDocument())
+        // The owner's first run then goes on: Import (nothing found) hands to Customize.
+        expect(await screen.findByText('Pick your look', {}, { timeout: 5000 })).toBeInTheDocument()
+      })
+
+      it('lets the on-hold notice be dismissed, so it never keeps the composer covered', async () => {
+        const api = await freshFirstRun()
+        vi.mocked(api.viewerOwnerOk).mockRejectedValue(new Error('502'))
+        renderWithProviders(<App />, { route: '/chat' })
+
+        const notice = await screen.findByTestId('first-run-owner-check-error')
+        fireEvent.click(within(notice).getByRole('button', { name: 'Dismiss' }))
+        await waitFor(() => expect(screen.queryByTestId('first-run-owner-check-error')).not.toBeInTheDocument())
+        expect(screen.queryByRole('dialog', { name: 'Import agent setup' })).not.toBeInTheDocument()
+      })
+
+      it('shows no on-hold notice when a refetch fails after the check already answered', async () => {
+        // react-query hands the failed refetch to the hook on a zero-delay timer
+        // (its notifyManager), after refetchQueries resolves; the notice itself has
+        // no delay. On a fake clock, advancing by 0 delivers it, so the check below
+        // sees the state the refetch left, not the one before it.
+        vi.useFakeTimers({ shouldAdvanceTime: true })
+        const api = await freshFirstRun()
+        vi.mocked(api.viewerOwnerOk).mockResolvedValueOnce(true).mockRejectedValue(new Error('502'))
+        renderWithProviders(<App />, { route: '/chat' })
+
+        expect(await screen.findByText('Pick your look', {}, { timeout: 5000 })).toBeInTheDocument()
+        // A later refetch fails (a gateway restart, say); the answer it had stands.
+        await act(async () => { await rendered.queryClient.refetchQueries({ queryKey: ['shared-crew', 'viewer', 'owner-ok'] }) })
+        expect(api.viewerOwnerOk).toHaveBeenCalledTimes(2)
+        await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+        expect(screen.queryByTestId('first-run-owner-check-error')).not.toBeInTheDocument()
+        expect(screen.getByText('Pick your look')).toBeInTheDocument()
+      })
     })
   })
 
@@ -671,7 +579,7 @@ describe('App routing', () => {
       expect(screen.getByRole('button', { name: 'Reload page' })).toBeInTheDocument()
       // The nav rail is still rendered around the failed route.
       expect(screen.getByText('Sessions')).toBeInTheDocument()
-      expect(screen.getByText('Settings')).toBeInTheDocument()
+      expect(screen.getByText('Account & Settings')).toBeInTheDocument()
 
       fireEvent.click(within(notice).getByRole('button', { name: 'Ask the agent' }))
       expect(consumeChatHandoff()).toContain(`- Message: ${caughtDiagnostic}`)
@@ -701,7 +609,7 @@ describe('App routing', () => {
     renderWithProviders(<App />, { route: '/chat' })
     expect(screen.getByText('Sessions')).toBeInTheDocument()
     expect(screen.getByText('Customize')).toBeInTheDocument()
-    expect(screen.getByText('Settings')).toBeInTheDocument()
+    expect(screen.getByText('Account & Settings')).toBeInTheDocument()
     // PR1 App Store split: the single 'Explore' entry is gone — the sidebar
     // now carries TWO App Store rows, Discover (/apps) and Library
     // (/apps/library).
@@ -808,6 +716,44 @@ describe('App routing', () => {
     expect(await screen.findByText('App 9')).toBeInTheDocument()
     // Toggle now offers to collapse again.
     expect(screen.getByTitle(/show fewer apps/i)).toBeInTheDocument()
+  })
+
+  it('scrolls the whole rail as one region above a pinned Settings block', async () => {
+    const { api } = await import('../api/client')
+    const manyApps = Array.from({ length: 8 }, (_, i) => ({
+      name: `app${i}`,
+      displayName: `App ${i}`,
+      enabled: true,
+      origin: 'installed',
+      manifest: { ui: { pages: [{ route: `/apps/app${i}`, icon: 'Package', label: `App ${i}` }] } },
+    }))
+    ;(api.listApps as ReturnType<typeof vi.fn>).mockResolvedValueOnce(manyApps)
+    localStorage.setItem('mc-apps-expanded', '1')
+    renderWithProviders(<App />, { route: '/chat' })
+    await screen.findByText('App 7')
+    const rail = screen.getByRole('navigation', { name: /main navigation/i })
+    const scroller = within(rail).getByTestId('nav-rail-scroller')
+    // The menu row, the primary rows and the Apps list share the one scroller...
+    expect(within(scroller).getByText('App 0')).toBeInTheDocument()
+    expect(within(scroller).getByText('App 7')).toBeInTheDocument()
+    expect(within(scroller).getByText('Discover')).toBeInTheDocument()
+    // ...and no group inside it scrolls on its own.
+    expect(scroller.querySelectorAll('.overflow-y-auto')).toHaveLength(0)
+    // Settings stays outside it, pinned below.
+    const settings = within(rail).getByText('Account & Settings')
+    expect(scroller.contains(settings)).toBe(false)
+    // The hidden scrollbar is replaced by a bottom fade, only while rows are below the fold.
+    const mask = MORE_BELOW_MASK.split(' ')[0]
+    const setOverflow = (hidden: number) => {
+      Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 100 })
+      Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => 100 + hidden })
+      Object.defineProperty(scroller, 'scrollTop', { configurable: true, get: () => 0 })
+      act(() => { scroller.dispatchEvent(new Event('scroll')) })
+    }
+    setOverflow(60)
+    expect(scroller.className).toContain(mask)
+    setOverflow(0)
+    expect(scroller.className).not.toContain(mask)
   })
 
   it('keeps the overflow toggle visible while expanded (no disappear / layout shift)', async () => {
@@ -952,11 +898,13 @@ describe('App routing', () => {
     // mc:apps-changed; the handler must drop that cache or a just-installed
     // registry app keeps showing a "Get" button until the cache expires.
     const { queryClient } = renderWithProviders(<App />, { route: '/chat' })
-    queryClient.setQueryData(['registry'], { apps: [] })
+    // Kiro Space store rows (the last two keys) carry the same server-computed flags.
+    const keys = [['registry'], ['market-listings', 'team-store'], ['market-listing', 'team-store', 'acme/board']]
+    for (const key of keys) queryClient.setQueryData(key, {})
     expect(queryClient.getQueryState(['registry'])?.isInvalidated).toBe(false)
     act(() => { window.dispatchEvent(new Event('mc:apps-changed')) })
     await waitFor(() => {
-      expect(queryClient.getQueryState(['registry'])?.isInvalidated).toBe(true)
+      for (const key of keys) expect(queryClient.getQueryState(key)?.isInvalidated).toBe(true)
     })
   })
 
@@ -1164,8 +1112,9 @@ describe('App routing', () => {
     renderWithProviders(<App />, { route: '/chat' })
     const toggle = await screen.findByTitle(/more app/i)
     // Hover -> the portaled label mounts (collapsed rows carry no inline text).
+    // Ten apps plus Task Runner's row, which the Apps group lists with them.
     fireEvent.mouseEnter(toggle)
-    expect(await screen.findByText('4 more')).toBeInTheDocument()
+    expect(await screen.findByText('5 more')).toBeInTheDocument()
     // Press it the way a mouse does: pointerdown -> focus -> click. Neither the
     // focus the press produces nor the surviving hover state may leave a label
     // on screen — and the dismissal must be immediate, with no fade-out: the
@@ -1174,7 +1123,7 @@ describe('App routing', () => {
     fireEvent.pointerDown(toggle)
     fireEvent.focus(toggle)
     act(() => { toggle.click() })
-    expect(screen.queryByText('4 more')).toBeNull()
+    expect(screen.queryByText('5 more')).toBeNull()
     expect(screen.queryByText('Show less')).toBeNull()
     // ...and the press still did its job: dismissing the label must not swallow
     // the toggle's own activation (the title flips once the list is expanded).
@@ -1452,8 +1401,8 @@ describe('App routing', () => {
     const GROUP_GAP = 6
     const SHIFT_LABELED = Math.ceil(PILL_WIDEST_LABELED + GROUP_GAP)
     // The capsule is a Liquid Glass host whose effect layers precede the
-    // segments, so the rung skips `[data-liquid-glass-layer]` on both sides.
-    const TERMINAL = '.tb-capsule > :not([data-liquid-glass-layer]) ~ :not([data-liquid-glass-layer])'
+    // segments, so the rung hides what follows the connection dot.
+    const TERMINAL = '.tb-capsule > .tb-capsule-keep ~ *'
     // ≥640px (label visible): every rung, terminal included, shifts by the
     // labeled footprint, inside the media gate.
     for (const sel of ['.tb-drop-metrics', '.tb-drop-usage', '.tb-drop-feedback', TERMINAL]) {
@@ -1796,10 +1745,10 @@ describe('App routing', () => {
     return shellSettled()
   })
 
-  it('keeps theme controls available from Settings', () => {
+  it('keeps theme controls available from Account & Settings', () => {
     renderWithProviders(<App />, { route: '/chat' })
     // Theme controls live in Settings > Display rather than the shell header.
-    expect(screen.getByText('Settings')).toBeInTheDocument()
+    expect(screen.getByText('Account & Settings')).toBeInTheDocument()
     return shellSettled()
   })
 

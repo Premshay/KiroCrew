@@ -135,7 +135,9 @@ def test_inject_records_reading_via_single_writer(tmp_path):
     state = _make_state(tmp_path)
 
     _inject(
-        state, _make_job(), "result",
+        state,
+        _make_job(),
+        "result",
         context_reading={"pct": 61.2, "used_tokens": 122400, "window_tokens": 200000},
     )
 
@@ -205,7 +207,9 @@ async def test_cron_slot_opens_with_stale_reading_not_zero(tmp_path):
     state.sessions.get_provider = MagicMock(return_value=None)
 
     _inject(
-        state, _make_job(), "cron result",
+        state,
+        _make_job(),
+        "cron result",
         context_reading={"pct": 57.3, "used_tokens": 114600, "window_tokens": 200000},
     )
 
@@ -230,7 +234,9 @@ async def test_cron_slot_reading_survives_model_check(tmp_path):
     state.sessions.get_provider = MagicMock(return_value=None)
 
     _inject(
-        state, _make_job(job_id="xyz789"), "cron result",
+        state,
+        _make_job(job_id="xyz789"),
+        "cron result",
         context_reading={"pct": 12.5},
     )
     slot = state.get_or_create_slot(name="cron-xyz789")
@@ -270,11 +276,11 @@ async def test_prefetch_reads_off_the_loop_when_the_slot_is_unlinked():
     slot.linked_session_key = ""
     state.get_slot = MagicMock(return_value=slot)
 
-    assert await prefetch_cron_history(state, "abc123") == rows
+    assert await prefetch_cron_history(state, "abc123") == (rows, (0, 0))
     assert seen, "the transcript was never read"
-    assert threading.get_ident() not in seen, (
-        "the cron transcript was parsed on the event-loop thread"
-    )
+    assert (
+        threading.get_ident() not in seen
+    ), "the cron transcript was parsed on the event-loop thread"
     state.get_slot.assert_called_once_with("cron-abc123")
 
 
@@ -286,7 +292,7 @@ async def test_prefetch_reads_when_the_slot_does_not_exist_yet():
     state.conversation_log = _log_recording([], seen)
     state.get_slot = MagicMock(return_value=None)
 
-    assert await prefetch_cron_history(state, "abc123") == []
+    assert await prefetch_cron_history(state, "abc123") == ([], (0, 0))
     assert threading.get_ident() not in seen
 
 

@@ -243,6 +243,15 @@ describe('VoicePanel system fields', () => {
     await waitFor(() => expect(systemVoices.mock.calls.length).toBeGreaterThan(calls))
   })
 
+  it('tells a teammate the Crew has no engine without the install command for a host they cannot reach', async () => {
+    vi.spyOn(api, 'viewerOwnerOk').mockResolvedValue(false)
+    seed({ provider: 'system' }, { systemUnavailable: true })
+    await waitFor(() => {
+      expect(screen.getByTestId('system-engine-absent').textContent).toMatch(/Crew's computer has no built-in speech engine/)
+    }, { timeout: 5_000 })
+    expect(screen.getByTestId('system-engine-absent').textContent).not.toMatch(/sudo|install espeak-ng/)
+  })
+
   it('disables the re-fetch button while the probe is in flight', async () => {
     // The probe spawns a subprocess, so it takes real time. Leaving the button
     // idle and the notice unchanged makes the click look ignored and invites
@@ -494,7 +503,7 @@ describe('VoicePanel polly consent-gate invalidation', () => {
 /* ── save failure ─────────────────────────────────────────────────────────── */
 
 describe('VoicePanel save failure', () => {
-  it('surfaces the save error and rolls the local inputs back', async () => {
+  it('surfaces the save error and keeps the profile draft', async () => {
     const { save } = seed({ provider: 'polly', aws_profile: 'original' }, { saveFails: true })
     await field('AWS Profile (Amazon Polly)')
 
@@ -504,10 +513,12 @@ describe('VoicePanel save failure', () => {
 
     await waitFor(() => expect(save).toHaveBeenCalled())
     await screen.findByText('Failed to save voice config', undefined, { timeout: 5_000 })
-    await waitFor(() => expect(screen.getByPlaceholderText('default')).toHaveValue('original'))
+    await waitFor(() => expect(profile).not.toBeDisabled())
+    expect(profile).toHaveValue('typo')
+    expect(screen.queryByRole('button', { name: /ask the agent/i })).not.toBeInTheDocument()
   })
 
-  it('dismisses the save error banner', async () => {
+  it('keeps the region draft and dismisses the save error banner', async () => {
     seed({ provider: 'polly' }, { saveFails: true })
     await field('AWS Profile (Amazon Polly)')
 
@@ -517,6 +528,8 @@ describe('VoicePanel save failure', () => {
 
     const banner = await screen.findByText('Failed to save voice config', undefined, { timeout: 5_000 })
     expect(banner).toBeTruthy()
+    await waitFor(() => expect(region).not.toBeDisabled())
+    expect(region).toHaveValue('eu-west-1')
     fireEvent.click(screen.getByRole('button', { name: /dismiss/i }))
     await waitFor(() => expect(screen.queryByText('Failed to save voice config')).toBeNull())
   })

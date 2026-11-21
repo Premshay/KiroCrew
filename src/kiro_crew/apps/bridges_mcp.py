@@ -30,6 +30,7 @@ from kiro_crew.apps.bridges_mcp_config import (
     _health_reconcile_guard,
     _mcp_lock,
     _read_mcp_json_unlocked,
+    _sync_app_tool_refs,
     _write_mcp_json_unlocked,
 )
 from kiro_crew.apps.bridges_sources import _registration_denied, _registration_source
@@ -505,7 +506,7 @@ def resolve_stdio_command(cfg: dict, app_root: Path | None = None) -> dict:
                 else:
                     # A native exe a wheel shipped as data - not a launcher
                     # at all; shimming it would hand a binary to the ZIP
-                    # reader. Direct launch, exactly as before the shim.
+                    # reader. Launched directly.
                     _shim_script = ""
             elif not _has_python_shebang(venv_cmd):
                 _shim_script = ""
@@ -1086,6 +1087,7 @@ def _register_mcp_servers(
                 third_party={k for k in servers if k.startswith(f"{app_name}:")},
             )
         )
+        _sync_app_tool_refs(mcp_data, app_name)
         _write_mcp_json_unlocked(mcp_data)
     logger.info(
         "Registered %d MCP server(s) for app %s (live_port=%s); skipped %d HTTP server(s) "
@@ -1273,16 +1275,18 @@ def _deregister_mcp_servers(app_name: str) -> int:
         to_remove = [k for k in servers if k.startswith(prefix)]
         for k in to_remove:
             del servers[k]
-        if to_remove:
+        before = mcp_data.get("tools")
+        _sync_app_tool_refs(mcp_data, app_name)
+        if to_remove or mcp_data.get("tools") != before:
             _write_mcp_json_unlocked(mcp_data)
     # NOT scrubbed here: the legacy shared ~/.kiro/settings/mcp.json is held by
     # OTHER processes (Kiro IDE, other kiro-cli agents), so its cross-process
     # flock can block indefinitely. deregister_app() runs synchronously on the
     # gateway event loop (dashboard disable/update/uninstall), and a stall here
     # would freeze all chat and heartbeat tasks. The scrub is idempotent and is
-    # performed at boot by reconcile_enabled_app_resources(), which the gateway
-    # already runs off-loop via run_in_executor — so the migration still lands,
-    # just not on this hot path.
+    # performed for every enabled app by the boot reconcile in
+    # start_enabled_app_backends(), which the gateway runs off-loop via
+    # run_in_executor — so the migration still lands, just not on this hot path.
     if to_remove:
         logger.info("Deregistered %d MCP server(s) for app %s", len(to_remove), app_name)
     return len(to_remove)

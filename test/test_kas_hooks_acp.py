@@ -142,7 +142,7 @@ class TestTriggerSpellings:
         set, so a NEW turn-lifecycle event still has to be added to the map.
         """
         # Body-scope import, as the sibling gates in this tree use: naming it in
-        # the module block puts this change's only new import beside another, and
+        # the module block puts this import beside another, and
         # two additions to one import region conflict on every rebase.
         from kiro_crew.hooks import HOOK_EVENT_SESSION_LANE_CHANGED
 
@@ -191,6 +191,11 @@ class TestSelection:
         pool = [bash, read, star, unmatched]
         selected = kas_wire.select_hooks(pool, trigger="preToolUse", tool_id="Bash")
         assert selected == [bash, star, unmatched]
+
+    def test_a_pipe_matcher_meets_each_alternative(self):
+        hook = _hook(matcher="Edit|Write")
+        assert kas_wire.select_hooks([hook], trigger="preToolUse", tool_id="Write") == [hook]
+        assert kas_wire.select_hooks([hook], trigger="preToolUse", tool_id="Read") == []
 
     def test_a_tool_matcher_is_withheld_when_no_tool_is_named(self):
         # Returning it would let the hook run for a tool its author excluded.

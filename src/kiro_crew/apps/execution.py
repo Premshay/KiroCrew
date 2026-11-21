@@ -36,6 +36,10 @@ _MAX_GRANT_NAME_LEN = 128
 _MAX_GRANT_ENTRIES = 512
 APP_NAME_RE = re.compile(rf"[a-z0-9][a-z0-9_-]{{0,{_MAX_GRANT_NAME_LEN - 1}}}")
 
+#: Longest ``installedAt`` a record that names an install keeps; an ISO timestamp is
+#: far shorter. The value comes from the app's own ``installed.json``.
+INSTALLED_AT_MAX_CHARS = 64
+
 
 def _builtin_manifest_sources() -> tuple[Path, ...]:
     """Return resolved builtin-manifest roots from core and the active edition.
@@ -116,9 +120,49 @@ def shipped_builtin_app_name_at(path: Path) -> str | None:
     return None
 
 
+#: The last scan: ``(stamp of the sources it read, the pairs it found)``.
+_shipped_cache: tuple[tuple[tuple[Path, int, int], ...], tuple[tuple[Path, str], ...]] | None = None
+
+
+def _sources_stamp(sources: tuple[Path, ...]) -> tuple[tuple[Path, int, int], ...]:
+    """Each source with its directory's inode and mtime, so an added or removed app shows."""
+    stamp = []
+    for source in sources:
+        try:
+            st = source.stat()
+        except OSError:
+            continue
+        stamp.append((source, st.st_ino, st.st_mtime_ns))
+    return tuple(stamp)
+
+
+def invalidate_shipped_builtin_apps() -> None:
+    """Forget the last scan of the shipped builtins; the next ask scans again."""
+    global _shipped_cache
+    _shipped_cache = None
+
+
 def _shipped_builtin_apps() -> Iterator[tuple[Path, str]]:
-    """Yield ``(resolved root, manifest name)`` for every shipped builtin."""
-    for source in _builtin_manifest_sources():
+    """Yield ``(resolved root, manifest name)`` for every shipped builtin.
+
+    Asked once per installed app on every agent-owner lookup, so the scan (a
+    resolve and a manifest read per builtin) is kept. It is scanned again when a
+    source directory's inode or mtime moves, when the sources themselves change,
+    and after :func:`invalidate_shipped_builtin_apps` (app install, update,
+    uninstall and builtin registration call it).
+    """
+    global _shipped_cache
+    stamp = _sources_stamp(_builtin_manifest_sources())
+    cached = _shipped_cache
+    if cached is None or cached[0] != stamp:
+        cached = (stamp, tuple(_scan_shipped_builtin_apps(tuple(s for s, _, _ in stamp))))
+        _shipped_cache = cached
+    return iter(cached[1])
+
+
+def _scan_shipped_builtin_apps(sources: tuple[Path, ...]) -> Iterator[tuple[Path, str]]:
+    """Read every shipped builtin under *sources* from disk."""
+    for source in sources:
         try:
             entries = sorted(source.iterdir())
         except OSError:
@@ -163,7 +207,7 @@ def builtin_app_names() -> frozenset[str]:
     not a user app that merely shadows a builtin name.
 
     Does filesystem I/O (dir scan + manifest reads + one installed-record read
-    per candidate); callers warm it ONCE off the event loop. A source that fails
+    per candidate); callers run it off the event loop. A source that fails
     to read is skipped, and an unreadable installed record drops just that name
     (fail-closed) — neither ever widens provenance.
     """
@@ -214,10 +258,10 @@ def builtin_app_mcp_servers() -> frozenset[str]:
 
     The keys of :func:`_builtin_app_mcp_server_configs`, the one enumeration
     :func:`builtin_app_host_cli_mcp_launches` also reads, so the two can never
-    disagree on which servers are shipped. Filesystem I/O; callers warm it ONCE
-    off the event loop. A source or manifest that fails to read is skipped
+    disagree on which servers are shipped. Filesystem I/O; callers run it off
+    the event loop. A source or manifest that fails to read is skipped
     (fail-closed), never widening the trusted set. An adopted former builtin's
-    servers are never here: the boot warm adds the ones that keep the gate grant
+    servers are never here: the gate's refresh adds the ones that keep the gate grant
     from ``builtin_adoption_gate``, so the host-CLI launches stay builtin-only.
     """
     return frozenset(_builtin_app_mcp_server_configs())
@@ -328,7 +372,7 @@ def builtin_app_agents(adopted: frozenset[str] = frozenset()) -> dict[str, str]:
     An agent name declared by MORE than one app is dropped entirely rather than
     resolved arbitrarily — ambiguous provenance must not grant either app's
     identity (fail-closed). Filesystem I/O (manifest + one read per declared
-    agent file); callers warm it ONCE off the event loop. A source, manifest, or
+    agent file); callers run it off the event loop. A source, manifest, or
     agent file that fails to read is skipped, never widening the mapping.
     """
     # Deferred import: manager imports this module at load time (see

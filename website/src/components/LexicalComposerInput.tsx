@@ -278,15 +278,17 @@ function $applyListLineBreak(): boolean {
   return true
 }
 
-// The number rewrites below the edited item, last to first: each sits after
-// the edit, so writing them never moves an offset still to be used.
+// The rewrites below the edited item, last to first: each sits after the edit,
+// so writing them never moves an offset still to be used. A write with nothing
+// to insert takes indentation away.
 function $applyRenumber(edit: ListLineBreakEdit): void {
   for (const write of [...(edit.renumber ?? [])].reverse()) {
-    const digits = $createRangeSelection()
-    $setPointAtOffset(digits.anchor, write.start)
-    $setPointAtOffset(digits.focus, write.end)
-    $setSelection(digits)
-    digits.insertRawText(write.insert)
+    const span = $createRangeSelection()
+    $setPointAtOffset(span.anchor, write.start)
+    $setPointAtOffset(span.focus, write.end)
+    $setSelection(span)
+    if (write.insert) span.insertRawText(write.insert)
+    else span.removeText()
   }
 }
 
@@ -801,9 +803,6 @@ function InteractionPlugin({
       historyCursorRef.current = cursor
       const historyDirection = direction === 'up' ? 'older' : 'newer'
       if (!promptHistoryKeyEngages(historyDirection, current, selection.start, cursor !== null)) return false
-      // A held ↑ scrolling up through the user's own draft stops at its start;
-      // a fresh press recalls, and a held ↑ keeps walking recalled prompts.
-      if (direction === 'up' && event.repeat && !cursor && current !== '') return false
       const step = stepPromptHistory(sentMessages, cursor, historyDirection, current, blocksRef.current)
       if (!step) return false
       event.preventDefault()

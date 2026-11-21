@@ -4,8 +4,8 @@ status: partial
 revision: v5
 author: kirocrew agent session, directed by zejiangg
 created: 2026-09-05
-last-audited: 2026-10-08
-audited-at: 9348a25a34
+last-audited: 2026-11-20
+audited-at: fc89562d69
 doc-pr: 8842
 implementation-prs: [8855, 9152, 9277, 12781, 12792, 16669, 17992]
 tracking-issues: [17977]
@@ -19,12 +19,14 @@ Status: partial. Phases 1, 2, 2.5, the 2.6 conductor swap, Phase 3 (the
 work-ledger wake gate, [#12781](https://github.com/kirodotdev/KiroCrew/pull/12781),
 including the one-call `watch: "work-ledger"` arm on `monitor_start` and
 `monitor_update`) and Phase 4 (the Crew board,
-[#12792](https://github.com/kirodotdev/KiroCrew/pull/12792)) are on main. Five tools
+[#12792](https://github.com/kirodotdev/KiroCrew/pull/12792)) are on main. Five ledger tools
 ship (`work_brief`, `work_report`, `work_ledger_read`, `work_ledger_record`,
-`work_ledger_rebuild`), with the worker/conductor agents, deprecated alias, doctor
+`work_ledger_rebuild`; `kirocrew-work` has since added `accept_eval`, #31849, and
+`work_ask_record`, #33805), with the worker/conductor agents, deprecated alias, doctor
 notice, and ledger cleanup command. Phase 3b (sibling visibility) and Phase 5
 (worker-to-worker communication) are proposed and not implemented: no `siblings`,
-`work_request`, `work_message` or `inbox` exists. Every
+`work_request`, `work_message` or `inbox` exists (the tools are dispatched in
+`src/kiro_crew/mcp_work.py`; checked at `fc89562d69`). Every
 historical code reference below was read at `c02cdd67c`. Material added in v4
 was read at `cc385211d8`, except where it describes one of the two open PRs it
 names, which was read at that PR's own head.
@@ -152,6 +154,8 @@ One per conductor session.
 | `depth` | int 0..2 | server | 0 for a root conductor; see §Two-level conductors |
 | `parent_item` | string or null | server | set when this conductor is itself a worker |
 | `created_at` | ISO 8601 | server | |
+| `goal_id` | 16 hex | server | minted with the board and by each `new_goal` (and by the next `goal` write on a header from before the field), so the rounds of one goal share it; the tracer keys a round's trace on it. Rides no crew-log entry: a rebuild keeps the cache's |
+| `round_started_at` | ISO 8601 | server | when the current round began: stamped with the board, and by a `goal` write that changes the round or starts a new goal. The tracer rolls a round's trace over by its age. Rides no crew-log entry: a rebuild keeps the cache's |
 
 There is deliberately **no item roster field**. The item list is derived by listing the items directory, which removes a writer and therefore a class of clobber. `list_work_items` in Issue Radar's `crew_store` already derives its list the same way.
 
@@ -461,7 +465,7 @@ files stay outside the fold; they are a follow-up, not part of the projection ch
 
 ### Tools
 
-Five tools ship, all mounted on one opt-in MCP server, `kirocrew-work`: `work_brief` and `work_report` for the worker, `work_ledger_read`, `work_ledger_record` and `work_ledger_rebuild` for the conductor (`WORKER_TOOLS` and `CONDUCTOR_TOOLS` in [`src/kiro_crew/mcp_work.py`](../../src/kiro_crew/mcp_work.py)). Which of them answer a given call depends on what the resolved caller is rather than on which spec mounted them; §Agent spec changes gives the dispatch table and argues for that placement. Four shipped in Phase 2, and `work_ledger_rebuild` came with the crew-log projection. `work_request` and `work_message` are Phase 5: proposed, not implemented.
+Five tools ship, all mounted on one opt-in MCP server, `kirocrew-work`: `work_brief` and `work_report` for the worker, `work_ledger_read`, `work_ledger_record` and `work_ledger_rebuild` for the conductor (`WORKER_TOOLS` and `CONDUCTOR_TOOLS` in [`src/kiro_crew/mcp_work.py`](../../src/kiro_crew/mcp_work.py)). Which of them answer a given call depends on what the resolved caller is rather than on which spec mounted them; §Agent spec changes gives the dispatch table and argues for that placement. Four shipped in Phase 2, and `work_ledger_rebuild` came with the crew-log projection. The server has since gained two more: `work_ask_record` in `CONDUCTOR_TOOLS` ([#33805](https://github.com/kirodotdev/KiroCrew/pull/33805)) and the `accept_eval` check in `CHECK_TOOLS` ([#31849](https://github.com/kirodotdev/KiroCrew/pull/31849)). `work_request` and `work_message` are Phase 5: proposed, not implemented.
 
 #### `work_brief` — worker reads its own item
 

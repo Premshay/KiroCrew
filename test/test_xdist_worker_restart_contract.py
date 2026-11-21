@@ -9,8 +9,8 @@ path, where the node is left in `assigned_work` but absent from
 never completes the session at all, which once burned the full
 40-minute job cap without ever naming the test at fault.
 
-Measured on the pins this job installs (pytest 9.0.3, pytest-xdist 3.5.0,
-pytest-timeout 2.2.0) with one test forced past `--timeout`:
+Measured with pytest 9.0.3, pytest-xdist 3.5.0 and pytest-timeout 2.2.0, with
+one test forced past `--timeout`:
 
     --max-worker-restart=2   run never finishes; one attempt was still live
                              after 108 minutes, no summary, no victim named
@@ -113,7 +113,7 @@ def test_every_windows_xdist_invocation_refuses_worker_replacement() -> None:
             f"{FLAG}: "
             f"{command!r}. Without it a timeout-killed worker sends the session "
             f"into xdist's node-replacement path, which hangs until the job cap "
-            f"(#4227). setup.cfg's --max-worker-restart=2 is a deliberate "
+            f". setup.cfg's --max-worker-restart=2 is a deliberate "
             f"developer-machine setting, so this has to be overridden per job."
         )
 
@@ -128,5 +128,5 @@ def test_the_flag_is_not_weakened_to_allow_a_replacement() -> None:
             assert value == "0", (
                 f"{job_name} sets --max-worker-restart={value}. Any "
                 f"nonzero value allows the node replacement that hangs the "
-                f"session; the first replacement is the one #4227 hit."
+                f"session, the first replacement included."
             )

@@ -89,6 +89,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from source_corpus import untraced
 from test_ratchet_scope import _drop_ambient_git_location, _fixture_git_env
 
 # ratchet_scope is a standalone script; load it the same way
@@ -432,8 +433,12 @@ def scan(root: Path = TEST_ROOT) -> dict[str, list[Site]]:
 
 @functools.lru_cache(maxsize=1)
 def _tree_scan() -> dict[str, list[Site]]:
-    """The real tree, read once per process: the tests below share one scan."""
-    return scan()
+    """The real tree, read once per process: the tests below share one scan.
+
+    The scan only parses test source, so it runs with the coverage tracer paused.
+    """
+    with untraced():
+        return scan()
 
 
 def _counts(found: dict[str, list[Site]]) -> Counter[str]:
@@ -761,7 +766,7 @@ def test_no_file_gains_a_short_fixed_wait() -> None:
                             f"  test/{rel}: baseline {a} is below real count {b} "
                             f"(would red main; lower to {b} by removing those {b - a} site(s))"
                         )
-                raise AssertionError(
+                pytest.fail(
                     f"{len(bv)} baseline entry change(s) in this PR "
                     f"violate the lowered_baseline contract:\n"
                     + "\n".join(bv_lines)
@@ -775,7 +780,7 @@ def test_no_file_gains_a_short_fixed_wait() -> None:
             for rel, (was, now, sites) in sorted(risen.items()):
                 report.append(f"  test/{rel}: {was} -> {now}")
                 report.extend(f"      {site}" for site in sites)
-            raise AssertionError(
+            pytest.fail(
                 f"{len(risen)} file(s) the PR touches gained a short fixed wait "
                 f"compared to their count at the PR base (a wait_for, "
                 f"asyncio.timeout or .result(timeout) under "
@@ -799,7 +804,7 @@ def test_no_file_gains_a_short_fixed_wait() -> None:
         for rel, (was, now) in sorted(risen_main.items()):
             report_main.append(f"  test/{rel}: {was} -> {now}")
             report_main.extend(f"      {site}" for site in found[rel])
-        raise AssertionError(
+        pytest.fail(
             f"{len(risen_main)} file(s) gained a short fixed wait (a wait_for, "
             f"asyncio.timeout or .result(timeout) under {LOST_RUN_FLOOR_SECS:g}s, "
             f"or a sleep under {SHORT_POLL_SLEEP_SECS:g}s inside a loop):\n"

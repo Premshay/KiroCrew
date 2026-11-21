@@ -118,14 +118,13 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
   const [params, setParams] = useSearchParams()
   const providerParam = params.get(CONNECTION_PROVIDER_PARAM)
   const highlightParam = params.get('highlight')
-  /** Entries (a provider slug, or the Google entry) whose OAuth app part is open. */
+  /** Entries (a provider slug, or the Google entry) whose OAuth app part is open.
+   *  An accordion: opening one entry closes the others, so the gallery never
+   *  holds several wide open cards at once. Cards a state forces open (a consent
+   *  in flight, a broken connection) stay open on their own, outside this set. */
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set())
-  const toggleExpanded = (entry: string) => setExpanded(prev => {
-    const next = new Set(prev)
-    if (next.has(entry)) next.delete(entry)
-    else next.add(entry)
-    return next
-  })
+  const toggleExpanded = (entry: string) => setExpanded(prev =>
+    prev.has(entry) ? new Set() : new Set([entry]))
   // Kept for the browser tab: opening a chat unmounts this page, and the
   // search must still be there on the way back (#25962).
   const [search, setSearch] = useState(() => safeGetSessionItem(SERVICES_SEARCH_KEY) ?? '')
@@ -373,18 +372,11 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
               error = t('pages.connectionsPage.mint_failure_callback_unauthorized_client', { provider: name })
               if (adminGuide) help = { href: adminGuide }
               break
+            // A refusal no org admin policy causes reads as the one generic line.
             case 'crew_oauth_callback_invalid_request':
-              error = t('pages.connectionsPage.mint_failure_callback_invalid_request', { provider: name })
-              break
             case 'crew_oauth_callback_unsupported_response_type':
-              error = t('pages.connectionsPage.mint_failure_callback_unsupported_response_type', { provider: name })
-              break
             case 'crew_oauth_callback_server_error':
-              error = t('pages.connectionsPage.mint_failure_callback_server_error', { provider: name })
-              break
             case 'crew_oauth_callback_temporarily_unavailable':
-              error = t('pages.connectionsPage.mint_failure_callback_temporarily_unavailable', { provider: name })
-              break
             case 'crew_oauth_callback_refused':
               error = t('pages.connectionsPage.mint_failure_callback_refused', { provider: name })
               break
@@ -479,7 +471,7 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
     if (!providerParam) return
     setSearch('')
     setHighlightedSlug(providerParam)
-    setExpanded(prev => new Set(prev).add(entryOf(providerParam)))
+    setExpanded(new Set([entryOf(providerParam)]))
     setParams(prev => {
       const next = new URLSearchParams(prev)
       next.delete(CONNECTION_PROVIDER_PARAM)
@@ -495,7 +487,7 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
     if (!highlightParam?.startsWith(OAUTH_HIGHLIGHT_PREFIX)) return
     const slug = highlightParam.slice(OAUTH_HIGHLIGHT_PREFIX.length)
     setSearch('')
-    setExpanded(prev => new Set(prev).add(entryOf(slug)))
+    setExpanded(new Set([entryOf(slug)]))
   }, [highlightParam])
 
   // Retried when the list lands and when the gallery is turned on: on a cold
@@ -550,11 +542,44 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
     // at or below this timestamp predates the attempt (same clock domain as
     // the banners themselves — see PendingConnect.sinceTs).
     const sinceTs = oauthByServer[provider.slug]?.timestamp ?? 0
+    let stored: Awaited<ReturnType<typeof api.mcpCustomGet>> | null = null
     if (existing) {
       // Round-trip the stored spec and only overlay the url: a `{ url }`-only
       // PUT is authoritative for the OAuth hints, so it would clear configured
       // `scopes`/`clientId` (and any other stated field) on every reconnect.
-      const stored = await api.mcpCustomGet(existing.name)
+      // The read finds only a row Kiro Crew stores itself; a 404 is a row the
+      // user wrote in their own mcp.json, which is not Kiro Crew's to rewrite,
+      // so say where it lives and what to change instead of "not found".
+      stored = await api.mcpCustomGet(existing.name).catch(async (error: unknown) => {
+        if (!(error instanceof ApiError && error.status === 404)) throw error
+        // The cached inventory never goes stale on its own, so it can still
+        // hold a row the user has since removed. Read it fresh here, at the
+        // decision: no row left means add the provider, not repeat this 404.
+        const fresh = await queryClient.fetchQuery<McpServer[]>({
+          queryKey: ['mcp-servers'],
+          queryFn: () => api.mcpServers(),
+          staleTime: 0,
+        })
+        const row = serverForConnection(provider, fresh)
+        if (!row) return null
+        // No raw scope holds the row any more: only the rendered agent config
+        // does, and a restart keeps it (the rebuild starts from that file). An
+        // add now would collide with that name, so point to MCP Servers'
+        // Uninstall, which also strips the rendered copy.
+        const rawScopes = Object.entries(row.presence ?? {}).filter(([scope]) => scope !== 'kirocrew')
+        if (row.presence && rawScopes.every(([, present]) => !present)) {
+          throw new Error(t('pages.connectionsPage.connect_rendered_copy_only', {
+            provider: provider.name,
+            name: existing.name,
+          }))
+        }
+        throw new Error(t('pages.connectionsPage.connect_hand_written_row', {
+          provider: provider.name,
+          name: existing.name,
+        }))
+      })
+    }
+    if (existing && stored) {
       await api.mcpCustomUpdate(existing.name, { ...stored.spec, url: provider.mcp_url })
       // Editing a spec deliberately preserves the disabled flag ("editing is
       // not consent to run") — but Reconnect IS consent, so re-enable the
@@ -596,7 +621,7 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
     setLocallyWaiting(current => ({
       ...current,
       [provider.slug]: {
-        kind: existing ? 'reconnect' : 'new',
+        kind: stored ? 'reconnect' : 'new',
         sinceTs,
         token: started?.token,
       },
@@ -989,7 +1014,11 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
                   // The backend's mint table outlives this tab's local state, so
                   // a refresh mid-consent still renders the waiting card.
                   status?.status === 'awaiting_consent',
-                  status?.needsClientConfig === true,
+                  // Each holds Connect back; the card picks the wording from
+                  // `needsCrewSignIn` and `crewSignInNotOwned`.
+                  status?.needsClientConfig === true
+                    || status?.needsCrewSignIn === true
+                    || status?.crewSignInNotOwned === true,
                   dismissedTs !== undefined,
                 )
                 return { server, oauth, status, grantPresent, unproven, state }
@@ -1021,6 +1050,9 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
                     grantSharedWith={status?.grantSharedWith}
                     grantSharedUnconfirmed={status?.grantSharedUnconfirmed}
                     backendLacksOauth={status?.backendLacksOauth === true}
+                    needsCrewSignIn={status?.needsCrewSignIn === true}
+                    crewSignInNotOwned={status?.crewSignInNotOwned === true}
+                    crewMintRefused={status?.crewMintRefused}
                     signInInChat={status?.signInInChat === true}
                     crewHeld={status?.crewHeld === true}
                     signInRedirect={status?.signInRedirect}
@@ -1052,8 +1084,9 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
                   // A Google consent in flight or a Google product to reconnect
                   // keeps the entry open, as such a card stays open on its own.
                   const googleStates = googleProviders.map(provider => cardModel(provider).state)
-                  const open = expanded.has(GOOGLE_ENTRY_SLUG) || googleStates.some(state =>
+                  const googleForcedOpen = googleStates.some(state =>
                     state === 'waiting-for-approval' || state === 'needs-attention' || state === 'not-verified')
+                  const open = expanded.has(GOOGLE_ENTRY_SLUG) || googleForcedOpen
                   // One status for the closed entry: the one that needs the user
                   // first, else Connected when any product is, else the shared
                   // configuration state, else Not connected.
@@ -1091,6 +1124,9 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
                       <header className="flex items-center gap-2.5">
                         <ProviderLogo slug="gmail" />
                         <h3 id="connection-google-heading" className="m-0 min-w-0 flex-1 truncate text-[14px] font-semibold text-text-strong">
+                          {/* A forced-open entry cannot close, so its name is
+                              plain text rather than a toggle with a chevron. */}
+                          {googleForcedOpen ? t('pages.connectionsPage.google_entry_name') : (
                           <button
                             type="button"
                             onClick={() => toggleExpanded(GOOGLE_ENTRY_SLUG)}
@@ -1101,6 +1137,7 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
                             <span className="min-w-0 truncate">{t('pages.connectionsPage.google_entry_name')}</span>
                             <ChevronDown className={`h-3.5 w-3.5 shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} aria-hidden="true" />
                           </button>
+                          )}
                         </h3>
                         {open && googleStepTip}
                         <ConnectionStateBadge state={googleState} />

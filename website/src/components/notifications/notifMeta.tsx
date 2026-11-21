@@ -108,6 +108,7 @@ export function notePriority(n: { priority?: string }): Priority {
  *  its English `title`/`body` for every reader with no catalog, and an id these
  *  maps do not hold falls back to them. */
 const SYSTEM_NOTE_TITLE_KEY = {
+  bot_limits_held: 'components.notifications.systemNote.bot_limits_held_title',
   turn_limit: 'components.notifications.systemNote.turn_limit_title',
   default_model_applied: 'components.notifications.systemNote.default_model_applied_title',
   default_model_failed: 'components.notifications.systemNote.default_model_failed_title',
@@ -120,9 +121,17 @@ const SYSTEM_NOTE_TITLE_KEY = {
   chat_stopped_refused: 'components.notifications.systemNote.chat_stopped_title',
   chat_stopped_stalled: 'components.notifications.systemNote.chat_stopped_title',
   folder_agent_label: 'components.notifications.systemNote.folder_agent_label_title',
+  folder_agent_key: 'components.notifications.systemNote.folder_agent_key_title',
+  repeated_failures: 'components.notifications.systemNote.repeated_failures_title',
+  mcp_share_paused: 'components.notifications.systemNote.mcp_share_paused_title',
+  moved_to_history_startup: 'components.notifications.systemNote.moved_to_history_title',
+  moved_to_history_idle: 'components.notifications.systemNote.moved_to_history_title',
+  relay_crew_added: 'components.notifications.systemNote.relay_crew_added_title',
+  relay_crews_available: 'components.notifications.systemNote.relay_crews_available_title',
 } as const
 type SystemNoteId = keyof typeof SYSTEM_NOTE_TITLE_KEY
 const SYSTEM_NOTE_BODY_KEY: Record<SystemNoteId, string> = {
+  bot_limits_held: 'components.notifications.systemNote.bot_limits_held_body',
   turn_limit: 'components.notifications.systemNote.turn_limit_body',
   default_model_applied: 'components.notifications.systemNote.default_model_applied_body',
   default_model_failed: 'components.notifications.systemNote.default_model_failed_body',
@@ -135,6 +144,13 @@ const SYSTEM_NOTE_BODY_KEY: Record<SystemNoteId, string> = {
   chat_stopped_refused: 'components.notifications.systemNote.chat_stopped_refused_body',
   chat_stopped_stalled: 'components.notifications.systemNote.chat_stopped_stalled_body',
   folder_agent_label: 'components.notifications.systemNote.folder_agent_label_body',
+  folder_agent_key: 'components.notifications.systemNote.folder_agent_key_body',
+  repeated_failures: 'components.notifications.systemNote.repeated_failures_body',
+  mcp_share_paused: 'components.notifications.systemNote.mcp_share_paused_body',
+  moved_to_history_startup: 'components.notifications.systemNote.moved_to_history_startup_body',
+  moved_to_history_idle: 'components.notifications.systemNote.moved_to_history_idle_body',
+  relay_crew_added: 'components.notifications.systemNote.relay_crew_added_body',
+  relay_crews_available: 'components.notifications.systemNote.relay_crews_available_body',
 }
 
 /** The note's title and body, in the dashboard's language when the gateway
@@ -149,6 +165,29 @@ export function noteText(n: Notification): { title: string; body: string } {
     ? Object.fromEntries(Object.entries(raw).filter(([, v]) => typeof v === 'string' || typeof v === 'number'))
     : undefined
   return { title: i18nT(SYSTEM_NOTE_TITLE_KEY[copy], params), body: i18nT(SYSTEM_NOTE_BODY_KEY[copy], params) }
+}
+
+/** The label of the button that follows a note's `url`, for a gateway note
+ *  whose link opens one named place. Any other note's button reads "Open". */
+const SYSTEM_NOTE_LINK_KEY: Partial<Record<SystemNoteId, string>> = {
+  mcp_share_paused: 'components.notifications.systemNote.mcp_share_paused_link',
+}
+
+export function noteLinkLabel(n: Notification): string {
+  const id = n.i18n?.id
+  const key = typeof id === 'string' && Object.hasOwn(SYSTEM_NOTE_LINK_KEY, id) ? SYSTEM_NOTE_LINK_KEY[id as SystemNoteId] : undefined
+  return i18nT(key ?? 'components.notifications.notificationDetailPanel.open')
+}
+
+/** An action button's label: a gateway note's `open` action reads "Open" in the
+ *  dashboard's language, like `noteLinkLabel`; every other action keeps the label
+ *  its producer sent. */
+export function noteActionLabel(n: Notification, a: { id: string; label: string }): string {
+  const id = n.i18n?.id
+  if (a.id === 'open' && typeof id === 'string' && Object.hasOwn(SYSTEM_NOTE_TITLE_KEY, id)) {
+    return i18nT('components.notifications.notificationDetailPanel.open')
+  }
+  return a.label
 }
 
 /** RFC Phase 4 security: deep-links must be dashboard-internal routes only.

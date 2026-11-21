@@ -19,6 +19,7 @@ import pathlib
 import re
 
 import pytest
+from redaction_structured_cases import github_classic
 
 from kiro_crew.dashboard.chat_runner import (
     _refined_tool_row_content,
@@ -40,6 +41,8 @@ from kiro_crew.dashboard.state import (
     build_refusal_steer_notice,
     should_queue_refusal_recovery,
 )
+
+_CREDENTIAL = github_classic(seed=13)
 
 
 class _SteerClient:
@@ -317,13 +320,17 @@ class TestRefusalRowKeepsItsReason:
 
     def test_running_row_is_still_refined(self):
         # The refinement is useful on a live row; only refusals are exempt.
-        assert _refined_tool_row_content("🔧 old title", "new title") == "🔧 new title"
+        assert _refined_tool_row_content("🔧 old title", "new title") == "Tool: new title"
+        assert _refined_tool_row_content("Tool: old title", "new title") == "Tool: new title"
 
     def test_completed_row_is_still_refined(self):
-        assert _refined_tool_row_content("✅ old title", "new title") == "✅ new title"
+        assert _refined_tool_row_content("✅ old title", "new title") == "Approved: new title"
+        assert (
+            _refined_tool_row_content("Approved: old title", "new title") == "Approved: new title"
+        )
 
     def test_unprefixed_row_gets_the_running_icon(self):
-        assert _refined_tool_row_content("bare text", "new title") == "🔧 new title"
+        assert _refined_tool_row_content("bare text", "new title") == "Tool: new title"
 
 
 class TestRecoveryIsNowAFallback:
@@ -456,7 +463,7 @@ class TestCauseSpecificWording:
     def test_policy_wording_is_unchanged_by_default(self):
         # Every pre-existing caller passes no cause; the policy text must be
         # byte-identical to what shipped, or the model's correction changes
-        # meaning on a path this change was not meant to touch.
+        # meaning on a path that passes no cause.
         assert build_refusal_steer_notice("bash", "denied") == build_refusal_steer_notice(
             "bash", "denied", cause=DENY_CAUSE_POLICY
         )
@@ -544,7 +551,7 @@ class TestInvalidNameExplainsItself:
         # The card's always-visible summary is keyed on this token. Without it the
         # card reads "safety policy blocked the call" for a deny no policy judged,
         # sending the reader to audit a rule that does not exist -- the same
-        # cause-blind wording this change removes for the model, left for the human.
+        # cause-blind wording the model is spared, left for the human.
         slot = _Slot()
         await _reject_invalid_tool(
             _SteerClient(),
@@ -627,11 +634,11 @@ class TestHookErrorExplainsItself:
             _Slot(),
             _Event(),
             session_key="s",
-            error="hook saw AKIAIOSFODNN7EXAMPLE",
+            error=f"hook saw {_CREDENTIAL}",
             refusal_notices=notices,
             refusal_reasons=[],
         )
-        assert "AKIAIOSFODNN7EXAMPLE" not in client.steered[0]
+        assert _CREDENTIAL not in client.steered[0]
 
     @pytest.mark.asyncio
     async def test_hook_error_records_a_fallback_entry(self):
@@ -644,12 +651,12 @@ class TestHookErrorExplainsItself:
             _Slot(),
             _Event(),
             session_key="s",
-            error="hook saw AKIAIOSFODNN7EXAMPLE",
+            error=f"hook saw {_CREDENTIAL}",
             refusal_reasons=reasons,
             refusal_notices=None,
         )
         assert reasons
-        assert "AKIAIOSFODNN7EXAMPLE" not in reasons[0][1]
+        assert _CREDENTIAL not in reasons[0][1]
 
 
 class TestEveryHostDenyCallSiteIsWired:
@@ -859,7 +866,7 @@ class TestEveryHostDenyCallSiteIsWired:
             ),
             (
                 "approval timeout",
-                "format_approval_timeout_card(_approval_window)",
+                "format_approval_timeout_card(\n            _approval_window, yolo_covers=",
                 400,
                 "DENY_CAUSE_APPROVAL_TIMEOUT",
             ),

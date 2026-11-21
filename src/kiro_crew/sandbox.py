@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio  # noqa: F401
 import contextlib  # noqa: F401
+import contextvars  # noqa: F401
 import ctypes
 import ctypes.util  # noqa: F401
 import errno  # noqa: F401
@@ -499,6 +500,8 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
         _EXTRACTOR_MAX_CPU_SECS,
         _EXTRACTOR_MAX_NOFILE,
         _EXTRACTOR_PREEXEC,
+        _FORK_FREE_SPAWN,
+        _FORK_ONLY_SPAWN_KWARGS,
         _INTERPRETER_ENOENT_DELAYS,
         _PROFILE_OOM_BIAS,
         _RESOURCE_PREEXEC,
@@ -507,7 +510,10 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
         _SHIM_ARGV_CACHE,
         _SHIM_ARGV_SEPARATOR,
         _SHIM_CHDIR_FD_FLAG,
+        _SHIM_CHDIR_FLAG,
+        _SHIM_CLOSE_FDS_FLAG,
         _SHIM_CTTY_FD_FLAG,
+        _SHIM_SETSID_FLAG,
         _SHIM_UNAVAILABLE_LOGGED,
         _SPAWN_SHIM_CODE,
         _SPAWN_SHIM_SOURCE,
@@ -517,6 +523,8 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
         RLIMIT_PROFILE_NONE,
         RLIMIT_PROFILE_SESSION_HOST,
         RLIMIT_PROFILE_TOOL,
+        RLIMIT_PROFILE_UNBOUNDED_SESSION_HOST,
+        _fork_free_spawn_plan,
         _is_transient_interpreter_enoent,
         _needs_path_search,
         _pass_fds_including,
@@ -530,6 +538,7 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
         build_resource_limit_preexec,
         create_subprocess_limited,
         extractor_resource_limit_preexec,
+        fork_free_spawns,
         popen_limited,
         resource_limit_preexec,
         resource_limit_supervisor_argv,
@@ -569,6 +578,7 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
         _CGROUP_DEFAULT_MAX_TOTAL_TASKS,
         _CGROUP_FALLBACK_MAX_TOTAL_MEMORY_MB,
         _CGROUP_TOTAL_MEMORY_FRACTION,
+        _CLIENT_SCOPE_UNIT_PREFIX,
         _PROC_MEMINFO,
         _PYTEST_SCOPE_MEMORY_HIGH_MB,
         _PYTEST_SCOPE_MEMORY_MAX_MB,
@@ -676,11 +686,13 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
         _live_target_irregular_detail,
         _live_target_multilink_detail,
         _live_target_symlink_detail,
+        _materialize_declared_mask_dirs,
         _materialize_env_mask_target,
         _materialize_live_target_mask_target,
         _materialize_maskable_dirs,
         _materialize_md_notebook_mask_targets,
         _materialize_refresh_chains_mask_target,
+        _materialize_signing_key_mask_target,
         _md_notebook_degraded_mask_dirs,
         _member_records_move,
         _migrate_md_notebook_legacy_state,
@@ -727,6 +739,7 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
         _governance_sandbox_floor,
         _install_root_targets_cached,
         _install_root_targets_with,
+        _liftable_declared_dir,
         _liftable_declared_file,
         _mode_to_level,
         _pod_os_home_targets,
@@ -738,6 +751,7 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
         _resolved_kiro_agents_targets,
         _resolves_to,
         _sandbox_policy,
+        app_backend_secret_mask_targets,
         app_backend_visible_targets,
         app_declared_mask_targets,
         app_declared_readonly_targets,

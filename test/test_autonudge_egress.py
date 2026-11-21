@@ -25,13 +25,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp.test_utils import make_mocked_request
+from redaction_structured_cases import github_classic
 
 from kiro_crew import autonudge_authz as authz
 from kiro_crew.autonudge import NudgeLoop
 from kiro_crew.dashboard.handlers import autonudge as h
 from kiro_crew.platform import PlatformCompositionError
 
-SECRET = "AKIAIOSFODNN7EXAMPLE"
+#: A synthetic GitHub classic token (valid checksum) the redactor removes.
+SECRET = github_classic(seed=101)
 _SAVE_REFUSAL = (
     "Safety checks are temporarily unavailable, so this goal cannot be saved. "
     "If this keeps happening, restart Kiro Crew."
@@ -183,6 +185,11 @@ class TestEveryProjectionArmUsesTheSameRule:
     def test_the_in_session_reading_scrubs_stopped_reason(self) -> None:
         out = h._autonudge_loop_reading(_loop(stopped_reason=f"died on {SECRET}"))
         assert SECRET not in out["stopped_reason"], "the in-session reading served it raw"
+
+    def test_the_in_session_reading_scrubs_message(self) -> None:
+        out = h._autonudge_loop_reading(_loop(message=f"retry with {SECRET}"))
+        assert out["message"].startswith("retry with "), "the instruction was not read back"
+        assert SECRET not in out["message"], "the in-session reading served it raw"
 
     def test_the_reduced_row_scrubs_stopped_reason(self) -> None:
         """The reduced row is what ``GET /api/autonudge`` serves for a structured

@@ -26,6 +26,16 @@ DEFAULT_MAX_PARALLEL_STEPS = (
 
 @dataclass
 class TaskRunnerConfig:
+    enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Enabled",
+            "Show Task Runner in the sidebar and let new runs start. Off hides the "
+            "sidebar row and refuses every new start (the page, the task_run tool, "
+            "the task run command and a saved task-plan workflow); runs already "
+            "going keep going and their pages stay open.",
+        ),
+    )
     max_parallel_steps: int = field(
         default=DEFAULT_MAX_PARALLEL_STEPS,
         metadata=_meta(
@@ -461,6 +471,18 @@ class WorkLedgerConfig:
             "conductor's next ledger read retires that binding and leaves the item "
             "unbound for redispatch on another crew. Used only with remote_dispatch "
             "on; a value that is not a positive number uses the default.",
+        ),
+    )
+    remote_dispatch_tags: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Remote dispatch tags",
+            'Words this crew advertises to a dispatching hub, such as ["gpu", "docker"]. '
+            "A work item whose requires.tags names a word this list lacks is never "
+            "placed here. Each tag is 1-32 characters of a-z, 0-9, '_' or '-', "
+            "starting with a letter or digit and holding at least one letter; at most "
+            "16. Anything else is dropped. Do not put a host or account name here. "
+            "Used only with remote_dispatch on.",
         ),
     )
 

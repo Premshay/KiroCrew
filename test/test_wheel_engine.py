@@ -20,12 +20,14 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
 from opener_helpers import answer_with, redirect_to
+from redaction_structured_cases import github_classic
 from spawn_test_helpers import (
     LONG_CHILD_WITH_GRANDCHILD,
     await_gone,
@@ -552,6 +554,17 @@ class TestFetchBytes:
         with pytest.raises(WheelUpdateError, match="could not fetch"):
             wheel_engine._fetch_bytes("https://x.example/f", 10, 1)
 
+    def test_an_unreachable_host_is_named_with_the_cause(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def refused(req: object, timeout: float) -> object:
+            raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+        answer_with(monkeypatch, refused)
+        with pytest.raises(WheelUpdateError) as info:
+            wheel_engine._fetch_bytes("https://x.example/f", 10, 1)
+        assert str(info.value) == "could not fetch https://x.example/f: connection refused"
+
 
 class _LoopbackServer(HTTPServer):
     """One-request-at-a-time loopback origin that serves ``payload`` with a chosen framing."""
@@ -676,8 +689,8 @@ class TestRunHelper:
     @pytest.mark.parametrize(
         "secret",
         [
-            "AKIAIOSFODNN7EXAMPLE",
-            "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8",
+            github_classic(seed=61),
+            github_classic(seed=98),
         ],
     )
     def test_a_credential_straddling_the_cut_is_redacted_whole(
@@ -691,7 +704,8 @@ class TestRunHelper:
         limit = wheel_engine._ERROR_DETAIL_CHARS
         for keep in range(1, len(secret)):
             # `keep` characters of the token fall inside the kept tail.
-            stderr = ("x" * (limit + 50) + secret + "y" * (limit - keep)).encode()
+            # Blanks around it: a token glued to a letter is no token.
+            stderr = ("x" * (limit + 50) + " " + secret + " " + "y" * (limit - keep - 1)).encode()
             _stub_children(monkeypatch, lambda _argv, err=stderr: (1, b"", err))
             with pytest.raises(WheelUpdateError) as info:
                 wheel_engine._run(["x"], 5, "step-x")

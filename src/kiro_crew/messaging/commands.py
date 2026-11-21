@@ -55,7 +55,6 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKENDS_HARNESS_MANAGED_COMPACTION,
 )
 from kiro_crew.agent_sdk.capabilities import compact_unsupported_backend
-from kiro_crew.apps.manager import TASK_RUNNER_APP, TASK_RUNNER_DISABLED_MESSAGE, app_disabled
 from kiro_crew.config.sections import CONTEXT_WARN_MARGIN_PCT
 from kiro_crew.cron import (
     CronStoreBusy,
@@ -79,6 +78,7 @@ from kiro_crew.session_lifecycle import (
     force_stop_keeping_others,
 )
 from kiro_crew.subagent_wait_reasons import DEFERRED_QUEUED_REASONS, stopped_before_start
+from kiro_crew.taskrunner_switch import task_runner_off
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime import edge
     from kiro_crew.cron import CronService
@@ -537,13 +537,13 @@ def compact_unsupported_reply(backend: str) -> str:
     arm = compact_refusal_arm(backend)
     if arm == COMPACT_ARM_HARNESS_MANAGED:
         return (
-            f"ℹ️ The `{backend}` backend manages compaction automatically — it "
+            f"Note: The `{backend}` backend manages compaction automatically — it "
             "summarizes the conversation on its own as context fills, so manual "
             "`/compact` isn't needed (and isn't supported) here."
         )
     if arm == COMPACT_ARM_RECYCLED:
         return (
-            f"ℹ️ The `{backend}` backend has no way to compact a conversation — "
+            f"Note: The `{backend}` backend has no way to compact a conversation — "
             "there is no `/compact` to run, and it summarizes nothing on its own. "
             "BECAUSE of that, Kiro Crew starts a fresh session for you when the context "
             "fills up: there is nothing else that can keep it from overflowing. The chat "
@@ -551,7 +551,7 @@ def compact_unsupported_reply(backend: str) -> str:
             "to start fresh on your own terms before that happens."
         )
     return (
-        f"ℹ️ Manual `/compact` isn't available on the `{backend}` backend, and "
+        f"Note: Manual `/compact` isn't available on the `{backend}` backend, and "
         "Kiro Crew can't compact it for you either. Start a new chat with `/new` before "
         "the context fills up."
     )
@@ -1110,9 +1110,9 @@ async def task_arg_reply(
         runner.cancel()
         return "🛑 Task cancelled."
 
-    # Same switch as POST /api/taskrunner: disabled in Library means no new runs.
-    if await asyncio.to_thread(app_disabled, TASK_RUNNER_APP):
-        return f"❌ {TASK_RUNNER_DISABLED_MESSAGE}"
+    # Same switch as POST /api/taskrunner: turned off means no new runs.
+    if (refusal := await asyncio.to_thread(task_runner_off)) is not None:
+        return f"❌ {refusal}"
     if runner.running:
         return "⚠️ Task runner is already running. Use `task run cancel` first."
     # The spec is READ and its contents reach the model, so an arbitrary path is

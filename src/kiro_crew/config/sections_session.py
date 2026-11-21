@@ -26,6 +26,16 @@ from kiro_crew.config.sections_defaults import (
 # hand; it only bounds a hand-edited or hostile value.
 STAR_ORDER_MAX = 10_000
 
+# How many worker sessions one Bot may have open at once (``max_workers``). The
+# owner sets it on the Bot's settings page; no Bot tool writes it. 0, the
+# default, sets no limit of the Bot's own: the bound on parallel work comes from
+# the host's resources unless the owner chooses a number
+# (rfc-work-ledger-concurrency-cap.md section 7). The ceiling is the work
+# ledger's own open bound (``work_ledger_records.MAX_ITEMS_PER_CONDUCTOR``).
+BOT_MAX_WORKERS_DEFAULT = 0
+BOT_MAX_WORKERS_MIN = 0
+BOT_MAX_WORKERS_MAX = 32
+
 
 def _archive_retention_days(session_data: dict) -> int:
     """Resolve session.archive_retention_days, normalizing the disable sentinel.
@@ -109,11 +119,24 @@ class SessionConfig:
         metadata=_meta(
             "Conductor Context Cap",
             "Trim a goal conductor's chat on the KAS backend at the start of a "
-            "dashboard turn: a chat over 400K tokens, or over 200K tokens after 5 "
-            "minutes idle, starts that turn on a new session seeded with its "
-            "session-ledger snapshot and the newest messages as text. Older messages "
-            "and tool output stay in the chat's transcript. Read at each turn start, "
-            "so a change needs no restart.",
+            "dashboard turn, only once its prompt cache has expired: a chat over "
+            "200K tokens whose previous turn ended 5 minutes or more ago starts that "
+            "turn on a new session seeded with its session-ledger snapshot, a list "
+            "of its tool results and the newest messages as text. A chat whose cache "
+            "is still warm is never trimmed, at any size. Older messages and tool "
+            "output stay in the chat's transcript. Read at each turn start, so a "
+            "change needs no restart.",
+        ),
+    )
+    worker_context_cap: bool = field(
+        default=False,
+        metadata=_meta(
+            "Worker Context Cap",
+            "Trim a dispatched worker's chat (kirocrew-worker) on the KAS backend the "
+            "same way as the Conductor Context Cap, over 300K tokens and only once its "
+            "prompt cache has expired (previous turn ended 5 minutes or more ago). A "
+            "warm cache is never trimmed. Off by default. Read at each turn start, so "
+            "a change needs no restart.",
         ),
     )
     idle_compaction: bool = field(
@@ -236,6 +259,19 @@ class SessionConfig:
             "results say how many were searched out of how many there are. A larger "
             "window makes each search read more transcripts. Clamped to "
             "100..100000. Read at each search, so a change needs no restart.",
+        ),
+    )
+    semantic_search: bool = field(
+        default=False,
+        metadata=_meta(
+            "Session Search by Meaning",
+            "Build a chunk store of session text in the background so session "
+            "search can later find a conversation by describing it. Off by "
+            "default. While on, the session index worker cuts each quiet session "
+            "into chunks with the embedding model's tokenizer, and the gateway embeds "
+            "them with the local embedding model at background priority (nothing is "
+            "embedded with the ollama_http provider); incognito and temporary "
+            "sessions are never read. Search does not read the store.",
         ),
     )
     watchdog_rss_max_mb: int = field(
@@ -370,6 +406,18 @@ class KiroCrewAgentConfig:
             "decides as usual (its own crew pin if it runs as a Bot, else "
             "agent.reasoning_effort, else the model default). Set, one of the five "
             "standard levels. An explicit effort on the call wins.",
+        ),
+    )
+    max_workers: int = field(
+        default=BOT_MAX_WORKERS_DEFAULT,
+        metadata=_meta(
+            "Workers at once",
+            "How many of this Bot's own worker sessions (on its worker template) "
+            "may be open at once. A session_create, session_revive or "
+            "session_fork past it is refused with bot_worker_cap_reached until "
+            "one of them is closed. Set by the owner on the Bot's settings page; "
+            "the Bot cannot change it. 0 (the default) sets no limit; otherwise "
+            "1 to 32.",
         ),
     )
     acp_backend: str = field(

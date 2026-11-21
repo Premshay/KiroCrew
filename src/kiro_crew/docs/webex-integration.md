@@ -80,7 +80,7 @@ and `/sessions` there lists the space's history rather than yours.
 
 | Command | What it does |
 |---|---|
-| `/new` | Start a fresh, restart-safe conversation; its first turn adds it to `/sessions` |
+| `/new` (or `/start`) | Start a fresh, restart-safe conversation; its first turn adds it to `/sessions` |
 | `/compact` | Compress the conversation context |
 | `/model` | List the models this account can use, and pick one |
 | `/agent [name]` | Show the agent and the ones you can pick; `/agent <name>` switches, `/agent default` goes back |
@@ -155,7 +155,7 @@ is **denied** after five minutes.
   references a local file keeps printing the path in a space instead of shipping
   the bytes.
 - **Shared turn pipeline** — Webex turns run on the same TurnDriver as Slack:
-  credential/exfiltration redaction, the tool-approval ladder, and security
+  credential redaction, the tool-approval ladder, and security
   event logging all apply.
 - **Approvals fail closed** — a prompt nobody
   answers is denied, and a policy that denies this channel blocks an approve

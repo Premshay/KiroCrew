@@ -12,7 +12,8 @@ Instance fields written: ``_dead``, ``_death_expected``, ``_death_label``,
 ``_death_reason``, ``_death_summary``, ``_death_tail``, ``_process_tree_confirmed_dead``,
 ``_kas_extract_broken_message``, ``_kas_extract_server_path``, ``_saw_auth_failure``,
 ``_saw_delegate_launch_failure``, ``_saw_kas_engine_refusal``, ``_saw_sandbox_init_failure``,
-``_scratch_dir``, ``_stall_turn_sessions``, ``_stderr_lines``, ``_stdin_stall_death``.
+``_scratch_dir``, ``_stall_turn_sessions``, ``_stderr_lines``, ``_stdin_stall_death``,
+``chat_joinable``.
 
 Instance fields read: ``_acp_backend``, ``_answer_tasks``, ``_broken_kas_server_path``,
 ``_initialized``, ``_process``, ``_remote_workspace``, ``_session_queues``,
@@ -28,7 +29,12 @@ from typing import TYPE_CHECKING, Callable
 
 from kiro_crew import runtime_death
 from kiro_crew.acp import kas_extract_repair, runtime_start
-from kiro_crew.acp.session_handle import AcpRuntimeError
+from kiro_crew.acp.session_handle import (
+    AcpRequestTimeout,
+    AcpRuntimeDead,
+    AcpRuntimeError,
+    AcpRuntimeOverloaded,
+)
 from kiro_crew.acp.types import ACP_BACKEND_KAS
 from kiro_crew.start_priority import START_QUEUE_ADMISSION, StartPriority, notify_start_queue
 
@@ -77,6 +83,14 @@ async def spawn(
         )
         if self.acp_backend == ACP_BACKEND_KAS:
             await self._spawn_admitted_repairing_kas_extract()
+            # The engine this start ended on, after any fallback, decides whether
+            # other chats may join the process (``RuntimeOwnership.acquire``). Only a
+            # verdict that the engine shares opens it: no verdict (the preview was
+            # off when this start resolved its route, even if it is on now) keeps
+            # it closed, so absence of evidence keeps one process per chat, at any
+            # cap (``RuntimeOwnership.acquire``).
+            verdict = getattr(self._harness, "spawn_engine_shares_chats", None)
+            self.chat_joinable = verdict is True
         else:
             await self._spawn_admitted_rederiving_once()
         outcome = "ready"
@@ -144,12 +158,14 @@ async def _spawn_admitted_repairing_kas_extract(self: AcpRuntime) -> None:
     """
     self._kas_extract_broken_message = ""
     try:
-        await self._spawn_admitted_rederiving_once()
+        await _spawn_retrying_engine_in_place(self)
         return
     except AcpRuntimeError as first:
         server_path = self._broken_kas_server_path()
         if server_path is None:
-            raise
+            if not await _fell_back_from_preview_bundle(self, first):
+                raise
+            return
         failure: AcpRuntimeError = first
     verdict = await asyncio.to_thread(kas_extract_repair.repair, server_path)
     if verdict.retry:
@@ -171,6 +187,154 @@ async def _spawn_admitted_repairing_kas_extract(self: AcpRuntime) -> None:
     self._kas_extract_broken_message = kas_extract_repair.fix_message(verdict)
     kas_extract_repair.note_blocked(verdict, server_path)
     raise failure
+
+
+def _engine_start_failure(exc: AcpRuntimeError) -> bool:
+    """Whether a failed start's error came from the engine process itself.
+
+    The engine died before ``initialize`` completed (``AcpRuntimeDead``), or left
+    ``initialize`` unanswered while nothing throttled it (``AcpRequestTimeout``
+    that is not ``AcpRuntimeOverloaded``). Every other ``AcpRuntimeError`` a
+    start raises is a refusal the default route would meet too.
+    """
+    if isinstance(exc, AcpRuntimeDead):
+        return True
+    return isinstance(exc, AcpRequestTimeout) and not isinstance(exc, AcpRuntimeOverloaded)
+
+
+#: Starts of Crew's own engine on a host it already ran on, before the chat's own
+#: Retry: the first plus this many more, :data:`ENGINE_RETRY_DELAY_SECS` apart.
+ENGINE_RETRIES = 2
+ENGINE_RETRY_DELAY_SECS = 5.0
+
+#: What a chat says when Crew's engine still does not start after those retries. The
+#: cause is in the gateway log; the chat offers its own Resume.
+ENGINE_DID_NOT_START = "Kiro Crew's engine didn't start."
+
+
+async def _retry_wait(secs: float) -> None:
+    """The pause between in-place engine starts; its own seam, so a test records it."""
+    await asyncio.sleep(secs)
+
+
+def _bundle_start(runtime: AcpRuntime) -> bool:
+    """Whether this runtime's last plan ran Crew's own engine (any route reason)."""
+    harness = getattr(runtime, "_harness", None)
+    return bool(getattr(harness, "bundle_engine_version", ""))
+
+
+async def _fixed_in_place(runtime: AcpRuntime) -> bool:
+    """Whether a failed start of Crew's engine is retried here rather than falling back.
+
+    Every bundle route except the two with a kiro-cli fallback: the sharing preview
+    (its own cooldown) and the build default on a host the engine never ran on (the
+    first switch). Blocking reads off the loop.
+    """
+    from kiro_crew.acp import kas_build_default, kas_route
+
+    reason = getattr(getattr(runtime, "_harness", None), "spawn_route_reason", "")
+    if reason == kas_route.REASON_SHARING_PREVIEW:
+        return False
+    if reason == kas_route.REASON_BUILD_DEFAULT:
+        return await asyncio.to_thread(kas_build_default.already_on_engine)
+    return True
+
+
+async def _spawn_retrying_engine_in_place(runtime: AcpRuntime) -> None:
+    """:meth:`_spawn_admitted_rederiving_once`, with Crew's engine fixed in place.
+
+    A start of Crew's own engine that dies or leaves ``initialize`` unanswered
+    (:func:`_engine_start_failure`) on a route fixed in place (:func:`_fixed_in_place`)
+    is started again, up to :data:`ENGINE_RETRIES` more times
+    :data:`ENGINE_RETRY_DELAY_SECS` apart, and then fails with
+    :data:`ENGINE_DID_NOT_START`, the cause going to the log. Any other failure
+    propagates as it was, for the kiro-cli fallback
+    (:func:`_fell_back_from_preview_bundle`). A start that succeeds records that the
+    engine ran here (``kas_build_default.remember_engine_ran``).
+    """
+    from kiro_crew.acp import kas_build_default
+
+    attempt = 0
+    while True:
+        try:
+            await runtime._spawn_admitted_rederiving_once()
+        except AcpRuntimeError as exc:
+            if not (_bundle_start(runtime) and _engine_start_failure(exc)):
+                raise
+            if getattr(runtime, "_remote_workspace", None) or not await _fixed_in_place(runtime):
+                raise
+            logger.warning(
+                "Kiro Crew's KAS engine did not start (attempt %d of %d): %s",
+                attempt + 1,
+                ENGINE_RETRIES + 1,
+                exc,
+            )
+            if attempt >= ENGINE_RETRIES or not await runtime._revive_after_failed_start():
+                raise AcpRuntimeError(ENGINE_DID_NOT_START) from exc
+            attempt += 1
+            await _retry_wait(ENGINE_RETRY_DELAY_SECS)
+            continue
+        if _bundle_start(runtime):
+            await asyncio.to_thread(kas_build_default.remember_engine_ran)
+        return
+
+
+async def _fell_back_from_preview_bundle(runtime: AcpRuntime, failure: AcpRuntimeError) -> bool:
+    """Retry a failed start ONCE on the default KAS route when the preview or the
+    build default chose the bundle on a host the engine never ran on.
+
+    The ``chat_runtime_sharing`` preview puts KAS on Crew's own engine
+    (``kas_route.REASON_SHARING_PREVIEW``), and so does a packaged build's preference
+    (``kas_route.REASON_BUILD_DEFAULT``). A plan that built but whose engine
+    then died or left ``initialize`` unanswered must not cost the chat: the
+    failure is recorded (``kas_route.note_preview_bundle_failed``, or
+    ``kas_build_default.note_first_switch_failed`` for a first switch), which keeps
+    the route off the bundle, and the sharing gate from sharing, for a cooldown,
+    and this handle starts once more, where ``resolve_spawn`` takes the default
+    route. True when that start succeeded; the build default's then carries the
+    chat's notice. A host the engine already ran on never falls back here: its
+    failure was retried in place (:func:`_spawn_retrying_engine_in_place`).
+
+    Only an engine failure counts (:func:`_engine_start_failure`): a refusal that
+    has nothing to do with the engine -- a derived spec that changed mid-start, a
+    timeout while the agents slice is throttled -- would fail the same way on the
+    default route, so it propagates unchanged, records nothing and starts no
+    second process. A configured ``agent.kas_bundle`` start, a relay start and a
+    remote-workspace handle (whose relay the failed start closed) answer False,
+    so their error propagates as before.
+
+    shortcut: a chat whose placement already joined this founding during the
+    failed start lands on the fallback process; the gate refuses every placement
+    after the record, so at most the starts already in flight share it. Upgrade
+    by closing the entry to joins (``RuntimeOwnership.close_to_joins``) here if
+    that window is ever seen.
+    """
+    from kiro_crew.acp import kas_build_default, kas_route
+
+    harness = getattr(runtime, "_harness", None)
+    reason = getattr(harness, "spawn_route_reason", "")
+    if reason not in (kas_route.REASON_SHARING_PREVIEW, kas_route.REASON_BUILD_DEFAULT):
+        return False
+    if not _engine_start_failure(failure):
+        return False
+    if reason == kas_route.REASON_BUILD_DEFAULT:
+        if await asyncio.to_thread(kas_build_default.already_on_engine):
+            return False
+        kas_build_default.note_first_switch_failed(str(failure))
+    else:
+        kas_route.note_preview_bundle_failed(str(failure))
+    if (
+        getattr(runtime, "_remote_workspace", None)
+        or not await runtime._revive_after_failed_start()
+    ):
+        return False
+    await runtime._spawn_admitted_rederiving_once()
+    # The notice names kiro-cli, so it is set only when the respawn ran on the relay.
+    respawned = getattr(harness, "spawn_route", None)
+    on_relay = respawned is not None and not getattr(respawned, "bundle", True)
+    if reason == kas_route.REASON_BUILD_DEFAULT and harness is not None and on_relay:
+        harness.engine_fallback_notice = kas_build_default.ENGINE_FALLBACK_NOTICE
+    return True
 
 
 async def _spawn_admitted_rederiving_once(self: AcpRuntime) -> None:

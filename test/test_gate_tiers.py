@@ -21,7 +21,10 @@ product.
 from __future__ import annotations
 
 import dataclasses
+import ntpath
+import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, NamedTuple
 
 import pytest
@@ -54,6 +57,12 @@ _HOME = Path.home()
 #: The builtin app whose own server the app-own-server scenarios call.
 _APP = "dev_fleet"
 _APP_SERVER = "dev_fleet:srv"
+#: The app whose own sessions hold approved browser sites in every scenario here.
+_BROWSER_APP = "tunes"
+_BROWSER_SITES = ("https://www.example.com/watch",)
+#: The app whose own agent calls the tool its manifest declares, on its own cron run.
+_TOOLS_APP = "clock"
+_TOOLS_AGENT = "clock-keeper"
 
 
 class Scenario(NamedTuple):
@@ -188,6 +197,19 @@ TIER_SCENARIOS: tuple[Scenario, ...] = (
         ),
     ),
     Scenario(
+        "spec-unjudged-denies",
+        TOOL_DENY,
+        ToolCall(
+            title="Run Command",
+            is_shell=True,
+            command="make clean",
+            mcp_tool="run_command",
+            identity_trusted=True,
+            kas_builtin_ids=True,
+            spec_unjudged_denies=(r".*rm\s+-r(f)?\s+~($|\s|/).*",),
+        ),
+    ),
+    Scenario(
         "app-own-server",
         TOOL_AUTO_APPROVE,
         ToolCall(
@@ -197,6 +219,32 @@ TIER_SCENARIOS: tuple[Scenario, ...] = (
             identity_trusted=True,
         ),
         surface={"app": _APP},
+        flags={"identity_grant": True},
+    ),
+    Scenario(
+        "app-own-tools",
+        TOOL_AUTO_APPROVE,
+        ToolCall(
+            title="Running: @kirocrew-core/clock_api",
+            mcp_server="kirocrew-core",
+            mcp_tool="clock_api",
+            identity_trusted=True,
+            app_run=(_TOOLS_APP, _TOOLS_AGENT),
+        ),
+        surface={"session_key": "cron:job-1"},
+        flags={"identity_grant": True},
+    ),
+    Scenario(
+        "app-browser-sites",
+        TOOL_AUTO_APPROVE,
+        ToolCall(
+            title="Running: @kirocrew-core/browser",
+            mcp_server="kirocrew-core",
+            mcp_tool="browser",
+            identity_trusted=True,
+            raw_params={"op": "navigate", "args": {"url": "https://www.example.com/watch?v=1"}},
+        ),
+        surface={"app": _BROWSER_APP, "session_key": "dashboard:app-tunes-1"},
         flags={"identity_grant": True},
     ),
     Scenario(
@@ -246,6 +294,12 @@ _OPAQUE = "mcp__ops__frobnicate"
 #: A verified MCP identity, as the operator-grants identity scenarios address it.
 _FLEET = ToolCall(
     title="Look up the fleet", mcp_server="ops", mcp_tool="list", identity_trusted=True
+)
+
+#: A recoverable shell call whose model-written description reads like the MCP
+#: identity ``@ops/list``: kiro-cli titles the call with that description.
+_FORGED_IDENTITY_SHELL = ToolCall(
+    title="@ops/list", kind="execute", command="make report", is_shell=True
 )
 
 #: A shell tool reported under a non-execute kind, with no recovered command: its own
@@ -339,6 +393,63 @@ BRANCH_SCENARIOS: tuple[Scenario, ...] = (
         flags={"identity_grant": False, "read_only": True},
     ),
     Scenario("", TOOL_ALLOW, _FLEET, config={"auto_approve_tools": ["Look up *"]}),
+    # The per-tool grants the approval card and the tool list write
+    # (``auto_approve_tool_identities``) approve a verified identity, in any case...
+    Scenario(
+        "operator-grants",
+        TOOL_AUTO_APPROVE,
+        _FLEET,
+        config={"auto_approve_tool_identities": ["@ops/list"]},
+        flags={"identity_grant": True},
+    ),
+    Scenario(
+        "operator-grants",
+        TOOL_AUTO_APPROVE,
+        _FLEET,
+        config={"auto_approve_tool_identities": ["@OPS/List"]},
+        flags={"identity_grant": True},
+    ),
+    # ...and never a title: a shell call whose description reads like that
+    # identity, in either spelling, or an MCP call whose identity is unproven.
+    Scenario(
+        "",
+        TOOL_ALLOW,
+        _FORGED_IDENTITY_SHELL,
+        config={"auto_approve_tool_identities": ["@ops/list"]},
+    ),
+    Scenario(
+        "",
+        TOOL_ALLOW,
+        dataclasses.replace(_FORGED_IDENTITY_SHELL, title="Running: @ops/list"),
+        config={"auto_approve_tool_identities": ["@ops/list"]},
+    ),
+    Scenario(
+        "",
+        TOOL_ALLOW,
+        dataclasses.replace(_FLEET, title="@ops/list", identity_trusted=False),
+        config={"auto_approve_tool_identities": ["@ops/list"]},
+    ),
+    # ``confirm_tools`` outranks that list exactly as it outranks auto_approve_tools.
+    Scenario(
+        "",
+        TOOL_ALLOW,
+        _FLEET,
+        config={"auto_approve_tool_identities": ["@ops/list"], "confirm_tools": ["@ops"]},
+    ),
+    Scenario(
+        "",
+        TOOL_ALLOW,
+        _FLEET,
+        config={"auto_approve_tool_identities": ["@ops/list"], "confirm_tools_unknown": True},
+    ),
+    # A hand-written ``auto_approve_tools`` entry keeps main's title fallback.
+    Scenario(
+        "operator-grants",
+        TOOL_AUTO_APPROVE,
+        _FORGED_IDENTITY_SHELL,
+        config={"auto_approve_tools": ["@ops/list"]},
+        flags={"identity_grant": False},
+    ),
     *_ARGUMENT_SCENARIOS,
 )
 
@@ -369,7 +480,19 @@ def gate_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(hooks, "_TITLE_ONLY_GRANT_NOTED", set())
     hooks.set_builtin_app_names([_APP])
     hooks.set_builtin_app_mcp_servers([_APP_SERVER])
-    hooks.set_builtin_app_agents({})
+    hooks.set_builtin_app_agents({_TOOLS_AGENT: _TOOLS_APP})
+    from kiro_crew.apps import app_agent_tools, browser_sites
+    from kiro_crew.mcp_tools.catalog import app_tools
+
+    declared = SimpleNamespace(app=_TOOLS_APP, name="clock_api")
+    monkeypatch.setattr(app_agent_tools, "declared_tools", lambda: (declared,))
+    monkeypatch.setattr(app_tools, "app_enabled_state", lambda app: app == _TOOLS_APP)
+
+    monkeypatch.setattr(
+        browser_sites,
+        "app_browser_sites",
+        lambda app: _BROWSER_SITES if app == _BROWSER_APP else (),
+    )
     yield
     gp.reset_store()
     ctx_mod.reset_context()
@@ -416,7 +539,10 @@ def test_the_table_is_the_gate_order() -> None:
         ("spec-shell-allowlist", "deny_policy"),
         ("spec-write-allowlist", "deny_policy"),
         ("spec-denies", "deny_policy"),
+        ("spec-unjudged-denies", "deny_policy"),
         ("app-own-server", "grant"),
+        ("app-own-tools", "grant"),
+        ("app-browser-sites", "grant"),
         ("operator-grants", "grant"),
         ("spec-builtin-grant", "grant"),
         ("batch-guard-grant", "grant"),
@@ -542,6 +668,47 @@ def test_each_tier_decides_its_own_scenario(scenario: Scenario) -> None:
     assert {name: getattr(verdict, name) for name in scenario.flags} == scenario.flags
 
 
+@pytest.mark.parametrize(
+    ("grant", "tool", "approved"),
+    [
+        ("@ops/*", "list", False),
+        ("@ops/lis?", "list", False),
+        ("@ops/[l]ist", "list", False),
+        ("@ops/*", "*", True),
+        ("@ops/[l]ist", "[l]ist", True),
+        ("@OPS/List", "list", True),
+        ("Running: @ops/list", "list", False),
+    ],
+)
+def test_identity_grants_match_only_literal_refs(grant: str, tool: str, approved: bool) -> None:
+    verdict = judge_scenario(
+        Scenario(
+            "operator-grants" if approved else "",
+            TOOL_AUTO_APPROVE if approved else TOOL_ALLOW,
+            dataclasses.replace(_FLEET, mcp_tool=tool),
+            config={"auto_approve_tool_identities": [grant]},
+        )
+    )
+    assert verdict.action == (TOOL_AUTO_APPROVE if approved else TOOL_ALLOW)
+    assert verdict.tier == ("operator-grants" if approved else "")
+    assert verdict.identity_grant is approved
+
+
+def test_identity_grants_keep_separators_distinct_on_windows() -> None:
+    scenario = Scenario(
+        "",
+        TOOL_ALLOW,
+        dataclasses.replace(_FLEET, mcp_server="notes", mcp_tool="read/item"),
+        config={"auto_approve_tool_identities": [r"@notes/read\item"]},
+    )
+    # fnmatch normalizes both operands through os.path.normcase on Windows.
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setattr(os.path, "normcase", ntpath.normcase)
+        verdict = judge_scenario(scenario)
+    assert (verdict.action, verdict.tier) == (TOOL_ALLOW, "")
+    assert not verdict.identity_grant
+
+
 def test_the_context_is_read_once_per_judgement(monkeypatch: pytest.MonkeyPatch) -> None:
     """ONE platform-context snapshot per judgement, taken when the targets tier first
     needs it: every later tier reuses it, so a live ceiling refresh cannot land
@@ -576,7 +743,11 @@ def test_the_keyword_form_judges_the_same_call() -> None:
         call = scenario.call
         _install_governance(scenario.governance)
         keyword = HookManager(HooksConfig(**scenario.config)).on_tool_call(
-            call.title, resolved_agent=call.resolved_agent, **call.kwargs(), **scenario.surface
+            call.title,
+            resolved_agent=call.resolved_agent,
+            app_run=call.app_run,
+            **call.kwargs(),
+            **scenario.surface,
         )
         direct = judge_scenario(scenario)
         assert (keyword.action, keyword.reason, keyword.tier) == (
@@ -601,7 +772,13 @@ _DENY_UNDER_GRANT = (
             grant == "app-own-server"
             and (
                 scenario.call.mcp_server
-                or scenario.tier in ("spec-shell-allowlist", "spec-write-allowlist", "spec-denies")
+                or scenario.tier
+                in (
+                    "spec-shell-allowlist",
+                    "spec-write-allowlist",
+                    "spec-denies",
+                    "spec-unjudged-denies",
+                )
             )
         )
     ]
@@ -640,7 +817,11 @@ def test_every_deny_beats_every_grant(scenario: Scenario, grant: str) -> None:
             spec_granted_builtins=frozenset({"execute_bash"}),
         )
         granted = dataclasses.replace(
-            call, title="Run Command", command="make build", spec_shell_allowlist=None
+            call,
+            title="Run Command",
+            command="make build",
+            spec_shell_allowlist=None,
+            spec_unjudged_denies=(),
         )
         assert (
             HookManager().judge(granted).tier == "spec-builtin-grant"
@@ -665,7 +846,13 @@ def test_classifier_only_drops_every_grant_tier() -> None:
     to the classifier (not read-only, so allow) and the app's own server is not
     auto-approved -- while a provable read still is."""
     by_tier = {s.tier: s for s in TIER_SCENARIOS}
-    grant_tiers = ("operator-grants", "app-own-server", "spec-builtin-grant", "batch-guard-grant")
+    grant_tiers = (
+        "operator-grants",
+        "app-own-server",
+        "app-own-tools",
+        "spec-builtin-grant",
+        "batch-guard-grant",
+    )
     for tier in grant_tiers:
         verdict = judge_scenario(by_tier[tier], classifier_only=True)
         assert verdict.action == TOOL_ALLOW, tier

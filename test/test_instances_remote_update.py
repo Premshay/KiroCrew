@@ -18,6 +18,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from redaction_structured_cases import github_classic
 
 import kiro_crew
 from kiro_crew.dashboard import handlers_instances as hi
@@ -668,7 +669,7 @@ class TestUpdateJob:
         await mgr.shutdown()
 
     async def test_a_credential_that_fits_the_version_shape_is_dropped(self, tmp_path, monkeypatch):
-        token = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        token = github_classic(seed=74)
         reg, mgr = _manager(tmp_path, versions=("0.9.0", token))
         reg.add(name="Box", ssh_host="box-alias", instance_id="box")
         _patch_runner(monkeypatch, _Runner((0, ""), (0, "")))
@@ -928,7 +929,7 @@ class TestRunnerStdoutTail:
     def test_the_ssh_runner_appends_a_redacted_stdout_tail_only_when_asked(self, monkeypatch):
         from kiro_crew.instances import token_mint as tm
 
-        secret = "AKIA" + "ABCDEFGHIJKLMNOP"
+        secret = github_classic()
 
         class _Proc:
             returncode = 1
@@ -955,7 +956,7 @@ class TestRunnerStdoutTail:
         from kiro_crew.cloud.ssm import CommandResult
         from kiro_crew.instances import ssm_token_mint as sm
 
-        secret = "AKIA" + "ABCDEFGHIJKLMNOP"
+        secret = github_classic()
 
         async def _send(*_a, **_k):
             return CommandResult(

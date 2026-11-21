@@ -57,8 +57,9 @@ def _deploy_with_progress(
     ``ec2.deploy`` blocks (the ``aws cloudformation deploy`` call waits on the
     WaitCondition), so we run it in a background thread and, on this thread,
     poll + print: (1) each new stack resource event, and (2) once the instance
-    exists, the tail of ``/var/log/kirocrew-setup.log`` over SSM. This replaces
-    the opaque spinner with real progress and makes failures diagnosable.
+    exists, the bootstrap's own phase lines from ``/var/log/kirocrew-setup.log``
+    over SSM. This replaces the opaque spinner with real progress and makes
+    failures diagnosable.
     """
     box: dict[str, object] = {}
     # Capture the detached `aws cloudformation deploy` child so a Ctrl+C on THIS
@@ -158,11 +159,16 @@ def _stream_progress(
                     instance_id = ev["physical_id"]
         except AWSError:
             pass
-        # 2) On-box bootstrap log tail (once the instance is up + SSM-managed).
+        # 2) On-box bootstrap phase lines (once the instance is up + SSM-managed).
         if instance_id:
             for logln in _fetch_bootstrap_log(instance_id, profile, region):
                 if logln in seen_log_lines:
                     continue
+                if not seen_log_lines:
+                    ui.detail(
+                        "      (setup phases only; full log:"
+                        " /var/log/kirocrew-setup.log on the instance)"
+                    )
                 seen_log_lines.add(logln)
                 ui.detail(f"      [box] {logln[:180]}")
                 printed = True
@@ -314,7 +320,7 @@ def _verify_operational(
         ui.detail(f"Verification code: {prompt.code}")
     login.resume_login_daemon(instance_id, profile, region, target=target)
     try:
-        with ui.Spinner("Waiting for sign-in approval…"):
+        with ui.Spinner(f"Waiting for sign-in approval (up to {login.signin_wait_limit()})…"):
             signed = login.wait_until_logged_in(instance_id, profile, region, target=target)
     finally:
         prompt.close()
@@ -323,16 +329,20 @@ def _verify_operational(
     return "ok" if signed else "unsigned"
 
 
-def _fetch_bootstrap_log(
-    instance_id: str, profile: str, region: str, *, lines: int = 6
-) -> list[str]:
-    """Best-effort tail of the on-box setup log over SSM (empty on any error)."""
+def _fetch_bootstrap_log(instance_id: str, profile: str, region: str) -> list[str]:
+    """Best-effort read of the bootstrap's phase lines over SSM (empty on any error).
+
+    Selected on the box from the whole log, so a phase line that scrolled past
+    between two polls under build output is still returned; carriage returns
+    split first, so one written after a spinner frame still starts a line.
+    """
+    # `/var/log/kirocrew-setup.log` is a path on the instance, not on this host, so
+    # it is spelled in the remote command rather than hoisted into a constant here.
     try:
         res = ssm.run_command(
             instance_id,
-            "tail -n %d /var/log/kirocrew-setup.log 2>/dev/null "
-            "| tr -d '\\r' "
-            "| grep -avE 'Installing (npm|kirocrew and) depend|building React app' || true" % lines,
+            "tr '\\r' '\\n' 2>/dev/null < /var/log/kirocrew-setup.log "
+            "| grep -aE '^(=== |--- |BOOTSTRAP FAILED)' || true",
             profile,
             region,
             run_as="root",
@@ -390,8 +400,12 @@ def launch(
     ami_id: str = "",
     extra_packages: str = "",
     ssm_kms_key_arn: str = "",
+    skip_login: bool = False,
 ) -> int:
     """Run the full interactive launch flow. Returns a process exit code.
+
+    ``skip_login`` (``--no-login``) launches without the Kiro sign-in: a crew on
+    another agent harness works without one, so the step is skipped, not failed.
 
     ``login_target`` is the Kiro identity the crew signs in as (see
     :mod:`kiro_crew.cloud.login_target`); ``None`` is Builder ID. An Identity
@@ -411,7 +425,9 @@ def launch(
     profile = profile or cfg.profile
     region = region or cfg.region or DEFAULT_REGION
     target = login_target or KiroLoginTarget()
-    if target.is_identity_center and not target.region:
+    if skip_login:
+        ui.detail("The crew will not sign in to Kiro (--no-login).")
+    elif target.is_identity_center and not target.region:
         # Inherited from the local whoami, which names the start URL but not the
         # Identity Center region. Decide BEFORE provisioning: nothing is billed
         # yet, and a launch that later cannot sign in is the expensive outcome.
@@ -434,7 +450,9 @@ def launch(
                 break
             except LoginTargetError as exc:
                 ui.warn(str(exc))
-    if target.is_identity_center:
+    if skip_login:
+        pass
+    elif target.is_identity_center:
         ui.info(f"The crew will sign in as {target.describe()}.")
     else:
         ui.detail(
@@ -526,7 +544,8 @@ def launch(
             tier = sizes.interactive_tiers()[idx]
         ui.detail(
             f"~${tier.approx_usd_per_hr:.2f}/hr · "
-            f"~${sizes.monthly_estimate(tier):.0f}/mo if left running (approx)"
+            f"~${sizes.monthly_estimate(tier):.0f}/mo if left running "
+            f"({sizes.price_basis(region)})"
         )
         # An image of the other architecture fails only at the Instance resource,
         # after the role exists; refuse it before anything is asked or created.
@@ -624,7 +643,8 @@ def launch(
             print()
             ui.warn(
                 f"Stopped waiting, but AWS may still be creating {ec2.stack_name(tag)}; "
-                f"it bills about ${tier.approx_usd_per_hr:.2f}/hr while its instance runs."
+                f"it bills ~${tier.approx_usd_per_hr:.2f}/hr "
+                f"({sizes.price_basis(region)}) while its instance runs."
             )
             where = _cli_scope(profile, region)
             ui.detail(f"Check it:  kirocrew cloud status --tag {tag}{where}")
@@ -671,7 +691,10 @@ def launch(
     # condition: it holds through the operational recheck below unless that
     # recheck positively confirms the right identity.
     mismatch_seen = False
-    if login.is_logged_in(instance_id, profile, region, target=target):
+    if skip_login:
+        ui.note("Skipped (--no-login). Sign in later from the crew's Settings, or run:")
+        ui.detail(target.login_command())
+    elif login.is_logged_in(instance_id, profile, region, target=target):
         ui.ok(f"Kiro is already signed in on the instance as {target.describe()}.")
     elif login.remote_identity_state(instance_id, profile, region, target=target) == "mismatch":
         # A resumed instance can carry a valid session for the WRONG account --
@@ -701,15 +724,17 @@ def launch(
                 ui.detail(f"Verification code: {prompt.code}")
             ui.info("Approve in the browser to finish sign-in…")
             try:
-                with ui.Spinner("Waiting for sign-in approval…"):
+                with ui.Spinner(
+                    f"Waiting for sign-in approval (up to {login.signin_wait_limit()})…"
+                ):
                     signed = login.wait_until_logged_in(instance_id, profile, region, target=target)
             finally:
                 prompt.close()
             if signed:
                 ui.ok("Signed in.")
             else:
-                ui.warn("Sign-in not detected yet — you can finish it later.")
-                ui.detail("Re-run: kirocrew cloud connect (then sign in from the dashboard/SSM).")
+                ui.warn(f"Sign-in not approved within {login.signin_wait_limit()}.")
+                ui.detail(f"Sign in later with: {target.login_command()} (it shows a new code).")
         else:
             prompt.close()
             if prompt.identity_mismatch:
@@ -732,8 +757,14 @@ def launch(
     # identity MISMATCH is carried to the exit code below: the dashboard is still
     # opened and the crew registered (the named recovery needs both), but the
     # launch did not deliver the identity it was asked for and must not exit 0.
-    signin_state = _verify_operational(
-        instance_id, profile, region, assume_yes=assume_yes, login_target=target
+    # A skipped sign-in is not re-offered here: the check below would ask to sign
+    # in again, which is the step the owner just chose to skip.
+    signin_state = (
+        "skipped"
+        if skip_login
+        else _verify_operational(
+            instance_id, profile, region, assume_yes=assume_yes, login_target=target
+        )
     )
     if mismatch_seen and signin_state != "ok":
         # The recheck did not confirm the right identity (it failed transiently,
@@ -744,7 +775,7 @@ def launch(
     if signin_state == "unsigned":
         ui.warn(
             "Kiro backend is not signed in — new chats will error until you "
-            "sign in. Run: kirocrew cloud login"
+            f"sign in. Run: {target.login_command()}"
         )
 
     steps.step("Open the dashboard")

@@ -76,7 +76,9 @@ A gated loop that names no criteria of its own is screened under a built-in
 brief only once you grant the `nudge_evidence` scope on the Decisions card in
 Settings. That scope sends a watched session's transcript tail and a pull
 request's typed facts to the decision service, so it is off until you turn it
-on. With the scope off, such a loop runs as a plain timer.
+on. With the scope off, such a loop runs as a plain timer. A loop whose
+instruction names no session and no pull request, such as a conductor's patrol,
+gives the built-in brief nothing to read, so it runs as it does with the scope off.
 
 A loop never switches its session to a cheaper model for a check. The judge is a
 separate small call, not a turn of the loop's own session, and every cycle that
@@ -101,6 +103,12 @@ system already stopped — an approval stall, a spent cap or budget, a finished
 subject, or a stand-down after repeated cycles that never got a model session
 (`session_start_failures`) — is replaced by the new one; a loop you paused or
 stopped yourself is preserved.
+
+When a gated loop's watched pull request merges or closes, the session gets one
+last turn that opens with the result (`[monitor finished] PR owner/repo#N merged
+at <ts>, head <sha>. This is the last wake; …`), and the loop stops after it.
+`monitor_update` on a loop that ended this way is refused; arm a new watch with
+`monitor_start`.
 
 Each stop is logged once at WARNING in `gateway.log` as an
 `AutoNudge: … stopped — reason=…` line naming the reason, the cycles run and the

@@ -10,7 +10,7 @@
  * legacy ?tab=slack style deep links remap to ?tab=channels&channel=slack.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { act, render, screen, cleanup, fireEvent } from '@testing-library/react'
+import { act, render, screen, fireEvent } from '@testing-library/react'
 import { MemoryRouter, useLocation } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
@@ -36,10 +36,12 @@ vi.mock('../pages/settings/WebexPanel', () => ({ WebexPanel: () => <div data-tes
 vi.mock('../pages/settings/WeComPanel', () => ({ WeComPanel: () => <div data-testid="wecom-panel" /> }))
 vi.mock('../pages/settings/TeamsPanel', () => ({ TeamsPanel: () => <div data-testid="teams-panel" /> }))
 vi.mock('../pages/settings/DeveloperPanel', () => ({ DeveloperPanel: () => <div data-testid="developer-panel" /> }))
-// Default export, unlike the panels above. Stubbed for the same reason the
-// others are, plus one of its own: the real panel calls api.releases(), which
-// the fixed method set below does not carry.
-vi.mock('../pages/settings/ReleasesPanel', () => ({ default: () => <div data-testid="releases-panel" /> }))
+// Stubbed for the same reason the others are, plus one of its own: the real
+// panel's release notes call api.releases(), which the fixed method set below
+// does not carry.
+// Mocked so a test can prove the hidden Advanced panel never mounts.
+vi.mock('../pages/settings/AdvancedPanel', () => ({ AdvancedPanel: () => <div data-testid="advanced-panel" /> }))
+vi.mock('../pages/settings/AboutPanel', () => ({ AboutPanel: () => <div data-testid="about-panel" /> }))
 
 // ChannelsPanel renders real (it owns the remap target) — silence its status
 // queries with deterministic configs so no real fetch fires.
@@ -77,6 +79,7 @@ if (!window.matchMedia) {
 
 import SettingsPage from '../pages/SettingsPage'
 import { PREVIEW_SESSION_ENVIRONMENTS, PREVIEW_WEBHOOKS, setPreviewFlag } from '../utils/previewFlags'
+import { SETTINGS_REGISTRY } from '../components/commandPalette/settingsRegistry.gen'
 
 // The Webhooks tab is preview-gated and the gate reads real localStorage, so a
 // flag left set by one test would decide another test's roster.
@@ -103,6 +106,17 @@ function renderAt(route: string) {
 }
 
 describe('SettingsPage tabs', () => {
+  it('lists no Advanced tab, and its old address opens the first tab instead', () => {
+    renderAt('/settings/advanced')
+    expect(screen.queryByRole('button', { name: 'Advanced' })).not.toBeInTheDocument()
+    expect(screen.queryByTestId('advanced-panel')).not.toBeInTheDocument()
+    expect(screen.getByTestId('overview-panel')).toBeInTheDocument()
+  })
+
+  it('gives Settings search no entry that opens the Advanced page', () => {
+    expect(SETTINGS_REGISTRY.filter(e => e.tab === 'advanced')).toEqual([])
+  })
+
   it('hides Session Environments and its deep link until enabled', () => {
     renderAt('/settings/session-environments')
     expect(screen.queryByRole('button', { name: 'Session Environments' })).not.toBeInTheDocument()
@@ -158,14 +172,33 @@ describe('SettingsPage tabs', () => {
     expect(await screen.findByTestId('browser-panel', {}, { timeout: 5000 })).toBeInTheDocument()
   })
 
-  it('contains the Releases pane, and only that one, instead of scrolling the page', async () => {
-    // The archive puts a version rail beside the notes, so a page scroll took
-    // the "Releases" heading and the rail away with it. Every other tab is a
-    // form that should keep growing.
-    renderAt('/settings?tab=releases')
-    expect(screen.getByTestId('releases-panel').parentElement!.className).toContain('min-h-0')
+  it('lists no Releases tab: the release notes live at the foot of About', () => {
+    renderAt('/settings')
+    expect(screen.queryByRole('button', { name: 'Releases' })).not.toBeInTheDocument()
+    expect(screen.getByText('About')).toBeInTheDocument()
+  })
 
-    cleanup()
+  it.each([
+    ['/settings/releases', '/settings/about?release=notes'],
+    ['/settings?tab=releases', '/settings/about?release=notes'],
+    ['/settings/releases/0.12.0', '/settings/about?release=0.12.0'],
+    ['/settings/releases/0.12.0?from=link', '/settings/about?from=link&release=0.12.0'],
+  ])('sends the old Releases address %s to About', async (from, to) => {
+    renderAt(from)
+    expect(await screen.findByTestId('about-panel')).toBeInTheDocument()
+    expect(screen.getByTestId('loc')).toHaveTextContent(to)
+  })
+
+  it('drops an opened release when the reader leaves About through the rail', async () => {
+    renderAt('/settings/about?release=0.9.0')
+    await screen.findByTestId('about-panel')
+    fireEvent.click(screen.getByText('Computer Use'))
+    expect(screen.getByTestId('loc')).toHaveTextContent(/^\/settings\/computer-use$/)
+    fireEvent.click(screen.getByText('About'))
+    expect(screen.getByTestId('loc')).toHaveTextContent(/^\/settings\/about$/)
+  })
+
+  it('pages the Browser tab rather than containing it', async () => {
     renderAt('/settings?tab=browser')
     // Lazy chunk: wait for the import rather than relying on an earlier test warming it.
     expect((await screen.findByTestId('browser-panel', {}, { timeout: 5000 })).parentElement!.className).toContain('pb-8')

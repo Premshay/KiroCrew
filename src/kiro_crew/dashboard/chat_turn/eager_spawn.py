@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_turn.app_agent_binding import (
         _recover_app_agent_binding,
         app_agent_binding_applies,
+        app_session_selects_bot,
     )
     from kiro_crew.dashboard.chat_turn.crew_log_attribution import _slot_predecessor_store
     from kiro_crew.dashboard.chat_turn.model_fallback import (
@@ -51,8 +52,15 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_turn.turn_context import _require_session_memory_assignment
 
 # Debounce before a speculative spawn. Absorbs rapid consecutive signals
-# (slot create immediately followed by a project set, or a user re-picking
-# the project) so only the settled state spawns a session.
+# (a user re-picking the project or the agent) so only the settled state
+# spawns a session. The owner's own new chat skips it (``debounce=0.0`` from
+# the slot-create handler): measured on a pod, a message sent 2 s after "New
+# chat" waited a median 4.3-4.5 s (two runs of five) for its first output with
+# the debounce and 3.0 s without it, because the start had 1.5 s less of its 3 s left to run. A
+# create that a binding change follows (the client sets the project right after
+# it, ``no_session_folder``, or switches it to the Crew Mode conductor) keeps
+# the debounce: that change landing on a start that already reserved the key
+# would throw the start away, and for a project would owe a session reset.
 _EAGER_SPAWN_DEBOUNCE_SECS = 1.5
 
 
@@ -89,6 +97,16 @@ _EAGER_SPAWN_BACKOFF_MAX_SECS = 300.0
 
 #: Bound on the last-error text the stop notice carries into the chat.
 _EAGER_SPAWN_ERROR_DETAIL_MAX_CHARS = 500
+
+#: The stop row's English, filled with the failure count and the last error. A
+#: module template rather than an inline f-string because a host sandbox refusal
+#: prefixes the same sentence with its typed code, and the frontend's legacy
+#: pattern for ``eager_spawn_stopped`` is pinned against this template
+#: (``test_transient_notice_parity``).
+EAGER_SPAWN_STOPPED_TEXT = (
+    "This chat's agent failed to start {failures} times in a row, so it will not be "
+    "started again in the background. Send a message to try again. Last error: {detail}"
+)
 
 
 def _eager_spawn_backoff_secs(failures: int) -> float:
@@ -140,20 +158,23 @@ def _note_eager_spawn_failure(slot: "_ChatSlot", exc: BaseException) -> None:
     detail = redact_and_truncate(str(exc), _EAGER_SPAWN_ERROR_DETAIL_MAX_CHARS)
     try:
         from kiro_crew.dashboard import gateway_notice as gn
+        from kiro_crew.dashboard import host_sandbox_refusal as hsr
 
         _last_error = detail or type(exc).__name__
-        slot.append(
-            "error",
-            f"This chat's agent failed to start {failures} times in a row, so it "
-            "will not be started again in the background. Send a message to try "
-            f"again. Last error: {_last_error}",
-            "msg msg-err",
-            meta=gn.gateway_notice_meta(
-                gn.GATEWAY_NOTICE_EAGER_SPAWN_STOPPED,
-                failures=failures,
-                detail=_last_error,
-            ),
+        _stop_meta = gn.gateway_notice_meta(
+            gn.GATEWAY_NOTICE_EAGER_SPAWN_STOPPED,
+            failures=failures,
+            detail=_last_error,
         )
+        _stop_text = EAGER_SPAWN_STOPPED_TEXT.format(failures=failures, detail=_last_error)
+        _host_refusal = hsr.host_sandbox_refusal(exc)
+        if _host_refusal is not None:
+            # The last error is the host's sandbox runbook: typed in the meta and
+            # by the content prefix (a path with no row meta reads the prefix), so
+            # a reader who is not the machine owner gets the plain line instead.
+            _stop_meta.update(hsr.row_meta(_host_refusal))
+            _stop_text = hsr.row_text(_stop_text)
+        slot.append("error", _stop_text, "msg msg-err", meta=_stop_meta)
     except Exception:
         logger.debug("Eager spawn: could not post the stop notice for %s", slot.key, exc_info=True)
 
@@ -444,6 +465,7 @@ def schedule_eager_spawn(
     start_priority: StartPriority = StartPriority.BACKGROUND,
     on_ended: Callable[[Exception | None], None] | None = None,
     focus_resume: bool = False,
+    debounce: float | None = None,
 ) -> "asyncio.Task | None":
     """Speculatively create *slot*'s session ahead of its first message.
 
@@ -454,6 +476,10 @@ def schedule_eager_spawn(
 
     At most one pending task per slot: a newer signal cancels the older task,
     so the spawn always reflects the slot's settled agent/model/project.
+
+    ``debounce`` overrides the wait before the start
+    (``_EAGER_SPAWN_DEBOUNCE_SECS`` when ``None``); the owner's new chat passes
+    ``0.0`` because a person is about to type into it.
 
     ``allow_resume`` opts this spawn into resume prefetch (the slot-focused
     intent signal): a resumable key performs the speculative ``session/load``
@@ -525,6 +551,7 @@ def schedule_eager_spawn(
             start_priority=start_priority,
             on_ended=on_ended,
             focus_resume=focus_resume,
+            debounce=debounce,
         )
     )
     slot._eager_spawn_task = task
@@ -587,6 +614,7 @@ async def _eager_spawn(
     start_priority: StartPriority = StartPriority.BACKGROUND,
     on_ended: Callable[[Exception | None], None] | None = None,
     focus_resume: bool = False,
+    debounce: float | None = None,
 ) -> None:
     """Debounce, re-validate, then create the slot's session and release it.
 
@@ -600,12 +628,13 @@ async def _eager_spawn(
        exists to prevent. When a turn is running, its own end-of-turn path
        consumes the reset instead.
     2. Global and named V1 sessions may reach ``get_or_create``, which acquires
-       the per-session semaphore and is released immediately below because no
-       turn follows. Private V2 sessions stop before allocation so the first
-       real turn can validate and pin their trusted store before a provider is
-       registered. For eligible V1 sessions, a first message arriving during
-       the handshake blocks on the same semaphore and reuses the created
-       session.
+       the per-session semaphore. No turn follows, so it is given back below:
+       by this task on every path that keeps the session, and by the teardown
+       itself on the two that remove it. Private V2 sessions stop before
+       allocation so the first real turn can validate and pin their trusted
+       store before a provider is registered. For eligible V1 sessions, a
+       first message arriving during the handshake blocks on the same
+       semaphore and reuses the created session.
 
     ``on_ended`` (see ``schedule_eager_spawn``) is called on every exit but a
     cancel: a cancelled start was replaced by a newer slot signal or stopped by
@@ -622,7 +651,7 @@ async def _eager_spawn(
         # a concurrent signal, and the admission below must not evict it.
         if signal_generation is None:
             signal_generation = _arm_generation
-        await asyncio.sleep(_EAGER_SPAWN_DEBOUNCE_SECS)
+        await asyncio.sleep(_EAGER_SPAWN_DEBOUNCE_SECS if debounce is None else debounce)
         sessions = getattr(state, "sessions", None)
         if sessions is None:
             return
@@ -691,6 +720,7 @@ async def _eager_spawn(
                     cfg,
                     session_key,
                     _bound[0] or None,
+                    _bound[2] or None,
                 )
                 kiro_agent = bindings.kiro_agent
                 crew_alias = bindings.resolved_alias
@@ -724,6 +754,7 @@ async def _eager_spawn(
                         cfg,
                         session_key,
                         _bound[0] or None,
+                        _bound[2] or None,
                     )
                     kiro_agent = bindings.kiro_agent
                     crew_alias = bindings.resolved_alias
@@ -736,6 +767,10 @@ async def _eager_spawn(
                 if bindings.selection_kind == "template":
                     crew_alias = ""
                 resolved_ok = bindings.requested_resolved
+                if app_session_selects_bot(slot, bindings):
+                    # The first real turn refuses it, so nothing starts as the Bot.
+                    logger.info("Eager spawn: app slot %s names a Bot; not started", slot.key)
+                    return
                 await asyncio.to_thread(
                     _require_session_memory_assignment, session_key, bindings.memory_store_name
                 )
@@ -909,6 +944,7 @@ async def _eager_spawn(
                     _bound=_bound,
                     start_priority=start_priority,
                     focus_resume=focus_resume,
+                    store_to_warm=selected_store,
                 )
             finally:
                 # Every exit that is not a registration -- refused, another
@@ -955,6 +991,7 @@ async def _spawn_admitted_prefetch(
     _bound: tuple,
     start_priority: StartPriority,
     focus_resume: bool = False,
+    store_to_warm: str | None = None,
 ) -> None:
     """The admitted half of ``_eager_spawn``: handshake, guards, registration.
 
@@ -989,30 +1026,38 @@ async def _spawn_admitted_prefetch(
         # which case the speculative session/load runs here and the
         # resumed=True observation is armed for the real turn. See
         # get_or_create's docstring.
+        # A slot or crew pin is the caller's own selection; with neither, the
+        # allocation resolves the default-model ladder itself, exactly as it
+        # will for the first real turn.
         _requested_model = slot.model or ("" if slot.runtime_agent else agent_model or "")
+        from kiro_crew.agent_sdk.kas_project_hooks import person_turn_claim
+
         try:
-            _, is_new, resumed = await sessions.get_or_create(
-                session_key,
-                agent=kiro_agent or slot.agent or None,
-                # Canonical crew identity — the resolver's alias, which
-                # covers the default crew on an empty slot; plumbed to the
-                # session so per-agent watchdog windows never depend on a
-                # cross-namespace name match. "" is authoritative: no
-                # alias applied, so no override applies.
-                crew_agent=crew_alias,
-                **({"runtime_agent": slot.runtime_agent} if slot.runtime_agent else {}),
-                model=_requested_model or None,
-                cwd=slot.project or None,
-                # Same opt-in as the turn's claim: the chat shows the notice.
-                fallback_hidden_cwd=True,
-                speculative=True,
-                speculative_resume=allow_resume,
-                reasoning_effort_override=slot.reasoning_effort or None,
-                start_priority=start_priority,
-                focus_resume=focus_resume,
-                **_app_allocation_kwargs(slot),
-                **_slot_backend_allocation_kwargs(slot),
-            )
+            # The tab's own next turn is its person's, so the start it prefetches is
+            # marked as that turn's (``kas_project_hooks.PERSON_TURN``).
+            with person_turn_claim(True):
+                _, is_new, resumed = await sessions.get_or_create(
+                    session_key,
+                    agent=kiro_agent or slot.agent or None,
+                    # Canonical crew identity — the resolver's alias, which
+                    # covers the default crew on an empty slot; plumbed to the
+                    # session so per-agent watchdog windows never depend on a
+                    # cross-namespace name match. "" is authoritative: no
+                    # alias applied, so no override applies.
+                    crew_agent=crew_alias,
+                    **({"runtime_agent": slot.runtime_agent} if slot.runtime_agent else {}),
+                    model=_requested_model or None,
+                    cwd=slot.project or None,
+                    # Same opt-in as the turn's claim: the chat shows the notice.
+                    fallback_hidden_cwd=True,
+                    speculative=True,
+                    speculative_resume=allow_resume,
+                    reasoning_effort_override=slot.reasoning_effort or None,
+                    start_priority=start_priority,
+                    focus_resume=focus_resume,
+                    **_app_allocation_kwargs(slot),
+                    **_slot_backend_allocation_kwargs(slot),
+                )
         except (SpeculativeResumeRefused, SessionClosingError, SessionEndingError):
             # A refusal, a gateway shutdown, or a key being ended: no agent
             # start was attempted and failed, so none of them is counted.
@@ -1045,7 +1090,32 @@ async def _spawn_admitted_prefetch(
         # message starts the agent itself.
         logger.info("Eager spawn: %s left to first turn (refused)", session_key)
         return
-    sessions.release(session_key)
+    if is_new and not resumed and not slot.blocks_reads:
+        # The first message's build reads every recent-history file (about 75 in a
+        # busy store, a quarter of a second through the hardened reader). None of
+        # that depends on the message, so it is read now, beside the person's
+        # think time, and the build reuses it while the directory is unchanged
+        # (``MemoryStore.warm_recent_history``). A failure only costs the head start.
+        builder = getattr(state, "context_builder", None)
+        if builder is not None:
+            workspace = slot.workspace or None
+
+            def _read_history_early(warm_builder: Any) -> None:
+                warm_builder.get_memory_for(workspace, store_to_warm).warm_recent_history(days=14)
+
+            async def _warm_history() -> None:
+                try:
+                    await asyncio.to_thread(_read_history_early, builder)
+                except Exception:  # noqa: BLE001 - the first build reads for itself
+                    logger.debug("Eager spawn: history was not read early", exc_info=True)
+
+            warm = asyncio.create_task(_warm_history())
+            state._background_tasks.add(warm)
+            warm.add_done_callback(state._background_tasks.discard)
+    # Each path that keeps the session releases its permit. The two stale arms
+    # leave it held for ``remove``, which releases it in the lock hold that pops
+    # the session, so a claimant parked on it cannot take the stale session.
+    #
     # The cleanup below may only tear down a session THIS task created.
     # is_new=False means another creator won the same-key race (or the
     # claim attached to an already-registered session): a real turn
@@ -1055,6 +1125,7 @@ async def _spawn_admitted_prefetch(
     # winner registered with its own current bindings, so the stale-
     # bindings hazard these guards exist for does not apply to it.
     if not is_new:
+        sessions.release(session_key)
         logger.info("Eager spawn: another creator won %s, leaving session alone", session_key)
         return
     # The slot can be deleted while the handshake ran; the delete
@@ -1064,7 +1135,9 @@ async def _spawn_admitted_prefetch(
     # slot's (now stale) agent/cwd bindings. Tear it down.
     if state.get_slot(slot.key) is not slot:
         logger.info("Eager spawn: slot %s vanished mid-handshake, removing session", slot.key)
-        await sessions.remove(session_key)
+        # Shielded as in _prefetch_ttl: a later slot signal cancels this task, and
+        # a cancel after the pop would leak the process holding the session lock.
+        await asyncio.shield(sessions.remove(session_key))
         return
     # Same shape for a binding change: a switch handler's reset ran
     # before registration and found nothing, so the session we just
@@ -1076,8 +1149,10 @@ async def _spawn_admitted_prefetch(
             "Eager spawn: slot %s bindings changed mid-handshake, removing session",
             slot.key,
         )
-        await sessions.remove(session_key)
+        # Shielded for the same reason as the vanished-slot removal above.
+        await asyncio.shield(sessions.remove(session_key))
         return
+    sessions.release(session_key)
     if not resumed:
         # Stamp first, matching the turn site. This call IS the allocation, so the
         # two agree whenever a tier resolved one, and the stamp additionally carries

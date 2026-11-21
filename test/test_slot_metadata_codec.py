@@ -33,7 +33,7 @@ from kiro_crew.dashboard.slot_persistence import metadata_codec as codec
 from kiro_crew.dashboard.slot_persistence import metadata_line, metadata_values
 from kiro_crew.dashboard.source_providers.contract import source_ref_identity_key
 from kiro_crew.dashboard.state import durable_queue_entries
-from kiro_crew.history import SLOT_OWNED_META_KEYS
+from kiro_crew.history import SLOT_OWNED_META_KEYS, transcript_stem
 
 K1 = source_ref_identity_key(("github", "github.com", "o", "r", 1, "", "change", ""))
 K2 = source_ref_identity_key(("github", "github.com", "o", "r", 2, "", "change", ""))
@@ -65,6 +65,7 @@ _POPULATED: dict = {
     "crew_mode_agent": "kirocrew-conductor",
     "app_agent_owner": "pr-bulk-ops/agent-a",
     "project": "/srv/p",
+    "_project_picked": True,
     "executor": "remote",
     "instance_id": "inst-1",
     "remote_slot": "rs-1",
@@ -86,6 +87,8 @@ _POPULATED: dict = {
     "_auto_tagged": True,
     "_human_seen": True,
     "_telemetry_notice_shown": "0123456789abcdef",
+    "_project_hook_files_notice_shown": "fedcba9876543210",
+    "_session_notice_marks": ["0123456789abcdef", "fedcba9876543210"],
     "forked_from": "parent-slot",
     "forked_from_created_at": "2026-01-01T00:00:00",
     "linked_session_key": "slack:C1:1.2",
@@ -107,9 +110,9 @@ _APPLIED = {
 }
 
 
-#: The key order each save form writes: the bytes a save puts on disk, as the two
-#: hand-written save sites wrote them before the codec. A change here is a change to
-#: every saved file.
+#: The key order each save form writes for the keys saved files already carry: the
+#: bytes a save puts on disk. Reordering or dropping one of these is a change to every
+#: saved file; a new key needs no entry here.
 _BASE_LINE_ORDER = (
     "_type",
     "created_at",
@@ -137,6 +140,7 @@ _BASE_LINE_ORDER = (
     "crew_mode_agent",
     "app_agent_owner",
     "project",
+    "project_picked",
     "executor",
     "instance_id",
     "remote_slot",
@@ -154,6 +158,7 @@ _BASE_LINE_ORDER = (
     "origin",
     "created_by",
     "attribution",
+    "participants",
     "artifact",
     "pinned",
     "mutes_opened",
@@ -165,6 +170,8 @@ _BASE_LINE_ORDER = (
     "auto_tagged",
     "human_seen",
     "telemetry_notice_shown",
+    "project_hook_files_notice_shown",
+    "session_notice_marks",
     "last_user_at",
     "deferred_notes",
     "queued_prompts",
@@ -205,6 +212,7 @@ _BASE_MERGE_ORDER = (
     "crew_mode_agent",
     "app_agent_owner",
     "project",
+    "project_picked",
     "app",
     "declared_goal",
     "session_checkpoint",
@@ -215,6 +223,7 @@ _BASE_MERGE_ORDER = (
     "origin",
     "created_by",
     "attribution",
+    "participants",
     "linked_session_key",
     "channel_origin",
     "forked_from",
@@ -228,6 +237,8 @@ _BASE_MERGE_ORDER = (
     "auto_tagged",
     "human_seen",
     "telemetry_notice_shown",
+    "project_hook_files_notice_shown",
+    "session_notice_marks",
     "channel_folder_filed",
     "closed",
     "closed_at",
@@ -258,6 +269,7 @@ def _populated(state, *, app: str = "app-1"):
 
 def _purpose(purpose: str, *, name: str, member=None, listed: object = "Listed", **inputs):
     """Build *purpose*; *inputs* are extra constructor keywords (the restore inputs)."""
+    history_key = inputs.pop("history_key", "")
     if purpose == codec.RESTORE:
         return codec.Restore(name=name, member=member, **inputs)
     if purpose == codec.RECENT:
@@ -265,10 +277,10 @@ def _purpose(purpose: str, *, name: str, member=None, listed: object = "Listed",
             name=name,
             member=member,
             listing={"title": listed},
-            history_key=f"dashboard_{name}",
+            history_key=history_key or f"dashboard_{name}",
             **inputs,
         )
-    return codec.Resume(member=member, history_key=f"dashboard:{name}", **inputs)
+    return codec.Resume(member=member, history_key=history_key or f"dashboard:{name}", **inputs)
 
 
 def _slot_folds(slot) -> codec.SaveFolds:
@@ -321,8 +333,12 @@ def test_every_field_a_purpose_reads_round_trips_and_every_other_is_left_alone(
     state = _state(tmp_path, monkeypatch)
     source = _populated(state)
     meta = json.loads(json.dumps(codec.encode(source, merge=merge, folds=_slot_folds(source))))
-    # A recent restore shows the session list's title, which is the line's.
-    fresh, applied, baseline = _read_back(state, meta, purpose, listed=meta.get("title"))
+    # A recent restore shows the session list's title, which is the line's. Read
+    # under the linked thread's own transcript, the file a linked slot saves to.
+    own = transcript_stem(_POPULATED["linked_session_key"])
+    fresh, applied, baseline = _read_back(
+        state, meta, purpose, name=own, history_key=own, listed=meta.get("title")
+    )
 
     write = "merge" if merge else "line"
     restored, kept, settled = [], [], []
@@ -453,9 +469,16 @@ def test_both_save_forms_write_every_slot_owned_key(tmp_path, monkeypatch):
         sorted(SLOT_OWNED_META_KEYS - {"_type", "created_at", "last_consolidated"} - set(merge))
         == []
     )
-    assert list(line) == [key for key in _BASE_LINE_ORDER if key in line]
-    assert list(merge) == [key for key in _BASE_MERGE_ORDER if key in merge]
-    assert codec.LINE_ORDER == _BASE_LINE_ORDER and codec.MERGE_ORDER == _BASE_MERGE_ORDER
+    # Each form writes in the codec's declared order...
+    assert list(line) == [key for key in codec.LINE_ORDER if key in line]
+    assert list(merge) == [key for key in codec.MERGE_ORDER if key in merge]
+    # ...and that order keeps every key a saved file already has, in its place
+    # relative to the others. A new key may go anywhere.
+    for order, base in (
+        (codec.LINE_ORDER, _BASE_LINE_ORDER),
+        (codec.MERGE_ORDER, _BASE_MERGE_ORDER),
+    ):
+        assert [key for key in order if key in base] == list(base)
 
 
 def test_the_coverage_check_sees_a_form_that_drops_a_key(tmp_path, monkeypatch):
@@ -492,6 +515,7 @@ def test_the_full_save_clears_by_absence_and_the_merge_by_a_falsy_value(tmp_path
         "agent_kind": "",
         "app_agent_owner": "",
         "project": "",
+        "project_picked": False,
         "turn_in_flight_generation": 0,
         "turn_in_flight_prompt": None,
         "deferred_notes": [],
@@ -507,7 +531,7 @@ def test_the_full_save_clears_by_absence_and_the_merge_by_a_falsy_value(tmp_path
 
 def test_slot_args_take_each_purposes_construction_inputs():
     meta = {"app": "app-1", "origin": "cron", "linked_session_key": "slack:C1:1.2"}
-    assert codec.slot_args(meta, codec.Restore(name="x")) == {
+    assert codec.slot_args(meta, codec.Restore(name="slack_C1_1.2")) == {
         "agent": "",
         "mode": "",
         "app": "app-1",
@@ -530,6 +554,7 @@ def test_slot_args_take_each_purposes_construction_inputs():
         "origin": "cron",
     }
     assert codec.slot_args({}, codec.Resume(history_key="dashboard:x"))["channel_origin"] is False
+    assert codec.slot_args(meta, codec.Restore(name="x"))["channel_origin"] is False
 
 
 def test_resume_binds_a_review_transcripts_own_link_for_the_dashboard_user_only():
@@ -680,6 +705,17 @@ def test_a_retired_or_malformed_mode_reads_as_plain_chat(raw, restored, tmp_path
     assert slot.mode == restored
     resume, _, _ = _read_back(state, {"mode": raw}, codec.RESUME)
     assert resume.mode == ("" if raw == "member" else restored)
+
+
+@pytest.mark.parametrize("keeps", [True, False])
+def test_a_resume_drops_a_mode_its_caller_ruled_out(keeps, tmp_path, monkeypatch):
+    """The caller decides off the loop (``apps.hidden_sessions.resume_keeps_mode``);
+    the read itself does no I/O. A restart restore keeps the saved mode."""
+    state = _state(tmp_path, monkeypatch)
+    resume, _, _ = _read_back(state, {"mode": "acme-app"}, codec.RESUME, keeps_mode=keeps)
+    assert resume.mode == ("acme-app" if keeps else "")
+    restore, _, _ = _read_back(state, {"mode": "acme-app"}, codec.RESTORE, name="kept")
+    assert restore.mode == "acme-app"
 
 
 def test_the_restricted_mark_follows_the_line_and_resume_clears_a_stale_one(tmp_path, monkeypatch):

@@ -156,6 +156,12 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         # cookie auth and are refused before the handler's own session
         # recognition can run.
         "/api/session-ledger",
+        # MCP-only (the three resource-subscription tools) and the
+        # `kirocrew resource-subs` CLI; no browser caller. Prefix matching covers
+        # "/remove" and "/operator". Without this entry the internal-secret calls
+        # fall through to cookie auth and are refused before the handler's own
+        # session recognition can run.
+        "/api/resource-subscriptions",
         # MCP-only (the four kirocrew-work tools); no browser caller. Prefix
         # matching covers "/record", "/brief" and "/report". Without this entry
         # the tools' internal-secret calls fall through to cookie auth and are
@@ -256,6 +262,8 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         "/api/session-control/read",
         "/api/session-control/summary",
         "/api/session-control/queue",
+        "/api/session-control/crews",
+        "/api/session-control/run-queued",
         # MCP-only structured monitor inspection. The caller selects its
         # session identity through X-Session-Key, so cookie authentication can
         # never authorize this leaf.
@@ -326,6 +334,9 @@ _MIXED_INTERNAL_API_PATHS = frozenset(
         "/api/lessons",
         # MCP recall still requires the handler's protected member/session proof.
         "/api/memory/recall",
+        # The terminal memory-provider conformance kit. With the internal secret
+        # the handler runs only the read-only checks; the owner's browser runs all.
+        "/api/memory/provider/conformance",
         "/api/crons",  # CLI cron trigger; prefix covers all sub-routes (consistent with spawn/taskrunner)
         # The cron_add/cron_update MCP tools resolve-or-create Schedule-page
         # folders via X-Internal-Secret. Same trap as "/api/artifact-folders"

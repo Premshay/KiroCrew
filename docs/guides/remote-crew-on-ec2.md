@@ -151,7 +151,9 @@ loginctl enable-linger <user>
 ```
 
 (A gateway installed as a **system** unit under `/etc/systemd/system` already
-survives logout; linger still matters for pods and for user-level installs.)
+survives logout, and `kirocrew service install` turns linger on for its account
+so the agent runtimes survive too; linger still matters for pods and for
+user-level installs.)
 
 ### "kiro login: not logged in"
 
@@ -183,7 +185,7 @@ property of the launch, not of whichever `kiro-cli login` happens to run:
   through the same organization portal — you are asked for the **Identity Center
   region** (the AWS Region your Identity Center instance lives in, *not* the EC2
   region the crew runs in) because `whoami` does not report it. Builder ID users
-  get the Builder ID flow, exactly as before.
+  get the Builder ID flow.
 - **Overridable.** `kirocrew cloud launch --identity-provider https://example.awsapps.com/start --license pro --idp-region us-east-1`
   names the identity explicitly; `--no-inherit-identity` forces Builder ID. The
   dashboard form offers the same choice. If `kiro-cli whoami` fails to run on the
@@ -195,13 +197,21 @@ property of the launch, not of whichever `kiro-cli login` happens to run:
   *and* resume of the device flow, so a gateway restart or an expired device code
   never falls back to Builder ID. An Identity Center sign-in that cannot produce a
   device code fails visibly rather than degrading to a different identity.
-- **Verified.** "Already signed in" now means signed in *as the intended identity*.
+- **Verified.** "Already signed in" means signed in *as the intended identity*.
   A valid session for the wrong account (a Builder ID session on a crew that should
   be on your organization's Identity Center) is reported as a mismatch with the
   `cloud logout` / `cloud login` commands to switch — not as success.
 
 The same three flags exist on `kirocrew cloud login` for an already-launched crew;
 with a wrong-but-valid session present, run `kirocrew cloud logout` first.
+
+**The sign-in is optional.** A crew that runs another agent harness works without
+a Kiro sign-in. Turn off **Sign in to Kiro on the new crew** in the launch form,
+press **Skip for now** on the progress card while the sign-in runs, or pass
+`kirocrew cloud launch --no-login`. The sign-in step then reads skipped, not
+failed, and a code already shown is stopped on the instance. The crew connects
+as usual, and it can sign in later in its own Settings → Kiro Account (or with
+`kirocrew cloud login`).
 
 ### Port/tunnel mismatch (the common one)
 
@@ -227,7 +237,7 @@ port into the CSRF allowlist — see
 
 ### Set-up pre-flight: credential helper not found, or plugin refused
 
-The **Set up a new one** pre-flight runs the AWS CLI from the gateway, and a
+The **Add Crew → Set up a new Crew** pre-flight runs the AWS CLI from the gateway, and a
 gateway started from the Dock or Finder has a minimal `PATH`.
 
 - **"The AWS CLI could not find `<name>` on the gateway's PATH."** Your profile's

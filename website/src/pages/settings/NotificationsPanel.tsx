@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useRef, useState } from 'react'
 import { useMutation, useMutationState, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Lock, MonitorCog, Blocks, Check, RadioTower, Bell, Volume2, ListMusic, Music } from 'lucide-react'
+import { Lock, Check, RadioTower, Bell, Volume2, ListMusic, Music } from 'lucide-react'
 import { SettingsSection, SettingsCard, SettingsToggle, SettingsSelect } from '../../components/settings'
 import { SettingsSubNav, type SubNavItem } from '../../components/SettingsSubNav'
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '../../components/ui/select'
@@ -19,13 +19,13 @@ import { CustomSoundsSection, type UndoResult } from './CustomSoundsSection'
 import { PushSection } from './NotificationsPushSection'
 import { AppSessionMuteSection } from './AppSessionMuteSection'
 import { DeliverToControl, type BridgePatch } from './NotificationsBridgeRoute'
-import { saveChatCompleteNotify, useChatCompleteNotify } from '../../hooks/chatCompleteNotify'
+import { saveChatCompleteMinSeconds, saveChatCompleteNotify, useChatCompleteMinSeconds, useChatCompleteNotify } from '../../hooks/chatCompleteNotify'
 import { loadBannerEnabled, saveBannerEnabled } from '../../hooks/notificationBanner'
 import { loadUnreadOnAttention, saveUnreadOnAttention } from '../../hooks/unreadOnAttention'
 import { useNotificationPermission } from '../../hooks/useNotificationPermission'
 
 import { i18nT } from '../../i18n/t'
-import { fmtTime } from '../../i18n/format'
+import { compareText, fmtTime, fmtUnit } from '../../i18n/format'
 const PRESET_OPTIONS: SoundPreset[] = ['none', ...SOUND_PRESETS]
 
 /** localStorage key the sound settings persist under. Mirrors the private
@@ -187,6 +187,19 @@ const muteLabel = (choice: MuteChoice, now: number): string => {
   }
 }
 
+/** Shortest-turn choices for the toast, in seconds; `0` means every turn. A
+ *  stored value outside this list is still offered, so the select never hides
+ *  what is saved. */
+const MIN_TURN_CHOICES = [0, 15, 60, 300] as const
+
+const minTurnLabel = (seconds: number): string => {
+  if (seconds === 0) return i18nT('pages.settings.notificationsPanel.notify_min_turn_every')
+  const duration = seconds % 60 === 0
+    ? fmtUnit(seconds / 60, 'minute', { unitDisplay: 'long' })
+    : fmtUnit(seconds, 'second', { unitDisplay: 'long' })
+  return i18nT('pages.settings.notificationsPanel.notify_min_turn_longer_than', { duration })
+}
+
 /** Shared style for the sound-preview buttons: the Sound card's "Test
  *  notification" button and the per-category "Test" buttons must stay
  *  visually identical, so both compose from this one string. */
@@ -204,6 +217,12 @@ const CHANNEL_LABELS: Record<string, () => string> = {
   // handoffs) and is jargon besides -- this channel carries the bell entry a chat
   // raises when it STOPS with an error, so it is labelled in task language.
   'system.turn': () => i18nT('pages.settings.notificationsPanel.channel_turn'),
+  // The bare id is "memory", which reads as memory in general; this channel
+  // carries only the opt-in weekly note that tool failures keep coming back.
+  'system.memory': () => i18nT('pages.settings.notificationsPanel.channel_memory'),
+  // The bare id is "relay", which names the transport; this channel carries only
+  // the note that a team Crew can now be opened, so it is named for that list.
+  'system.relay': () => i18nT('components.relayCrews.group_team_crews'),
 }
 
 /** Catalog KEY for each system channel's "when does this fire?" tip, one entry
@@ -228,6 +247,8 @@ const CHANNEL_TIP_KEY: Record<string, string> = {
   'system.member': 'pages.settings.notificationsPanel.channel_tip_member',
   'system.apps': 'pages.settings.notificationsPanel.channel_tip_apps',
   'system.turn': 'pages.settings.notificationsPanel.channel_tip_turn',
+  'system.memory': 'pages.settings.notificationsPanel.channel_tip_memory',
+  'system.relay': 'pages.settings.notificationsPanel.channel_tip_relay',
 }
 
 /** Human label for a channel within its group (drop the source prefix apps
@@ -305,18 +326,19 @@ function ChannelsSection({ patch }: { patch: (channel: string, settings: Channel
   }
 
   const sources = Array.from(new Set(channels.map(c => c.source)))
-    .sort((a, b) => (a === 'system' ? -1 : b === 'system' ? 1 : a.localeCompare(b)))
+    .sort((a, b) => (a === 'system' ? -1 : b === 'system' ? 1 : compareText(a, b)))
 
   return (
     <SettingsSection title={i18nT('pages.settings.notificationsPanel.sources')} hint={i18nT('pages.settings.notificationsPanel.mute_notification_sources_or_override_their_prio')}>
       <div className="text-[12px] text-muted -mt-1 mb-2" data-setting-label={i18nT('pages.settings.notificationsPanel.sources')}>{i18nT('pages.settings.notificationsPanel.mute_notification_sources_or_override_their_prio_summary')}</div>
       {sources.map((source, i) => (
-        <SettingsCard key={source} index={i}>
-          <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-[.05em] text-muted pb-1 border-b border-border">
-            {source === 'system' ? <MonitorCog className="lucide-inline" /> : <Blocks className="lucide-inline" />}
-            {source}
-            {source !== 'system' && <span className="text-[10px] font-medium normal-case tracking-normal px-1.5 py-px rounded-full bg-accent-subtle text-accent">{i18nT('pages.settings.notificationsPanel.app')}</span>}
-          </div>
+        <Fragment key={source}>
+        {/* The source names its group, above the box like every group heading. */}
+        <div className="flex items-center gap-1.5 mt-4 mb-2 text-[11px] font-semibold uppercase tracking-[.05em] text-muted">
+          {source}
+          {source !== 'system' && <span className="text-[10px] font-medium normal-case tracking-normal px-1.5 py-px rounded-full bg-accent-subtle text-accent">{i18nT('pages.settings.notificationsPanel.app')}</span>}
+        </div>
+        <SettingsCard index={i}>
           {channels.filter(c => c.source === source).map(c => {
             const muted = !!c.settings.muted
             const override = c.settings.priority
@@ -381,6 +403,7 @@ function ChannelsSection({ patch }: { patch: (channel: string, settings: Channel
             )
           })}
         </SettingsCard>
+        </Fragment>
       ))}
     </SettingsSection>
   )
@@ -424,6 +447,8 @@ function SystemNotificationsRow() {
 export function NotificationsPanel({ basePath }: { basePath?: string } = {}) {
   const [settings, setSettings] = useState(() => loadSoundSettings())
   const notifyChatComplete = useChatCompleteNotify()
+  const minTurnSeconds = useChatCompleteMinSeconds()
+  const minTurnChoices = [...new Set<number>([...MIN_TURN_CHOICES, minTurnSeconds])].sort((a, b) => a - b)
   const [bannerEnabled, setBannerEnabled] = useState(() => loadBannerEnabled())
   const [unreadOnAttention, setUnreadOnAttention] = useState(() => loadUnreadOnAttention())
 
@@ -846,6 +871,15 @@ export function NotificationsPanel({ basePath }: { basePath?: string } = {}) {
             hint={i18nT('pages.settings.notificationsPanel.notify_when_a_background_chat_finishes_description')}
             checked={notifyChatComplete}
             onChange={saveChatCompleteNotify}
+          />
+          <SettingsSelect
+            label={i18nT('pages.settings.notificationsPanel.notify_min_turn')}
+            hint={i18nT('pages.settings.notificationsPanel.notify_min_turn_description')}
+            value={String(minTurnSeconds)}
+            options={minTurnChoices.map(String)}
+            optionLabels={minTurnChoices.map(minTurnLabel)}
+            onChange={v => saveChatCompleteMinSeconds(Number(v))}
+            disabled={!notifyChatComplete}
           />
           <SettingsToggle
             label={i18nT('pages.settings.notificationsPanel.unread_only_when_done_or_waiting')}

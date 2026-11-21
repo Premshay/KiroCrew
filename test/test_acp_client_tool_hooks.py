@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 from acp_client_helpers import _native_projection_for_fake_processes  # noqa: F401 - fixture
 from acp_client_helpers import _pin_the_installed_kiro_cli_version  # noqa: F401 - fixture
+from redaction_structured_cases import github_classic
 
 import kiro_crew.acp.client as acp_client
 from kiro_crew.acp.client import AcpClient
@@ -19,6 +20,10 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_OPENCODE,
     JsonRpcMessage,
 )
+
+# A GitHub token with a valid checksum: the plan redacts it, while an AWS key ID
+# stays visible as an identifier.
+_SECRET = github_classic(seed=31)
 
 
 class TestAcpClientToolAudit:
@@ -749,9 +754,14 @@ class TestAcpClientToolHooks:
     """
 
     @staticmethod
-    def _call_ev(title="Reading /x/SKILL.md", tool_input=None, call_id="tc1"):
-        # Stand-in for an EVENT_TOOL_CALL AcpEvent (reads .title/.tool_input).
-        return types.SimpleNamespace(title=title, tool_input=tool_input, tool_call_id=call_id)
+    def _call_ev(title="Reading /x/SKILL.md", tool_input=None, call_id="tc1", raw_tool_params=None):
+        # Stand-in for an EVENT_TOOL_CALL AcpEvent (reads .title/.tool_input/.raw_tool_params).
+        return types.SimpleNamespace(
+            title=title,
+            tool_input=tool_input,
+            tool_call_id=call_id,
+            raw_tool_params=raw_tool_params,
+        )
 
     @staticmethod
     def _result_ev(output="---\nname: x\n---", call_id="tc1"):
@@ -783,7 +793,7 @@ class TestAcpClientToolHooks:
         # frontmatter: the Post-fire path MUST redact it (parity with chat_runner's
         # PostToolUse) before handing it to the hook engine — addresses review-bot
         # security-controls.
-        raw_output = "---\nname: x\nsecret: AKIAIOSFODNN7EXAMPLE\n---"
+        raw_output = f"---\nname: x\nsecret: {_SECRET}\n---"
         await client._maybe_fire_post_tool_hooks(self._result_ev(output=raw_output))
 
         pre = [c for c in store.calls if c["event"] == "PreToolUse"]
@@ -797,7 +807,7 @@ class TestAcpClientToolHooks:
         # redacted (not the raw form).
         fired_output = post[0]["tool_response"]["output"]
         assert fired_output == "---\nname: x\nsecret: [REDACTED: credential]\n---"
-        assert "AKIAIOSFODNN7EXAMPLE" not in fired_output  # raw credential scrubbed
+        assert _SECRET not in fired_output  # raw credential scrubbed
         # YAML frontmatter (name:) is untouched by redaction → skill capture intact.
         assert "name: x" in fired_output
 
@@ -813,14 +823,14 @@ class TestAcpClientToolHooks:
         client = AcpClient(session_key="sk", agent="code-review-sage", audit_source="subagent")
         client._observed_tool_calls["tc1"] = ("Reading /x/SKILL.md", "read")
         # Credential near the front + padding to blow past the 2000-char bound.
-        raw_output = "secret: AKIAIOSFODNN7EXAMPLE\n" + ("x" * 3000)
+        raw_output = f"secret: {_SECRET}\n" + ("x" * 3000)
         await client._maybe_fire_post_tool_hooks(self._result_ev(output=raw_output))
 
         post = [c for c in store.calls if c["event"] == "PostToolUse"]
         assert len(post) == 1
         fired_output = post[0]["tool_response"]["output"]
         assert len(fired_output) == 2000  # bounded to first 2000 chars
-        assert "AKIAIOSFODNN7EXAMPLE" not in fired_output  # raw credential scrubbed
+        assert _SECRET not in fired_output  # raw credential scrubbed
         assert "[REDACTED: credential]" in fired_output  # redaction survives truncation
 
     @pytest.mark.asyncio
@@ -835,14 +845,14 @@ class TestAcpClientToolHooks:
         store = self._Store()
         monkeypatch.setattr(acp_client, "get_global_hook_store", lambda: store)
         client = AcpClient(session_key="sk", agent="code-review-sage", audit_source="subagent")
-        raw_input = '{"cmd": "aws configure set key AKIAIOSFODNN7EXAMPLE"}'
+        raw_input = json.dumps({"cmd": f"gh auth login --with-token {_SECRET}"})
         await client._maybe_fire_pre_tool_hooks(self._call_ev(tool_input=raw_input))
 
         pre = [c for c in store.calls if c["event"] == "PreToolUse"]
         assert len(pre) == 1
         fired_input = pre[0]["tool_input"]  # parsed by fire_tool_hooks
         fired_str = json.dumps(fired_input)
-        assert "AKIAIOSFODNN7EXAMPLE" not in fired_str  # raw credential scrubbed
+        assert _SECRET not in fired_str  # raw credential scrubbed
         assert "[REDACTED: credential]" in fired_str  # redaction marker present
 
     @pytest.mark.asyncio
@@ -855,15 +865,46 @@ class TestAcpClientToolHooks:
         store = self._Store()
         monkeypatch.setattr(acp_client, "get_global_hook_store", lambda: store)
         client = AcpClient(session_key="sk", agent="code-review-sage", audit_source="subagent")
-        raw_input = {"cmd": "aws configure set key AKIAIOSFODNN7EXAMPLE"}
+        raw_input = {"cmd": f"gh auth login --with-token {_SECRET}"}
         await client._maybe_fire_pre_tool_hooks(self._call_ev(tool_input=raw_input))
 
         pre = [c for c in store.calls if c["event"] == "PreToolUse"]
         assert len(pre) == 1
         fired_input = pre[0]["tool_input"]  # parsed by fire_tool_hooks
         fired_str = json.dumps(fired_input)
-        assert "AKIAIOSFODNN7EXAMPLE" not in fired_str  # raw credential scrubbed
+        assert _SECRET not in fired_str  # raw credential scrubbed
         assert "[REDACTED: credential]" in fired_str  # redaction marker present
+
+    @pytest.mark.asyncio
+    async def test_pre_fire_builds_tool_input_from_raw_params_still_redacted(self, monkeypatch):
+        """A frame that carries ``raw_tool_params`` hands the hook THAT dict, redacted
+        value by value, so a command whose display text does not parse (here the
+        approval card's diff-like text) reaches the hook as ``tool_input.command``.
+        The control the two tests above pin is intact: no raw credential reaches the
+        hook script, and a URL keeps its shape with only the secret value masked.
+        """
+        store = self._Store()
+        monkeypatch.setattr(acp_client, "get_global_hook_store", lambda: store)
+        client = AcpClient(session_key="sk", agent="code-review-sage", audit_source="subagent")
+        url = "https://example.com/a?token=" + "a1b2c3d4" * 4
+        command = f'curl -s --url "{url}" -H "x: {_SECRET}"'
+        display = "--- a\n+++ b\n"  # not JSON: alone it would carry no tool_input
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(display)
+        await client._maybe_fire_pre_tool_hooks(
+            self._call_ev(tool_input=display, raw_tool_params={"command": command})
+        )
+
+        pre = [c for c in store.calls if c["event"] == "PreToolUse"]
+        assert len(pre) == 1
+        fired_input = pre[0]["tool_input"]
+        assert fired_input == {
+            "command": (
+                'curl -s --url "https://example.com/a?token=[REDACTED: credential]"'
+                ' -H "x: [REDACTED: credential]"'
+            )
+        }
+        assert _SECRET not in json.dumps(fired_input)  # raw credential scrubbed
 
     @pytest.mark.asyncio
     async def test_pre_fire_uses_unknown_tool_name_when_title_none(self, monkeypatch):

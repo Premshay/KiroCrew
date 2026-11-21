@@ -35,6 +35,7 @@ from kiro_crew.lesson_validation import (
     LESSON_APPLIES_ON_TOPIC,
     LESSON_APPLIES_UNSTATED,
     LESSON_APPLIES_VALUES,
+    LESSON_RULES_HEADER,
     cjk_parts,
     contains_volatile_lesson_fact,
     render_lesson_tier,
@@ -601,35 +602,36 @@ def find_contradiction_candidates(
     candidates = []
     for existing in store.get_lessons():
         sim = similarity(existing)
-        if threshold_low <= sim < threshold_high:
-            try:
-                decoded = json.loads(existing["value_json"])
-            except (ValueError, TypeError):
-                continue
-            if _lesson_scope_unusable(decoded):
-                continue
-            if _lesson_scope(decoded) != repo_scope:
-                continue
-            # Rendered text, not str(): a mapping-shaped row would otherwise
-            # hand its Python repr to the contradiction prompt as the "rule".
-            existing_val = _lesson_display_text(decoded)
-            if not existing_val:
-                continue
-            # The stored body travels with the candidate. The sweep's delete runs
-            # minutes later, after an LLM verdict, and ``_lesson_key`` keys on rule
-            # text plus scope alone, so a re-tier in between (delete + re-add) puts
-            # a different row under the same key. Passing this body back as
-            # ``expect_value_json`` makes the delete compare-and-delete, so it
-            # cannot tombstone the replacement.
-            candidates.append(
-                {
-                    "key": existing["key"],
-                    "rule": existing_val,
-                    "similarity": sim,
-                    "applies": _lesson_applies(decoded),
-                    "value_json": existing["value_json"],
-                }
-            )
+        if not threshold_low <= sim < threshold_high:
+            continue
+        try:
+            decoded = json.loads(existing["value_json"])
+        except (ValueError, TypeError):
+            continue
+        if _lesson_scope_unusable(decoded):
+            continue
+        if _lesson_scope(decoded) != repo_scope:
+            continue
+        # Rendered text, not str(): a mapping-shaped row would otherwise
+        # hand its Python repr to the contradiction prompt as the "rule".
+        existing_val = _lesson_display_text(decoded)
+        if not existing_val:
+            continue
+        # The stored body travels with the candidate. The sweep's delete runs
+        # minutes later, after an LLM verdict, and ``_lesson_key`` keys on rule
+        # text plus scope alone, so a re-tier in between (delete + re-add) puts
+        # a different row under the same key. Passing this body back as
+        # ``expect_value_json`` makes the delete compare-and-delete, so it
+        # cannot tombstone the replacement.
+        candidates.append(
+            {
+                "key": existing["key"],
+                "rule": existing_val,
+                "similarity": sim,
+                "applies": _lesson_applies(decoded),
+                "value_json": existing["value_json"],
+            }
+        )
     candidates.sort(key=lambda x: x["similarity"], reverse=True)
     return candidates[:5]
 
@@ -831,40 +833,41 @@ def delete_lesson(
             deleted = True
             continue
         matched.append((e, _keep_one_identity(val)))
-    if keep_one:
-        # Only rows the prompt can serve take part. A row outside its validity
-        # window, superseded or otherwise withheld is never the survivor (the
-        # lesson would vanish from prompts with an active copy deleted) and is
-        # never removed here either.
-        servable = {r["key"] for r in store._eligible_rows([m[0] for m in matched], "directive")}
-        matched = [m for m in matched if m[0]["key"] in servable]
-        # A row's record metadata (validity window, subject, scope facets) is
-        # part of the lesson as well: two rows that differ in any of it are not
-        # copies, so a copy valid for longer is never traded for one that expires.
-        facets = {
-            r["key"]: json.dumps(r.get("record_metadata") or {}, sort_keys=True)
-            for r in store.with_record_metadata([m[0] for m in matched])
-        }
-        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
-        for e, identity in matched:
-            groups.setdefault((identity, facets[e["key"]]), []).append(e)
-        for rows in groups.values():
-            rows.sort(key=lambda r: (str(r.get("created_at") or ""), str(r["key"])))
-            if len(rows) < 2:
-                continue
-            # The rows are a snapshot. A survivor whose body differs from the
-            # snapshot (a clause attached, a re-tier) may not be a copy of the
-            # others, so the group is left alone; each extra is a
-            # COMPARE-AND-DELETE on the body read here, so a copy enriched
-            # since is kept, not tombstoned.
-            survivor = store.get_semantic(rows[0]["key"])
-            if survivor is None or survivor.get("value_json") != rows[0]["value_json"]:
-                continue
-            for extra in rows[1:]:
-                if store.delete_semantic(
-                    extra["key"], "user_explicit", expect_value_json=extra["value_json"]
-                ):
-                    deleted = True
+    if not keep_one:
+        return deleted
+    # Only rows the prompt can serve take part. A row outside its validity
+    # window, superseded or otherwise withheld is never the survivor (the
+    # lesson would vanish from prompts with an active copy deleted) and is
+    # never removed here either.
+    servable = {r["key"] for r in store._eligible_rows([m[0] for m in matched], "directive")}
+    matched = [m for m in matched if m[0]["key"] in servable]
+    # A row's record metadata (validity window, subject, scope facets) is
+    # part of the lesson as well: two rows that differ in any of it are not
+    # copies, so a copy valid for longer is never traded for one that expires.
+    facets = {
+        r["key"]: json.dumps(r.get("record_metadata") or {}, sort_keys=True)
+        for r in store.with_record_metadata([m[0] for m in matched])
+    }
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for e, identity in matched:
+        groups.setdefault((identity, facets[e["key"]]), []).append(e)
+    for rows in groups.values():
+        rows.sort(key=lambda r: (str(r.get("created_at") or ""), str(r["key"])))
+        if len(rows) < 2:
+            continue
+        # The rows are a snapshot. A survivor whose body differs from the
+        # snapshot (a clause attached, a re-tier) may not be a copy of the
+        # others, so the group is left alone; each extra is a
+        # COMPARE-AND-DELETE on the body read here, so a copy enriched
+        # since is kept, not tombstoned.
+        survivor = store.get_semantic(rows[0]["key"])
+        if survivor is None or survivor.get("value_json") != rows[0]["value_json"]:
+            continue
+        for extra in rows[1:]:
+            if store.delete_semantic(
+                extra["key"], "user_explicit", expect_value_json=extra["value_json"]
+            ):
+                deleted = True
     return deleted
 
 
@@ -941,15 +944,12 @@ def get_lessons_context(
             ``repo_scope`` gate. Omitting it withholds every scoped lesson.
         authority_order: ``memory.rule_authority_order`` for a background
             read (:mod:`kiro_crew.memory_rule_authority`). ``off`` keeps the
-            rule block's order; ``shadow`` keeps it and records in the
-            injection receipt which ids the authority order would add or drop;
-            ``enforce`` orders the rule block by authority level, keeping the
+            rule block's order; ``enforce`` orders the rule block by authority level, keeping the
             authored-before-untagged split and request relevance inside a level.
         lesson_fold: ``memory.lesson_fold`` for a background read
             (:mod:`kiro_crew.memory_lesson_fold`). ``off`` keeps the rule block;
-            ``shadow`` keeps it and records in the injection receipt which ids
-            would fold into which; ``enforce`` leaves folded rows out of the rule
-            block and says how many.
+            ``enforce`` leaves folded rows out of the rule block and says how
+            many.
         relevance_rule: ``memory.relevance_rule`` for a background read
             (:mod:`kiro_crew.memory_relevance_rule`). ``off`` admits the
             findings tier on any shared stemmed word; ``shadow`` keeps that and
@@ -1028,9 +1028,8 @@ def get_lessons_context(
         # which still holds inside a level, as does request relevance. Same rows,
         # so the room below is the same under every mode.
         directives = authored + untagged
-        by_level = _rule_authority.by_authority(directives)
         if order_mode == _rule_authority.MODE_ENFORCE:
-            directives = by_level
+            directives = _rule_authority.by_authority(directives)
         fold_header = ""
         if fold_space is not None:
             # The kept copy is chosen by authority, then recency, not by request
@@ -1039,9 +1038,8 @@ def get_lessons_context(
             space, dim = fold_space
             pairs = _lesson_fold.fold_pairs(directives, entries, space=space, dim=dim)
             folded = {key for _, key in pairs}
-            if fold_mode == _lesson_fold.MODE_ENFORCE and folded:
+            if folded:
                 directives = [e for e in directives if e[0].get("key") not in folded]
-                by_level = [e for e in by_level if e[0].get("key") not in folded]
                 fold_header = "\n" + _lesson_fold.FOLD_NOTICE.format(count=len(folded))
             injection_receipts.record_stage(
                 injection_receipts.LESSON_FOLD,
@@ -1055,11 +1053,7 @@ def get_lessons_context(
         # directive block is served first: when room is short, a past finding
         # yields to a standing rule rather than the two sharing the shortfall.
         directive_tier = {
-            "header": (
-                "[Learned corrections — retained rules from past mistakes.\n"
-                "Follow explicit user rules; stored inferences do not override "
-                "the current user.]" + fold_header
-            ),
+            "header": LESSON_RULES_HEADER + "]" + fold_header,
             "footer": "[End of learned corrections]",
             "omission": (
                 "[Context budget: omitted {count} of {total} retained rules above the "
@@ -1084,9 +1078,7 @@ def get_lessons_context(
                 if not hard_cap or len(whole) <= hard_cap
                 else tighter_lesson_budget(cap, hard_cap)
             )
-        if order_mode == _rule_authority.MODE_SHADOW:
-            _record_authority_shadow(directives, by_level, directive_room, directive_tier)
-        elif order_mode == _rule_authority.MODE_ENFORCE:
+        if order_mode == _rule_authority.MODE_ENFORCE:
             injection_receipts.record_stage(
                 injection_receipts.RULE_AUTHORITY_ORDER,
                 mode=order_mode,
@@ -1207,10 +1199,7 @@ def get_lessons_context(
     order = "most relevant" if query_text else "most recent"
 
     def render(rows: list[tuple[dict, str]]) -> str:
-        header = (
-            "[Learned corrections — user-taught rules from past mistakes.\n"
-            "ALWAYS follow these. They override default behavior."
-        )
+        header = LESSON_RULES_HEADER
         if len(rows) < total:
             header += (
                 f"\nShowing {len(rows)} of {total} lessons, {order} first; "
@@ -1220,9 +1209,11 @@ def get_lessons_context(
         return f"{header}]\n{body}\n{_EXPLICIT_LESSONS_FOOTER}"
 
     if not cap:
+        injection_receipts.note_recalled_lessons(ranked)
         return render(ranked)
     whole = render(ranked)
     if len(whole) <= cap:
+        injection_receipts.note_recalled_lessons(ranked)
         return whole
 
     # Each entry is judged against the RENDERED block, frame included, so an
@@ -1239,34 +1230,8 @@ def get_lessons_context(
         # silent. It exceeds *cap*; ``truncate_explicit_lessons`` shortens it
         # for a caller that needs the block to fit.
         selected = ranked[:1]
+    injection_receipts.note_recalled_lessons(selected)
     return render(selected)
-
-
-def _record_authority_shadow(
-    current: list[tuple[dict, str]],
-    by_level: list[tuple[dict, str]],
-    room: int,
-    tier: dict[str, str],
-) -> None:
-    """Record which rule ids the authority order would add to or drop from the block.
-
-    Both orders are fitted to the same *room* inside private collections, so the
-    probe leaves no omission record and no receipt of its own.
-    """
-    kept: list[set[str]] = []
-    for rows in (current, by_level):
-        with context_omissions.collect(), injection_receipts.collect() as probe:
-            render_lesson_tier(rows, room, omission_kind=context_omissions.LESSON_RULES, **tier)
-        entry = probe.get(injection_receipts.LESSONS) or {}
-        kept.append(set(entry.get("ids") or ()))
-    shown, ordered = kept
-    injection_receipts.record_stage(
-        injection_receipts.RULE_AUTHORITY_ORDER,
-        mode=_rule_authority.MODE_SHADOW,
-        policy=_rule_authority.POLICY_VERSION,
-        would_add=sorted(ordered - shown),
-        would_drop=sorted(shown - ordered),
-    )
 
 
 def _renderable_entries(

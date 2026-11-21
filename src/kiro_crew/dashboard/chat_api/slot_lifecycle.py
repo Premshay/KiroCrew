@@ -75,6 +75,13 @@ def _slot_still_ours(state: DashboardState, name: str, slot: _ChatSlot) -> bool:
     return current is None or current is slot
 
 
+def _session_still_live(state: DashboardState, session_key: str, context: str) -> bool:
+    """Return whether a slot or runtime still owns *session_key*."""
+    from kiro_crew.dashboard.session_owners import runtime_owns_session
+
+    return runtime_owns_session(state, session_key, context)
+
+
 async def _restore_original_after_failed_close(
     state: DashboardState,
     name: str,
@@ -142,6 +149,51 @@ class _NudgeRetireFailed(Exception):
     def __init__(self, loop: "NudgeLoop | None") -> None:
         super().__init__("autonudge loop removal on slot close failed")
         self.loop = loop
+
+
+#: Bound on how long a close waits for the session's resource subscriptions to
+#: go. The removal itself keeps running past it; the close does not wait longer.
+_RESOURCE_SUBSCRIPTION_RETIRE_SECS = 5.0
+
+
+async def _retire_resource_subscriptions(state: DashboardState, *session_keys: str) -> None:
+    """Drop the closed sessions' MCP resource subscriptions (RFC §4.7).
+
+    Runs only once the close has committed, so a close that is refused and
+    rolled back keeps them. Fail-soft and bounded: it never fails or stalls the
+    close it follows, and every key shares the one bound.
+    """
+    from kiro_crew.mcp_gateway.resource_subscriptions import (  # circular: mcp_gateway -> config -> dashboard
+        retire_session,
+        retire_within_bound,
+    )
+
+    async def _retire_all() -> int:
+        results = await asyncio.gather(
+            *(
+                retire_session(
+                    key,
+                    keep=lambda candidate: _session_still_live(
+                        state, candidate, f"retiring subscriptions for {candidate}"
+                    ),
+                )
+                for key in session_keys
+            ),
+            return_exceptions=True,
+        )
+        removed = 0
+        for key, result in zip(session_keys, results):
+            if isinstance(result, BaseException):
+                logger.error("Resource subscription removal failed for %s", key, exc_info=result)
+            else:
+                removed += result
+        return removed
+
+    what = session_keys[0] if len(session_keys) == 1 else f"{len(session_keys)} closed sessions"
+    try:
+        await retire_within_bound(_retire_all(), what, timeout=_RESOURCE_SUBSCRIPTION_RETIRE_SECS)
+    except Exception:  # noqa: BLE001 - the close has committed; this must not undo its tail
+        logger.error("Resource subscription removal failed for %s", what, exc_info=True)
 
 
 async def _retire_slot_nudge_loop(name: str) -> "NudgeLoop | None":
@@ -899,6 +951,8 @@ async def _close_slot(
             # Otherwise return, do not raise: for the ORIGINAL the close is complete
             # (popped, task cancelled, tail durable), so every caller — the DELETE
             # handler and session-control's close_target — must read this as success.
+            if not _session_still_live(state, closing_key, f"closing slot {name}"):
+                await _retire_resource_subscriptions(state, closing_key)
             return
         rows_before = slot.total_messages
         try:
@@ -1217,23 +1271,31 @@ async def _close_slot(
     # session an unbound replacement runs on, so removing it would tear down a live
     # replacement's session no matter which transcript that replacement writes. Skip
     # it unless the key is still ours.
-    if _slot_still_ours(state, name, slot):
-        await _timed_close_stage(
-            name, "session teardown", state.sessions.remove(_history_key_for(name))
-        )
-        # Stop the archived session's remote workspace and keep it for retention:
-        # background, best effort, a no-op without one. Inside the identity check,
-        # so a replacement's is never touched.
-        from kiro_crew.coder.retention import feed_notifier, schedule_archived
+    try:
+        if _slot_still_ours(state, name, slot):
+            await _timed_close_stage(
+                name, "session teardown", state.sessions.remove(_history_key_for(name))
+            )
+            # Stop the archived session's remote workspace and keep it for retention:
+            # background, best effort, a no-op without one. Inside the identity check,
+            # so a replacement's is never touched.
+            from kiro_crew.coder.retention import feed_notifier, schedule_archived
 
-        schedule_archived((_history_key_for(name), closing_key), feed_notifier(state))
-        # The browser tabs that session opened close with it; other chats keep theirs.
-        # A linked slot's session (slack:<ts>) outlives its tab and shares the hub key,
-        # so it keeps its tabs. Imported here, never at boot: it loads the handlers.
-        if not slot.linked_session_key:
-            from kiro_crew.dashboard.handlers.browser_ops import close_chat_tabs
+            schedule_archived((_history_key_for(name), closing_key), feed_notifier(state))
+            # The browser tabs that session opened close with it; other chats keep theirs.
+            # A linked slot's session (slack:<ts>) outlives its tab and shares the hub key,
+            # so it keeps its tabs. Imported here, never at boot: it loads the handlers.
+            if not slot.linked_session_key:
+                from kiro_crew.dashboard.handlers.browser_ops import close_chat_tabs
 
-            close_chat_tabs(state, _history_key_for(name))
+                close_chat_tabs(state, _history_key_for(name))
+    finally:
+        # The close committed at the save, so the retirement runs even when the
+        # remove raises. The remove pops the runtime before any await that can
+        # raise, so the owner check still answers for the closed key; both calls
+        # are fail-soft and never replace the remove's exception.
+        if not _session_still_live(state, closing_key, f"closing slot {name}"):
+            await _retire_resource_subscriptions(state, closing_key)
     _release_closed_execution(state, slot, closing_key, closing_execution)
     _sync_dashboard_slots(state)
     state.push_slot_removed(name)
@@ -1257,7 +1319,7 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
     DELETE-endpoint's App Kit ownership check and maps the outcome to a
     response.
 
-    When the person closes a conductor (an Ultra Mode root or a Bot thread, no
+    When the person closes a conductor (a conductor mode root or a Bot thread, no
     app token), the open sessions it manages close with it, down the whole line.
     Any other session keeps the sessions it opened. A worker left behind a closed
     conductor can neither be steered nor report to anyone. A worker that fails
@@ -1301,6 +1363,11 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
         if exc.status == 409:
             return web.json_response({"error": exc.message, "code": exc.code}, status=409)
         return web.json_response({"error": exc.message, "code": exc.code}, status=500)
+    if not request_app:
+        # The person's own close, which a cron job set to start fresh reopens empty.
+        from kiro_crew.dashboard.cron_inject import note_cron_tab_closed_by_person
+
+        await note_cron_tab_closed_by_person(state, slot)
     closed, failed = await _close_managed(state, name, line) if line else ([], [])
     if not closed and not failed:
         return web.json_response({"ok": True})
@@ -1332,6 +1399,14 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
     dry_run = body.get("dry_run", False)
     request_app = request.get("app", "")
     cutoff = time.time() - max_days * 86400
+    # Read once for this pass, and before the loop registry: this read can await
+    # the store, and nothing below reads the loops again before a pop.
+    from kiro_crew.dashboard.slot_retention import (
+        resource_subscribed_slot_keys,
+        service_subscribed_slot_keys,
+    )
+
+    subscribed = await resource_subscribed_slot_keys()
     # Slots owning an ARMED auto-nudge loop are exempt from idle archival.
     # Archiving one marks it closed, and the nudge fire path then cannot reach
     # it and REMOVES the loop — terminally. An unattended worker is idle by
@@ -1359,6 +1434,7 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
         state,
         looped=_looped,
         cutoff=cutoff,
+        subscribed=subscribed,
         request_app=request_app,
         active_slot=active_slot,
     )
@@ -1382,6 +1458,7 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
         )
     archived: list[str] = []
     failed: list[str] = []
+    retiring: list[str] = []
     _tasks_to_cancel: list[asyncio.Task] = []
     from kiro_crew.execution_context import read_live_session_execution
 
@@ -1424,6 +1501,11 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
                     name,
                 )
                 failed.append(name)
+            continue
+        # The pass read its subscribed set once, and a subscribe can commit while
+        # an earlier tab in this loop is being archived.
+        if name in service_subscribed_slot_keys():
+            candidate.cancel_close()
             continue
         removed = state._slots.pop(name, None)
         if not removed:
@@ -1515,6 +1597,8 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
                     # in ``archived`` either way, and the two together say "not
                     # archived, and something was lost" rather than "nothing to do".
                     failed.append(name)
+                if not _session_still_live(state, closing_key, f"cleaning up slot {name}"):
+                    retiring.append(closing_key)
                 continue
             rows_before = removed.total_messages
             handover_attempted = False
@@ -1776,6 +1860,8 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
         # screen was swept. Move on without touching the replacement's session or its
         # running task.
         if not _slot_still_ours(state, name, removed):
+            if not _session_still_live(state, closing_key, f"cleaning up slot {name}"):
+                retiring.append(closing_key)
             continue
         # Session cleanup is best-effort — history is already written.
         try:
@@ -1789,6 +1875,10 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
                 from kiro_crew.dashboard.handlers.browser_ops import close_chat_tabs
 
                 close_chat_tabs(state, _history_key_for(name))
+        # The same archive as a tab close, so the same §4.7 retirement, done for
+        # every archived session together after the loop under one bound.
+        if not _session_still_live(state, closing_key, f"cleaning up slot {name}"):
+            retiring.append(closing_key)
         # Same retention as a single archive (see _close_slot).
         from kiro_crew.coder.retention import feed_notifier, schedule_archived
 
@@ -1804,6 +1894,8 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
         if removed.running and removed.task is not None:
             removed.task.cancel()
             _tasks_to_cancel.append(removed.task)
+    if retiring:
+        await _retire_resource_subscriptions(state, *retiring)
     # Await all cancelled tasks concurrently with a single bounded timeout
     if _tasks_to_cancel:
         await asyncio.wait(_tasks_to_cancel, timeout=5.0)

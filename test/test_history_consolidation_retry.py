@@ -122,8 +122,7 @@ class TestTheLineIsValidatedWithTheRows:
         c = _make_consolidator(log)
 
         async def response(_prompt, **_kwargs):
-            with history_mod.allow_on_loop_persist():
-                log.update_metadata(KEY, {"memory_mode": "incognito"})
+            await asyncio.to_thread(log.update_metadata, KEY, {"memory_mode": "incognito"})
             return {"history_entry": "derived from rows now under a restricted line"}
 
         with patch.object(c, "_call_llm", AsyncMock(side_effect=response)):
@@ -898,22 +897,23 @@ class TestEveryEntryPointRespectsTheAccounting:
         """The expiry path consults no time throttle of its own at all."""
         log = _seed_log(tmp_path)
         c = _make_consolidator(log)
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(
-                KEY,
-                {
-                    "consolidation_attempts": 1,
-                    "consolidation_retry_at": time.time() + 3600,
-                },
-            )
+        await asyncio.to_thread(
+            log.update_metadata,
+            KEY,
+            {
+                "consolidation_attempts": 1,
+                "consolidation_retry_at": time.time() + 3600,
+            },
+        )
 
         c.consolidate_session(KEY)
         assert not c._tasks, "session expiry re-fired a backed-off consolidation"
 
         # Past the deadline the same call proceeds, so backoff delays rather than
         # disables the path.
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(KEY, {"consolidation_retry_at": time.time() - 1})
+        await asyncio.to_thread(
+            log.update_metadata, KEY, {"consolidation_retry_at": time.time() - 1}
+        )
         with patch.object(c, "_consolidate", new_callable=AsyncMock):
             c.consolidate_session(KEY)
             assert c._tasks
@@ -925,14 +925,14 @@ class TestEveryEntryPointRespectsTheAccounting:
 
         log = _seed_log(tmp_path)
         c = _make_consolidator(log)
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(
-                KEY,
-                {
-                    "consolidation_attempts": 2,
-                    "consolidation_retry_at": time.time() + 3600,
-                },
-            )
+        await asyncio.to_thread(
+            log.update_metadata,
+            KEY,
+            {
+                "consolidation_attempts": 2,
+                "consolidation_retry_at": time.time() + 3600,
+            },
+        )
 
         state = MagicMock()
         state.consolidator = c
@@ -945,8 +945,9 @@ class TestEveryEntryPointRespectsTheAccounting:
         assert resp.status == 429
         assert not c._tasks, "manual trigger bypassed the backoff"
 
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(KEY, {"consolidation_retry_at": time.time() - 1})
+        await asyncio.to_thread(
+            log.update_metadata, KEY, {"consolidation_retry_at": time.time() - 1}
+        )
         with patch.object(c, "_consolidate", new_callable=AsyncMock):
             resp = await api_memory_consolidate(request)  # type: ignore[arg-type]
             assert resp.status == 200
@@ -996,14 +997,14 @@ class TestTheManualTriggerClaimsAtomically:
 
         log = _seed_log(tmp_path)
         c = _make_consolidator(log)
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(
-                KEY,
-                {
-                    "consolidation_attempts": 2,
-                    "consolidation_retry_at": time.time() + 3600,
-                },
-            )
+        await asyncio.to_thread(
+            log.update_metadata,
+            KEY,
+            {
+                "consolidation_attempts": 2,
+                "consolidation_retry_at": time.time() + 3600,
+            },
+        )
 
         state = MagicMock()
         state.consolidator = c
@@ -1018,8 +1019,9 @@ class TestTheManualTriggerClaimsAtomically:
 
         # Once the backoff expires the same key is dispatchable again, which it
         # would not be if the refusal above had left the claim in place.
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(KEY, {"consolidation_retry_at": time.time() - 1})
+        await asyncio.to_thread(
+            log.update_metadata, KEY, {"consolidation_retry_at": time.time() - 1}
+        )
         with patch.object(c, "_consolidate", new_callable=AsyncMock):
             resp = await api_memory_consolidate(request)  # type: ignore[arg-type]
             assert resp.status == 200
@@ -1036,21 +1038,20 @@ class TestConsolidateIsTheEligibilityChokePoint:
     """
 
     def _arm_backoff(self, log: ConversationLog, attempts: int = 1) -> None:
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(
-                KEY,
-                {
-                    "consolidation_attempts": attempts,
-                    "consolidation_retry_at": time.time() + 3600,
-                },
-            )
+        log.update_metadata(
+            KEY,
+            {
+                "consolidation_attempts": attempts,
+                "consolidation_retry_at": time.time() + 3600,
+            },
+        )
 
     @pytest.mark.asyncio
     async def test_a_direct_call_inside_the_backoff_bills_nothing(self, tmp_path):
         """No caller pre-check at all — the inner gate alone must refuse."""
         log = _seed_log(tmp_path)
         c = _make_consolidator(log)
-        self._arm_backoff(log)
+        await asyncio.to_thread(self._arm_backoff, log)
 
         with patch.object(c, "_call_llm", new_callable=AsyncMock) as spy:
             await c._consolidate(KEY, include_history=True)
@@ -1081,7 +1082,7 @@ class TestConsolidateIsTheEligibilityChokePoint:
         schedules a task (this path runs on every user turn)."""
         log = _seed_log(tmp_path, count=history_mod._CONSOLIDATION_THRESHOLD)
         c = _make_consolidator(log)
-        self._arm_backoff(log)
+        await asyncio.to_thread(self._arm_backoff, log)
 
         with patch.object(c, "_call_llm", new_callable=AsyncMock) as spy:
             c.maybe_consolidate(KEY)
@@ -1101,7 +1102,7 @@ class TestConsolidateIsTheEligibilityChokePoint:
         True; the second (the inner gate) tells the truth."""
         log = _seed_log(tmp_path, count=history_mod._CONSOLIDATION_THRESHOLD)
         c = _make_consolidator(log)
-        self._arm_backoff(log)
+        await asyncio.to_thread(self._arm_backoff, log)
 
         with (
             patch.object(c, "_call_llm", new_callable=AsyncMock) as spy,
@@ -1126,7 +1127,7 @@ class TestConsolidateIsTheEligibilityChokePoint:
         gate's refusal path actually runs."""
         log = _seed_log(tmp_path, count=history_mod._CONSOLIDATION_THRESHOLD)
         c = _make_consolidator(log)
-        self._arm_backoff(log)
+        await asyncio.to_thread(self._arm_backoff, log)
 
         with (
             patch.object(c, "_call_llm", new_callable=AsyncMock),
@@ -1142,8 +1143,9 @@ class TestConsolidateIsTheEligibilityChokePoint:
 
         # Once the backoff expires the same key is dispatchable again, which
         # it would not be if the refusal above had left the claim in place.
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(KEY, {"consolidation_retry_at": time.time() - 1})
+        await asyncio.to_thread(
+            log.update_metadata, KEY, {"consolidation_retry_at": time.time() - 1}
+        )
         with patch.object(c, "_call_llm", AsyncMock(return_value={"history_entry": "x"})) as spy:
             c.consolidate_session(KEY)
             assert c._tasks, "a released key was still refused after the backoff"
@@ -1175,7 +1177,7 @@ class TestConsolidateIsTheEligibilityChokePoint:
         actually runs."""
         log = _seed_log(tmp_path, count=history_mod._CONSOLIDATION_THRESHOLD)
         c = _make_consolidator(log)
-        self._arm_backoff(log)
+        await asyncio.to_thread(self._arm_backoff, log)
 
         with (
             patch.object(c, "_call_llm", new_callable=AsyncMock) as spy,
@@ -1192,8 +1194,9 @@ class TestConsolidateIsTheEligibilityChokePoint:
 
         # Once the backoff expires the SAME window is retried — the refusal
         # delayed the extraction rather than dropping it.
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(KEY, {"consolidation_retry_at": time.time() - 1})
+        await asyncio.to_thread(
+            log.update_metadata, KEY, {"consolidation_retry_at": time.time() - 1}
+        )
         with patch.object(c, "_call_llm", AsyncMock(return_value={"noop": True})) as spy:
             c.maybe_consolidate(KEY)
             assert c._tasks, "the un-advanced offset did not re-arm the threshold"
@@ -1209,7 +1212,7 @@ class TestConsolidateIsTheEligibilityChokePoint:
         the backoff skip instead of a false success."""
         log = _seed_log(tmp_path)
         c = _make_consolidator(log)
-        self._arm_backoff(log)
+        await asyncio.to_thread(self._arm_backoff, log)
 
         with patch.object(c, "_call_llm", new_callable=AsyncMock) as spy:
             assert (await c.consolidate_now(KEY)).status == "skipped"

@@ -22,12 +22,14 @@ is idle.
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
 import logging
+import sys
 import time
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from kiro_crew.dashboard.slot_ownership import app_owns_slot_session
 from kiro_crew.dashboard.slot_projection import summary_rows
@@ -53,6 +55,26 @@ SWEEP_INTERVAL_SECS = 3600.0
 #: Where the archive notifications send the person: the chat page with the
 #: History pane open.
 HISTORY_URL = "/chat?history=1"
+
+#: The History notice's dashboard copy ids (``noteText`` in ``notifMeta.tsx``).
+HistoryNote = Literal["moved_to_history_startup", "moved_to_history_idle"]
+
+#: The English the History notice keeps, per copy id, singular then plural: the
+#: ``_one`` / ``_other`` bodies of that id in ``en.manual.json``.
+_HISTORY_NOTE_BODY: dict[HistoryNote, tuple[str, str]] = {
+    "moved_to_history_startup": (
+        "{count} older open tab was left in History at startup to keep {limit} sessions"
+        " open at most. Open History to resume it.",
+        "{count} older open tabs were left in History at startup to keep {limit} sessions"
+        " open at most. Open History to resume one.",
+    ),
+    "moved_to_history_idle": (
+        "Archived {count} session idle past the {days}-day mark to History to stay under"
+        " the {limit}-session limit. Open History to resume it.",
+        "Archived {count} sessions idle past the {days}-day mark to History to stay under"
+        " the {limit}-session limit. Open History to resume one.",
+    ),
+}
 
 
 def _bound_keys(pairs: Iterable[tuple[Any, Any]]) -> set[str]:
@@ -87,6 +109,102 @@ def live_loop_slot_keys(*, include_paused: bool = False) -> set[str] | None:
     if svc is None:
         return None
     return loop_slot_keys(svc.list_all(), include_paused=include_paused)
+
+
+#: The holder service's module. Looked up rather than imported, and imported only
+#: to read its store with the switch on, so with
+#: ``mcp_gateway.resource_subscriptions.enabled`` off the sweep loads nothing and
+#: reads nothing for a feature nobody turned on.
+_RESOURCE_SUBSCRIPTIONS_MODULE = "kiro_crew.mcp_gateway.resource_subscriptions"
+
+
+class _Default(enum.Enum):
+    """What :func:`select_idle_slot_keys` reads when its caller passes no *subscribed*."""
+
+    #: :func:`live_subscribed_slot_keys` and never the store: a synchronous
+    #: caller may be on the event loop.
+    MEMORY_ONLY = enum.auto()
+
+
+def _subscribed_slot_keys(session_keys: Iterable[str]) -> set[str]:
+    from kiro_crew.dashboard.chat_utils import (  # circular: chat_utils -> state
+        dashboard_slot_key,
+    )
+
+    return {dashboard_slot_key(key) or key.removeprefix("dashboard:") for key in session_keys}
+
+
+def _subscription_service() -> Any:
+    module = sys.modules.get(_RESOURCE_SUBSCRIPTIONS_MODULE)
+    return module.active_service() if module is not None else None
+
+
+def live_subscribed_slot_keys() -> set[str] | None:
+    """Subscribed slot keys memory can vouch for; ``None`` when only the store can.
+
+    A started service whose store was readable owns the authoritative record
+    set. Without one the switch decides: off, no record can be live (an empty
+    set); on, the records are the store's, whether no service runs, one is still
+    starting, or one started on a store it could not read.
+    """
+    service = _subscription_service()
+    if service is not None and service.started and not service.store_unreadable:
+        return _subscribed_slot_keys(r.session_key for r in service.records())
+    from kiro_crew.config import live
+
+    config = live.snapshot()
+    if config is None or not config.mcp_gateway.resource_subscriptions.enabled:
+        return set()
+    return None
+
+
+def stored_subscription_session_keys() -> set[str] | None:
+    """Session keys the resource subscription store on disk holds. BLOCKING.
+
+    The store the service starts on (``default_store``), read while no service
+    can answer for it. It is never written here, and a missing store holds
+    nothing; a store that cannot be read returns ``None``, which callers treat
+    as "unknown".
+    """
+    from kiro_crew.mcp_gateway.resource_subscription_store import StoreUnreadable
+    from kiro_crew.mcp_gateway.resource_subscriptions import default_store
+
+    store = default_store()
+    try:
+        records = store.load()
+    except (OSError, StoreUnreadable):
+        logger.warning(
+            "Could not read the resource subscription store at %s", store.path, exc_info=True
+        )
+        return None
+    return {r.session_key for r in records}
+
+
+async def resource_subscribed_slot_keys() -> set[str] | None:
+    """The slot keys whose session holds an MCP resource subscription, read once per pass.
+
+    What :func:`live_subscribed_slot_keys` answers, else the store, read off the
+    event loop. ``None`` only when the store cannot be read, and then every slot
+    is kept.
+    """
+    keys = live_subscribed_slot_keys()
+    if keys is not None:
+        return keys
+    stored = await asyncio.to_thread(stored_subscription_session_keys)
+    return None if stored is None else _subscribed_slot_keys(stored)
+
+
+def service_subscribed_slot_keys() -> set[str]:
+    """The slot keys in the active service's records, started or not. Never blocks.
+
+    For the re-check right before a pop. Only a running service adds a record,
+    and it can add one after the pass read its set: a service that started
+    mid-pass, or one whose subscribe lands before ``started`` is set.
+    """
+    service = _subscription_service()
+    if service is None:
+        return set()
+    return _subscribed_slot_keys(r.session_key for r in service.records())
 
 
 def stored_loop_slot_keys() -> set[str] | None:
@@ -173,8 +291,25 @@ def note_foreground(state: "DashboardState", conn: int, slot_key: object) -> Non
         return
     if isinstance(slot_key, str) and slot_key and len(slot_key) <= _MAX_FOREGROUND_KEY:
         slots[conn] = slot_key
+        state.last_focused_slot = slot_key
+        # A tab the restore still owes moves to the front of what is left of it.
+        if (
+            getattr(state, "restoring_open_slots", False)
+            and slot_key in state.restoring_open_slot_keys
+            and slot_key not in state._slots
+        ):
+            # The latest focus is the tab the person is on, so it goes first.
+            if slot_key in state.restore_front_keys:
+                state.restore_front_keys.remove(slot_key)
+            state.restore_front_keys.insert(0, slot_key)
     else:
         slots.pop(conn, None)
+    # Emptied by a blur or a closed socket, the last answer stays: it is what the
+    # shutdown flush records.
+    if slots:
+        state.last_visible_slots = tuple(
+            dict.fromkeys(v for v in slots.values() if v != state.last_focused_slot)
+        )
 
 
 def foreground_slot_keys(state: "DashboardState") -> set[str]:
@@ -234,6 +369,7 @@ def select_idle_slot_keys(
     *,
     looped: set[str],
     cutoff: float,
+    subscribed: set[str] | None | _Default = _Default.MEMORY_ONLY,
     request_app: str = "",
     active_slot: str = "",
     skip_running: bool = False,
@@ -243,21 +379,35 @@ def select_idle_slot_keys(
     """Pick the live slots idle since before *cutoff*.
 
     Skips pinned slots, slots in *looped* (an armed auto-nudge loop is idle by
-    nature between cycles, and archiving its tab ends the loop for good), when
-    *request_app* is set every slot that app does not own on its own session and
-    transcript (the per-slot checkpoint's rule), slots whose activity is unknown, with
+    nature between cycles, and archiving its tab ends the loop for good), slots
+    in *subscribed*, whose session holds an MCP resource subscription (the same
+    reason; every slot while it is ``None``, unknown), when *request_app* is set
+    every slot that app does not own on its own session and transcript (the
+    per-slot checkpoint's rule), slots whose activity is unknown, with
     *skip_running* slots with a turn in flight, with *skip_app_owned* every
     app-owned slot, and with *skip_busy* slots a connected dashboard shows in
     the foreground, waiting on an approval or with sub-agent work attached
     (:func:`foreground_slot_keys`, :func:`has_pending_approval`,
     :func:`subagents_attached_now`). *active_slot* is never picked; the second
     return value says whether it would have been.
+
+    An async caller passes *subscribed* from :func:`resource_subscribed_slot_keys`.
+    Without it only memory answers (:func:`live_subscribed_slot_keys`), so where
+    only the store knows, every slot is kept.
     """
+    if subscribed is _Default.MEMORY_ONLY:
+        subscribed = live_subscribed_slot_keys()
     stale: list[str] = []
     active_is_stale = False
     for name in list(state._slots):
         slot = state._slots.get(name)
-        if slot is None or slot.pinned or name in looped:
+        if (
+            slot is None
+            or slot.pinned
+            or name in looped
+            or subscribed is None
+            or name in subscribed
+        ):
             continue
         if request_app and not app_owns_slot_session(request_app, slot):
             continue
@@ -282,13 +432,22 @@ def select_idle_slot_keys(
 
 
 def _still_idle_check(
-    state: "DashboardState", slot: "_ChatSlot", name: str, cutoff: float
+    state: "DashboardState",
+    slot: "_ChatSlot",
+    name: str,
+    cutoff: float,
+    *,
+    subscribed: set[str] | None,
 ) -> Callable[[], None]:
     """The synchronous re-check ``close_slot`` runs right before it pops *slot*.
 
     It first asks that *name* still holds *slot*: the sweep awaits its probes
     after reading the slot, and a tab closed and reopened under the same key in
     that window is a different session the re-check never judged.
+
+    *subscribed* is the set the pass selected with, since reading the store
+    blocks. The active service's records are read again here: a service can add
+    one after the pass read its set (:func:`service_subscribed_slot_keys`).
     """
 
     def _check() -> None:
@@ -302,6 +461,9 @@ def _still_idle_check(
             or slot._app
             or looped is None
             or name in looped
+            or subscribed is None
+            or name in subscribed
+            or name in service_subscribed_slot_keys()
             or slot_last_activity(slot) >= cutoff
             or name in foreground_slot_keys(state)
             or has_pending_approval(state, slot)
@@ -330,17 +492,25 @@ async def _queued_or_attached(state: "DashboardState", slot: "_ChatSlot") -> boo
         return True
 
 
-def notify_left_in_history(state: "DashboardState", count: int, reason: str) -> None:
-    """Tell the person *count* tabs left the sidebar for History. Never raises."""
+def notify_left_in_history(
+    state: "DashboardState", copy_id: HistoryNote, count: int, **params: int
+) -> None:
+    """Tell the person *count* tabs left the sidebar for History. Never raises.
+
+    *copy_id* names the note's dashboard copy, which *count* and *params* fill.
+    """
     if count <= 0:
         return
+    params = {"count": count, **params}
+    one, other = _HISTORY_NOTE_BODY[copy_id]
     try:
         state.notify(
             "agent",
             "Sessions moved to History",
-            f"{reason} Open History to resume one.",
+            (one if count == 1 else other).format(**params),
             meta={"count": count},
             url=HISTORY_URL,
+            i18n={"id": copy_id, "params": params},
         )
     except Exception:  # noqa: BLE001 - the log line below is the fallback report
         logger.warning("Could not publish the History notice for %d tab(s)", count, exc_info=True)
@@ -365,6 +535,9 @@ async def sweep_idle_slots(
     """
     if idle_days <= 0 or state.live_slot_count() < SWEEP_HIGH_WATER:
         return []
+    # Before the loop read: this read can await the store, and the selection then
+    # sees the loops as they are now.
+    subscribed = await resource_subscribed_slot_keys()
     # A PAUSED loop exempts its tab too: ``close_slot`` removes whatever loop the
     # slot holds, and a resume can land while that removal waits for the lock.
     looped = live_loop_slot_keys(include_paused=True)
@@ -378,6 +551,7 @@ async def sweep_idle_slots(
         state,
         looped=looped,
         cutoff=cutoff,
+        subscribed=subscribed,
         skip_running=True,
         skip_app_owned=True,
         skip_busy=True,
@@ -393,7 +567,7 @@ async def sweep_idle_slots(
             continue
         if await _queued_or_attached(state, slot):
             continue
-        still_idle = _still_idle_check(state, slot, name, cutoff)
+        still_idle = _still_idle_check(state, slot, name, cutoff, subscribed=subscribed)
         try:
             # Synchronous and immediately before the call: no await may separate
             # this check from close_slot retiring the slot's loop.
@@ -412,10 +586,7 @@ async def sweep_idle_slots(
             "Idle slot sweep archived %d session(s) idle over %d day(s)", len(archived), idle_days
         )
         notify_left_in_history(
-            state,
-            len(archived),
-            f"Archived {len(archived)} session(s) idle over {idle_days} day(s) to History "
-            f"to stay under the {MAX_LIVE_SLOTS}-session limit.",
+            state, "moved_to_history_idle", len(archived), days=idle_days, limit=MAX_LIVE_SLOTS
         )
     return archived
 

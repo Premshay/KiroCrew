@@ -81,11 +81,13 @@ CAPABILITY_FIELDS = (
     "crew_fires_spec_hooks",
     "crew_fires_spec_observer_hooks",
     "supports_native_todos",
+    "keeps_own_checklist",
     "runs_own_slash_commands",
     "honors_zero_tool_ban",
     "acp_client_spawnable",
     "honors_remote_mcp_oauth",
     "native_workflows",
+    "refines_tool_call_titles",
 )
 
 
@@ -335,25 +337,23 @@ def test_codex_still_needs_its_read_only_mode() -> None:
     assert permission_config_for(ACP_BACKEND_CODEX) == ("mode", "read-only")
 
 
-def test_known_membership_is_unchanged_by_the_move() -> None:
-    """``ACP_BACKENDS_KNOWN`` gained and lost nothing.
+def test_known_membership_is_exactly_the_declared_backend_ids() -> None:
+    """``ACP_BACKENDS_KNOWN`` names every declared ``ACP_BACKEND_<NAME>`` id and nothing else.
 
     Membership is the gate on the ``acp_backend`` kwarg, so a widened set means
-    provider construction accepts a value it must reject.
+    provider construction accepts a value it must reject. The ids are read off the
+    module's ``ACP_BACKEND_<NAME>`` constants, so a new harness declared there and
+    added to the set needs no edit here, while a stray literal (the stored ``"kiro"``
+    spelling, a typo) or a declared id left out of the set fails.
     """
-    assert sorted(sdk_backends.ACP_BACKENDS_KNOWN) == [
-        "",
-        "claude",
-        "codex",
-        "copilot",
-        "deepseek",
-        "goose",
-        "kas",
-        "mimocode",
-        "opencode",
-        "pi",
-        "strands",
-    ]
+    declared = {
+        value
+        for name, value in vars(sdk_backends).items()
+        if re.fullmatch(r"ACP_BACKEND_[A-Z0-9]+", name) and isinstance(value, str)
+    }
+    assert declared, "no ACP_BACKEND_<NAME> constant was found"
+    assert sdk_backends.ACP_BACKENDS_KNOWN == declared
+    assert sdk_backends.STORED_BACKEND_KIRO not in sdk_backends.ACP_BACKENDS_KNOWN
 
 
 #: Every capability field for every known id, plus an unknown one.
@@ -695,7 +695,9 @@ def test_honor_zero_tool_ban_membership_matches_the_rule() -> None:
     # ``_deny_zero_tools`` sees each one. Copilot CLI 1.0.100 reads a file inside the
     # session's own directory without asking (measured, see the set's comment), so a
     # total ban cannot be honoured there even though the three facts hold.
-    reads_unasked = {sdk_backends.ACP_BACKEND_COPILOT}
+    # Antigravity ACP 1.4.4 ran every file read of a signed-in turn without asking
+    # (``acp_frames/antigravity/turn-live-tools.jsonl``).
+    reads_unasked = {sdk_backends.ACP_BACKEND_COPILOT, sdk_backends.ACP_BACKEND_ANTIGRAVITY}
     # A second ground, beside the refusal: a zero-tool session that MOUNTS NO TOOL,
     # so no call exists for a pre-approval to run. claude's session options carry an
     # empty ``tools`` with ``strictMcpConfig`` and an empty wire array, measured on
@@ -746,7 +748,7 @@ def test_a_harness_with_unasked_tools_is_trusted_with_no_permission_side_refusal
     unasked = sdk_backends.ACP_BACKENDS_UNASKED_NATIVE_TOOLS
     assert not unasked & sdk_backends.ACP_BACKENDS_HONOR_ZERO_TOOL_BAN
     assert not unasked & sdk_backends.ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS
-    assert unasked == {sdk_backends.ACP_BACKEND_MIMOCODE}
+    assert unasked == {sdk_backends.ACP_BACKEND_ANTIGRAVITY, sdk_backends.ACP_BACKEND_MIMOCODE}
 
 
 def test_the_knowledge_pool_client_takes_the_default_backend() -> None:

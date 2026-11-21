@@ -10,10 +10,10 @@ The instance store is two modules and one route, each with one job:
 | Piece | Where | What it owns |
 |---|---|---|
 | registry | `dashboard_templates/catalog.py` | the built-in templates and the operator's own, one loader |
-| instance | `dashboard_templates/instance.py` | the copy, its versions, rollback, state, history |
+| instance | `dashboard_templates/instance.py`, with `instance_adopt.py` for the adopt-only-while-empty form, `instance_read.py` for the link-refusing opens of a reader without the lock, and `instance_remove.py` for the import card's Undo of an adopted page | the copy, its versions, rollback, state, history |
 | route | `dashboard/handlers/member_dashboard.py` | what the frame reads |
 
-The agent-facing surface is separate and MCP-only: `dashboard/handlers/agent_panel_dashboard.py`, behind the `dashboard/handlers/agent_panel.py` facade, serves the `/api/agent-panel/dashboard/{fields,write,templates,preview,apply,rollback}` routes, `dashboard_agentic.py` checks and records agentic field writes and the mistake book, and `dashboard_feed.py` is the O(fields) subscription channel a filled page reads fold values through.
+The agent-facing surface is separate and MCP-only: `dashboard/handlers/agent_panel_dashboard.py`, behind the `dashboard/handlers/agent_panel.py` facade, serves the `/api/agent-panel/dashboard/{fields,types,write,save,templates,preview,apply,rollback}` routes (`record` and `snapshot` have their own modules, `agent_panel_record.py` and `agent_panel_snapshot.py`), `dashboard_agentic.py` checks and records agentic field writes and the mistake book, and `dashboard_feed.py` is the O(fields) subscription channel a filled page reads fold values through.
 
 An array or object field is emptied with `dashboard_write` `clear: true` and no
 `value`. The MCP server (`mcp_panel.py`) reads the field's declared type from the
@@ -103,20 +103,20 @@ Bot's own. An `empty` root session is shown `DEFAULT_TEMPLATE_ID`. Only shipped 
 match by name; an operator's page never does. The read route and the `[DASHBOARD]` turn
 block both resolve through it, and nothing is written. No shipped page may be named
 `default`.
-A ROOT session running the Ultra Mode conductor template (`crew_mode.runs_crew_mode`) gets the same
+A ROOT session running the conductor template of conductor mode (`crew_mode.runs_crew_mode`) gets the same
 `[DASHBOARD]` block on every dashboard turn, keyed by its own store key
 (`session_turn_block`), but only once a page is ADOPTED: the default page it is shown
 while `empty` asks nothing of it, so it gets no block. A root session on any other agent
-(not in Ultra Mode) or on a Bot (`agent_kind == "member"`), a dispatched or adopted
+(not in conductor mode) or on a Bot (`agent_kind == "member"`), a dispatched or adopted
 session, and a Bot DM get no session block; the page itself is left as it is.
-Switching a root session to the Ultra Mode conductor template (Ultra Mode on) adopts `goal-board` through the ordinary
+Switching a root session to the conductor template of conductor mode (conductor mode on) adopts `goal-board` through the ordinary
 `adopt` (`adopt_crew_mode_board_on_switch`, called by `switch_slot_agent`), only while the
 page is `empty`, so a page already chosen is kept and switching away changes nothing.
 It applies to a Persistent chat only (an unset memory mode counts as one): an Incognito
 or Temporary chat may not open sessions, so switching it to the conductor adopts nothing.
 With no page in force, the Bot's Dashboard tab on `/members` shows the suggestions
 page (`CrewDashboardEmpty`), and the turn block says so and lists no fields and no upkeep
-pointer. A shipped page named for the Bot is drawn as before. The decision is made
+pointer. A shipped page named for the Bot is drawn. The decision is made
 ONCE, by `dashboard_agentic.shows_suggestions` (template instance served, record `empty`,
 no page named for the slug, no package on screen): the read route sends it as
 `suggestions: true` and the website draws what that says, and `turn_block` asks the same
@@ -237,7 +237,9 @@ Three more rules hold for the operator root only:
 A live dashboard answers "what is true now", which is the wrong tool for "what was true
 when this went wrong". A snapshot is the second question, and it is the field values plus
 everything needed to know what they meant: template id, template version, instance
-version, values, seq.
+version, values, seq. This store is the RFC design and is not in the tree; the agent
+panel's `snapshot` route (`agent_panel_snapshot.py`) is a different thing, a PNG of the
+page in force kept under the data home.
 
 Each is required. A bag of numbers with no template is a page nobody can redraw; a page
 with no seq cannot be placed against the log it came from; values with no instance
@@ -267,53 +269,35 @@ directory per slug, so for a colliding slug the instance belongs to neither Bot,
 serving it to both -- with an editor -- would let them overwrite each other's dashboard.
 The exact name must derive this slug, exist in config, and be the only name that does.
 
-Both the READ and every WRITE are owner-gated, the same boundary `work_ledger_board`
-draws: the body carries this Bot's work-ledger and crew-log data (task titles,
-summaries, PR links), so arriving as rendered html does not make it a wider audience's. A
-non-owner is refused rather than served an empty read, which would show its numbers as
-stale when the truth is that they were withheld. A write mutates a stored page the
-gateway later renders. App tokens are denied outright -- an app
+Every WRITE is owner-gated, and so is the READ for everyone but one caller -- the same
+boundary `work_ledger_board` draws: the body carries this Bot's work-ledger and crew-log
+data (task titles, summaries, PR links), so arriving as rendered html does not make it a
+wider audience's. Any other non-owner is refused rather than served an empty read, which
+would show its numbers as stale when the truth is that they were withheld. A write
+mutates a stored page the gateway later renders. App tokens are denied outright -- an app
 token scoped to `/api/members` reaches these by prefix.
+
+The one caller is a team Crew teammate the Kiro relay verified, on a Bot in their roster
+(`member_dashboard._teammate_reader`, which calls `members_access._teammate_admitted` and
+audits `members.dashboard` under `resources="relay_teammate"`). They already run that
+Bot's turns and can ask it for any value its page shows, so they read the APPLIED page
+only: a staged page (`?preview=1`) and its Keep and Discard stay owner-only. Their read is
+one-shot. It never arms, replaces or evicts the live page the owner's tabs are pushed
+from, so the owner keeps its own language and version counter; the teammate's page is
+armed and disarmed in one worker call. A teammate's tab therefore gets no pushed frames
+and refreshes through its own timed re-read, and `/refetch`, which recovers a gap in
+those pushes, stays owner-only.
 
 All five rules live in one `_resolve` chokepoint, so a route added later cannot forget
 one of them, and a test reads the handlers' own syntax trees to assert every one calls it
 and every write calls the owner gate.
 
 The page is scrubbed before it is served, in both halves of the body (the raw `html` and the
-composed `rendered_html`), by `_template_text_safe`. Markup, attributes and prose get every
-redaction pass. The text of a `<script>` or `<style>` element gets every pass but the
-bare-secret guess for two shapes, so a page's code arrives as its author wrote it (a long alphabet to index
-into, a base64 data URI) while a key id, PEM block, JWT or prefixed token written into that
-code is still masked.
-
-`dashboard_frame.map_page_text` takes the full pass over the whole page as its baseline, and the
-one change it allows is to put the code pass's result for a script or style element's text where
-the baseline had the full pass's. So the page differs from the baseline only inside that text,
-and only by an ordered alphabet and a data URI payload, the two shapes the code pass spares. The baseline is cut at that text and the pieces are
-scrubbed one by one; a rule that reaches across a cut (a PEM block, a labelled value) makes them
-differ from the baseline, and then the baseline is the answer. The browser reads the page that
-comes out, so the result is scanned again, and unless the kept text is still exactly its script
-and style text the baseline is the answer as well. A page the full pass leaves alone, or with no
-such text, is the baseline.
-
-`dashboard_frame.code_spans` finds that text, and what it finds is a licence to apply a
-weaker rule, so it reads the page the way the HTML tokenizer does where that decides what is
-code: a `<script` inside a comment, a quoted attribute value or a `<textarea>` opens nothing,
-a `>` inside a quoted value does not end its tag, a bare value runs to white space or `>`, a
-script that holds `<!--` ends where the tokenizer's escape states end it (a `</script>` that
-closes a nested `<script>` does not), and names fold ASCII case and split on ASCII white space
-only. Where the tree builder decides
-instead, the scan reads a simple `<svg>` or `<select>` (text and ordinary tags up to its end
-tag) whole and goes on; any other `<svg>` or `<select>`, and every `<math>` and `<template>`
-(a column group inside one ignores a `<style>`), ends the scan.
-A frame may run with scripting on or off, and `<noscript>` holds text in one and markup in the
-other, so the scan ends at it too. It also ends at anything it cannot read (an element or tag
-that never ends, `<script/>` in HTML, `<plaintext>`) and after `_MAX_SCAN_STEPS` constructs.
-Everything after that point keeps every pass, as does every element past the first
-`MAX_CODE_PIECES`, so a page the scan doubts gets more masking, never less. A key in any other shape, labelled or not, is masked as it is anywhere. A key-shaped window inside
-a data URI payload of 64 characters or more is served as written, and a shuffled table is rewritten
-as before. A base64 data URI in an attribute (an `img` `src`) is markup, so it still gets every
-pass.
+composed `rendered_html`), by `_template_text_safe`: `redact_via_context` over the whole page,
+markup, attributes, prose and the text of every `<script>` and `<style>` element alike. The rule
+table masks only values that are credentials by themselves, so a page's code arrives as its author
+wrote it (a long alphabet to index into, a base64 data URI) while a PEM block, a signed JWT or a
+vendor token written into that code is masked.
 
 ## The staged preview is beside the record, never in it
 
@@ -362,11 +346,11 @@ them, and the parity rule is about the pair being committed.
 `MAX_RETAINED_VERSIONS` (20) versions one Bot keeps therefore hold at most 60 MiB
 of pages. A page passes
 two size checks -- this store's before it becomes a version, and the frame's before the
-document that renders it is assembled -- and two independent numbers meant the store
-could refuse a page the frame would happily draw. It did: `project-report` is over
-147,000 bytes and is `DEFAULT_TEMPLATE_ID`, so under a private 64 KiB ceiling no
-Bot could adopt it, and a root session that adopted anything else could never come
-back to the page it starts on. The frame is where the cost is actually paid, which
+document that renders it is assembled -- and two independent numbers would let the
+store refuse a page the frame would happily draw: `project-report` is over 170,000
+bytes and is `DEFAULT_TEMPLATE_ID`, so under a smaller store ceiling no Bot could
+adopt it, and a root session that adopted anything else could never come back to the
+page it starts on. The frame is where the cost is actually paid, which
 makes it the honest place for the number; `test_dashboard_templates_builtin.py` asserts
 the identity and takes every shipped template through preview and apply.
 
@@ -404,18 +388,13 @@ previews only: a session's page has no person route.
 
 A Bot's page changes only through its own `dashboard_apply`, `dashboard_rollback` and
 the person's Keep, and every version stays on disk, so `dashboard_rollback` is how a
-change is undone. The person's structure lock that once froze the page, its
-**Lock dashboard layout** switch, its badge, its `POST /api/members/{slug}/dashboard/lock`
-route and its LOCKED turn-block line are gone.
+change is undone. There is no lock switch, lock route or LOCKED turn-block line.
 
-A `crew-panels/<slug>.dashboard-lock` file written before the removal is neither read
-nor rewritten, and no migration runs: `read` serves `instance.json`, every commit goes
-through, and the page in force is the record. While a lock held, `_commit` refused every
-version, so the record still names the page the lock held unless the Bot's own shell
-rewrote `instance.json`; that version is still in `versions/`, so `dashboard_rollback`
-reaches it. A record written before the `package` key existed now follows the older
-package rule (`keeps_older_package_rule`) whether or not a lock file is beside it, as an
-unlocked record always did. Deleting a Bot leaves such a file where it is.
+A leftover `crew-panels/<slug>.dashboard-lock` file is neither read nor rewritten, and
+no migration runs: `read` serves `instance.json`, every commit goes through, and the
+page in force is the record. A record written before the `package` key existed follows
+the older package rule (`keeps_older_package_rule`) whether or not a lock file is
+beside it. Deleting a Bot leaves such a file where it is.
 
 ## Every commit syncs the upkeep helpers
 

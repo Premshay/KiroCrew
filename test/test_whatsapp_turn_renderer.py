@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from redaction_structured_cases import github_classic
 
 from conftest import host_abs
 from kiro_crew.messaging.display_safety import canonicalize_display
@@ -14,22 +15,22 @@ from kiro_crew.whatsapp.turn_renderer import WhatsAppRenderer
 
 CAPS = TransportCapabilities(max_message_chars=4096, max_buttons=0)
 
-#: Split so this file never holds the contiguous key: an absence assertion
-#: against a literal the source already carries proves nothing about the literal a
-#: scanner would have to match.
-KEY = "AKIA" + "IOSFODNN7EXAMPLE"
+#: Built at runtime so this file never holds the contiguous token: an absence
+#: assertion against a literal the source already carries proves nothing about the
+#: literal a scanner would have to match.
+KEY = github_classic(seed=143)
 #: A credential the driver's byte-level stream scan cannot see, because the bold
 #: markers break it. WhatsApp eats those markers, so the reader gets an intact key
 #: unless the renderer re-scans the form it actually sends.
-SPLIT_KEY = f"AKIA**I**{KEY[5:]}"
+SPLIT_KEY = f"{KEY[:4]}**{KEY[4]}**{KEY[5:]}"
 
 
 def shown(text: str) -> str:
     """*text* as a WhatsApp client renders it, with its markup consumed.
 
     Asserting on the delivered bytes is the mistake the display screen exists to
-    prevent: ``AKIA*I*OSFODNN7EXAMPLE`` passes ``KEY not in sent`` while the
-    reader sees the key.
+    prevent: ``ghp_*X*...`` passes ``KEY not in sent`` while the reader sees the
+    key.
     """
     return canonicalize_display(text)
 
@@ -52,6 +53,10 @@ class FakeTransport:
         self._n += 1
         # Distinct ids so a test can tell one bubble from another.
         return f"ID{self._n}"
+
+    # The real transport sends an already-converted chunk as it is; this fake
+    # converts nothing either way, so both land in ``sent``.
+    send_rendered = send_message
 
     async def send_image(self, jid: str, data: bytes, caption: str) -> str:
         self.images.append((jid, data, caption))
@@ -124,6 +129,44 @@ class TestBufferedEmit:
         await r.on_text_chunk("Pick one.\n[OPTIONS: a | b]")
         await r.on_done()
         assert transport.sent[0][1] == "Pick one."
+
+    async def test_a_converted_chunk_is_not_converted_again(self):
+        # ``send_message`` converts Markdown, as the real transport does; a
+        # second pass would read the first pass's bold ``*x*`` as italic.
+        from kiro_crew.whatsapp.renderer import render_chunks
+
+        class Converting(FakeTransport):
+            async def send_message(self, jid: str, content: str) -> str:
+                return await FakeTransport.send_message(
+                    self, jid, "\n".join(render_chunks(content))
+                )
+
+        transport, client = Converting(), FakeClient()
+        transport.client = client
+        r = WhatsAppRenderer(transport, client, "chat@s.whatsapp.net", CAPS)
+        await r.on_turn_start()
+        await r.on_text_chunk("# Plan\n**bold** and *it* and ***both***")
+        await r.on_done()
+        assert transport.sent[0][1] == "*Plan*\n*bold* and _it_ and *_both_*"
+
+    async def test_a_scratchpad_only_reply_posts_none_of_it(self):
+        # The body renders to no chunks, so the fallback must be converted too:
+        # sent as it is, it would post the model's ``<thinking>`` text.
+        from kiro_crew.whatsapp.renderer import render_chunks
+
+        class Converting(FakeTransport):
+            async def send_message(self, jid: str, content: str) -> str:
+                return await FakeTransport.send_message(
+                    self, jid, "\n".join(render_chunks(content))
+                )
+
+        transport, client = Converting(), FakeClient()
+        transport.client = client
+        r = WhatsAppRenderer(transport, client, "chat@s.whatsapp.net", CAPS)
+        await r.on_turn_start()
+        await r.on_text_chunk("<thinking>secret plan</thinking>")
+        await r.on_done()
+        assert not any("secret plan" in text for _, text in transport.sent)
 
     async def test_option_action_tag_after_options_is_stripped(self):
         r, transport, _ = make()

@@ -9,8 +9,9 @@ to the agent it dispatches, and acquiring the session that agent runs in; and
 arming the scheduler once memory is ready, and saying when startup moved an
 unreadable cron store aside.
 
-Orchestrator fields read: ``_cfg``, ``_no_crons``, ``_running_script_ids``,
-``ctx_builder``, ``dashboard_state``, ``sessions``.
+Orchestrator fields read: ``_cfg``, ``_cron_injecting``, ``_no_crons``,
+``_running_script_ids``, ``cron_svc``, ``ctx_builder``, ``dashboard_state``,
+``sessions``, ``subagent_mgr``.
 Orchestrator fields written: ``_cron_armed``, ``_cron_quarantine``,
 ``_cron_reconciled``, ``_cron_runs_holding`` (a message run's task, from before its
 first acquire to its end), ``cron_svc``.
@@ -34,7 +35,9 @@ if TYPE_CHECKING:
         LLMProvider,
         Path,
         _await_cron_fire_time_gate,
+        _defer_cron_before_dispatch,
         _pre_create_cron_slot,
+        _subagent_work_pending,
         agent_sequence_dispatches,
         build_cron_session_context,
         cron_job_env_without_reserved,
@@ -104,7 +107,7 @@ def _annotate_model_downgrade(job: CronJob, text: str) -> str:
     # job.model is LLM-controllable via MCP; redact before it
     # reaches Slack/dashboard through last_result.
     safe_model = redact_credentials(redact_exfiltration_urls(job.model)[0])[0]
-    return f"⚠️ Model '{safe_model}' unavailable; ran with default.\n\n" + text
+    return f"Warning: Model '{safe_model}' unavailable; ran with default.\n\n" + text
 
 
 async def _init_cron(self: GatewayOrchestrator, *, arm: bool = True) -> None:
@@ -161,6 +164,29 @@ async def _init_cron(self: GatewayOrchestrator, *, arm: bool = True) -> None:
             return outcome
 
         cap = await self._cron_capture(job)
+
+        # ── An app's job never runs as a Bot ──
+        # Every kind of job, before anything is dispatched: a script or command
+        # job's tool calls take the captured store too. A policy denial like the
+        # governance gates below, so it does not feed the auto-pause counter.
+        if _app_job_runs_as_bot(
+            job, cap.cron_execution, cap.cron_agent, live.snapshot() or getattr(self, "_cfg", None)
+        ):
+            job.last_status = "error"
+            job.last_error = APP_JOB_BOT_REFUSAL
+            job.fire_time_denied = True
+            try:
+                sel().log_tool_invocation(
+                    session_key=f"cron:{job.id}",
+                    tool_name="cron_dispatch",
+                    tool_kind="cron_message",
+                    outcome="denied",
+                    error=APP_JOB_BOT_REFUSAL,
+                )
+            except Exception:
+                logger.debug("SEL logging failed in the app-job Bot deny path", exc_info=True)
+            await self._alert_cron_failure(job, APP_JOB_BOT_REFUSAL, denied=True)
+            return None
 
         # ── Concurrent execution guard ──
         if (job.script or job.command) and job.id in self._running_script_ids:
@@ -294,6 +320,27 @@ async def _init_cron(self: GatewayOrchestrator, *, arm: bool = True) -> None:
     # A run the service's stop cuts short is filed cancelled and not retried,
     # so the owner is told here rather than left with only the history row.
     self.cron_svc.set_interrupt_alert(self._alert_cron_interrupted)
+    # A persisted auto-pause never runs again until resumed; the save that
+    # detects its rising edge runs on a worker thread, so the callback only
+    # hands the async notice to this loop. The futures are tracked so the
+    # exit path can drain a notice still in flight, bounded, before the loop
+    # ends. Per-service, like the two alerts above: it dies with the service.
+    # Read into a local while the create above still narrows the Optional:
+    # the nested def below would widen the attribute for the checker.
+    _cron_svc = self.cron_svc
+    _loop = asyncio.get_running_loop()
+
+    def _notify_auto_pause(job: CronJob, streak: int, reason: str) -> None:
+        fut = asyncio.run_coroutine_threadsafe(
+            self._alert_cron_auto_paused(job, streak, reason), _loop
+        )
+        # add() runs on whatever thread the save fired on while the done
+        # callback discards on the loop thread; each set operation is atomic
+        # under the GIL, so no lock is needed around the pair.
+        self._auto_pause_alerts.add(fut)
+        fut.add_done_callback(self._auto_pause_alerts.discard)
+
+    _cron_svc.set_auto_pause_alert(_notify_auto_pause)
     if self._no_crons:
         logger.info("Cron scheduler disabled (--no-crons)")
     else:
@@ -581,6 +628,65 @@ async def _cron_capture(self: GatewayOrchestrator, job: CronJob) -> _CronCapture
         prior_result,
         _gate_alias or cron_agent,
     )
+
+
+#: Why a fire of an app's job that captured a Bot's execution is refused.
+APP_JOB_BOT_REFUSAL = (
+    "an app's schedule cannot run as a Bot; recreate it with one of the app's own agents"
+)
+
+
+def _job_is_an_apps(job: CronJob) -> bool:
+    """Whether *job* carries an app's creator tag."""
+    return str(getattr(job, "created_by", "") or "").startswith("app:")
+
+
+def _app_job_runs_as_bot(
+    job: CronJob, cron_execution: ExecutionContext, cron_agent: str, cfg: Any
+) -> bool:
+    """Whether *job* is an app's and runs on a Bot's own: its capture or a file it names.
+
+    An app does not reach a Bot's memory store or chat by naming the Bot
+    (``execution_context.is_bot_own_execution``). A create refuses such a job; one
+    stored before that refusal still carries the capture, and is refused here.
+    Nor does it reach a Bot's own file: a name the job stores, its ``agent_id``
+    or any ``agent_sequence`` step, is judged for every job. The effective
+    ``cron_agent`` after default substitution is judged only for a job that
+    dispatches an agent. In the template namespace a Bot's own file
+    (``mate_worker.is_mate_owned_agent``) would load that Bot's prompt, servers
+    and tools, so such a job fails by name before dispatch.
+    """
+    from kiro_crew import mate_worker
+    from kiro_crew.execution_context import is_bot_own_execution
+
+    if not _job_is_an_apps(job):
+        return False
+    names = [job.agent_id, *(job.agent_sequence or [])]
+    if not (job.script or job.command):
+        names.append(cron_agent)
+    return is_bot_own_execution(cron_execution, cfg) or any(
+        mate_worker.is_mate_owned_agent(str(name or "").strip()) for name in names
+    )
+
+
+def _app_job_names_bot(job: CronJob, alias: str | None, cfg: Any) -> bool:
+    """Whether *job* is an app's and *alias*, a name it stores, is a Bot's own row.
+
+    Such a name is dispatched in the template namespace
+    (``_resolve_cron_agent(..., template_namespace=True)``): the run takes none
+    of the Bot's agent, workspace, model pin or crew identity, and a name no
+    template declares fails the run by name. A row on the shared store still
+    collapses, as for any job. In memory; a row whose binding cannot be
+    resolved answers True, so it is not handed to an app on a guess.
+    """
+    if not alias or not _job_is_an_apps(job) or alias not in (getattr(cfg, "agents", None) or {}):
+        return False
+    from kiro_crew.execution_context import is_bot_own_execution, resolve_member_execution
+
+    try:
+        return is_bot_own_execution(resolve_member_execution(cfg, alias), cfg)
+    except ValueError:
+        return True
 
 
 def _resolve_cron_agent(
@@ -882,6 +988,59 @@ def _retained_session_agent_mismatch(
     if isinstance(live_agent, str) and live_agent and live_agent != (agent or ""):
         return live_agent
     return None
+
+
+async def _cron_key_work_pending(self: GatewayOrchestrator, key: str) -> bool:
+    """Whether sub-agent work or an injection still runs on *key*'s session.
+
+    A sub-agent probe that raises counts as pending: a batch is never reset under
+    work nobody could rule out.
+    """
+    if self._cron_injecting.get(key, 0) > 0:
+        return True
+    if not self.subagent_mgr:
+        return False
+    try:
+        return await _subagent_work_pending(self.subagent_mgr, key)
+    except Exception:  # noqa: BLE001 - counted as pending
+        logger.debug(
+            "cron: sub-agent work on %s unreadable; counted as pending", key, exc_info=True
+        )
+        return True
+
+
+async def _cron_batch_kind_defers(
+    self: GatewayOrchestrator,
+    job: CronJob,
+    key: str,
+    provider: Any,
+    *,
+    reprojected: bool,
+) -> bool:
+    """Defer a scheduled fire that cannot run on the batch a person's turn projected.
+
+    That batch recorded withholding what the fire auto-approves
+    (``kas_project_hooks.scheduled_turn_reprojects``), so the fire re-projects it
+    first. Before the re-projection, it waits while work is pending on *key*
+    (``_cron_key_work_pending``: sub-agent work, an injection, or a probe that
+    raised); after it (*reprojected*), it waits when the batch is still
+    person-kind, never running on it or dropping the spec's hooks. A manual Run is
+    never deferred: its person is there to answer the asks, so with work pending it
+    runs as projected, without the kind reset (the caller's ``scheduled=False``).
+    """
+    from kiro_crew.agent_sdk.kas_project_hooks import scheduled_turn_reprojects
+
+    if not scheduled_turn_reprojects(provider):
+        return False
+    if self.cron_svc is not None and self.cron_svc.run_trigger(job.id) == "manual":
+        return False
+    if not reprojected and not await self._cron_key_work_pending(key):
+        return False
+    logger.info("Cron '%s': %s runs a person's batch; deferring this fire", job.name, key)
+    _defer_cron_before_dispatch(
+        job, "the session runs a batch a person's turn projected and cannot be re-projected yet"
+    )
+    return True
 
 
 def _announce_cron_quarantine(self: GatewayOrchestrator) -> None:

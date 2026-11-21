@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
-from kiro_crew.apps.manager import TASK_RUNNER_APP, TASK_RUNNER_DISABLED_MESSAGE, app_disabled
+from kiro_crew.config.fields import _coerce_bool
 from kiro_crew.constants import DENY_CAUSE_SURFACE_POLICY
 from kiro_crew.dashboard.handlers._shared import (
     read_bounded_json,
@@ -36,6 +36,7 @@ from kiro_crew.shared_crew.turn_gate import TurnRefused
 from kiro_crew.start_priority import StartPriority
 from kiro_crew.task_planner import plan_to_yaml
 from kiro_crew.taskrunner import WorkflowInitializing
+from kiro_crew.taskrunner_switch import task_runner_off
 from kiro_crew.workflow_memory import capture_admission_execution
 
 if TYPE_CHECKING:
@@ -158,7 +159,7 @@ async def _require_taskrunner_owner(request: web.Request, operation: str) -> web
     the class ``is_owner_dashboard_request`` can rule on at all. The other two
     caller classes keep the control that already governs them -- an
     ``X-Internal-Secret`` loopback process (the ``task_run`` MCP tool) reaches
-    here with ``app`` ABSENT, and an app token (the Projects app declares
+    here with ``app`` ABSENT, and an app token (an app whose manifest declares
     ``/api/taskrunner``) is confined to its manifest's declared paths by
     ``_enforce_app_scope``.
     """
@@ -168,12 +169,14 @@ async def _require_taskrunner_owner(request: web.Request, operation: str) -> web
 
 
 async def _task_runner_disabled() -> web.Response | None:
-    """409 while Task Runner is off in Library: a run would have no page to watch or stop it."""
-    if not await asyncio.to_thread(app_disabled, TASK_RUNNER_APP):
+    """409 while Task Runner is turned off (``taskrunner.enabled``, or the ``apps`` policy).
+
+    The code stays ``app_disabled``, the answer every start gave while Task Runner was
+    an app, so a client reading it needs no change.
+    """
+    if (refusal := await asyncio.to_thread(task_runner_off)) is None:
         return None
-    return web.json_response(
-        {"error": TASK_RUNNER_DISABLED_MESSAGE, "code": "app_disabled"}, status=409
-    )
+    return web.json_response({"error": refusal, "code": "app_disabled"}, status=409)
 
 
 async def _gate_auto_approve(
@@ -412,6 +415,7 @@ async def _claim_plan_dir(work_dir: Path) -> tuple[str, Path]:
         try:
             _new_id, task_dir = worker.result()
         except Exception:
+            # The claim failed, so there is no directory to remove.
             pass
         else:
             try:
@@ -983,13 +987,13 @@ async def api_taskrunner_to_chat(request: web.Request) -> web.Response:
     lines.append("\n## Step Results\n")
     for s in run.tasks:
         if s.status == TaskStatus.PASSED:
-            icon = "✅"
+            icon = "Done:"
         elif s.status == TaskStatus.FAILED:
-            icon = "❌"
+            icon = "Error:"
         elif s.status in (TaskStatus.IN_PROGRESS, TaskStatus.REVIEWING):
-            icon = "🔄"
+            icon = "Running:"
         else:
-            icon = "⏭"
+            icon = "Skipped:"
         lines.append(f"{icon} **Step {s.index}: {s.title}**")
         if s.error:
             lines.append(f"  Error: {s.error[:300]}")
@@ -1226,7 +1230,10 @@ async def api_taskrunner_execute_plan(request: web.Request) -> web.Response:
         return body_err
     assert body is not None  # read_bounded_json returns (dict, None) on success
     agent = body.get("agent", "")
+    # bool("false") is True: the shared reader maps the usual spellings, and any
+    # other value keeps the same truth test as before.
     fresh = body.get("fresh", False)
+    fresh = _coerce_bool(fresh, bool(fresh))
     workspace_dir = body.get("workspace_dir", "")
     # Same provenance gate as /start: an app/proxy-embedded caller cannot mint
     # trust on the resume/execute path either (no source claim here — the run

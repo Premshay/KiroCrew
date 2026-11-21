@@ -86,7 +86,7 @@ home). Pass them with `-e` / compose `environment:`:
 | `KIRO_API_KEY` | kiro-cli model credential alternative to interactive login |
 | `KIROCREW_PORT` | Dashboard port (default 5476) |
 | `KIROCREW_BIND` | Bind address inside the container (image default `0.0.0.0`; see below) |
-| `KIROCREW_ALLOW_UNSANDBOXED` | Set `1` to explicitly allow agent exec without the inner sandbox (see Sandbox below) |
+| `KIROCREW_ALLOW_UNSANDBOXED` | Set `1` on first run (no `config.json` in the volume yet) to explicitly allow agent exec without the inner sandbox (see Sandbox below) |
 
 Credential hygiene: on every start the entrypoint moves the channel
 credentials it finds in the environment into the data home's `.env` file
@@ -169,6 +169,10 @@ new link with `docker exec kirocrew kirocrew token --ttl 2h`, as in
 
 There is no in-container auto-update: the image is immutable and the tag is
 the version selector (channel tags track their channel; version tags pin).
+**Settings → About** still checks the release feed: when it lists a newer
+version and GHCR confirms that version's image can be pulled, About names it
+("Version X is available as a container image") with a Release notes link.
+Nothing is applied from there; you still pull the new image as above.
 
 ## Networking and security model
 
@@ -181,7 +185,7 @@ the version selector (channel tags track their channel; version tags pin).
   host-local.
 - **Auth surface, precisely:** the API and WebSocket surface requires a
   valid dashboard token (cookie or minted link) regardless of bind
-  address. Three deliberate carve-outs exist, none of which serve secrets:
+  address. Four deliberate carve-outs exist, none of which serve secrets:
   1. **Liveness probes** — `/api/health`, `/api/live`, `/api/ready` are
      tokenless AND exempt from the DNS-rebinding Host check (orchestrators
      address containers by IP). Their payloads are secret-free; the build
@@ -191,13 +195,23 @@ the version selector (channel tags track their channel; version tags pin).
      similar non-secret static files are served without a token (standard
      SPA bootstrap; the app is useless without a token once loaded).
   3. **Local bootstrap** — `/api/token/local`, `/api/shutdown`,
-     `/api/logout` and `/api/update/revalidate` require a same-machine peer
+     `/api/logout`, `/api/update/revalidate` and `/api/relay-viewer/token`
+     require a same-machine peer
      (a loopback address, or a same-user peer on the dashboard's
      kernel-verified unix socket) **plus** a filesystem secret, so they are
      unreachable through the published port by construction.
-  CSRF origin checks apply to all state-changing requests, and the
-  DNS-rebinding Host barrier applies to every request except the three
-  probe paths.
+  4. **Self-authenticating routes** — inbound webhooks
+     (`POST /api/hooks/agent`, `GET /api/hooks/agent/status`,
+     `POST /api/messaging/teams`), the connection OAuth callback
+     (`GET /api/connections/oauth/callback`), and the HMAC-token frame
+     documents (`/sandbox-doc/`, `/app-frame/`, `/app-frame-fetch/`) skip the
+     dashboard-token gate because each handler checks its own credential
+     (a webhook token, a Bot Framework JWT, a pending sign-in `state`, or a
+     minted path token or capability).
+  CSRF origin checks apply to all state-changing requests except
+  `POST /api/messaging/teams` and `/app-frame-fetch/`, whose handlers read no
+  cookie. The DNS-rebinding Host barrier applies to every request except the
+  three probe paths.
 - **Exposing beyond localhost:** publishing `5476:5476` opens the TCP
   port, but LAN browsers will still be rejected until their origin is
   allowed — set `dashboard.url` (or `KIROCREW_CORS_ORIGINS`) to the
@@ -211,9 +225,10 @@ the version selector (channel tags track their channel; version tags pin).
   hardened native install. If no backend works, agent command execution
   stays DISABLED (fail-closed) — the gateway, dashboard, and channel bots
   run normally. To enable agents in that situation, either permit user
-  namespaces (see **Sandbox troubleshooting** below) or restart with
-  `-e KIROCREW_ALLOW_UNSANDBOXED=1` to explicitly accept unsandboxed agent
-  execution. In the consented posture the container is the only isolation
+  namespaces (see **Sandbox troubleshooting** below) or explicitly accept
+  unsandboxed agent execution: `-e KIROCREW_ALLOW_UNSANDBOXED=1` on first run,
+  or `agent.sandbox_allow_unsandboxed_exec=true` in an existing `config.json`
+  (the entrypoint reads the variable only while `config.json` is absent). In the consented posture the container is the only isolation
   boundary: treat its contents (mounted volumes included) as reachable by
   agent commands, and do not mount host paths you would not hand to the
   agent. The startup log states which posture was chosen.
@@ -279,6 +294,23 @@ posture. It prints the standing reminder instead, whenever
 `agent.sandbox_allow_unsandboxed_exec` is absent from `config.json`, naming the two
 ways to let agent commands through. See
 [Check the startup log](docker-troubleshooting.md#check-the-startup-log).
+
+### A team Crew pod: the container is the boundary
+
+A team Crew deployed as a workload (`KIROCREW_WORKLOAD_IDENTITY=spiffe`) in a pod
+under the Kubernetes Restricted Pod Security Standard has no inner sandbox: the
+`RuntimeDefault` seccomp profile refuses user namespaces. To run its agent
+commands, set `agent.sandbox_allow_unsandboxed_exec=true` (or
+`KIROCREW_ALLOW_UNSANDBOXED=1` on the first run). The container is then the only
+boundary. Each agent process logs a `SECURITY` warning that it runs without
+OS-level isolation; once that choice is made, `agent.sandbox_allow_no_isolation=true`
+turns the warning into an info line.
+
+Use it only when the pod is the isolation unit: one Crew per pod, a read-only root
+filesystem, a narrow service account and no secrets mounted that the agent must not
+read. Agent commands can read every file the gateway can, the JWT-SVID file
+included. If the cluster allows a Localhost seccomp profile, Option A below brings
+the inner sandbox back and is the safer choice.
 
 ### Option A — Kiro Crew seccomp profile (recommended)
 
@@ -406,7 +438,10 @@ docker run -d --name kirocrew \
 ```
 
 In this posture the container is the only isolation boundary. Do not mount
-host paths you would not hand directly to the agent.
+host paths you would not hand directly to the agent. The entrypoint reads
+`KIROCREW_ALLOW_UNSANDBOXED` only on first run; on a volume that already holds
+`config.json`, set `agent.sandbox_allow_unsandboxed_exec` to `true` there
+instead.
 
 ### Option C — `--privileged` (not recommended)
 
@@ -470,10 +505,11 @@ prefix the build with `DOCKER_BUILDKIT=1`.
 ### Baking in the KAS engine (`BUNDLE_KAS`)
 
 The `agent.kas_bundle` route runs Kiro Crew's own pinned KAS engine instead of
-going through kiro-cli. By default the image does not carry that engine, and
-turning the route on needs `docker exec <container> kirocrew kas install` first,
-which downloads about 55 MB into the home volume. To build an image with the
-engine already inside:
+going through kiro-cli. By default the image does not carry that engine: when
+the gateway starts and finds none, it downloads it (about 55 MB) into the home
+volume, whatever `agent.kas_bundle` says. If that start-time download fails,
+the next chat that takes the route tries again, and `docker exec <container> kirocrew kas install`
+fetches it on demand. To build an image with the engine already inside:
 
 ```
 docker build -f docker/Dockerfile --build-arg BUNDLE_KAS=1 -t kirocrew:dev-kas .
@@ -493,17 +529,22 @@ every `docker exec` command see it. The backend reads it as a second root after
 the home volume's own `kirocrew kas install`, so an engine you install yourself
 still wins. `docker exec <container> kirocrew kas status` reports the baked copy
 as `(built into the app)`. On an image built without `BUNDLE_KAS=1` the
-directory exists but is empty, and nothing reads as built in. The route itself
-stays off until you turn it on:
+directory exists but is empty, and nothing reads as built in.
+
+The image is a packaged build, so with `agent.kas_bundle` unset it prefers the
+built-in engine: KAS chats run on it once you are signed in to Kiro Crew, and a
+container signed in only to kiro-cli stays on kiro-cli until then. If the first
+move to the engine fails, that chat runs on kiro-cli and new chats try the
+engine again after 10 minutes. A saved value always wins. To pin the route
+either way:
 
 ```
-docker exec <container> kirocrew config set agent.kas_bundle true
+docker exec <container> kirocrew config set agent.kas_bundle true   # or false for kiro-cli
 docker restart <container>
 ```
 
-`BUNDLE_KAS` defaults to `0` because the route is still in shadow testing
-(`agent.kas_bundle` defaults to `false`) and the extracted engine adds about
-370 MB to the image.
+`BUNDLE_KAS` defaults to `0` because the extracted engine adds about 370 MB to
+the image.
 
 ## Troubleshooting
 

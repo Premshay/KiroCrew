@@ -248,8 +248,11 @@ class TestRendering:
         assert "someone" not in label
 
     def test_sanitize_redacts_a_credential(self):
-        dirty = "fn (pkg/mod.py:1);AKIAIOSFODNN7EXAMPLE 3"
-        assert "AKIAIOSFODNN7EXAMPLE" not in perf_sampler.sanitize_profile(dirty)
+        from kiro_crew.testing.synthetic_credentials import github_classic
+
+        secret = github_classic(seed=92)
+        dirty = f"fn (pkg/mod.py:1);{secret} 3"
+        assert secret not in perf_sampler.sanitize_profile(dirty)
 
 
 # ── py-spy integration (out-of-process) ──

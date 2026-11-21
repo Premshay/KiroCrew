@@ -23,7 +23,7 @@ from kiro_crew import conductor_patrol, session_ledger, work_ledger
 from kiro_crew.constants import env_file_display
 from kiro_crew.crew_log import emit as crew_log_emit
 from kiro_crew.crew_log.errors import CrewLogError
-from kiro_crew.dashboard import session_control
+from kiro_crew.dashboard import session_control, trace_binding
 from kiro_crew.dashboard.handlers.work_ledger_caller import (
     _caller_key,
     _code_channel_caller,
@@ -68,6 +68,7 @@ from kiro_crew.dashboard.handlers.work_ledger_refusals import (
 )
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.metrics import work as work_metrics
+from kiro_crew.tracing import work as trace_work
 from kiro_crew.validation import WORK_LEDGER_RECORD_SCHEMA, ValidationError, validate_tool_args
 from kiro_crew.work_ledger import WorkLedgerError
 from kiro_crew.work_vocab import (
@@ -86,8 +87,9 @@ logger = logging.getLogger("kiro_crew.dashboard.handlers.work_ledger")
 #: ``pr`` into the item's ``acceptance`` and is served by
 #: :func:`work_ledger.apply_acceptance_update`, which is deliberately not a
 #: seventh member of that frozenset (see its docstring). ``ask`` records what an
-#: item needs from the person (:func:`work_ledger.apply_ask_record`).
-RECORD_ACTIONS: frozenset[str] = work_ledger.CONDUCTOR_ACTIONS | {"accept", "ask"}
+#: item needs from the person (:func:`work_ledger.apply_ask_record`). ``retire``
+#: moves a crew-bound item off its crew (:func:`_record_conductor_retire`).
+RECORD_ACTIONS: frozenset[str] = work_ledger.CONDUCTOR_ACTIONS | {"accept", "ask", "retire"}
 
 
 def _count_recorded(action: str, item: Any, header: Any) -> None:
@@ -277,6 +279,8 @@ async def _record_conductor_write(
             stop = await before_write()
             if stop is not None:
                 return stop
+        # What the header held before this write, when it may open a round (tracing).
+        before = await trace_work.header_before(key, action)
         # The worker key is folded through ``session_ledger.ledger_key`` before the
         # store writes the binding (see the ``handlers.work_ledger`` note); the snapshot names the
         # same path, or a failed bind's binding would escape the undo.
@@ -430,6 +434,17 @@ async def _record_conductor_write(
         # write whose record did not land is undone above, so this point is
         # reached once per write the route reports as successful.
         _count_recorded(action, item, header)
+        await trace_work.recorded(
+            unit,
+            key,
+            action,
+            actor="conductor",
+            item=item,
+            header=header,
+            event_id=getattr(event, "id", None),
+            before=before,
+            root_kind=lambda: trace_binding.root_kind(state, key),
+        )
         if action == "close" and item is not None:
             await _count_crew_mode_run(state, key, item)
         # A remote bind names a PEER's slot, which no local crew record can resolve.
@@ -548,6 +563,9 @@ async def api_work_ledger_record(request: web.Request) -> web.Response:
         return dirty
     assert unit is not None
 
+    if action == "retire":
+        return await _record_conductor_retire(state, key, cleaned, request)
+
     if action == "bind":
         refusal = _refuse_unowned_worker(request, key, cleaned.get("worker_session_key"))
         if refusal is None:
@@ -578,19 +596,92 @@ async def api_work_ledger_record(request: web.Request) -> web.Response:
     if action == "decide" and resp.status == 200:
         resp = await _forward_remote_decide(state, key, cleaned, resp)
     elif resp.status == 200 and cleaned.get("item_id"):
-        await _revoke_closed_remote_trust(state, key, str(cleaned["item_id"]))
+        await _close_remote_item(state, key, str(cleaned["item_id"]), request)
     return resp
 
 
-async def _revoke_closed_remote_trust(state: DashboardState, key: str, item_id: str) -> None:
-    """A write that closed a REMOTE item also ends its worker's remote grant (RFC §4)."""
+async def _record_conductor_retire(
+    state: DashboardState, key: str, cleaned: dict[str, Any], request: web.Request
+) -> web.Response:
+    """``action=retire``: the caller's own crew-bound item leaves its crew (RFC §5b).
+
+    Refused ``remote_dispatch_disabled`` while the switch is off, as every crew
+    verb is. The retire closes a live peer slot, so before anything is written it
+    passes the gate ``session_close(crew=)`` does: ``agent.session_control`` and
+    :func:`remote_dispatch_routes.authorize_remote_dispatch`, whose last arm admits
+    only a turn the owner sent. A wake or ``session_send`` turn is refused with the
+    item and the peer slot untouched. The write itself is the hub's own retire,
+    with the conductor's reason; a code channel's conductor gets the published
+    fields only, as on every write.
+    """
+    from kiro_crew.dashboard import session_control as sc
+    from kiro_crew.dashboard.handlers import remote_dispatch_routes, remote_ingest
+
+    refusal = await remote_dispatch_routes.refuse_if_disabled(key, "work_ledger_record.retire")
+    if refusal is not None:
+        return refusal
+    if not await asyncio.to_thread(sc.session_control_enabled):
+        return web.json_response(
+            {
+                "error": "session control is disabled (agent.session_control)",
+                "code": "session_control_disabled",
+            },
+            status=403,
+        )
+    try:
+        await remote_dispatch_routes.authorize_remote_dispatch(request, "retire")
+    except remote_dispatch_routes.CrewCallError as exc:
+        if exc.code == remote_dispatch_routes.OWNER_UNVERIFIABLE:
+            exc.message = (
+                "retire needs a turn the owner sent; nothing was changed. Leave the "
+                f"item as it is and let the owner retire it from their own turn ({exc.message})"
+            )
+        return remote_dispatch_routes._response(exc)
+    for name in ("item_id", "reason"):
+        if not cleaned.get(name):
+            return _refuse_400(work_ledger.CODE_INVALID_VALUE, f"retire needs {name}", name)
+    return await remote_ingest.retire_by_conductor(
+        state,
+        key,
+        str(cleaned["item_id"]),
+        str(cleaned["reason"]),
+        code_channel=_code_channel_caller(request),
+        caller_sk=request.headers.get("X-Session-Key", ""),
+    )
+
+
+async def _close_remote_item(
+    state: DashboardState, key: str, item_id: str, request: web.Request
+) -> None:
+    """A write that closed a REMOTE item ends its worker's grant and leaves its slot to close.
+
+    RFC §5c (:func:`remote_ingest.close_remote_item`). Whether the peer slot may be
+    DELETEd at once is the gate ``session_close(crew=)`` and ``action=retire``
+    pass (``agent.session_control`` and
+    :func:`remote_dispatch_routes.authorize_remote_dispatch`): only a turn the owner
+    sent. Any other turn, a patrol wake included, only ends the grant and records
+    the close as pending, so it never kills a worker that is still running.
+    Asked only for a closed item still bound to a crew, so no other write pays
+    for the gate or leaves its audit row. Never raises past the write.
+    """
     from kiro_crew.dashboard.handlers.work_ledger_read import _remote_dispatch_on
 
     if not await asyncio.to_thread(_remote_dispatch_on):
         return
-    from kiro_crew.dashboard.handlers import remote_ingest
+    from kiro_crew.dashboard import session_control as sc
+    from kiro_crew.dashboard.handlers import remote_dispatch_routes, remote_ingest
 
-    await remote_ingest.revoke_if_closed(state, key, item_id)
+    item = await remote_ingest.settled_item(key, item_id)
+    if item is None or not item.is_terminal or not item.worker_instance_id:
+        return
+    owner_turn = False
+    try:
+        if await asyncio.to_thread(sc.session_control_enabled):
+            await remote_dispatch_routes.authorize_remote_dispatch(request, "item_close")
+            owner_turn = True
+    except Exception:  # noqa: BLE001 - any doubt is not an owner turn (fail closed)
+        owner_turn = False
+    await remote_ingest.close_remote_item(state, key, item_id, owner_turn=owner_turn)
 
 
 async def _forward_remote_decide(
@@ -1051,8 +1142,9 @@ def _write(key: str, action: str, cleaned: dict[str, Any]) -> dict[str, Any]:
             worker_instance_id=cleaned.get("worker_instance_id"),
         )
     if action == "retire":
-        # Reached only from the hub's own remote ingest (wave 8), never from the
-        # record route: its schema has no ``retire`` action.
+        # Reached only through ``remote_ingest._commit_retire``: the hub's own
+        # ingest (wave 8) and the conductor's ``action=retire``, which the record
+        # route hands there before any write, so the pair always comes from the item.
         return work_ledger.apply_remote_retire(
             key,
             str(cleaned.get("item_id") or ""),

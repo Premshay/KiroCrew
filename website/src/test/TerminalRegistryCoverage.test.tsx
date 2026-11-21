@@ -99,7 +99,7 @@ class MockWebSocket {
  *  and registers one onData + one onResize listener per connection. */
 class FakeTerm {
   reset = vi.fn()
-  write = vi.fn<(data: Uint8Array) => void>()
+  write = vi.fn<(data: Uint8Array | string, cb?: () => void) => void>()
   cols = 80
   rows = 24
   element: { offsetParent: unknown } | undefined = undefined
@@ -329,6 +329,40 @@ describe('terminalRegistry', () => {
       expect(sendToTerminalSession(id, code, { preserveTrailingWhitespace: true })).toBe(true)
       expect(ws.send).toHaveBeenCalledExactlyOnceWith(new TextEncoder().encode(code))
       expect(decode(ws)).toBe(code)
+    })
+
+    // ConPTY hands a bare LF to the console as Ctrl+Enter, which PSReadLine binds
+    // to InsertLineAbove: a multi-line snippet then lands in reverse order and is
+    // never submitted. A PowerShell session gets CR, the Enter key, per line.
+    it.each([
+      ['C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', 'Get-Date', 'Get-Date\r'],
+      ['C:\\Program Files\\PowerShell\\7\\pwsh.exe', '$a = 2\n$b = 3\n$a + $b\n\n', '$a = 2\r$b = 3\r$a + $b\r'],
+      ['C:\\Program Files\\PowerShell\\7\\pwsh.exe', "$t = @'\r\nlinha um\r\n'@", "$t = @'\rlinha um\r'@\r"],
+    ])('submits each line with Enter on a PowerShell session (%s)', (shell, code, sent) => {
+      const id = session('send-powershell')
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+      act(() => { ws.simulateOpen(); ws.simulateJson({ type: 'ready', shell }) })
+      expect(sendToTerminalSession(id, code)).toBe(true)
+      expect(decode(ws)).toBe(sent)
+    })
+
+    it('uses Enter for a PowerShell session on the verbatim path too', () => {
+      const id = session('send-powershell-verbatim')
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+      act(() => { ws.simulateOpen(); ws.simulateJson({ type: 'ready', shell: 'C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' }) })
+      expect(sendToTerminalSession(id, 'Write-Output "a "\nWrite-Output b', { preserveTrailingWhitespace: true })).toBe(true)
+      expect(decode(ws)).toBe('Write-Output "a "\rWrite-Output b\r')
+    })
+
+    it('keeps LF for a POSIX session', () => {
+      const id = session('send-posix')
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+      act(() => { ws.simulateOpen(); ws.simulateJson({ type: 'ready', shell: '/bin/bash' }) })
+      expect(sendToTerminalSession(id, 'echo a\necho b')).toBe(true)
+      expect(decode(ws)).toBe('echo a\necho b\n')
     })
 
     it('sends raw data without appending a newline', () => {
@@ -574,7 +608,7 @@ describe('terminalRegistry', () => {
 
       WS_INSTANCES[0].simulateBinary(bytes)
       expect(term.write).toHaveBeenCalledTimes(1)
-      expect(new TextDecoder().decode(term.write.mock.calls[0][0])).toBe('hello from the PTY')
+      expect(new TextDecoder().decode(term.write.mock.calls[0][0] as Uint8Array)).toBe('hello from the PTY')
     })
 
     it('swallows a control frame that is not JSON', () => {
@@ -1500,6 +1534,123 @@ describe('terminalRegistry', () => {
       Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true })
       document.dispatchEvent(new Event('visibilitychange'))
       expect(WS_INSTANCES).toHaveLength(11)
+    })
+  })
+
+  describe('OSC 52 copies during a reconnect replay', () => {
+    function osc52Handle() {
+      return { suspend: vi.fn(), resume: vi.fn(), closeWindow: vi.fn(), dispose: vi.fn() }
+    }
+
+    it('closes the copy window when the dashboard sends a command line', () => {
+      const id = session('osc52-send-line')
+      const osc52 = osc52Handle()
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon(), undefined, undefined, undefined, osc52)
+      const ws = WS_INSTANCES[WS_INSTANCES.length - 1]
+      ws.simulateOpen()
+      ws.simulateJson({ type: 'ready' })
+      expect(sendToTerminalSession(id, 'cat notes.txt')).toBe(true)
+      expect(osc52.closeWindow).toHaveBeenCalledTimes(1)
+    })
+
+    /** A term whose write callbacks run only when the test releases them, as
+     *  xterm runs them once the data written before them is parsed. */
+    function queuedTerm() {
+      const term = new FakeTerm()
+      const callbacks: (() => void)[] = []
+      term.write.mockImplementation((_data, cb) => { if (cb) callbacks.push(cb) })
+      return { term, flush: () => { while (callbacks.length) callbacks.shift()!() } }
+    }
+
+    it('suspends copies before the terminal is reset for the replay', () => {
+      const id = session('osc52-open')
+      const { term } = queuedTerm()
+      const osc52 = osc52Handle()
+      ensureTerminalConnection(id, term.asTerminal(), new FakeFit().asFitAddon(), undefined, undefined, undefined, osc52)
+      const ws = WS_INSTANCES[WS_INSTANCES.length - 1]
+      ws.simulateOpen()
+      expect(osc52.suspend).toHaveBeenCalledTimes(1)
+      expect(term.reset).toHaveBeenCalledTimes(1)
+      expect(osc52.suspend.mock.invocationCallOrder[0]).toBeLessThan(term.reset.mock.invocationCallOrder[0])
+    })
+
+    it('resumes only from the replayed write callback without a ready frame', () => {
+      const id = session('osc52-replayed')
+      const { term, flush } = queuedTerm()
+      const osc52 = osc52Handle()
+      ensureTerminalConnection(id, term.asTerminal(), new FakeFit().asFitAddon(), undefined, undefined, undefined, osc52)
+      const ws = WS_INSTANCES[WS_INSTANCES.length - 1]
+      ws.simulateOpen()
+      ws.simulateBinary(new TextEncoder().encode('\x1b]52;c;b2xk\x07'))
+      expect(term.write).toHaveBeenCalledTimes(1)
+      flush()
+      expect(osc52.resume).not.toHaveBeenCalled()
+
+      ws.simulateJson({ type: 'replayed' })
+      expect(term.write).toHaveBeenCalledTimes(2)
+      expect(osc52.resume).not.toHaveBeenCalled()
+      expect(getTerminalWs(id)).toBeNull()
+      flush()
+      expect(osc52.resume).toHaveBeenCalledTimes(1)
+      expect(getTerminalWs(id)).toBeNull()
+    })
+
+    it('does not resume from ready alone', () => {
+      const id = session('osc52-ready-only')
+      const { term, flush } = queuedTerm()
+      const osc52 = osc52Handle()
+      ensureTerminalConnection(id, term.asTerminal(), new FakeFit().asFitAddon(), undefined, undefined, undefined, osc52)
+      const ws = WS_INSTANCES[WS_INSTANCES.length - 1]
+      ws.simulateOpen()
+      ws.simulateJson({ type: 'ready' })
+      flush()
+      expect(osc52.resume).not.toHaveBeenCalled()
+      expect(term.write).not.toHaveBeenCalled()
+      expect(getTerminalWs(id)).toBe(ws as unknown as WebSocket)
+    })
+
+    it('does not resume from a replayed frame on a replaced socket', () => {
+      const id = session('osc52-stale')
+      vi.useFakeTimers()
+      const { term, flush } = queuedTerm()
+      const osc52 = osc52Handle()
+      ensureTerminalConnection(id, term.asTerminal(), new FakeFit().asFitAddon(), undefined, undefined, undefined, osc52)
+      const first = WS_INSTANCES[WS_INSTANCES.length - 1]
+      first.simulateOpen()
+      first.simulateClose()
+      vi.advanceTimersByTime(60_000)
+      const second = WS_INSTANCES[WS_INSTANCES.length - 1]
+      expect(second).not.toBe(first)
+      second.simulateOpen()
+      expect(osc52.suspend).toHaveBeenCalledTimes(2)
+
+      first.simulateJson({ type: 'replayed' })
+      expect(term.write).not.toHaveBeenCalled()
+      flush()
+      expect(osc52.resume).not.toHaveBeenCalled()
+      second.simulateJson({ type: 'replayed' })
+      expect(term.write).toHaveBeenCalledTimes(1)
+      expect(osc52.resume).not.toHaveBeenCalled()
+      flush()
+      expect(osc52.resume).toHaveBeenCalledTimes(1)
+    })
+
+    it('does not resume when the socket is replaced before the queued write callback runs', () => {
+      const id = session('osc52-stale-callback')
+      vi.useFakeTimers()
+      const { term, flush } = queuedTerm()
+      const osc52 = osc52Handle()
+      ensureTerminalConnection(id, term.asTerminal(), new FakeFit().asFitAddon(), undefined, undefined, undefined, osc52)
+      const first = WS_INSTANCES[WS_INSTANCES.length - 1]
+      first.simulateOpen()
+      first.simulateJson({ type: 'replayed' })
+      expect(term.write).toHaveBeenCalledTimes(1)
+      first.simulateClose()
+      vi.advanceTimersByTime(60_000)
+      const second = WS_INSTANCES[WS_INSTANCES.length - 1]
+      second.simulateOpen()
+      flush()
+      expect(osc52.resume).not.toHaveBeenCalled()
     })
   })
 })

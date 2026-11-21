@@ -1228,8 +1228,7 @@ class IngestionPipeline:
                 # *One unit*, because the append must sit BETWEEN the two writes:
                 # a chunk whose location write raises has to already be in
                 # created_item_ids or the partial-failure rollback leaves the
-                # item orphaned. Inside the hop that ordering is preserved
-                # exactly as it was inline.
+                # item orphaned. The hop keeps that ordering.
                 def _write_chunk() -> str:
                     new_id = self.store.add_item(
                         title=item_title,
@@ -1704,7 +1703,8 @@ class IngestionPipeline:
             aliases = probed_aliases[:MAX_ENTITY_ALIASES]
             if not aliases_complete:
                 logger.warning(
-                    "alias identity reuse skipped for %r: alias evidence exceeds limit", name
+                    "alias identity reuse skipped for an entity of %r: alias evidence exceeds limit",
+                    item_id,
                 )
             existing, resolution_tier = resolve_entity(
                 self.store,
@@ -1753,11 +1753,12 @@ class IngestionPipeline:
                     try:
                         self.store.add_entity_aliases(eid, enrich_aliases)
                     except Exception as exc:  # noqa: BLE001
+                        # The id and the type only: the name and the message
+                        # carry document text (the message can echo aliases).
                         logger.warning(
-                            "add_entity_aliases skipped for entity %r (%s): %s",
-                            name,
+                            "add_entity_aliases skipped for entity %r: %s",
                             eid,
-                            exc,
+                            type(exc).__name__,
                         )
             else:
                 eid = created

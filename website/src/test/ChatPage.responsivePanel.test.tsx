@@ -20,6 +20,7 @@ import { setSidePanelDock } from '../hooks/useSidePanelDock'
 import { switchSlot, toggleActivity } from '../store/chatSlice'
 import { paneCovered } from '../hooks/paneVisibility'
 import { closeCrewWindow, openCrewWindow } from '../pages/chat/crew-window/crewWindowStore'
+import { setRailWidth, __resetRailWidth } from '../hooks/useRailWidth'
 
 // --- Stub child components (same scaffold as ChatPage.embedded test) ---
 vi.mock('react-virtuoso', () => ({ Virtuoso: () => null }))
@@ -43,8 +44,8 @@ vi.mock('../pages/chat/ChatSettings', () => ({ loadChatConfig: () => ({ contentW
 // SidePanel: stub the component (pulls in xterm etc.) but keep the space
 // contract deterministic: threshold = 320 + 560 = 880, reopen at 920.
 vi.mock('../pages/chat/SidePanel', () => ({
-  default: ({ fillWidth, onPutPinInComposer }: { fillWidth?: number; onPutPinInComposer?: (ts: string) => void }) => (
-    <div data-testid="side-panel" data-fill-width={fillWidth ?? ''}>
+  default: ({ fillWidth, extraReserveW, onPutPinInComposer }: { fillWidth?: number; extraReserveW?: number; onPutPinInComposer?: (ts: string) => void }) => (
+    <div data-testid="side-panel" data-fill-width={fillWidth ?? ''} data-extra-reserve-w={extraReserveW ?? ''}>
       {onPutPinInComposer && <button type="button" aria-label="Put in composer" data-testid="put-pin" onClick={() => onPutPinInComposer('pin-ts')} />}
     </div>
   ),
@@ -69,6 +70,9 @@ vi.mock('../hooks/useVoiceInput', () => ({ useVoiceInput: () => ({ recording: fa
 // (false) by default, flipped by the mobile describe below.
 let mockIsMobile = false
 vi.mock('../hooks/useIsMobile', () => ({ useIsMobile: () => mockIsMobile }))
+// jsdom has no layout, so the side panel's on-screen check reads every open
+// panel as zero-size and closes it mid-test; its own spec covers it.
+vi.mock('../hooks/useSidePanelHealth', () => ({ useSidePanelHealth: vi.fn() }))
 
 // --- Stub API ---
 vi.mock('../api/client', () => ({
@@ -412,6 +416,62 @@ describe('ChatPage — session-header activity toggle (relocated from the top ba
 })
 
 /**
+ * A popped-out session (`/popout/chat`) renders no nav rail and no
+ * session sidebar. Its shell publishes rail width 0, and the page must not
+ * subtract the shared pinned-sidebar width either, or an 832 px pop-out fills
+ * the chat column with an unresizable panel. Its title row also carries the
+ * same open toggle as the main window.
+ */
+describe('ChatPage — activity panel in a popped-out session window', () => {
+  beforeEach(() => { setWindowWidth(832); localStorage.clear(); setRailWidth(0) })
+  afterEach(() => { __resetRailWidth(); document.getElementById('activity-bar-slot')?.remove() })
+
+  function renderPopout() {
+    const store = createTestStore()
+    act(() => {
+      store.dispatch(switchSlot.pending('req-popout', 'slot-popout'))
+      store.dispatch(switchSlot.fulfilled({
+        key: 'slot-popout',
+        messages: [{ role: 'assistant', content: 'hi', cls: '' }],
+        running: false, hasMore: false, total: 1, queue: [],
+      }, 'req-popout', 'slot-popout'))
+    })
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+    render(
+      <QueryClientProvider client={queryClient}>
+        <Provider store={store}>
+          <ThemeProvider>
+            <MemoryRouter initialEntries={['/popout/chat/slot-popout?sid=slot-popout']}>
+              <Routes><Route path="/popout/chat/:slug?" element={<ChatPage embedded embedMode="chat" popout />} /></Routes>
+            </MemoryRouter>
+          </ThemeProvider>
+        </Provider>
+      </QueryClientProvider>,
+    )
+    return { store }
+  }
+
+  it('shows the Open activity panel toggle in the pop-out title row, and it opens the panel', async () => {
+    const { store } = renderPopout()
+    const btn = await screen.findByLabelText('Open activity panel')
+    expect(store.getState().chat.activityOpen).toBe(false)
+    fireEvent.click(btn)
+    expect(store.getState().chat.activityOpen).toBe(true)
+    expect(await screen.findByTestId('side-panel')).toBeInTheDocument()
+  })
+
+  it('opens the panel beside the chat with no sidebar reserve, so it stays resizable', async () => {
+    const { store } = renderPopout()
+    act(() => { store.dispatch(toggleActivity()) })
+    const panel = await screen.findByTestId('side-panel')
+    // 832 - rail 0 - sidebar 0 = 832 >= 640: beside, not fill.
+    expect(panel).toHaveAttribute('data-fill-width', '')
+    expect(panel).toHaveAttribute('data-extra-reserve-w', '0')
+    expect(screen.queryByTestId('action-error')).toBeNull()
+  })
+})
+
+/**
  * Mobile: the toggle must NOT be gated on `!isMobile` — a phone still needs a
  * way to open the activity panel, since SidePanel renders full-width there and
  * ChatSidePanels keeps an inline (non-portal) render path specifically for mobile.
@@ -550,5 +610,59 @@ describe('ChatPage — focus-mode caption reserve on the title row', () => {
     const group = reserved()
     expect(group, 'reserve survives an open bottom-docked panel').not.toBeNull()
     expect(group!.classList.contains('ml-auto')).toBe(true)
+  })
+})
+
+/**
+ * #37165: the embedded chat frame (`/embed/chat`) mounts no session sidebar,
+ * so the stored sidebar width must not come off the width its activity panel
+ * decides beside-or-fill from. A companion chat (`embedMode="chat"` inside the
+ * main window, beside the real chrome) keeps the main window's arithmetic.
+ */
+describe('ChatPage — activity panel in an embedded chat frame', () => {
+  beforeEach(() => { localStorage.clear(); __resetRailWidth() })
+  afterEach(() => { __resetRailWidth() })
+
+  function renderEmbedded(path: string, routePath: string) {
+    const store = createTestStore()
+    act(() => {
+      store.dispatch(switchSlot.pending('req-embed', 'slot-embed'))
+      store.dispatch(switchSlot.fulfilled({
+        key: 'slot-embed',
+        messages: [{ role: 'assistant', content: 'hi', cls: '' }],
+        running: false, hasMore: false, total: 1, queue: [],
+      }, 'req-embed', 'slot-embed'))
+    })
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+    render(
+      <QueryClientProvider client={queryClient}>
+        <Provider store={store}>
+          <ThemeProvider>
+            <MemoryRouter initialEntries={[path]}>
+              <Routes><Route path={routePath} element={<ChatPage embedded embedMode="chat" noUrlSync />} /></Routes>
+            </MemoryRouter>
+          </ThemeProvider>
+        </Provider>
+      </QueryClientProvider>,
+    )
+    act(() => { store.dispatch(toggleActivity()) })
+    return store
+  }
+
+  it('sits the panel beside the chat when the frame itself seats both', async () => {
+    // The embed document's shell publishes no rail. 800 >= 640, but 800 minus
+    // the default 260px sidebar it never draws would not.
+    setWindowWidth(800)
+    act(() => { setRailWidth(0) })
+    renderEmbedded('/embed/chat', '/embed/chat/:slug?')
+    expect(await screen.findByTestId('side-panel')).toHaveAttribute('data-fill-width', '')
+  })
+
+  it('keeps the sidebar in the arithmetic for a companion chat in the main window', async () => {
+    // 900 - rail 74 - sidebar 260 = 566 < 640: the narrow companion still fills.
+    setWindowWidth(900)
+    act(() => { setRailWidth(74) })
+    renderEmbedded('/apps/papyrus', '/apps/papyrus')
+    expect(await screen.findByTestId('side-panel')).toHaveAttribute('data-fill-width', '566')
   })
 })

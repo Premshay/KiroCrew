@@ -35,7 +35,12 @@ from kiro_crew.agent_files import MATE_CONDUCTOR_AGENT_FILENAME as _MATE_CONDUCT
 from kiro_crew.agent_files import MATE_WORKER_AGENT_FILENAME as _MATE_WORKER_AGENT_FILENAME
 from kiro_crew.agent_files import RESEARCH_AGENT_FILENAME as _RESEARCH_AGENT_FILENAME
 from kiro_crew.agent_files import TEAM_LEAD_AGENT_FILENAME as _TEAM_LEAD_AGENT_FILENAME
-from kiro_crew.agent_materialization import auto_approve, managed_mcp, skill_resources
+from kiro_crew.agent_materialization import (
+    auto_approve,
+    conductor_agents,
+    managed_mcp,
+    skill_resources,
+)
 from kiro_crew.user_json import strict_json_equal
 
 
@@ -290,17 +295,12 @@ def _install_mate_conductor_agent() -> None:
     # goal-conductor skill's ``accept_eval`` tool, and is rendered only where this
     # spec mounts the work ledger (``member_mate_tools.binding_has_ledger_tools``).
     # The mapping follows the text: a spec without the ledger names no skill, and a
-    # mapping there would only narrow the skills an unmapped spec inherits.
-    # Judged as the prompt check judges the written spec: after the governance
-    # ceiling has filtered ``allowedTools`` (on a copy, so the write's own pass
-    # still runs and audits once).
+    # mapping there would only narrow the skills an unmapped spec inherits. A
+    # governance ceiling that withholds a ledger verb does not change it: the verb
+    # stays mounted and asks for approval (owner decision in docs/decisions, case N1).
     from kiro_crew.member_mate_tools import spec_has_ledger_tools
 
-    governed = {**config, "allowedTools": list(config.get("allowedTools") or [])}
-    auto_approve._apply_allowed_tools_ceiling(
-        governed, source="_install_mate_conductor_agent", audit=False
-    )
-    if spec_has_ledger_tools(governed):
+    if spec_has_ledger_tools(config):
         # ``dashboard`` rides along because the crewmate prompt names that skill
         # (``conductor.crew_log_section``), and ``WIDGET_POINTER_SKILLS``; a mapping
         # of goal-conductor alone would scope the chat's skills to it and leave
@@ -319,8 +319,12 @@ def _install_mate_worker_agent() -> None:
     The agent a crewmate's worker sessions run on: the session its chat opens
     with ``session_create`` to hand work off. Derived from the default template
     like the mate conductor above, so its base prompt, tools and ``mcpServers``
-    are the ones a crewmate's hand-off session ran on before it had a worker of
-    its own. This file is the worker's whole SOURCE BASE; a crewmate's own
+    are the template's. The ``~/.kiro/crew/mcp.json`` store is not merged in, so
+    a server added on the MCP Servers page does not reach a Bot's worker base; a
+    Bot's worker gets it only when it is added to that Bot
+    (``docs/architecture/agent-mcp-and-skill-reach.md``, "Mate worker", and
+    ``docs/decisions/*-conductors-stay-simple-and-new-abilities-go-to-workers.md``).
+    This file is the worker's whole SOURCE BASE; a crewmate's own
     additions (``~/.kiro/mates/agents/<id>.json``) are layered on at projection
     time by :mod:`kiro_crew.mate_worker`, never written here, so one file serves
     every crewmate.
@@ -328,14 +332,14 @@ def _install_mate_worker_agent() -> None:
     from kiro_crew.mate_worker import (
         MATE_WORKER_AGENT,
         MATE_WORKER_EXCLUDED_TOOLS,
-        MATE_WORKER_PROMPT,
+        mate_worker_prompt,
     )
 
     config = agent_mod.build_agent_config()
     config["name"] = MATE_WORKER_AGENT
     config["description"] = "The agent a Bot's worker sessions run on."
     # The worker's own principles ride after the shared base prompt.
-    principles = MATE_WORKER_PROMPT
+    principles = mate_worker_prompt()
     base_prompt = config.get("prompt") if isinstance(config.get("prompt"), str) else ""
     config["prompt"] = f"{base_prompt.rstrip()}\n\n{principles}" if base_prompt else principles
     _register_edition_refs(config)
@@ -453,9 +457,9 @@ def _note_injection_ignored(name: str, path: Path) -> None:
         return
     _ignored_injections_logged.add(name)
     agent_mod.logger.info(
-        "Knowledge agent spec %s carries an entry another tool injects into every agent "
+        "Agent spec %s carries an entry another tool injects into every agent "
         "spec (registered filter %r); leaving the file as it is and launching the "
-        "knowledge worker without it",
+        "agent without it",
         path,
         name,
     )
@@ -617,6 +621,37 @@ def knowledge_view_without_registered_injection(
     return expected
 
 
+def lite_view_without_registered_injection(spec: dict[str, Any]) -> dict[str, Any]:
+    """The ``kirocrew-lite`` spec a KAS session is sent, given the one read from disk.
+
+    The same rule as :func:`knowledge_view_without_registered_injection`: when the only
+    change to the file is an injection a registered filter removes exactly
+    (:func:`kiro_crew.agent_spec_injections.only_registered_injection`), the governed
+    template, never the filter's output, so the spec sent mounts nothing. Every other
+    spec is returned unchanged, and the file is never rewritten here. Used only where
+    Kiro Crew sends the spec itself (KAS); kiro-cli loads the file on disk, so there
+    nothing is tolerated. Blocking.
+    """
+    if not agent_spec_injections.registered_spec_injection_filters():
+        return spec
+    try:
+        expected = _lite_agent_config()
+        auto_approve.govern_spec(
+            expected,
+            agent_filename=_LITE_AGENT_FILENAME,
+            source="lite_view_without_registered_injection",
+            kas_policy="none",
+        )
+    except Exception:
+        agent_mod.logger.debug("lite template unavailable for the view", exc_info=True)
+        return spec
+    injection = agent_spec_injections.only_registered_injection(spec, expected)
+    if injection is None:
+        return spec
+    _note_injection_ignored(injection, agent_mod.kiro_agents_dir_path() / _LITE_AGENT_FILENAME)
+    return expected
+
+
 def _without_guide_server(config: dict) -> dict:
     """*config* with the guide and member platform servers, refs and grants removed.
 
@@ -763,36 +798,34 @@ def _mount_work_ledger(config: dict, grants: tuple[str, ...]) -> None:
     pin), and the installer's shared tail (``auto_approve.write_governed_spec``)
     puts *grants* through the governance ceiling, so a withheld verb stays
     mounted and prompts.
-    """
-    from kiro_crew.mcp_cleanup import mcp_entry_is_muted
 
+    The ledger is a core component, on by default for a Bot as for conductor mode
+    (owner decision in docs/decisions, case N2): a switch-off of ``kirocrew-work``
+    on the default template (its entry's ``disabled`` or ``disabledTools``, an
+    ``excludedTools`` entry naming it) is not carried over, as
+    :func:`_mount_team_lead_dispatch` and the conductor-mode worker do not carry it.
+    """
     servers = config.get("mcpServers")
     if not isinstance(servers, dict):
         servers = {}
-    entry = managed_mcp._managed_opt_in_entry("mcp-work")
-    inherited = servers.get("kirocrew-work")
-    off: list[str] = []
-    # The operator's restrictions on an inherited entry are kept on the managed
-    # transport: a whole-server switch-off, and per-tool limits, whose grants
-    # are not added.
-    if isinstance(inherited, dict):
-        if mcp_entry_is_muted(inherited):
-            entry["disabled"] = True
-        limits = inherited.get("disabledTools")
-        if isinstance(limits, list):
-            off = [t for t in limits if isinstance(t, str) and t.strip()]
-            if off:
-                entry["disabledTools"] = off
-    servers["kirocrew-work"] = entry
+    servers["kirocrew-work"] = managed_mcp._managed_opt_in_entry("mcp-work")
     config["mcpServers"] = servers
     tools = [t for t in config.get("tools") or [] if isinstance(t, str)]
     if "*" not in tools and "@kirocrew-work" not in tools:
         tools.append("@kirocrew-work")
     config["tools"] = tools
+    excluded = config.get("excludedTools")
+    if isinstance(excluded, list):
+        config["excludedTools"] = [
+            t for t in excluded if not (isinstance(t, str) and _names_work_server(t))
+        ]
     allowed = [t for t in config.get("allowedTools") or [] if isinstance(t, str)]
-    withheld = {f"@kirocrew-work/{t}" for t in off}
-    kept = (g for g in grants if g not in withheld)
-    config["allowedTools"] = list(dict.fromkeys((*allowed, *kept)))
+    config["allowedTools"] = list(dict.fromkeys((*allowed, *grants)))
+
+
+def _names_work_server(ref: str) -> bool:
+    """Whether the tool reference *ref* names ``kirocrew-work`` or one of its tools."""
+    return ref == "@kirocrew-work" or ref.startswith("@kirocrew-work/")
 
 
 def _install_team_lead_agent() -> None:
@@ -820,7 +853,12 @@ def _install_team_lead_agent() -> None:
         "items, does the small focused ones itself, dispatches a session for every "
         "other one, and patrols that fleet."
     )
-    config["prompt"] = agent_mod._TEAM_LEAD_SYSTEM_PROMPT
+    # The shared conductor rules ride in the prompt, because the goal-conductor
+    # skill points at "your prompt's" rules instead of restating them.
+    config["prompt"] = conductor_agents.with_conductor_ask(
+        f"{agent_mod._TEAM_LEAD_SYSTEM_PROMPT.rstrip()}\n\n"
+        f"{agent_mod._SHARED_CONDUCTOR_RULES_BLOCK}"
+    )
     # The skills this agent is told to read: ``team-lead`` ("read it before acting on
     # a goal"), ``goal-conductor`` for the patrol procedure the charter shares with
     # the conductors, and ``dashboard`` because a lead is a crewmate and the crewmate
@@ -830,7 +868,7 @@ def _install_team_lead_agent() -> None:
     skill_resources.map_prompt_skills(
         config, "team-lead", "goal-conductor", "dashboard", *skill_resources.WIDGET_POINTER_SKILLS
     )
-    # Ultra Mode chats run on this spec: expose the edition servers it mounts, as the
+    # Conductor mode chats run on this spec: expose the edition servers it mounts, as the
     # default spec does, with every call still behind the approval prompt.
     _register_edition_refs(config)
     _mount_team_lead_dispatch(config)

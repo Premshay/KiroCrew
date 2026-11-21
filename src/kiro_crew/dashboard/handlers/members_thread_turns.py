@@ -21,7 +21,7 @@ from aiohttp import web
 from kiro_crew import members as members_mod
 from kiro_crew.dashboard.chat_utils import effective_session_key
 from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
-from kiro_crew.dashboard.handlers.members_access import _deny_app_caller
+from kiro_crew.dashboard.handlers.members_access import _deny_app_caller, _teammate_admitted
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.members import MemberSlugError
 
@@ -44,9 +44,15 @@ async def api_member_greet(request: web.Request) -> web.Response:
     denied = await _deny_app_caller(request, "members.greet")
     if denied is not None:
         return denied
-    owner_denied = await require_owner_dashboard_request(request, "members.greet")
-    if owner_denied is not None:
-        return owner_denied
+    admitted = await _teammate_admitted(
+        request,
+        "members.greet",
+        slug=request.match_info["slug"],
+    )
+    if not admitted:
+        owner_denied = await require_owner_dashboard_request(request, "members.greet")
+        if owner_denied is not None:
+            return owner_denied
     state: DashboardState | None = request.app.get("state")
     if state is None:
         return web.json_response(
@@ -86,8 +92,49 @@ def _turn_busy(state: DashboardState, slot: Any, key: str) -> bool:
 
 
 def _work_pending(slot: Any) -> bool:
-    """Queued messages or unconsumed steers: work the runner starts on its own."""
-    return bool(slot.queue_depth) or bool(getattr(slot, "_pending_steers", None))
+    """Queued messages or unconsumed steers: work the runner starts on its own.
+
+    A held entry (a card restored after a restart that nobody chose) never
+    starts on its own, so it does not count: otherwise a held message whose
+    card offers no way to remove it refuses Fresh start forever.
+    """
+    # Imported here: a module-level name would join the members facade's served set.
+    from kiro_crew.dashboard.slot_queue_repository import is_held_queue_entry
+
+    return any(not is_held_queue_entry(item) for item in slot._queue) or bool(
+        getattr(slot, "_pending_steers", None)
+    )
+
+
+def _written_held_ids(slot: Any) -> list[str]:
+    """The held entries whose user row is already in the transcript.
+
+    Such a message never sends on its own, and its cancel is refused because
+    its row is written, so nothing but a reset removes it. A held entry with
+    no row is not listed: its card can still send, edit or cancel it.
+    """
+    from kiro_crew.dashboard import responsive_chat
+    from kiro_crew.dashboard.slot_queue_repository import is_held_queue_entry
+
+    return [
+        item["id"]
+        for item in slot._queue
+        if is_held_queue_entry(item) and responsive_chat.row_already_written(slot, item)
+    ]
+
+
+def _drop_queue_entries(state: DashboardState, slot: Any, queue_ids: list[str]) -> None:
+    """Drop *queue_ids* after a clear: they belong to the conversation it dropped,
+    and their words stay in the transcript."""
+    dropped = False
+    for queue_id in queue_ids:
+        if slot.queue_remove_by_id(queue_id) is not None:
+            dropped = True
+            # No content: the row is in the transcript, so nothing goes back
+            # to the composer (the same frame chat_rewind sends).
+            state.broadcast_ws("queue_cancel", {"slot": slot.key, "queue_id": queue_id})
+    if dropped:
+        state.push_slots_update()
 
 
 def _queue_pending(name: str) -> web.Response:
@@ -121,8 +168,8 @@ async def api_member_fresh_start(request: web.Request) -> web.Response:
 
     The slot key is never changed and no slot is created: monitor loops, the
     work ledger and the crew log are bound to it. The transcript stays on disk.
-    Same gates as every member route: app tokens get 404, and only the owner's
-    dashboard passes.
+    Same gates as the chat open: app tokens get 404, and the owner's dashboard
+    or a team Crew teammate on a person-created Bot passes.
     """
     from kiro_crew.dashboard import chat_handlers as ch
     from kiro_crew.dashboard.chat_runner import _answer_slash_without_channel
@@ -130,9 +177,15 @@ async def api_member_fresh_start(request: web.Request) -> web.Response:
     denied = await _deny_app_caller(request, "members.fresh_start")
     if denied is not None:
         return denied
-    owner_denied = await require_owner_dashboard_request(request, "members.fresh_start")
-    if owner_denied is not None:
-        return owner_denied
+    admitted = await _teammate_admitted(
+        request,
+        "members.fresh_start",
+        slug=request.match_info["slug"],
+    )
+    if not admitted:
+        owner_denied = await require_owner_dashboard_request(request, "members.fresh_start")
+        if owner_denied is not None:
+            return owner_denied
     state: DashboardState | None = request.app.get("state")
     if state is None:
         return web.json_response(
@@ -154,6 +207,15 @@ async def api_member_fresh_start(request: web.Request) -> web.Response:
         or slot.agent != binding.get("member")
         or getattr(slot, "executor", "") == "remote"
     ):
+        return ch.slot_not_found()
+    # The held-entry check and the /clear reply below read the window's rows; a
+    # restored row loads it here with its reads off the loop. A slot that holds
+    # its window returns without suspending, so the checks below still run in
+    # one tick.
+    from kiro_crew.dashboard.state import load_window_off_loop
+
+    await load_window_off_loop(slot)
+    if state._slots.get(binding.get("slot_key", "")) is not slot:
         return ch.slot_not_found()
     name = slot.key
     key = effective_session_key(slot)
@@ -195,6 +257,8 @@ async def api_member_fresh_start(request: web.Request) -> web.Response:
     # longer remembers what is above it. A session that still refuses the discard
     # keeps it queued for its next turn boundary, as /clear does.
     reset_at = datetime.now(timezone.utc).isoformat()
+    # Read before the clear, while the rows are those of the conversation it drops.
+    written_held = _written_held_ids(slot)
     outcome = await _answer_slash_without_channel(state, slot, key, "/clear")
     cleared = outcome == "discarded"
     # Whether the fold boundary landed in the member's own log, so the client
@@ -206,6 +270,7 @@ async def api_member_fresh_start(request: web.Request) -> web.Response:
     # boundary-recording fault that has nothing to do with the conversation.
     reset_persisted = False
     if cleared:
+        _drop_queue_entries(state, slot, written_held)
         # Durable fold so the "earlier conversation" boundary survives a reload:
         # the roster projection carries `reset_at`, which `GET /api/members`
         # serves back to the page that otherwise only holds it in React state.

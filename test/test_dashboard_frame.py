@@ -206,6 +206,32 @@ class TestTheComposedDocument:
         a page it then presents as the template's."""
         assert self.page() in self.doc()
 
+    def test_the_body_carries_the_tabs_scheme_marker_and_no_class(self) -> None:
+        """The tab's frame marks its scheme on the body as an attribute, so an offline
+        run must meet the same body: a page whose own ``.light`` rule once styled a body
+        classed ``light`` was squashed on the tab while the save's check and the snapshot,
+        composed over a bare ``<body>``, drew it whole. A class would put the host in the
+        page's class namespace; an attribute keeps every class name the page's own."""
+        doc = self.doc()
+        assert f'<body {dashboard_frame.MODE_ATTRIBUTE}="{dashboard_frame.OFFLINE_MODE}">' in doc
+        assert re.search(r"<body[^>]*\sclass=", doc) is None
+
+    def test_the_scheme_marker_is_the_browser_wrappers(self) -> None:
+        """One attribute on both sides, read out of the wrapper rather than restated, and the
+        wrapper's Tailwind ``dark:`` variant reads that attribute and no class."""
+        from pathlib import Path
+
+        from kiro_crew import dashboard_snapshot_look
+
+        wrapper = (
+            Path(__file__).resolve().parents[1] / "website" / "src" / "lib" / "widgetSrcdoc.ts"
+        ).read_text(encoding="utf-8")
+        attribute = re.search(r"export const FRAME_MODE_ATTRIBUTE = '([^']+)'", wrapper)
+        assert attribute is not None and attribute.group(1) == dashboard_frame.MODE_ATTRIBUTE
+        directives = dashboard_snapshot_look.TAILWIND_DIRECTIVES
+        assert f"[{dashboard_frame.MODE_ATTRIBUTE}=dark]" in directives
+        assert ".dark" not in directives
+
     def test_the_data_island_precedes_the_page(self) -> None:
         """A page's own inline script runs during parse, so a bootstrap placed after
         it would leave the first script reading ``undefined`` -- and a chart that
@@ -849,173 +875,6 @@ class TestTheScanAgreesWithItselfOnRandomPages:
                 last_end = end
                 checked += 1
         assert checked > 100, "the corpus no longer produces spans, so this proves nothing"
-
-
-class TestMappingAPageByKind:
-    """``map_page_text`` is the markup function's page, with code's result in script and style text.
-
-    The markup function runs over the whole page first and its answer is the baseline. The one
-    change allowed is to put the code function's result for an element's text where the markup
-    function's was, and the result is checked before it is served.
-    """
-
-    PAGES = (
-        "",
-        "<p>x</p>",
-        "<script>a</script>",
-        "<script></script><i>c</i>",
-        "<p>a</p><script>b</script><i>c</i><style>d</style>",
-        "<p>a</p><style>b{}</style><script>unclosed",
-    )
-
-    def test_two_identity_functions_give_the_page_back(self) -> None:
-        for html in self.PAGES:
-            assert dashboard_frame.map_page_text(html, lambda s: s, lambda s: s) == html
-
-    def test_script_and_style_text_gets_the_code_function_and_the_rest_the_markup_function(
-        self,
-    ) -> None:
-        html = "<p>KC</p><script>KC</script><i>KC</i><style>KC</style>"
-        out = dashboard_frame.map_page_text(
-            html, lambda s: s.replace("K", "#"), lambda s: s.replace("C", "-")
-        )
-        assert out == "<p>#C</p><script>K-</script><i>#C</i><style>K-</style>"
-
-    def test_the_code_function_sees_only_the_text_of_each_element(self) -> None:
-        seen: list[str] = []
-
-        def code(piece: str) -> str:
-            seen.append(piece)
-            return piece
-
-        html = "<p>a</p><script>b</script><i>c</i><style>d</style>"
-        dashboard_frame.map_page_text(html, lambda s: s.upper(), code)
-        assert seen == ["b", "d"]
-
-    def test_a_page_with_no_code_reaches_the_markup_function_whole(self) -> None:
-        seen: list[str] = []
-
-        def markup(piece: str) -> str:
-            seen.append(piece)
-            return piece
-
-        def not_code(piece: str) -> str:
-            raise AssertionError(f"{piece!r} is not code")
-
-        html = "<p>x</p>"
-        assert dashboard_frame.map_page_text(html, markup, not_code) == html
-        assert seen == [html]
-
-    def test_a_page_the_markup_function_leaves_alone_never_reaches_the_code_function(self) -> None:
-        def not_code(piece: str) -> str:
-            raise AssertionError(f"{piece!r} was handed over although nothing was scrubbed")
-
-        html = "<p>x</p><script>a</script>"
-        assert dashboard_frame.map_page_text(html, lambda s: s, not_code) == html
-
-    def test_a_run_that_the_markup_function_reads_whole_is_not_cut_by_the_code_function(
-        self,
-    ) -> None:
-        """A key id glued to a partial key is one run to the markup function.
-
-        Letting the code function rewrite the prose first would leave the markup function a
-        tail too short to match, and the tail would be served.
-        """
-        html = "<p>AAAAKKKK</p><style>a{}</style>"
-
-        def markup(piece: str) -> str:
-            return re.sub(r"[AK]{8,}", "#", piece)
-
-        def code(piece: str) -> str:
-            return piece.replace("AAAA", "[R]")
-
-        out = dashboard_frame.map_page_text(html, markup, code)
-        assert out == markup(html) == "<p>#</p><style>a{}</style>"
-
-    def test_a_rule_that_reaches_across_a_start_tag_gives_the_page_to_the_markup_function(
-        self,
-    ) -> None:
-        """The pieces scrubbed one by one must add up to the page scrubbed whole."""
-        html = "<p>1</p>x<script>K</script><i>K</i>"
-
-        def markup(piece: str) -> str:
-            return piece.replace("x<script>K</script>", "#").replace("K", "k")
-
-        out = dashboard_frame.map_page_text(html, markup, lambda s: s)
-        assert out == markup(html) == "<p>1</p>#<i>k</i>"
-
-    def test_text_that_would_end_early_once_the_code_function_is_done_is_not_kept_as_code(
-        self,
-    ) -> None:
-        """Dropping a nested script opener moves where the element ends; what follows is prose."""
-        html = "<script>A<!--<script>B</script>C</script><p>K</p>"
-
-        def code(piece: str) -> str:
-            return piece.replace("<!--<script>", "")
-
-        def markup(piece: str) -> str:
-            return piece.replace("K", "k").replace("C", "c")
-
-        out = dashboard_frame.map_page_text(html, markup, code)
-        assert out == markup(html) == "<script>A<!--<script>B</script>c</script><p>k</p>"
-
-    def test_a_markup_function_that_moves_where_an_element_ends_gets_the_page_whole(self) -> None:
-        html = "<script>K</script><p>K</p>"
-
-        def markup(piece: str) -> str:
-            return piece.replace("</script>", "").replace("K", "k")
-
-        out = dashboard_frame.map_page_text(html, markup, lambda s: s)
-        assert out == markup(html) == "<script>k<p>k</p>", "the script text was kept as code"
-
-    def test_a_markup_function_that_leaves_the_elements_alone_keeps_the_code_text(self) -> None:
-        html = "<p>K</p><script>K</script><p>K</p><style>K</style>"
-        out = dashboard_frame.map_page_text(html, lambda s: s.replace("K", "k"), lambda s: s)
-        assert out == "<p>k</p><script>K</script><p>k</p><style>K</style>"
-
-    def test_the_number_of_calls_is_bounded_however_many_elements_the_page_holds(self) -> None:
-        """Each stretch between elements is a call; thousands of tiny elements must not cost thousands."""
-        extra = 40
-        bound = dashboard_frame.MAX_CODE_PIECES
-        html = "<script>a</script>" * (bound + extra)
-        calls = {"markup": 0, "code": 0}
-
-        def count(kind: str):
-            def fn(piece: str) -> str:
-                calls[kind] += 1
-                return piece.replace("a", "b") if kind == "markup" else piece
-
-            return fn
-
-        dashboard_frame.map_page_text(html, count("markup"), count("code"))
-        assert calls["code"] == bound
-        # the whole page, then each stretch outside (one more than the elements) and each text
-        assert calls["markup"] == 1 + (bound + 1) + bound
-
-    def test_an_element_past_the_bound_goes_to_the_stricter_function(self) -> None:
-        html = "<script>a</script>" * (dashboard_frame.MAX_CODE_PIECES + 1)
-        out = dashboard_frame.map_page_text(
-            html, lambda s: s.replace("a", "="), lambda s: s.replace("a", "-")
-        )
-        assert out.count("-") == dashboard_frame.MAX_CODE_PIECES
-        assert out.endswith("<script>=</script>"), "the last element was kept as code"
-
-    def test_neither_function_is_called_with_an_empty_piece(self) -> None:
-        markup_seen: list[str] = []
-        code_seen: list[str] = []
-
-        def markup(piece: str) -> str:
-            markup_seen.append(piece)
-            return piece.replace("a", "x")
-
-        def code(piece: str) -> str:
-            code_seen.append(piece)
-            return piece
-
-        html = "<script>a</script><style>b</style><script>c"
-        dashboard_frame.map_page_text(html, markup, code)
-        assert code_seen == ["a", "b"]
-        assert all(markup_seen), markup_seen
 
 
 #: The CSS generic families a role variable may be built from.

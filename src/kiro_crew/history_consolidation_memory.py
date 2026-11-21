@@ -396,8 +396,8 @@ def _refuse_oversized_semantic(
     and ``_consolidate``'s member-store branch before ``apply_consolidation``. Both run
     after the write-boundary recheck, so a discarded result refuses and logs nothing.
     Routing therefore reads the model's answer as it would without the bound, in every
-    ``memory.kind_routing`` mode: every item it routes keeps its decision, counted and,
-    under ``shadow``, sampled, and a ``state`` item ``enforce`` keeps out is refused as
+    ``memory.kind_routing`` mode: every item it routes keeps its decision and is counted,
+    and a ``state`` item ``enforce`` keeps out is refused as
     ``work_state``, never for size, because routing has already taken it out of the list
     this reads. So the size code never takes the place of routing's refusal either.
 
@@ -1091,7 +1091,6 @@ def _save_lessons(
                         rule_emb=rule_emb,
                         rule_emb_generation=rule_generation,
                         rule_emb_resolved=True,
-                        defer_backfills=True,
                         # Gated by _gated_lesson_scope above; write_lesson
                         # canonicalises and re-checks admissibility itself.
                         repo_scope=scope,

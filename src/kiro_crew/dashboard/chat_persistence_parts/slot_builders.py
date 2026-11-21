@@ -33,6 +33,7 @@ if TYPE_CHECKING:
         _has_validated_effort_marker,
         _is_app_owned_channel_row,
         _load_restore_cfg,
+        _local_turn_generation,
         _member_restore_identity,
         _metadata_codec,
         _normalize_slot_key,
@@ -71,6 +72,7 @@ def _prefetch_rehydrate_inputs(
     adopt_closed: bool = False,
     kiro_model_map: dict[str, str] | None = None,
     with_status: bool = False,
+    tail_window_above: int | None = None,
 ) -> tuple[
     dict, bool, list[dict] | None, dict[str, str] | None, tuple[str, str] | None, str | None, bool
 ]:
@@ -96,6 +98,13 @@ def _prefetch_rehydrate_inputs(
     *messages* and *model_map* are ``None`` when there is nothing to build — no
     metadata, an unreadable read, or a session closed with ✕ that the caller did
     not opt to adopt — so a caller can decide without a second disk round trip.
+    *tail_window_above*, when set, reads only the newest window of a transcript
+    chain larger than that many bytes (:func:`slot_window_tail.read_window_tail`);
+    the older rows stay on disk and page in on scroll, except for a tab whose
+    metadata carries a local-turn marker or deferred notes, which reads in full.
+    The messages value is then
+    a ``WindowTail``, which the window load accepts. A chain the page read
+    refuses takes the full read.
     *member_identity* is the prefetched ``_member_restore_identity`` answer
     (dm.json is file IO too, and the apply half is loop-affine); it is resolved
     only when there is something to build.
@@ -107,15 +116,29 @@ def _prefetch_rehydrate_inputs(
     if not readable or not meta or (meta.get("closed") and not adopt_closed):
         return meta or {}, readable, None, None, None, None, False
     _seed_session_tree(meta)
+    messages: Any = None
+    # A local-turn marker or held notes are settled against the loaded rows, so a
+    # window that omits the rows they refer to would duplicate or re-deliver them.
+    if (
+        tail_window_above is not None
+        and not _local_turn_generation(meta)
+        and not meta.get("deferred_notes")
+        and _window_tail.chain_bytes(conv_log, history_key) > tail_window_above
+    ):
+        messages = _window_tail.read_window_tail(conv_log, history_key, _WINDOW_ROWS)
+    if messages is None:
+        messages = conv_log.read_messages_chained(history_key)
     return (
         meta,
         readable,
-        conv_log.read_messages_chained(history_key),
+        messages,
         kiro_model_map if kiro_model_map is not None else _build_kiro_model_map(),
         # The transcript key is "dashboard:" + slot name; identity is a
         # property of the slot name.
         _member_restore_identity(history_key.removeprefix("dashboard:")),
-        _restored_agent_name(str(meta.get("linked_session_key") or history_key), meta),
+        _restored_agent_name(
+            _metadata_codec.own_linked_session_key(meta, history_key) or history_key, meta
+        ),
         _has_validated_effort_marker(meta.get("reasoning_effort")),
     )
 
@@ -803,7 +826,7 @@ async def _rehydrate_slot_from_history_noted(
     # ``dashboard:`` session that does not exist.
     _claims = await asyncio.to_thread(
         _read_mcp_app_claims,
-        session_key_for(slot_name, str(meta.get("linked_session_key") or "")),
+        session_key_for(slot_name, _metadata_codec.own_linked_session_key(meta, history_key)),
     )
     # Tab-close race: the close records its tombstone at once but persists
     # ``closed`` after its own awaits, so this metadata may still say open and a
@@ -976,7 +999,7 @@ def _prefetch_recent_session(
     slot_name = _recent_session_slot_name(key) or ""
     member_identity = _member_restore_identity(slot_name)
     agent = _restored_agent_name(
-        str(meta.get("linked_session_key") or slot_transcript_key(slot_name or key)),
+        _metadata_codec.own_linked_session_key(meta, key) or slot_transcript_key(slot_name or key),
         meta,
     )
     effort_marker = _has_validated_effort_marker(meta.get("reasoning_effort"))

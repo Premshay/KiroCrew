@@ -250,6 +250,24 @@ def _proxy_principal(request: web.Request) -> tuple[str, str]:
     return PRINCIPAL_NONE, ""
 
 
+def _is_memory_provider_route(name: str, path: str) -> bool:
+    """Whether *path* falls under a memory provider route app *name* declares."""
+    manifest = get_app_manifest(name)
+    if manifest is None:
+        return False
+    # A URL path, read with POSIX path rules: empty and ``.`` segments drop out.
+    # Imported here: every module-level name of this owner is served by the
+    # ``apps.routes`` facade, and a stray import would join that surface.
+    from pathlib import PurePosixPath
+
+    parts = PurePosixPath(path.lstrip("/")).parts
+    for decl in manifest.contributes.memoryProviders.usable():
+        route = PurePosixPath(decl.route.lstrip("/")).parts
+        if route and parts[: len(route)] == route:
+            return True
+    return False
+
+
 async def handle_app_api_proxy(
     request: web.Request, *, read_body: bytes | None = None
 ) -> web.StreamResponse:
@@ -270,6 +288,26 @@ async def handle_app_api_proxy(
     # Path traversal guard (input validation first)
     if ".." in path:
         return web.json_response({"error": "invalid path"}, status=400)
+
+    # A declared memory provider route answers the gateway's own provider calls,
+    # which carry the store scope Crew resolved for the caller. The proxy signs
+    # with the same secret, so a proxied call could name any store; it is refused.
+    if await asyncio.to_thread(_is_memory_provider_route, name, path):
+        sel().log_api_access(
+            caller=request.get("app", "") or "dashboard",
+            operation="app_proxy_memory_provider_route",
+            outcome="denied",
+            source="app_routes",
+            resources=f"/apps/{name}/{path}",
+            error="memory provider routes are called by the gateway only",
+        )
+        return web.json_response(
+            {
+                "code": "memory_provider_route",
+                "error": "memory provider routes are called by the gateway only",
+            },
+            status=403,
+        )
 
     # Cross-app guard (CWE-269): if the caller authenticated with an APP token
     # (``request["app"]`` set by token_auth_middleware), it may only proxy into
@@ -450,8 +488,10 @@ async def handle_app_api_proxy(
         session = request.app.get("_proxy_session")
         owns_session = session is None or session.closed
         if owns_session:
-            # As the shared session in routes.py: relay the encoded bytes as-is.
-            session = aiohttp.ClientSession(auto_decompress=False)
+            # As the shared session in routes.py: the encoded bytes as-is, no cookie jar.
+            session = aiohttp.ClientSession(
+                auto_decompress=False, cookie_jar=aiohttp.DummyCookieJar()
+            )
         try:
             async with asyncio.timeout(_PROXY_TIMEOUT) as total_bound:
                 async with session.request(

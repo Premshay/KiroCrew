@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 from guide_route_helpers import FakeState, agent, run_guide_app
+from redaction_structured_cases import ALNUM, synth
 
 from kiro_crew import crewmate_prompts, mcp_mate
 from kiro_crew import members as members_mod
@@ -300,7 +301,7 @@ def test_a_credential_shaped_name_is_refused_and_not_echoed(_events) -> None:
     _seed()
     state = FakeState()
     _thread(state, ASSISTANT_MEMBER_NAME)
-    raw = "https://user:password@example.com"
+    raw = "https://user:Sup3rS3cretPw@example.com"  # ``password`` itself is a placeholder
     status, body = _update(state, {"display_name": raw})
     assert (status, body["code"]) == (400, "invalid_name")
     assert raw not in str(body)
@@ -344,7 +345,7 @@ def test_the_description_is_cleaned_and_saved_and_the_row_names_the_field(_event
     [
         (42, "invalid_description"),
         ("x" * (members_mod.MEMBER_DESCRIPTION_MAX_CHARS + 1), "invalid_description"),
-        ("token https://user:password@example.com", "invalid_description"),
+        ("token https://user:Sup3rS3cretPw@example.com", "invalid_description"),
     ],
 )
 def test_an_unusable_description_is_refused(raw: object, code: str, _events) -> None:
@@ -632,7 +633,8 @@ def test_the_row_masks_a_credential_shaped_trait_but_the_undo_keeps_it() -> None
     _seed()
     state = FakeState()
     slot = _thread(state, ASSISTANT_MEMBER_NAME)
-    planted = "AKIAIOSFODNN7EXAMPLE"
+    # A short GitLab-shaped token: a trait value is capped below a GitHub token's length.
+    planted = "glpat-" + synth(20, ALNUM, 6)
     status, body = _update(state, {"avatar": {"traits": {"eyes": planted}}})
     assert status == 200, body
     (row,) = _self_rows(slot)
