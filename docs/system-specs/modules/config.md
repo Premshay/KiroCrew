@@ -7,6 +7,9 @@ agent-pattern overrides live with agent fields; `decisions.spawn_route` lives
 with decision fields; and the batch-only `bridge` recogniser lives with STT.
 Set `subagent.local_check.auto_commit` to `true` to commit eligible local worker
 changes after a passing check. The default is `false`.
+Explicit and brief-derived checks use the configured worker sandbox tier.
+They inherit only `PATH`, `HOME`, and `LANG` from the gateway environment.
+If the sandbox cannot be applied, the check fails and cannot trigger a commit.
 The commit keeps hooks enabled and excludes paths already dirty at run start.
 New files must be staged by the worker. A dirty primary checkout is ineligible.
 Resolved bindings include a member's reasoning-effort pin in dispatch identity.
