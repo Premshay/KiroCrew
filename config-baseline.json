@@ -6506,6 +6506,10 @@
         "bucket": 100,
         "history_budget_chars": 2000,
         "spawn_route": {},
+        "quota_limits": {
+          "low_pct": 50.0,
+          "out_pct": 95.0
+        },
         "model_route": {
           "simple": "",
           "medium": "",
@@ -6578,6 +6582,37 @@
       "label": "*",
       "help": "",
       "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
+      "path": "decisions.quota_limits",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Subscription quota thresholds",
+      "help": "When a vendor's subscription window counts as low or out, as the share of the window used: {low_pct, out_pct}, defaults 50 and 95. The same two numbers apply to every vendor and every account (Claude, Codex, Antigravity, ...): a vendor at or past low_pct is skipped for routine sub-agent work while another vendor has room, and one at or past out_pct, or refused by its provider, is not offered at all. A vendor with several accounts is out only when every account is. Each value is clamped to 0-100; a low_pct above out_pct reads as the defaults.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {
+        "low_pct": 50.0,
+        "out_pct": 95.0
+      }
+    },
+    {
+      "path": "decisions.quota_limits.*",
+      "kind": "core",
+      "type": "number",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
       "enumValues": null,
       "defaultValue": null
     },

@@ -2,14 +2,22 @@
 
 ``spawn.route`` (``decisions/points/spawn_route.py``) skips a vendor near or past
 its window before a spawn fails on it (POLICY.md, operator ruling of 2026-11-20).
-This module holds the readings it needs and turns each into one shape::
+Every vendor is read the same way (operator ruling of 2026-11-21):
+
+1. its reader fills ONE normalized shape (:mod:`kiro_crew.quota_rules`): vendor ->
+   accounts -> windows or models -> ``{used_pct, resets_at, as_of, status}``;
+2. :mod:`kiro_crew.quota_rules` judges it with the one rule set (``low_pct``,
+   ``out_pct``, ``rejected`` is out; a vendor is out only when every account is),
+   giving the health shape spawn.route reads::
 
     {"out": bool, "used_pct": 0..100, "window": str, "resets_at": epoch s,
      "source": str, "as_of": epoch s}
 
-``used_pct`` is the binding window's (the most-used one when a vendor has several).
-An unknown value is an ABSENT key, never 0: a vendor nobody has read is usable,
-not idle.
+``used_pct`` is the binding window's (the most-used one when an account has
+several; the best account's when a vendor has several). An unknown value is an
+ABSENT key, never 0: a vendor nobody has read is usable, not idle. Until a harness
+says which account served a turn, every reading is account
+:data:`~kiro_crew.quota_rules.DEFAULT_ACCOUNT`.
 
 Sources
 -------
@@ -22,13 +30,15 @@ Sources
 - Codex: the ``limit_id: "codex"`` row of the rollout logs
   (``dashboard/handlers/codex_usage.py``).
 - Antigravity: ``antigravity_quota.json`` under the data home, written by the
-  Nexus companion: ``{as_of, models: {<id>: {remaining_fraction, reset_time}}}``.
-- Local: ``GET /fleet/status`` of the fleet router (a role's lane is up).
-- Quota outs: a run that HIT its vendor's quota marks the vendor (or, for
-  Antigravity, the model's quota group) out until its reset at once
-  (:func:`note_quota_out`, called by ``subagent_manager.quota_switch``), so no
-  new spawn waits for a probe or a tombstone scan to learn it. Kept in
-  ``vendor_limits.json`` under ``_outs``.
+  Nexus companion: ``{as_of, models: {<id>: {remaining_fraction, reset_time, group}}}``.
+- Local: ``GET /fleet/status`` of the fleet router (a role's lane is up). Lanes,
+  not a subscription window, so it has no quota shape.
+- Quota outs: a run that HIT its vendor's quota marks it out until its reset at
+  once (:func:`note_quota_out`, called by ``subagent_manager.quota_switch``), so no
+  new spawn waits for a probe or a tombstone scan to learn it. A mark is keyed by
+  vendor + account + model group: a vendor whose quota is held per model group
+  (:data:`PER_MODEL_VENDORS`) marks only the group, every other vendor the whole
+  account. Kept in ``vendor_limits.json`` under ``_marks``.
 
 Every reader here never raises: a missing or malformed source is "unknown".
 """
@@ -43,7 +53,10 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
+
+from kiro_crew import quota_rules as qr
+from kiro_crew.quota_rules import DEFAULT_ACCOUNT
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +66,21 @@ ANTIGRAVITY_QUOTA_NAME = "antigravity_quota.json"
 #: The fleet router's status route; ``KIROCREW_FLEET_STATUS_URL`` overrides it.
 FLEET_STATUS_URL = "http://127.0.0.1:8484/fleet/status"
 FLEET_TIMEOUT_S = 1.5
-#: A ``used_pct`` at or above this is "low" (half the window or less left).
-LOW_PCT = 50.0
+#: The default "low" threshold, kept for callers of the old name. The thresholds in
+#: force are :func:`kiro_crew.quota_rules.rules` (``decisions.quota_limits``).
+LOW_PCT = qr.QUOTA_LOW_PCT_DEFAULT
+#: Vendors whose quota is held per model group, so a quota hit marks only the group.
+PER_MODEL_VENDORS = ("antigravity",)
+
+#: Store keys that are not a vendor's default-account readings.
+ACCOUNTS_KEY = "_accounts"  # {vendor: {account: {window: reading}}}, non-default accounts
+MARKS_KEY = "_marks"  # {vendor: {account: {group: mark}}}, group "" = the whole account
+LEGACY_OUTS_KEY = "_outs"  # before 2026-11-21: {vendor: {"vendor": mark, "models": {id: mark}}}
 
 _lock = threading.Lock()
-#: ``{vendor: {window: reading}}``; loaded from disk on first use.
-_store: dict[str, dict[str, dict[str, Any]]] | None = None
+#: ``{vendor: {window: reading}}`` for the default account, plus the reserved keys
+#: above; loaded from disk on first use.
+_store: dict[str, Any] | None = None
 
 
 def _data_home() -> Path:
@@ -86,19 +108,47 @@ def _pct(utilization: object) -> float | None:
     return round(min(u * 100.0 if u <= 1.0 else u, 100.0), 1)
 
 
-def _load() -> dict[str, dict[str, dict[str, Any]]]:
+def _merge_mark(bucket: dict[str, Any], group: str, mark: Mapping[str, Any]) -> None:
+    """Keep *mark* under *group* unless the one there already lasts as long: a mark extends, never shortens."""
+    prev = bucket.get(group) or {}
+    if float(prev.get("until") or 0) < float(mark.get("until") or 0):
+        bucket[group] = dict(mark)
+
+
+def _migrate_legacy_outs(store: dict[str, Any]) -> None:
+    """Fold a pre-account ``_outs`` table into ``_marks`` under the default account."""
+    legacy = store.pop(LEGACY_OUTS_KEY, None)
+    if not isinstance(legacy, dict):
+        return
+    marks = store.setdefault(MARKS_KEY, {})
+    for vendor, row in legacy.items():
+        if not isinstance(vendor, str) or not isinstance(row, dict):
+            continue
+        bucket = marks.setdefault(vendor, {}).setdefault(DEFAULT_ACCOUNT, {})
+        whole = row.get("vendor")
+        if isinstance(whole, dict):
+            _merge_mark(bucket, "", whole)
+        for model, mark in (row.get("models") or {}).items():
+            if isinstance(model, str) and isinstance(mark, dict):
+                _merge_mark(bucket, model, {**mark, "models": [model]})
+
+
+def _load() -> dict[str, Any]:
     global _store
     if _store is not None:
         return _store
-    loaded: dict[str, dict[str, dict[str, Any]]] = {}
+    loaded: dict[str, Any] = {}
     try:
         raw = json.loads(_store_path().read_text(encoding="utf-8"))
         if isinstance(raw, dict):
-            for vendor, windows in raw.items():
-                if isinstance(vendor, str) and isinstance(windows, dict):
-                    loaded[vendor] = {
-                        str(w): dict(r) for w, r in windows.items() if isinstance(r, dict)
-                    }
+            for key, value in raw.items():
+                if not isinstance(key, str) or not isinstance(value, dict):
+                    continue
+                if key.startswith("_"):
+                    loaded[key] = json.loads(json.dumps(value))
+                else:
+                    loaded[key] = {str(w): dict(r) for w, r in value.items() if isinstance(r, dict)}
+        _migrate_legacy_outs(loaded)
     except FileNotFoundError:
         pass
     except Exception:
@@ -116,8 +166,17 @@ def _persist(snapshot: Mapping[str, Any]) -> None:
         logger.debug("vendor_limits: store not written", exc_info=True)
 
 
-def note_claude_rate_limit(info: object, *, now: float | None = None) -> bool:
-    """Keep one ``SDKRateLimitInfo``; ``True`` when it changed the store. Never raises."""
+def _windows_of(store: dict[str, Any], vendor: str, account: str) -> dict[str, Any]:
+    """The (mutable) ``{window: reading}`` table of *vendor*'s *account* in *store*."""
+    if account == DEFAULT_ACCOUNT:
+        return store.setdefault(vendor, {})
+    return store.setdefault(ACCOUNTS_KEY, {}).setdefault(vendor, {}).setdefault(account, {})
+
+
+def note_claude_rate_limit(
+    info: object, *, now: float | None = None, account: str = DEFAULT_ACCOUNT
+) -> bool:
+    """Keep one ``SDKRateLimitInfo`` for *account*; ``True`` when it changed the store. Never raises."""
     if not isinstance(info, dict):
         return False
     status = info.get("status")
@@ -135,13 +194,15 @@ def note_claude_rate_limit(info: object, *, now: float | None = None) -> bool:
     resets = _finite(info.get("resetsAt"))
     if resets is not None:
         reading["resets_at"] = resets
+    account = account or DEFAULT_ACCOUNT
     with _lock:
         store = _load()
-        prev = store.get("claude", {}).get(window)
+        windows = _windows_of(store, "claude", account)
+        prev = windows.get(window)
         same = prev is not None and all(
             prev.get(k) == reading.get(k) for k in ("status", "used_pct", "resets_at")
         )
-        store.setdefault("claude", {})[window] = reading
+        windows[window] = reading
         snapshot = json.loads(json.dumps(store))
     if not same:
         _persist(snapshot)
@@ -160,45 +221,27 @@ def note_usage_meta(update: object) -> None:
         logger.debug("vendor_limits: usage meta ignored", exc_info=True)
 
 
-def claude_health(now: float | None = None) -> dict[str, Any]:
-    """Claude's binding window: the most-used live one; ``out`` when any live window rejected."""
-    now = time.time() if now is None else now
+# ---------------------------------------------------------------------------
+# Readers: each fills the normalized shape (quota_rules) and nothing else
+# ---------------------------------------------------------------------------
+
+
+def claude_quota() -> dict[str, Any]:
+    """Claude's readings in the normalized shape: every account's windows as kept."""
     with _lock:
-        windows = {w: dict(r) for w, r in _load().get("claude", {}).items()}
-    live = {
-        w: r
-        for w, r in windows.items()
-        if r.get("resets_at") is None or float(r["resets_at"]) > now
-    }
-    if not live:
-        return {}
-    rejected = [w for w, r in live.items() if r.get("status") == "rejected"]
-    if rejected:
-        w = max(rejected, key=lambda k: float(live[k].get("resets_at") or 0))
-    else:
-        scored = [w for w, r in live.items() if "used_pct" in r]
-        if not scored:
-            w = max(live, key=lambda k: float(live[k].get("as_of") or 0))
-        else:
-            w = max(scored, key=lambda k: float(live[k]["used_pct"]))
-    r = live[w]
-    out: dict[str, Any] = {
-        "out": bool(rejected),
-        "window": w,
-        "source": "claude_rate_limit_event",
-        "as_of": max(float(x.get("as_of") or 0) for x in live.values()),
-    }
-    if rejected:
-        out["used_pct"] = 100.0
-    elif "used_pct" in r:
-        out["used_pct"] = float(r["used_pct"])
-    if r.get("resets_at") is not None:
-        out["resets_at"] = r["resets_at"]
-    return out
+        store = _load()
+        accounts: dict[str, Any] = {}
+        default = store.get("claude")
+        if isinstance(default, dict) and default:
+            accounts[DEFAULT_ACCOUNT] = {"windows": json.loads(json.dumps(default))}
+        for acct, windows in ((store.get(ACCOUNTS_KEY) or {}).get("claude") or {}).items():
+            if isinstance(windows, dict) and windows:
+                accounts[str(acct)] = {"windows": json.loads(json.dumps(windows))}
+    return {"source": "claude_rate_limit_event", "accounts": accounts} if accounts else {}
 
 
-def codex_health(reading: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Codex's binding window from the rollout reading (``codex_usage``); ``out`` at 100 %."""
+def codex_quota(reading: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Codex's rollout reading (``codex_usage``) in the normalized shape; stale windows dropped."""
     if reading is None:
         try:
             from kiro_crew.dashboard.handlers.codex_usage import read_codex_rate_limits
@@ -209,32 +252,91 @@ def codex_health(reading: Mapping[str, Any] | None = None) -> dict[str, Any]:
             return {}
     if not reading:
         return {}
-    best: tuple[str, Mapping[str, Any]] | None = None
-    for name, label in (("five_hour", "five_hour"), ("weekly", "weekly")):
+    as_of = _iso_ts(reading.get("captured_at")) or _finite(reading.get("source_mtime"))
+    windows: dict[str, Any] = {}
+    for name in ("five_hour", "weekly"):
         w = reading.get(name)
         if not isinstance(w, Mapping) or w.get("stale"):
             continue
         used = _finite(w.get("used_percent"))
         if used is None:
             continue
-        if best is None or used > float(best[1]["used_percent"]):
-            best = (label, w)
-    if best is None:
+        row: dict[str, Any] = {"used_pct": round(used, 1)}
+        if w.get("resets_at") is not None:
+            row["resets_at"] = w["resets_at"]
+        if as_of is not None:
+            row["as_of"] = as_of
+        windows[name] = row
+    if not windows:
         return {}
-    label, w = best
-    used = float(w["used_percent"])
-    out: dict[str, Any] = {
-        "out": used >= 100.0,
-        "used_pct": round(used, 1),
-        "window": label,
-        "source": "codex_rollout",
-    }
-    if w.get("resets_at") is not None:
-        out["resets_at"] = w["resets_at"]
-    as_of = _iso_ts(reading.get("captured_at")) or _finite(reading.get("source_mtime"))
-    if as_of is not None:
-        out["as_of"] = as_of
+    return {"source": "codex_rollout", "accounts": {DEFAULT_ACCOUNT: {"windows": windows}}}
+
+
+def antigravity_quota(*, path: Path | None = None) -> dict[str, Any]:
+    """The companion's per-model probe in the normalized shape (every row, expired or not)."""
+    try:
+        raw = json.loads((path or _data_home() / ANTIGRAVITY_QUOTA_NAME).read_text("utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        logger.debug("vendor_limits: antigravity quota unreadable", exc_info=True)
+        return {}
+    rows = raw.get("models") if isinstance(raw, dict) else None
+    if not isinstance(rows, dict):
+        return {}
+    as_of = _iso_ts(raw.get("as_of"))
+    models: dict[str, Any] = {}
+    for mid, row in rows.items():
+        if not isinstance(mid, str) or not isinstance(row, dict):
+            continue
+        rem = _finite(row.get("remaining_fraction"))
+        if rem is None:
+            continue
+        entry: dict[str, Any] = {"used_pct": round(100.0 * (1.0 - min(max(rem, 0.0), 1.0)), 1)}
+        reset = _iso_ts(row.get("reset_time"))
+        if reset is not None:
+            entry["resets_at"] = reset
+        if as_of is not None:
+            entry["as_of"] = as_of
+        group = row.get("group")
+        if isinstance(group, str) and group:
+            entry["group"] = group
+        models[mid] = entry
+    if not models:
+        return {}
+    return {"source": "agy_quota", "accounts": {DEFAULT_ACCOUNT: {"models": models}}}
+
+
+def quota_snapshot() -> dict[str, dict[str, Any]]:
+    """Every vendor's normalized shape that has a reading: ``{vendor: shape}``. Never raises."""
+    out: dict[str, dict[str, Any]] = {}
+    for vendor, read in _QUOTA_READERS.items():
+        try:
+            shape = read()
+        except Exception:
+            logger.debug("vendor_limits: %s quota unreadable", vendor, exc_info=True)
+            shape = {}
+        if shape:
+            out[vendor] = shape
     return out
+
+
+# ---------------------------------------------------------------------------
+# Health: the one rule set applied to a reader's shape
+# ---------------------------------------------------------------------------
+
+
+def claude_health(now: float | None = None, rules: qr.QuotaRules | None = None) -> dict[str, Any]:
+    """Claude's verdict: the binding window of the best account; ``out`` when every account is."""
+    now = time.time() if now is None else now
+    return qr.vendor_view(claude_quota(), rules, now=now)
+
+
+def codex_health(
+    reading: Mapping[str, Any] | None = None, rules: qr.QuotaRules | None = None
+) -> dict[str, Any]:
+    """Codex's verdict from the rollout reading. Its staleness is the rollout's own flag."""
+    return qr.vendor_view(codex_quota(reading), rules, now=None)
 
 
 def _iso_ts(value: object) -> float | None:
@@ -249,58 +351,21 @@ def _iso_ts(value: object) -> float | None:
 
 
 def antigravity_health(
-    models: list[str] | None = None, *, path: Path | None = None, now: float | None = None
+    models: list[str] | None = None,
+    *,
+    path: Path | None = None,
+    now: float | None = None,
+    rules: qr.QuotaRules | None = None,
 ) -> dict[str, Any]:
-    """Antigravity's per-model quota from the companion's file.
+    """Antigravity's per-model verdict from the companion's file.
 
     ``per_model`` is each model's ``used_pct``. The vendor ``used_pct`` is the
     most-used of *models* (the offered candidates) when given, else of all; the
-    vendor is ``out`` only when every one of those models is used up and not yet
+    vendor is ``out`` only when every one of those models is out and not yet
     reset, since its quotas are per model. Absent file -> ``{}`` (unknown).
     """
     now = time.time() if now is None else now
-    try:
-        raw = json.loads((path or _data_home() / ANTIGRAVITY_QUOTA_NAME).read_text("utf-8"))
-    except FileNotFoundError:
-        return {}
-    except Exception:
-        logger.debug("vendor_limits: antigravity quota unreadable", exc_info=True)
-        return {}
-    rows = raw.get("models") if isinstance(raw, dict) else None
-    if not isinstance(rows, dict):
-        return {}
-    per_model: dict[str, float] = {}
-    resets: dict[str, float] = {}
-    for mid, row in rows.items():
-        if not isinstance(mid, str) or not isinstance(row, dict):
-            continue
-        rem = _finite(row.get("remaining_fraction"))
-        if rem is None:
-            continue
-        reset = _iso_ts(row.get("reset_time"))
-        if reset is not None and reset <= now:
-            # The window rolled over since the probe: the reading no longer holds.
-            continue
-        per_model[mid] = round(100.0 * (1.0 - min(max(rem, 0.0), 1.0)), 1)
-        if reset is not None:
-            resets[mid] = reset
-    if not per_model:
-        return {}
-    scope = [m for m in (models or []) if m in per_model] or list(per_model)
-    worst = max(scope, key=lambda m: per_model[m])
-    out: dict[str, Any] = {
-        "out": all(per_model[m] >= 100.0 for m in scope),
-        "used_pct": per_model[worst],
-        "window": "per_model",
-        "per_model": per_model,
-        "source": "agy_quota",
-    }
-    if worst in resets:
-        out["resets_at"] = resets[worst]
-    as_of = _iso_ts(raw.get("as_of"))
-    if as_of is not None:
-        out["as_of"] = as_of
-    return out
+    return qr.vendor_view(antigravity_quota(path=path), rules, now=now, models=models)
 
 
 def local_health(status: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -353,85 +418,84 @@ def _fleet_status() -> Any:
         return None
 
 
-OUTS_KEY = "_outs"
+#: Each vendor's normalized-shape reader (looked up at call time, so a test's patch holds).
+_QUOTA_READERS: dict[str, Callable[[], dict[str, Any]]] = {
+    "claude": lambda: claude_quota(),
+    "codex": lambda: codex_quota(),
+    "antigravity": lambda: antigravity_quota(),
+}
 
 
-def _antigravity_group_peers(model: str, path: Path | None = None) -> list[str]:
-    """Every model sharing *model*'s Antigravity quota group (the companion's probe file).
+# ---------------------------------------------------------------------------
+# Quota-out marks: vendor + account + model group
+# ---------------------------------------------------------------------------
 
-    Quota is held per group, so one model out means its whole group is. A model
-    the file does not group stands alone.
-    """
+
+def _model_group(vendor: str, model: str, account: str) -> tuple[str, list[str]]:
+    """``(group key, every model in it)`` for *model*: quota is held per group, so one
+    model out means its whole group is. A model the probe does not group stands alone."""
     try:
-        raw = json.loads((path or _data_home() / ANTIGRAVITY_QUOTA_NAME).read_text("utf-8"))
-        rows = raw.get("models") if isinstance(raw, dict) else None
-        if not isinstance(rows, dict):
-            return [model]
-        group = (rows.get(model) or {}).get("group") if isinstance(rows.get(model), dict) else None
+        shape = _QUOTA_READERS[vendor]() if vendor in _QUOTA_READERS else {}
+        accounts = shape.get("accounts") or {}
+        acct = accounts.get(account) or accounts.get(DEFAULT_ACCOUNT) or {}
+        rows = acct.get("models") or {}
+        group = (rows.get(model) or {}).get("group")
         if not isinstance(group, str) or not group:
-            return [model]
+            return model, [model]
         peers = [m for m, r in rows.items() if isinstance(r, dict) and r.get("group") == group]
-        return sorted(set(peers) | {model})
+        return group, sorted(set(peers) | {model})
     except Exception:
-        return [model]
+        return model, [model]
 
 
-def _antigravity_live_room(path: Path | None = None) -> tuple[float, set[str]]:
-    """``(as_of, models with quota left)`` from the companion's live probe; ``(0, set())`` when unknown.
+def _live_readings(vendor: str) -> dict[str, dict[str, Any]]:
+    """Per account, the vendor's newest live reading as ``{as_of, out, room}``; ``{}`` when none.
 
-    A quota mark comes from one refused turn and holds until the reset the error
-    named. The probe is read after every turn, so a newer probe that shows room
-    on a model proves the mark is stale (an early reset, a plan change).
+    A per-model vendor reads its probe (``room`` = models not out, by the one rule
+    set); every other vendor its health verdict (Claude: the rate-limit event every
+    turn carries; Codex: the newest rollout reading). Read on every routing call, so
+    a mark is reconciled against live data without waiting for a restart.
     """
     try:
-        raw = json.loads((path or _data_home() / ANTIGRAVITY_QUOTA_NAME).read_text("utf-8"))
-        as_of = _iso_ts(raw.get("as_of")) if isinstance(raw, dict) else None
-        rows = raw.get("models") if isinstance(raw, dict) else None
-        if as_of is None or not isinstance(rows, dict):
-            return 0.0, set()
-        room = {
-            m
-            for m, r in rows.items()
-            if isinstance(r, dict) and (_finite(r.get("remaining_fraction")) or 0.0) > 0.0
-        }
-        return float(as_of), room
-    except Exception:
-        return 0.0, set()
-
-
-def _live_reading(vendor: str) -> dict[str, Any]:
-    """The vendor's newest live quota reading as ``{as_of, out, room}``; ``{}`` when none.
-
-    Claude: the rate-limit event every Claude turn carries (any account). Codex: the
-    newest rollout reading. Antigravity: the companion's per-model probe (``room`` =
-    models with quota left). Read on every routing call, so a mark is reconciled
-    against live data without waiting for a restart.
-    """
-    try:
-        if vendor == "antigravity":
-            as_of, room = _antigravity_live_room()
-            return {"as_of": as_of, "out": not room, "room": room} if as_of else {}
+        rule_set = qr.rules()
+        out: dict[str, dict[str, Any]] = {}
+        if vendor in PER_MODEL_VENDORS:
+            shape = _QUOTA_READERS[vendor]() if vendor in _QUOTA_READERS else {}
+            for acct, data in (shape.get("accounts") or {}).items():
+                rows = (data or {}).get("models") or {}
+                as_ofs = [_finite(r.get("as_of")) for r in rows.values()]
+                as_of = max((a for a in as_ofs if a is not None), default=None)
+                if not as_of:
+                    continue
+                room = {m for m, r in rows.items() if not rule_set.reading_out(r)}
+                out[str(acct)] = {"as_of": as_of, "out": not room, "room": room}
+            return out
+        # Called bare, so a caller (or a test) that swaps a reader keeps its contract.
         if vendor == "claude":
             h = claude_health()
         elif vendor == "codex":
             h = codex_health()
         else:
             return {}
-        if not h or not h.get("as_of"):
-            return {}
-        return {"as_of": float(h["as_of"]), "out": bool(h.get("out")), "room": None}
+        views = h.get("accounts") if isinstance(h.get("accounts"), dict) else None
+        for acct, view in (views or ({DEFAULT_ACCOUNT: h} if h else {})).items():
+            if view and view.get("as_of"):
+                out[str(acct)] = {
+                    "as_of": float(view["as_of"]),
+                    "out": bool(view.get("out")),
+                    "room": None,
+                }
+        return out
     except Exception:
         return {}
 
 
-def _stale_against_live(
-    vendor: str, mark: Mapping[str, Any], model: str, live: Mapping[str, Any]
-) -> bool:
-    """Whether a live reading newer than *mark* shows the vendor (or *model*) has quota.
+def _stale_against_live(mark: Mapping[str, Any], model: str, live: Mapping[str, Any]) -> bool:
+    """Whether a live reading newer than *mark* shows its account (or *model*) has quota.
 
     A mark is one refused turn's word, kept until the reset the error named; a newer
-    live reading that is not out (another account, an early reset, a plan change)
-    outranks it.
+    live reading on the same account that is not out (an early reset, a plan
+    change) outranks it.
     """
     as_of = float(live.get("as_of") or 0) if live else 0.0
     if not as_of or as_of <= float(mark.get("as_of") or 0) or live.get("out"):
@@ -442,6 +506,41 @@ def _stale_against_live(
     return (model in room) if model else bool(room)
 
 
+def _public(mark: Mapping[str, Any], account: str) -> dict[str, Any]:
+    return {**{k: v for k, v in mark.items() if k != "models"}, "account": account}
+
+
+def _covering(
+    vendor: str, now: float
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, dict[str, Any]]], set[str]]:
+    """``(whole, per_model, accounts)``: per account, its live whole-account mark and its
+    live per-model marks (a group mark expanded to each model it holds), after expiry
+    and reconciliation; and every account the vendor is known to have."""
+    with _lock:
+        row = json.loads(json.dumps((_load().get(MARKS_KEY) or {}).get(vendor) or {}))
+    live = _live_readings(vendor)
+    whole: dict[str, dict[str, Any]] = {}
+    per_model: dict[str, dict[str, dict[str, Any]]] = {}
+    for acct, groups in row.items():
+        if not isinstance(groups, dict):
+            continue
+        reading = live.get(acct) or {}
+        for group, mark in groups.items():
+            if not isinstance(mark, dict) or float(mark.get("until") or 0) <= now:
+                continue
+            if group == "":
+                if not _stale_against_live(mark, "", reading):
+                    whole[acct] = mark
+                continue
+            for m in mark.get("models") or [group]:
+                if not _stale_against_live(mark, m, reading):
+                    prev = per_model.setdefault(acct, {}).get(m)
+                    if prev is None or float(prev["until"]) < float(mark["until"]):
+                        per_model[acct][m] = {**mark, "model": m}
+    marked = {a for a, g in row.items() if isinstance(g, dict) and g}
+    return whole, per_model, marked | set(live)
+
+
 def note_quota_out(
     vendor: str,
     *,
@@ -449,16 +548,19 @@ def note_quota_out(
     model: str = "",
     detail: str = "",
     now: float | None = None,
+    account: str = DEFAULT_ACCOUNT,
 ) -> dict[str, Any]:
-    """Mark *vendor* out until *until* (epoch s) after a run hit its quota. Never raises.
+    """Mark *vendor*'s *account* out until *until* (epoch s) after a run hit its quota. Never raises.
 
-    Antigravity's quota is per model group, so with a *model* only that group
-    is marked; every other vendor is out whole. Returns the mark written (``{}``
-    when nothing could be). A later mark extends, never shortens, an earlier one.
+    A vendor whose quota is held per model group (:data:`PER_MODEL_VENDORS`) with a
+    *model* marks only that group; every other vendor marks the whole account.
+    Returns the mark written (``{}`` when nothing could be). A later mark extends,
+    never shortens, an earlier one.
     """
     try:
         now = float(time.time() if now is None else now)
         until = float(until)
+        account = account or DEFAULT_ACCOUNT
         if not vendor or until <= now:
             return {}
         mark: dict[str, Any] = {
@@ -467,86 +569,83 @@ def note_quota_out(
             "model": model or "",
             "detail": (detail or "")[:300],
         }
-        per_model = vendor == "antigravity" and bool(model)
-        if per_model:
-            mark["models"] = _antigravity_group_peers(model)
+        group = ""
+        if vendor in PER_MODEL_VENDORS and model:
+            group, mark["models"] = _model_group(vendor, model, account)
         with _lock:
             store = _load()
-            outs = store.setdefault(OUTS_KEY, {})
-            key = "models" if per_model else "vendor"
-            row = outs.setdefault(vendor, {})
-            if per_model:
-                bucket = row.setdefault("models", {})
-                for m in mark["models"]:
-                    prev = bucket.get(m) or {}
-                    if float(prev.get("until") or 0) < until:
-                        bucket[m] = {k: v for k, v in mark.items() if k != "models"}
-            else:
-                prev = row.get(key) or {}
-                if float(prev.get("until") or 0) < until:
-                    row[key] = {k: v for k, v in mark.items() if k != "models"}
+            bucket = store.setdefault(MARKS_KEY, {}).setdefault(vendor, {})
+            _merge_mark(bucket.setdefault(account, {}), group, mark)
             snapshot = json.loads(json.dumps(store))
         _persist(snapshot)
-        return mark
+        return {**mark, "account": account, "group": group}
     except Exception:
         logger.debug("vendor_limits: quota out not recorded", exc_info=True)
         return {}
 
 
-def quota_out(vendor: str, model: str = "", now: float | None = None) -> dict[str, Any] | None:
-    """The live quota mark covering *vendor* (and *model*), or ``None``. Never raises."""
+def quota_out(
+    vendor: str, model: str = "", now: float | None = None, account: str | None = None
+) -> dict[str, Any] | None:
+    """The live quota mark covering *vendor* (and *model*), or ``None``. Never raises.
+
+    With *account*, that account alone. Without one, the vendor is covered only when
+    every account it is known to have is; the mark returned is the one that lifts
+    first, since the vendor is usable again as soon as any account is.
+    """
     try:
         now = time.time() if now is None else now
-        with _lock:
-            row = dict(_load().get(OUTS_KEY, {}).get(vendor) or {})
-        live = _live_reading(vendor)
-        whole = row.get("vendor")
-        if (
-            isinstance(whole, dict)
-            and float(whole.get("until") or 0) > now
-            and not _stale_against_live(vendor, whole, "", live)
-        ):
-            return dict(whole)
-        if model:
-            m = (row.get("models") or {}).get(model)
-            if (
-                isinstance(m, dict)
-                and float(m.get("until") or 0) > now
-                and not _stale_against_live(vendor, m, model, live)
-            ):
-                return {**m, "model": model}
+        whole, per_model, accounts = _covering(vendor, now)
+        found: list[dict[str, Any]] = []
+        for acct in [account] if account else sorted(accounts):
+            mark = whole.get(acct)
+            if mark is not None:
+                found.append(_public(mark, acct))
+                continue
+            m = (per_model.get(acct) or {}).get(model) if model else None
+            if m is None:
+                return None
+            found.append(_public(m, acct))
+        if found:
+            return min(found, key=lambda x: float(x["until"]))
     except Exception:
         logger.debug("vendor_limits: quota out unreadable", exc_info=True)
     return None
 
 
 def quota_outs(now: float | None = None) -> dict[str, dict[str, Any]]:
-    """Live quota marks: ``{vendor: {"until": s, "models": {id: until}}}``; whole-vendor
-    marks carry ``until``, per-model ones only ``models``. Never raises."""
+    """Live quota marks: ``{vendor: {"until": s, "models": {id: until}}}``. Never raises.
+
+    ``until`` is present when every account of the vendor is marked out whole (the
+    earliest of their resets); ``models`` lists each model every account has out,
+    at least one of them by a model-group mark (the earliest reset among them).
+    """
     now = time.time() if now is None else now
     out: dict[str, dict[str, Any]] = {}
     try:
         with _lock:
-            raw = json.loads(json.dumps(_load().get(OUTS_KEY, {})))
-        for vendor, row in raw.items():
-            if not isinstance(row, dict):
+            vendors = list((_load().get(MARKS_KEY) or {}).keys())
+        for vendor in vendors:
+            whole, per_model, accounts = _covering(vendor, now)
+            if not accounts:
                 continue
             state: dict[str, Any] = {}
-            live = _live_reading(vendor)
-            whole = row.get("vendor")
-            if (
-                isinstance(whole, dict)
-                and float(whole.get("until") or 0) > now
-                and not _stale_against_live(vendor, whole, "", live)
-            ):
-                state["until"] = float(whole["until"])
-            models = {
-                m: float(r["until"])
-                for m, r in (row.get("models") or {}).items()
-                if isinstance(r, dict)
-                and float(r.get("until") or 0) > now
-                and not _stale_against_live(vendor, r, m, live)
-            }
+            if all(a in whole for a in accounts):
+                state["until"] = min(float(whole[a]["until"]) for a in accounts)
+            models: dict[str, float] = {}
+            for m in sorted({m for marks in per_model.values() for m in marks}):
+                untils = []
+                for a in accounts:
+                    covers = [
+                        float(x["until"])
+                        for x in (whole.get(a), (per_model.get(a) or {}).get(m))
+                        if x is not None
+                    ]
+                    if not covers:
+                        break
+                    untils.append(max(covers))
+                else:
+                    models[m] = min(untils)
             if models:
                 state["models"] = models
             if state:
@@ -557,8 +656,8 @@ def quota_outs(now: float | None = None) -> dict[str, dict[str, Any]]:
 
 
 def is_low(state: Mapping[str, Any]) -> bool:
-    pct = state.get("used_pct")
-    return isinstance(pct, (int, float)) and pct >= LOW_PCT
+    """Whether *state* is at or past ``low_pct`` (:func:`kiro_crew.quota_rules.is_low`)."""
+    return qr.is_low(state)
 
 
 def _reset_for_tests() -> None:

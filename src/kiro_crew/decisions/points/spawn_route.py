@@ -831,7 +831,9 @@ def build_state(
     has_check: bool = False,
     include_context: bool = True,
     estimate: Mapping[str, int] | None = None,
+    limits: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
+    from kiro_crew import quota_rules
     from kiro_crew.subagent_manager.local_check import estimate_tokens
 
     return {
@@ -866,6 +868,9 @@ def build_state(
             for v, s in health.items()
             if s.get("out") or any(s.get(k) is not None for k in _HEALTH_KEYS)
         },
+        # The one quota rule set (``quota_rules``, ``decisions.quota_limits``): the
+        # decision server judges "low" and "out" with the same numbers KiroCrew did.
+        "limits": dict(limits) if limits is not None else quota_rules.rules().as_state(),
     }
 
 
@@ -1271,7 +1276,7 @@ def apply_route_backend(info: Any, routed: Mapping[str, Any], execution: Any = N
 
 
 def _is_low(state: Mapping[str, Any]) -> bool:
-    from kiro_crew.vendor_limits import is_low
+    from kiro_crew.quota_rules import is_low
 
     return is_low(state)
 
