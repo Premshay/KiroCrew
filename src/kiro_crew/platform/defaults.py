@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 if TYPE_CHECKING:
+    from kiro_crew.decisions.vendors import VendorSpec
     from kiro_crew.publish_provider import PublishProvider
     from kiro_crew.platform.interfaces import (
         BrowserCredentialTarget,
@@ -65,6 +66,9 @@ class DefaultProviderRegistry:
 
     def create_factory(self, cfg: Any) -> Callable[..., Any]:
         return cfg.create_provider_factory()
+
+    def routing_vendors(self) -> tuple[VendorSpec, ...] | None:
+        return None
 
     def agent_runtime_policy(self, engine_identity: str) -> dict[str, Any] | None:
         return None

@@ -31,6 +31,12 @@ runtime-service / frontend points in `platform/interfaces_runtime.py`, both
 re-exported by `interfaces.py`. A new extension point goes to the module of its
 kind.
 
+`ProviderRegistry.routing_vendors()` can declare a vendor's seat tokens, model
+prefixes, native backend, and metered status. Routing validates the full
+declaration before using it. Metered entries are excluded from cross-vendor
+routing. A declared native backend must still pass native backend admission.
+A registry that returns `None` retains the existing routing rules.
+
 The execution catalog reads `ProviderRegistry.agent_runtime_policy(engine_identity)`
 through `current_context()` and `safe_context_call` for owner-visible, unpinned
 member rows. A native harness pin uses upstream model discovery and its own
