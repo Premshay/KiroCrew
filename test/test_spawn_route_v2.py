@@ -44,9 +44,7 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(vl, "_data_home", lambda: tmp_path)
     vl._reset_for_tests()
     monkeypatch.setattr(sr, "_limits_cache", None)
-    monkeypatch.setattr(sr, "_health_cache", None)
     monkeypatch.setattr(sr, "_agy_models_cache", None)
-    monkeypatch.setattr(sr, "load_tombstones", lambda root=None: [])
     consent = tmp_path / "decisions_consent.json"
     consent.write_text(
         json.dumps({"enabled": True, "endpoint": DECISION_PROVIDER_ENDPOINT_DEFAULT}),
@@ -446,8 +444,7 @@ class TestCandidates:
 # ---------------------------------------------------------------------------
 
 
-def test_merged_health_keeps_unknown_absent():
-    tombs = sr.vendor_health([], now=NOW)
+def test_routing_health_keeps_unknown_absent():
     limits = {
         "claude": {
             "out": False,
@@ -465,7 +462,7 @@ def test_merged_health_keeps_unknown_absent():
             "source": "codex_rollout",
         },
     }
-    h = sr.merged_health(tombs, limits)
+    h = sr._routing_health(limits)
     state = sr.build_state("b", vendor="claude", parent_model="", cands=[], health=h)["health"]
     assert set(state) == {"claude", "codex"}
     assert state["claude"]["used_pct"] == 42.0 and state["claude"]["out"] is False
@@ -522,7 +519,10 @@ class TestRoutedAcrossVendors:
     def test_generic_tombstone_rate_limit_does_not_block_a_vendor(self, routed_env, monkeypatch):
         oracle = routed_env(_Oracle("claude/small/0"))
         monkeypatch.setattr(
-            sr, "cached_health", lambda: {"claude": {"out": True, "until": NOW + 100}}
+            sr,
+            "cached_health",
+            lambda: {"claude": {"out": True, "until": NOW + 100}},
+            raising=False,
         )
         assert asyncio.run(sr.routed_spawn("x", agent="crew-claude", session_key="s1"))
         assert not oracle.states[0]["health"].get("claude", {}).get("out")

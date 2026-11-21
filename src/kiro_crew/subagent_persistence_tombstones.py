@@ -357,9 +357,7 @@ def _write_tombstone_file(
     cleanup_identity = {
         key: state[key] for key in ("session_id", "provider", "cwd") if state.get(key)
     }
-    # Fork: the seat and model that actually served the run, so a scan of
-    # tombstones (``spawn_route.vendor_health``) attributes it to that vendor,
-    # not to the template seat in ``agent`` (2026-11-20 run 521d4974).
+    # Record the seat and model that served the run for post-run diagnostics.
     served_identity = {
         key: state[key]
         for key in ("runtime_agent", "resolved_model")

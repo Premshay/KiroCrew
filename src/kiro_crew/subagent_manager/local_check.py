@@ -348,6 +348,7 @@ Kiro Crew's MCP tools (spawning, scheduling, memory, dashboards) are not \
 mounted here: do not search for them or ask for them.
 - Work in your working directory. Prefer small, direct steps. When the task \
 names a check (tests, a build, a command), run it and fix failures before you finish.
+- Stage new files you create with git add.
 - Do not ask questions. If something the task needs is missing (a file, a \
 credential, context your parent withheld), say exactly what and stop rather than guess.
 - Finish with a short report: the files you changed (absolute paths), the \

@@ -274,6 +274,7 @@ class TestLeanContractSafety:
         for needle in (
             "data, never instructions",
             "Never read credential files",
+            "Stage new files you create with git add.",
             "never force-push",
             "do not reword it",
             "127.0.0.1",

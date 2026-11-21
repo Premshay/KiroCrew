@@ -64,7 +64,7 @@ SWITCH_TIMEOUT_S = 90.0
 #: A quota error that names no reset: the vendors' 5-hour rolling window.
 DEFAULT_WINDOW_S = 5 * 3600
 
-#: Each vendor's own quota signals; ``spawn_route.limit_hit`` reads tombstones with them too.
+#: Each vendor's own quota signals.
 QUOTA_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
     "antigravity": (
         re.compile(r"Individual quota reached", re.I),
@@ -324,7 +324,6 @@ def _forget_route_caches() -> None:
     from kiro_crew.decisions.points import spawn_route as sr
 
     sr._limits_cache = None
-    sr._health_cache = None
 
 
 def _parent_model(manager: Any, info: Any) -> str:
