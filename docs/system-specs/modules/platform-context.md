@@ -39,7 +39,8 @@ A registry that returns `None` retains the existing routing rules.
 
 Companion execution seats can declare `vendor`, `role`, `account`, `ctx`,
 `overhead_tokens`, and `metered`. Core validates types and ranges and still
-reserves native backend IDs. The router excludes metered seats, uses live
+reserves native backend IDs. Invalid rows are logged and skipped individually.
+The router excludes metered seats, uses live
 context windows ahead of declared fallbacks, and includes declared overhead
 in the fit and its reported estimate. Older seat records remain valid.
 

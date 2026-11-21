@@ -42,6 +42,41 @@ def validate_member_execution_seat(runtime_agent: str, execution: Any) -> None:
         )
 
 
+def _validate_seat(row: Any, cfg: Any) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        raise ValueError("expected a seat object")
+    name, alias = row.get("id"), row.get("runtime_agent")
+    if not isinstance(name, str) or not name.strip() or name.strip() != name:
+        raise ValueError("requires a nonempty id")
+    if not isinstance(alias, str) or not alias:
+        raise ValueError("requires a nonempty runtime_agent")
+    binding = cfg.agents.get(alias)
+    if binding is None or binding.member_id:
+        raise ValueError("runtime_agent must be a registered template alias")
+    seat: dict[str, Any] = {
+        "id": name,
+        "runtime_agent": alias,
+        "runtime": str(row.get("runtime") or name),
+    }
+    for key in ("vendor", "role", "account"):
+        if key in row:
+            value = row[key]
+            if not isinstance(value, str) or not value or value.strip() != value:
+                raise ValueError(f"requires a nonempty {key}")
+            seat[key] = value
+    for key, minimum in (("ctx", 1), ("overhead_tokens", 0)):
+        if key in row:
+            value = row[key]
+            if type(value) is not int or value < minimum:
+                raise ValueError(f"requires {key} >= {minimum}")
+            seat[key] = value
+    if "metered" in row:
+        if type(row["metered"]) is not bool:
+            raise ValueError("requires a boolean metered flag")
+        seat["metered"] = row["metered"]
+    return seat
+
+
 def declared_execution_seats(cfg: Any = None) -> dict[str, dict[str, Any]]:
     from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND
     from kiro_crew.config import KiroCrewConfig
@@ -53,41 +88,22 @@ def declared_execution_seats(cfg: Any = None) -> dict[str, dict[str, Any]]:
     cfg = cfg if cfg is not None else KiroCrewConfig.load()
     rows = getter(cfg)
     if not isinstance(rows, list):
-        raise ValueError("Companion execution_seats must return a list")
+        logger.error("Companion execution_seats must return a list")
+        return {}
     result = {}
-    for row in rows:
-        if not isinstance(row, dict):
-            raise ValueError("Companion execution seat must be an object")
-        name, alias = row.get("id"), row.get("runtime_agent")
-        if not isinstance(name, str) or not name or not isinstance(alias, str) or not alias:
-            raise ValueError("Companion execution seat requires id and runtime_agent")
+    for index, row in enumerate(rows):
+        label = row.get("id") if isinstance(row, dict) else None
+        label = label if isinstance(label, str) and label else f"row {index + 1}"
+        try:
+            seat = _validate_seat(row, cfg)
+            name = seat["id"]
+            if name in result:
+                raise ValueError("duplicate id")
+        except ValueError as exc:
+            logger.error("Skipping execution seat %r: %s", label, exc)
+            continue
         if name in POLICY_ID_BY_BACKEND.values():
             logger.warning("Skipping execution seat %r: conflicts with a native backend", name)
             continue
-        binding = cfg.agents.get(alias)
-        if binding is None or binding.member_id:
-            raise ValueError(f"Execution seat {name!r} requires a registered template alias")
-        if name in result:
-            raise ValueError(f"Duplicate execution seat {name!r}")
-        result[name] = {
-            "id": name,
-            "runtime_agent": alias,
-            "runtime": str(row.get("runtime") or name),
-        }
-        for key in ("vendor", "role", "account"):
-            if key in row:
-                value = row[key]
-                if not isinstance(value, str) or not value or value.strip() != value:
-                    raise ValueError(f"Execution seat {name!r} requires a nonempty {key}")
-                result[name][key] = value
-        for key, minimum in (("ctx", 1), ("overhead_tokens", 0)):
-            if key in row:
-                value = row[key]
-                if type(value) is not int or value < minimum:
-                    raise ValueError(f"Execution seat {name!r} requires {key} >= {minimum}")
-                result[name][key] = value
-        if "metered" in row:
-            if type(row["metered"]) is not bool:
-                raise ValueError(f"Execution seat {name!r} requires a boolean metered flag")
-            result[name]["metered"] = row["metered"]
+        result[name] = seat
     return result

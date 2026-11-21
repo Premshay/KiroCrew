@@ -72,7 +72,7 @@ def test_only_registered_unmetered_vendors_can_receive_cross_routes(monkeypatch)
     }
 
 
-def test_declared_seat_metadata_reaches_routing_and_live_window_wins(monkeypatch):
+def test_declared_seat_metadata_reaches_routing_and_live_window_wins(monkeypatch, caplog):
     row = {
         "id": "opaque-seat",
         "runtime_agent": "runner",
@@ -85,12 +85,15 @@ def test_declared_seat_metadata_reaches_routing_and_live_window_wins(monkeypatch
     }
     providers = SimpleNamespace(
         routing_vendors=lambda: (VendorSpec("local"),),
-        execution_seats=lambda cfg: [row],
+        execution_seats=lambda cfg: [{**row, "id": "bad-seat", "ctx": True}, row],
     )
     monkeypatch.setattr(context, "current_context", lambda: SimpleNamespace(providers=providers))
     cfg = SimpleNamespace(agents={"runner": SimpleNamespace(member_id="")})
 
-    assert declared_execution_seats(cfg)["opaque-seat"]["account"] == "work"
+    seats = declared_execution_seats(cfg)
+    assert set(seats) == {"opaque-seat"}
+    assert seats["opaque-seat"]["account"] == "work"
+    assert "Skipping execution seat 'bad-seat': requires ctx >= 1" in caplog.text
     backends = spawn_route.route_backends("", cfg)
     candidates = spawn_route.local_candidates(backends)
     assert candidates[0]["backend"] == "opaque-seat"
@@ -102,7 +105,3 @@ def test_declared_seat_metadata_reaches_routing_and_live_window_wins(monkeypatch
     assert fallback["agent"].budget == 40000 - 8192
     assert live["agent"].budget == 50000 - 8192
     assert live["agent"].overhead_tokens == 100
-
-    row["ctx"] = True
-    with pytest.raises(ValueError, match="ctx >= 1"):
-        declared_execution_seats(cfg)
