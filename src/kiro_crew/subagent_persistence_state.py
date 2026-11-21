@@ -131,6 +131,7 @@ def create_agent_folder(
         "last_tool": "",
         "context_groups": context_groups,
         "delegation": dict(delegation or {}),
+        **({"lean_helper": True} if (previous or {}).get("lean_helper") is True else {}),
         # The per-spawn backend, so a continuation after a restart resumes the
         # conversation on the harness that holds it. Absent = the default.
         **({"backend": backend} if isinstance(backend, str) else {}),

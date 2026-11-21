@@ -104,6 +104,34 @@ def _part(**kwargs) -> str:
     return inclusion.shared_resources_part(**args)
 
 
+def test_lean_run_record_excludes_shared_files_after_restart(home, guide, configured, monkeypatch):
+    from kiro_crew.subagent_manager import local_check as lc
+    from kiro_crew.subagent_persistence import create_agent_folder, update_state
+
+    configured(str(guide))
+    run_id = "lean001"
+    key = f"subagent:{run_id}"
+    create_agent_folder(run_id)
+    assert update_state(run_id, lean_helper=True)
+    monkeypatch.setattr(lc, "_LEAN_SESSIONS", type(lc._LEAN_SESSIONS)())
+
+    assert lc.is_lean_session(key)
+    assert _RULE not in _start(home, session_key=key)
+    assert _RULE not in _reinjected(home, session_key=key)
+    assert _RULE in _start(home, session_key="dashboard:regular")
+
+
+def test_local_fit_counts_shared_files_where_they_are_injected(guide, configured):
+    from kiro_crew.subagent_manager import local_check as lc
+
+    configured()
+    full = lc.fit_local("agent", "check", groups=frozenset({"project"}))
+    lean = lc.fit_local("subagent", "check", groups=frozenset({"project"}))
+    configured(str(guide))
+    assert lc.fit_local("agent", "check", groups=frozenset({"project"})).need > full.need
+    assert lc.fit_local("subagent", "check", groups=frozenset({"project"})).need == lean.need
+
+
 # --- off by default --------------------------------------------------------------
 
 
