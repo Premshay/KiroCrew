@@ -6,6 +6,7 @@ import pytest
 
 from kiro_crew.decisions.points import spawn_route
 from kiro_crew.decisions.vendors import VendorSpec, identify_vendor, validate_vendors
+from kiro_crew.execution_seats import declared_execution_seats
 from kiro_crew.platform import context
 
 
@@ -69,3 +70,38 @@ def test_only_registered_unmetered_vendors_can_receive_cross_routes(monkeypatch)
     assert spawn_route.route_backends("") == {
         "free": {"backend": "team-runner", "runtime_agent": "runner", "native": ""},
     }
+
+
+def test_declared_seat_metadata_reaches_routing_and_live_window_wins(monkeypatch, caplog):
+    row = {
+        "id": "opaque-seat",
+        "runtime_agent": "runner",
+        "vendor": "local",
+        "role": "agent",
+        "account": "work",
+        "ctx": 40000,
+        "overhead_tokens": 100,
+        "metered": False,
+    }
+    providers = SimpleNamespace(
+        routing_vendors=lambda: (VendorSpec("local"),),
+        execution_seats=lambda cfg: [{**row, "id": "bad-seat", "ctx": True}, row],
+    )
+    monkeypatch.setattr(context, "current_context", lambda: SimpleNamespace(providers=providers))
+    cfg = SimpleNamespace(agents={"runner": SimpleNamespace(member_id="")})
+
+    seats = declared_execution_seats(cfg)
+    assert set(seats) == {"opaque-seat"}
+    assert seats["opaque-seat"]["account"] == "work"
+    assert "Skipping execution seat 'bad-seat': requires ctx >= 1" in caplog.text
+    backends = spawn_route.route_backends("", cfg)
+    candidates = spawn_route.local_candidates(backends)
+    assert candidates[0]["backend"] == "opaque-seat"
+
+    _, fallback, _ = spawn_route.fit_local_candidates(candidates, "brief", {}, backends=backends)
+    _, live, _ = spawn_route.fit_local_candidates(
+        candidates, "brief", {"local": {"ctx": {"agent": 50000}}}, backends=backends
+    )
+    assert fallback["agent"].budget == 40000 - 8192
+    assert live["agent"].budget == 50000 - 8192
+    assert live["agent"].overhead_tokens == 100

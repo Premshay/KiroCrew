@@ -37,6 +37,13 @@ declaration before using it. Metered entries are excluded from cross-vendor
 routing. A declared native backend must still pass native backend admission.
 A registry that returns `None` retains the existing routing rules.
 
+Companion execution seats can declare `vendor`, `role`, `account`, `ctx`,
+`overhead_tokens`, and `metered`. Core validates types and ranges and still
+reserves native backend IDs. Invalid rows are logged and skipped individually.
+The router excludes metered seats, uses live
+context windows ahead of declared fallbacks, and includes declared overhead
+in the fit and its reported estimate. Older seat records remain valid.
+
 The execution catalog reads `ProviderRegistry.agent_runtime_policy(engine_identity)`
 through `current_context()` and `safe_context_call` for owner-visible, unpinned
 member rows. A native harness pin uses upstream model discovery and its own

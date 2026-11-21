@@ -490,7 +490,7 @@ def _local_role_of_seat(seat_id: str) -> str:
     return "subagent" if ("background" in low or low.endswith("-bg")) else "agent"
 
 
-def route_backends(parent_vendor: str, cfg: Any | None = None) -> dict[str, dict[str, str]]:
+def route_backends(parent_vendor: str, cfg: Any | None = None) -> dict[str, dict[str, Any]]:
     """What runs a child of each OTHER vendor, keyed by vendor (``local/<role>`` for the fleet).
 
     Each value is ``{backend, runtime_agent, native}``: ``backend`` is the id
@@ -501,7 +501,7 @@ def route_backends(parent_vendor: str, cfg: Any | None = None) -> dict[str, dict
     environment and account), the native backend does not. The parent's own
     vendor is ``backend == ""``. Never raises; an unreadable source offers less.
     """
-    out: dict[str, dict[str, str]] = {}
+    out: dict[str, dict[str, Any]] = {}
     try:
         from kiro_crew.execution_seats import declared_execution_seats
 
@@ -511,12 +511,21 @@ def route_backends(parent_vendor: str, cfg: Any | None = None) -> dict[str, dict
         seats = {}
     vendors = _cross_vendors()
     for seat_id, seat in sorted(seats.items()):
-        vendor = vendor_of_seat(seat_id) or vendor_of_seat(seat.get("runtime_agent", ""))
-        if vendor not in vendors or vendor == parent_vendor:
+        vendor = (
+            seat.get("vendor") or vendor_of_seat(seat_id) or vendor_of_seat(seat["runtime_agent"])
+        )
+        if seat.get("metered") or vendor not in vendors or vendor == parent_vendor:
             continue
-        key = f"local/{_local_role_of_seat(seat_id)}" if vendor == "local" else vendor
+        role = seat.get("role") or _local_role_of_seat(seat_id)
+        key = f"local/{role}" if vendor == "local" else vendor
         out.setdefault(
-            key, {"backend": seat_id, "runtime_agent": seat["runtime_agent"], "native": ""}
+            key,
+            {
+                "backend": seat_id,
+                "runtime_agent": seat["runtime_agent"],
+                "native": "",
+                **{field: seat[field] for field in ("ctx", "overhead_tokens") if field in seat},
+            },
         )
     try:
         from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND, selectable_backend_values
@@ -807,7 +816,9 @@ async def routed_spawn(
         vendor = vendor_of_seat(agent, parent_model)
         if not vendor:
             return None
-        backends = await asyncio.to_thread(route_backends, vendor) if cross_vendor else {}
+        backends = {}
+        if cross_vendor or vendor == "local":
+            backends = await asyncio.to_thread(route_backends, "" if vendor == "local" else vendor)
         cands = await asyncio.to_thread(
             all_candidates, vendor, config, cross_vendor=cross_vendor, backends=backends
         )
@@ -822,7 +833,7 @@ async def routed_spawn(
         health = _routing_health(limits)
         _apply_quota_outs(health, outs)
         cands, fits, too_big = fit_local_candidates(
-            cands, brief, health, groups=context_groups, pinned=pinned_groups
+            cands, brief, health, groups=context_groups, pinned=pinned_groups, backends=backends
         )
         if not cands:
             return None
@@ -897,6 +908,7 @@ def fit_local_candidates(
     *,
     groups: frozenset[str] | None = None,
     pinned: frozenset[str] = frozenset(),
+    backends: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, Any], list[str]]:
     """Fit each local candidate to its lane: ``(kept cands, {role: LocalFit}, too-big roles)``.
 
@@ -918,7 +930,17 @@ def fit_local_candidates(
             kept.append(c)
             continue
         role = c.get("tier") or ""
-        fit = fit_local(role, brief, groups=groups, pinned=pinned, ctx=ctx_by_role.get(role))
+        seat = (backends or {}).get(f"local/{role}", {})
+        live_ctx = ctx_by_role.get(role)
+        ctx = live_ctx if type(live_ctx) is int and live_ctx > 0 else seat.get("ctx")
+        fit = fit_local(
+            role,
+            brief,
+            groups=groups,
+            pinned=pinned,
+            ctx=ctx,
+            overhead_tokens=seat.get("overhead_tokens"),
+        )
         if fit.fits:
             fits[role] = fit
             kept.append(c)
@@ -937,9 +959,7 @@ def _fitted_estimate(
 
     est = lc.estimate_tokens(brief, groups=groups)
     for role, fit in fits.items():
-        est[role] = (
-            lc.brief_tokens(brief) + lc.LOCAL_HARNESS_OVERHEAD_TOKENS.get(role, 0) + fit.need
-        )
+        est[role] = lc.brief_tokens(brief) + fit.overhead_tokens + fit.need
     return est
 
 
@@ -1003,7 +1023,7 @@ async def reroute_after_quota(
         vendor = vendor_of_seat(agent, parent_model)
         if not vendor:
             return None
-        backends = await asyncio.to_thread(route_backends, vendor)
+        backends = await asyncio.to_thread(route_backends, "" if vendor == "local" else vendor)
         cands = await asyncio.to_thread(
             all_candidates, vendor, config, cross_vendor=True, backends=backends
         )
@@ -1011,7 +1031,7 @@ async def reroute_after_quota(
         cands = drop_quota_outs(cands, outs, exclude_vendors)
         # No live health on this path: each local role is fitted to its known window.
         cands, fits, too_big = fit_local_candidates(
-            cands, brief, {}, groups=context_groups, pinned=pinned_groups
+            cands, brief, {}, groups=context_groups, pinned=pinned_groups, backends=backends
         )
         chosen = fallback_choice(cands, tier)
     except asyncio.CancelledError:

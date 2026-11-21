@@ -212,16 +212,23 @@ def input_budget(role: str, ctx: int | None = None) -> int:
 class LocalFit:
     """Whether a run fits a local *role*, and which context groups it drops to."""
 
-    __slots__ = ("role", "fits", "drop", "budget", "need")
+    __slots__ = ("role", "fits", "drop", "budget", "need", "overhead_tokens")
 
     def __init__(
-        self, role: str, fits: bool, drop: tuple[str, ...], budget: int, need: int
+        self,
+        role: str,
+        fits: bool,
+        drop: tuple[str, ...],
+        budget: int,
+        need: int,
+        overhead_tokens: int,
     ) -> None:
         self.role = role
         self.fits = fits
         self.drop = drop
         self.budget = budget
         self.need = need
+        self.overhead_tokens = overhead_tokens
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (
@@ -237,6 +244,7 @@ def fit_local(
     groups: frozenset[str] | None = None,
     pinned: frozenset[str] = frozenset(),
     ctx: int | None = None,
+    overhead_tokens: int | None = None,
 ) -> LocalFit:
     """Fit a run keeping *groups* to local *role*, trimming in :data:`TRIM_ORDER`.
 
@@ -248,7 +256,9 @@ def fit_local(
     skipped as too big rather than sent to overflow.
     """
     budget = input_budget(role, ctx)
-    room = budget - LOCAL_HARNESS_OVERHEAD_TOKENS.get(role, 0) - brief_tokens(brief)
+    if overhead_tokens is None:
+        overhead_tokens = LOCAL_HARNESS_OVERHEAD_TOKENS.get(role, 0)
+    room = budget - overhead_tokens - brief_tokens(brief)
     kept = set(_ALL_GROUPS if groups is None else groups)
     drop: list[str] = []
     need = context_tokens(frozenset(kept), role)
@@ -260,7 +270,7 @@ def fit_local(
             drop.append(group)
             need -= CONTEXT_GROUP_TOKENS[group]
     fits = need <= room
-    return LocalFit(role, fits, tuple(drop) if fits else (), budget, need)
+    return LocalFit(role, fits, tuple(drop) if fits else (), budget, need, overhead_tokens)
 
 
 def trim_line_for(drop: list[str] | tuple[str, ...], budget: int) -> str:
@@ -414,16 +424,20 @@ def local_role_of_run(info: Any) -> str:
     """The local router role serving *info*, or ``""`` when the local fleet does not serve it.
 
     A run routed to the fleet carries its role as ``route_tier``; a run started
-    on a companion execution seat (``spawn_run(backend="local-background")``)
-    is matched to the seat whose template alias it runs under. Blocking (reads
+    on a companion execution seat is matched to the seat whose template
+    alias it runs under. Blocking (reads
     the config): call it off the event loop. Never raises.
     """
     if getattr(info, "route_vendor", "") == "local":
         tier = str(getattr(info, "route_tier", "") or "")
         return tier if tier in LOCAL_CTX_FALLBACK else ""
+    return _local_execution_seat(info)[0]
+
+
+def _local_execution_seat(info: Any) -> tuple[str, dict[str, Any]]:
     runtime_agent = str(getattr(info, "runtime_agent", "") or "")
     if not runtime_agent:
-        return ""
+        return "", {}
     try:
         from kiro_crew.decisions.points.spawn_route import _local_role_of_seat, vendor_of_seat
         from kiro_crew.execution_seats import declared_execution_seats
@@ -431,11 +445,13 @@ def local_role_of_run(info: Any) -> str:
         seats = declared_execution_seats()
     except Exception:
         logger.debug("local role: execution seats unreadable", exc_info=True)
-        return ""
+        return "", {}
     for seat_id, seat in sorted(seats.items()):
-        if seat.get("runtime_agent") == runtime_agent and vendor_of_seat(seat_id) == "local":
-            return _local_role_of_seat(seat_id)
-    return ""
+        if seat.get("runtime_agent") != runtime_agent:
+            continue
+        if (seat.get("vendor") or vendor_of_seat(seat_id)) == "local":
+            return seat.get("role") or _local_role_of_seat(seat_id), seat
+    return "", {}
 
 
 def lean_helper_profile() -> dict[str, list[str]]:
@@ -456,7 +472,15 @@ def fit_seat_run(info: Any, role: str) -> LocalFit:
     """
     groups = frozenset(g for g, flag in _FLAG_OF.items() if getattr(info, flag, True))
     task = getattr(info, "_raw_task", "") or getattr(info, "task", "") or ""
-    fit = fit_local(role, str(task), groups=groups, pinned=pinned_groups(info))
+    _, seat = _local_execution_seat(info)
+    fit = fit_local(
+        role,
+        str(task),
+        groups=groups,
+        pinned=pinned_groups(info),
+        ctx=seat.get("ctx"),
+        overhead_tokens=seat.get("overhead_tokens"),
+    )
     if fit.drop:
         apply_trim(info, fit.drop)
     return fit

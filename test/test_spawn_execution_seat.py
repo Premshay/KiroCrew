@@ -284,7 +284,7 @@ def test_member_bound_run_reaches_selected_seat(monkeypatch):
     ],
 )
 def test_declarations_require_non_member_alias_and_cannot_shadow_native(
-    monkeypatch, name, member, expected
+    monkeypatch, caplog, name, member, expected
 ):
     provider = SimpleNamespace(
         execution_seats=lambda _cfg: [{"id": name, "runtime_agent": "seat-template"}]
@@ -297,8 +297,8 @@ def test_declarations_require_non_member_alias_and_cannot_shadow_native(
     if expected:
         assert declared_execution_seats(cfg)[name]["runtime_agent"] == "seat-template"
     else:
-        with pytest.raises(ValueError):
-            declared_execution_seats(cfg)
+        assert declared_execution_seats(cfg) == {}
+        assert "runtime_agent must be a registered template alias" in caplog.text
 
 
 def test_native_collision_is_logged_and_other_seats_survive(monkeypatch, caplog):
