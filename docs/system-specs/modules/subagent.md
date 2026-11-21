@@ -96,6 +96,8 @@ Those IDs select a validated template runtime alias through `runtime_agent`,
 not a native ACP backend registration. Receipts identify the execution seat;
 queued starts and continuations preserve it, and the run uses a dedicated
 provider. Native backend validation and installation checks remain unchanged.
+A seat ID reserved by a native backend is skipped with a warning. Other
+valid seats remain available.
 Member-bound runs require the selected seat's existing runtime policy to name
 a backend in the member-capability set or declare `member_capabilities`.
 A crewmate's own worker requires the worker-kit set or `member_worker_kit`

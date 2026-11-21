@@ -35,8 +35,8 @@ def _close_managers(close_subagent_managers):
 @pytest.fixture
 def seats(monkeypatch):
     rows = {
-        "antigravity": {
-            "id": "antigravity",
+        "antigravity-companion": {
+            "id": "antigravity-companion",
             "runtime_agent": "crew-antigravity",
             "runtime": "Antigravity",
         }
@@ -62,13 +62,15 @@ async def test_http_spawn_selects_companion_seat(selectable, seats):
     app["state"] = state
     app.router.add_post("/api/spawn", api_spawn)
     async with TestClient(TestServer(app)) as client:
-        response = await client.post("/api/spawn", json={"task": "hello", "backend": "antigravity"})
+        response = await client.post(
+            "/api/spawn", json={"task": "hello", "backend": "antigravity-companion"}
+        )
         assert response.status == 200, await response.text()
         receipt = await response.json()
     info = manager.get(receipt["id"])
     assert info.runtime_agent == "crew-antigravity"
     assert info.backend is None
-    assert receipt["execution_seat"] == "antigravity"
+    assert receipt["execution_seat"] == "antigravity-companion"
     assert receipt["runtime_agent"] == "crew-antigravity"
     assert "Execution seat" in receipt["runtime_note"]
 
@@ -108,7 +110,7 @@ async def test_unknown_backend_refusal_lists_declared_seats(selectable, seats):
     request, manager = _real_request({"task": "hello", "backend": "missing-seat"})
     response = await api_spawn(request)
     assert response.status == 400
-    assert json.loads(response.text)["execution_seats"] == ["antigravity"]
+    assert json.loads(response.text)["execution_seats"] == ["antigravity-companion"]
     assert not manager._agents
 
 
@@ -277,9 +279,8 @@ def test_member_bound_run_reaches_selected_seat(monkeypatch):
 @pytest.mark.parametrize(
     "name,member,expected",
     [
-        ("antigravity", "", True),
-        ("claude", "", False),
-        ("antigravity", "private-member", False),
+        ("antigravity-companion", "", True),
+        ("antigravity-companion", "private-member", False),
     ],
 )
 def test_declarations_require_non_member_alias_and_cannot_shadow_native(
@@ -298,3 +299,23 @@ def test_declarations_require_non_member_alias_and_cannot_shadow_native(
     else:
         with pytest.raises(ValueError):
             declared_execution_seats(cfg)
+
+
+def test_native_collision_is_logged_and_other_seats_survive(monkeypatch, caplog):
+    from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND
+
+    assert "antigravity" in POLICY_ID_BY_BACKEND.values()
+    provider = SimpleNamespace(
+        execution_seats=lambda _cfg: [
+            {"id": "antigravity", "runtime_agent": "seat-template"},
+            {"id": "codex-companion", "runtime_agent": "seat-template"},
+        ]
+    )
+    monkeypatch.setattr(
+        "kiro_crew.platform.context.current_context",
+        lambda: SimpleNamespace(providers=provider),
+    )
+    cfg = SimpleNamespace(agents={"seat-template": SimpleNamespace(member_id="")})
+
+    assert set(declared_execution_seats(cfg)) == {"codex-companion"}
+    assert "Skipping execution seat 'antigravity': conflicts with a native backend" in caplog.text

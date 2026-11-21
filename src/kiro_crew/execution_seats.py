@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class ExecutionSeatError(ValueError):
@@ -58,13 +61,14 @@ def declared_execution_seats(cfg: Any = None) -> dict[str, dict[str, str]]:
         name, alias = row.get("id"), row.get("runtime_agent")
         if not isinstance(name, str) or not name or not isinstance(alias, str) or not alias:
             raise ValueError("Companion execution seat requires id and runtime_agent")
+        if name in POLICY_ID_BY_BACKEND.values():
+            logger.warning("Skipping execution seat %r: conflicts with a native backend", name)
+            continue
         binding = cfg.agents.get(alias)
         if binding is None or binding.member_id:
             raise ValueError(f"Execution seat {name!r} requires a registered template alias")
         if name in result:
             raise ValueError(f"Duplicate execution seat {name!r}")
-        if name in POLICY_ID_BY_BACKEND.values():
-            raise ValueError(f"Execution seat {name!r} conflicts with a native backend")
         result[name] = {
             "id": name,
             "runtime_agent": alias,
