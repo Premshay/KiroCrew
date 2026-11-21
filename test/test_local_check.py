@@ -26,6 +26,11 @@ from kiro_crew.subagent_parts.run_record import SubagentInfo
 @pytest.fixture(autouse=True)
 def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(vl, "_data_home", lambda: tmp_path)
+    monkeypatch.setattr(lc, "configured_sandbox_mode", lambda: "strict")
+    monkeypatch.setattr(
+        lc, "sandboxed_spawn_argv", lambda argv, *, env, **kwargs: (argv, env, None)
+    )
+    monkeypatch.setattr(lc, "wrapped_by_crew_sandbox", lambda argv: True)
     vl._reset_for_tests()
     yield
     vl._reset_for_tests()
@@ -531,6 +536,49 @@ class TestNoCheck:
 
 
 class TestRunCheck:
+    def test_requires_sandbox_before_starting_check(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(lc, "wrapped_by_crew_sandbox", lambda argv: False)
+        monkeypatch.setattr(
+            lc, "run_limited", lambda *a, **kw: pytest.fail("Started without sandbox")
+        )
+
+        passed, output = lc.run_check("true", str(tmp_path))
+
+        assert not passed
+        assert "a Kiro Crew sandbox is required" in output
+
+    def test_launches_wrapped_command_and_releases_launcher(self, tmp_path, monkeypatch):
+        launcher = tmp_path / "launcher"
+        launcher.touch()
+        wrapped = [str(launcher), "pytest", "test_example.py"]
+        env = {"PATH": "/test/bin", "HOME": str(tmp_path), "LANG": "C"}
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        monkeypatch.setenv("GATEWAY_TEST_SECRET", "fixture-value")
+
+        def prepare(argv, **options):
+            assert argv == ["pytest", "test_example.py"]
+            assert options == {
+                "mode": "strict",
+                "env": env,
+                "strip_python_env": True,
+                "is_kiro_cli": False,
+            }
+            return wrapped, env, str(launcher)
+
+        def run(argv, **options):
+            assert argv == wrapped
+            assert options["env"] == env
+            assert options["cwd"] == str(tmp_path)
+            assert launcher.exists()
+            return subprocess.CompletedProcess(argv, 0, "passed", "")
+
+        monkeypatch.setattr(lc, "sandboxed_spawn_argv", prepare)
+        monkeypatch.setattr(lc, "run_limited", run)
+
+        assert lc.run_check(lc.extract_check("Run `pytest test_example.py`"), str(tmp_path))[0]
+        assert not launcher.exists()
+
     def test_only_allowed_environment_reaches_explicit_check(self, tmp_path, monkeypatch):
         monkeypatch.setenv("GATEWAY_TEST_SECRET", "fixture-value")
         monkeypatch.setenv("LANG", "C")
