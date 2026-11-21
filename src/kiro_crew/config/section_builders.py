@@ -22,6 +22,7 @@ schema/validation.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 # Computer-use ceilings come from the feature's constants module rather than
@@ -53,8 +54,11 @@ from kiro_crew.config.integration_sections import (
     InstancesConfig,
     McpConfig,
     McpGatewayConfig,
+    McpResourceSubscriptionsConfig,
     PublishConfig,
     TunnelConfig,
+    _resolve_cwd_use,
+    _resolve_cwd_use_launch,
     _resolve_stub_overrides,
     _resolve_stub_roster,
     _resolve_stub_servers,
@@ -64,11 +68,14 @@ from kiro_crew.config.memory_sections import (
     STARTUP_RECALL_TIMEOUT_MAX_SECS,
     KnowledgeConfig,
     MemoryConfig,
+    MemoryProviderConfig,
     SessionSummaryConfig,
     SkillsConfig,
     _coerce_embedding_provider,
     _read_auto_add_documents,
     dream_mode_from,
+    extraction_instructions_from,
+    fact_origin_gate_mode_from,
     kind_routing_mode_from,
     lesson_fold_mode_from,
     lesson_origin_gate_mode_from,
@@ -88,12 +95,14 @@ from kiro_crew.config.sections import (
     FOLDER_INGEST_CHUNK_BUDGET_MAX,
     IMPORT_CHUNK_BUDGET_MAX,
     SWEEP_CHUNK_BUDGET_MAX,
+    THRESHOLD_PCT_MIN,
     CodeChannelDefaultsConfig,
     DiscordConfig,
     FeishuConfig,
     IMessageConfig,
     SectionReader,
     SlackConfig,
+    SlackSharedAccessConfig,
     SttConfig,
     TeamsConfig,
     TelegramConfig,
@@ -115,6 +124,7 @@ from kiro_crew.config.sections import (
     _validated_stt_model,
     _validated_stt_provider,
     coerce_effort,
+    shared_user_ids,
 )
 from kiro_crew.config.service_sections import (
     CronHistoryConfig,
@@ -146,7 +156,7 @@ from kiro_crew.stt.limits import MIN_IDLE_EVICT_SECS as _STT_IDLE_EVICT_SECS_MIN
 from kiro_crew.stt.limits import MIN_PARTIAL_INTERVAL_MS as _STT_MIN_PARTIAL_INTERVAL_MS
 from kiro_crew.stt.limits import MIN_SILENCE_MS as _STT_MIN_SILENCE_MS
 from kiro_crew.stt.limits import MIN_TIMEOUT_SECS as _STT_MIN_TIMEOUT_SECS
-from kiro_crew.work_vocab import WORK_MAX_DEPTH_MAX, WORK_MAX_DEPTH_MIN
+from kiro_crew.work_vocab import WORK_MAX_DEPTH_MAX, WORK_MAX_DEPTH_MIN, coerce_dispatch_tags
 
 logger = logging.getLogger("kiro_crew.config.loader")
 
@@ -159,6 +169,8 @@ def _build_taskrunner_config(taskrunner_data: dict) -> TaskRunnerConfig:
     section = SectionReader(TaskRunnerConfig, taskrunner_data)
     argv = section.get("test_command")
     return TaskRunnerConfig(
+        # Only a literal false turns it off: Task Runner shipped on.
+        enabled=section.get("enabled") is not False,
         max_parallel_steps=section.get("max_parallel_steps"),
         workspace_dir=str(section.get("workspace_dir")),
         # All or nothing: dropping one bad element would run a different command.
@@ -171,13 +183,26 @@ def _build_taskrunner_config(taskrunner_data: dict) -> TaskRunnerConfig:
     )
 
 
+def _idle_reset_minutes(raw: object, default: int) -> int:
+    """``messaging.idle_reset_minutes`` floored at 0 (off), as ``MessagingConfig`` holds it."""
+    return max(0, _coerce_int(raw, default))
+
+
+def _daily_reset_hour(raw: object, default: int) -> int:
+    """``messaging.daily_reset_hour``: an hour of the day, anything else -1 (off)."""
+    hour = _coerce_int(raw, default)
+    return hour if 0 <= hour <= 23 else -1
+
+
 def _build_messaging_config(messaging_data: dict) -> MessagingConfig:
     section = SectionReader(MessagingConfig, messaging_data)
     return MessagingConfig(
         use_transport=bool(section.get("use_transport")),
         dm_scope=str(section.get("dm_scope")),
-        idle_reset_minutes=section.read("idle_reset_minutes", _coerce_int),
-        daily_reset_hour=section.read("daily_reset_hour", _coerce_int),
+        idle_reset_minutes=section.read(
+            "idle_reset_minutes", _idle_reset_minutes, unclamped=_coerce_int
+        ),
+        daily_reset_hour=section.read("daily_reset_hour", _daily_reset_hour, unclamped=_coerce_int),
         queue_mode=str(section.get("queue_mode")),
     )
 
@@ -241,6 +266,9 @@ def _build_work_ledger_config(work_ledger_data: dict) -> WorkLedgerConfig:
         remote_dispatch_retire_minutes=_positive_gb(
             work_ledger_data, "remote_dispatch_retire_minutes"
         ),
+        remote_dispatch_tags=list(
+            coerce_dispatch_tags(work_ledger_data.get("remote_dispatch_tags"))
+        ),
     )
 
 
@@ -298,6 +326,19 @@ def _history_idle_hours(section: SectionReader) -> float:
     return hours
 
 
+def _embedding_idle_evict_secs(raw: object) -> int | str:
+    """``"auto"``, or a stored number of seconds the operator chose.
+
+    The same reading as ``embeddings_settings.embedding_idle_evict_secs``, which the
+    evictor uses: a non-negative number is kept (``0`` never unloads; capped at a
+    year), and anything else, ``"auto"`` included, is ``"auto"``, which picks by
+    machine size at run time.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw < 0:
+        return "auto"
+    return min(int(raw), 365 * 24 * 3600)
+
+
 def _build_memory_config(memory_data: dict) -> MemoryConfig:
     section = SectionReader(MemoryConfig, memory_data)
     return MemoryConfig(
@@ -312,15 +353,15 @@ def _build_memory_config(memory_data: dict) -> MemoryConfig:
         # deliberate opt-in to the interactive pool.
         embedding_bulk_threads=section.read("embedding_bulk_threads", _safe_int, 0, 256),
         embedding_bulk_duty=section.read("embedding_bulk_duty", _safe_float, 0.05, 1.0),
-        # 0 is the documented "never unload" sentinel, so the floor is 0.
-        embedding_idle_evict_secs=section.read(
-            "embedding_idle_evict_secs", _safe_int, 0, 365 * 24 * 3600
+        embedding_idle_evict_secs=_embedding_idle_evict_secs(
+            section.get("embedding_idle_evict_secs")
         ),
         embedding_weight_repack=section.read("embedding_weight_repack", _safe_bool),
         embedding_child_process=section.read("embedding_child_process", _safe_bool),
         consolidation_write_child_process=section.read(
             "consolidation_write_child_process", _safe_bool
         ),
+        repeated_failures_notice=section.read("repeated_failures_notice", _safe_bool),
         recall_pool_processes=section.read("recall_pool_processes", _safe_int, 0, 8),
         recall_pool_worker_max_mb=section.read(
             "recall_pool_worker_max_mb", _safe_int, 256, 1024 * 1024
@@ -358,9 +399,13 @@ def _build_memory_config(memory_data: dict) -> MemoryConfig:
         writes_enabled=section.read("writes_enabled", _safe_bool),
         lesson_extraction_enabled=section.read("lesson_extraction_enabled", _safe_bool),
         kind_routing=kind_routing_mode_from(section.get("kind_routing")),
+        extraction_instructions=extraction_instructions_from(
+            section.get("extraction_instructions")
+        ),
         lesson_fold=lesson_fold_mode_from(section.get("lesson_fold")),
         lesson_origin_gate=lesson_origin_gate_mode_from(section.get("lesson_origin_gate")),
         lesson_tier_policy=lesson_tier_policy_mode_from(section.get("lesson_tier_policy")),
+        fact_origin_gate=fact_origin_gate_mode_from(section.get("fact_origin_gate")),
         rule_authority_order=rule_authority_order_mode_from(section.get("rule_authority_order")),
         member_lesson_dedup=member_lesson_dedup_mode_from(section.get("member_lesson_dedup")),
         relevance_rule=relevance_rule_mode_from(section.get("relevance_rule")),
@@ -373,6 +418,7 @@ def _build_memory_config(memory_data: dict) -> MemoryConfig:
             "startup_recall_timeout_secs", _safe_float, 0.0, STARTUP_RECALL_TIMEOUT_MAX_SECS
         ),
         migrated=section.get("migrated"),
+        provider=MemoryProviderConfig.from_raw(memory_data.get("provider")),
     )
 
 
@@ -383,14 +429,14 @@ def _build_knowledge_config(knowledge_data: dict) -> KnowledgeConfig:
         auto_ingest_artifact_kinds=[
             k for k in section.get("auto_ingest_artifact_kinds") if isinstance(k, str)
         ],
+        # A JSON number only (no numeric string), >= 0, and finite in bytes too:
+        # readers multiply it by 1 MiB. ``_safe_float`` answers -1 for a bool,
+        # NaN, Infinity or an int too large for a float.
         max_ingest_file_mb=(
-            float(mb)
-            if isinstance(
-                (mb := section.get("max_ingest_file_mb")),
-                (int, float),
-            )
-            and not isinstance(mb, bool)
-            and mb >= 0
+            mb
+            if isinstance(section.get("max_ingest_file_mb"), (int, float))
+            and (mb := _safe_float(section.get("max_ingest_file_mb"), -1.0)) >= 0
+            and math.isfinite(mb * 1024 * 1024)
             else section.default("max_ingest_file_mb")
         ),
         embed_timeout_secs=section.read("embed_timeout_secs", _safe_float),
@@ -488,6 +534,8 @@ def _build_mcp_config(mcp_data: dict) -> McpConfig:
         # schema validator before this runs, so it reads as absent and the default
         # applies rather than a guess at what the text meant.
         honour_auto_approve=section.get("honour_auto_approve") is True,
+        # Opt-in, off by default: only a real ``true`` turns the write fence on.
+        protect_kiro_permission_rules=section.get("protect_kiro_permission_rules") is True,
     )
 
 
@@ -500,6 +548,11 @@ def _name_list(value: Any) -> list[str]:
 
 def _build_mcp_gateway_config(mcp_gateway_data: dict) -> McpGatewayConfig:
     section = SectionReader(McpGatewayConfig, mcp_gateway_data)
+    # An unreadable resource_subscriptions value takes every default; the cap never drops below 0.
+    subscriptions_data = mcp_gateway_data.get("resource_subscriptions")
+    if not isinstance(subscriptions_data, dict):
+        subscriptions_data = {}
+    subscriptions = SectionReader(McpResourceSubscriptionsConfig, subscriptions_data)
     _spawn_min = section.read("spawn_concurrency_min", _safe_int, 1)
     _spawn_max = section.read("spawn_concurrency_max", _safe_int, _spawn_min)
     return McpGatewayConfig(
@@ -566,6 +619,8 @@ def _build_mcp_gateway_config(mcp_gateway_data: dict) -> McpGatewayConfig:
         # from the roster. Shares the resolver with the runtime so a
         # non-bool value is dropped in exactly one place.
         stub_overrides=_resolve_stub_overrides(mcp_gateway_data),
+        cwd_use=_resolve_cwd_use(mcp_gateway_data),
+        cwd_use_launch=_resolve_cwd_use_launch(mcp_gateway_data),
         # The file's own roster, carried so ``save()`` can put it back
         # instead of flattening it to the effective set above. See the
         # field's own comment for why that flattening is a data loss.
@@ -583,6 +638,10 @@ def _build_mcp_gateway_config(mcp_gateway_data: dict) -> McpGatewayConfig:
         keep_alive_servers=_name_list(section.get("keep_alive_servers")),
         read_buffer_limit_bytes=section.read("read_buffer_limit_bytes", _safe_int, 1024),
         response_spill_threshold_bytes=section.read("response_spill_threshold_bytes", _safe_int, 0),
+        resource_subscriptions=McpResourceSubscriptionsConfig(
+            enabled=subscriptions_data.get("enabled") is True,
+            max_pinned_backends=subscriptions.read("max_pinned_backends", _safe_int, 0),
+        ),
     )
 
 
@@ -619,17 +678,36 @@ def _build_tunnel_config(tunnel_data: dict) -> TunnelConfig:
         enabled=bool(section.get("enabled")),
         name_mode=str(section.get("name_mode")),
         name_override=str(section.get("name_override")),
-        # Only the JSON boolean ``true`` opens the relay path: a string or a number
-        # left by a hand edit keeps it off rather than reading as truthy.
-        relay_enabled=section.get("relay_enabled") is True,
+        relay_enabled=_relay_enabled(section.get("relay_enabled")),
         relay_lease_url=str(section.get("relay_lease_url") or ""),
         relay_lease_credential=str(section.get("relay_lease_credential") or ""),
         relay_lease_token_type=str(section.get("relay_lease_token_type") or ""),
+        # A value the person did not give (absent, null, empty or blank) leases from
+        # us-east-1; any value they gave must be a known Region, or the relay refuses
+        # and sends nothing.
+        relay_lease_region=_text_or_empty(section.get("relay_lease_region")),
         relay_handle_email_domains=_handle_email_domains(section.get("relay_handle_email_domains")),
-        # Only the JSON boolean ``true`` turns the viewer on, as for relay_enabled.
+        # Only the JSON boolean ``true`` turns the viewer's dev settings on: a string
+        # or a number left by a hand edit keeps them off rather than reading as truthy.
         relay_viewer_enabled=section.get("relay_viewer_enabled") is True,
         **_relay_viewer_targets(section),
     )
+
+
+def _text_or_empty(raw: object) -> str:
+    """``""`` for absent or null, else the value as text, so a given ``false`` is refused."""
+    return "" if raw is None else str(raw)
+
+
+def _relay_enabled(raw: object) -> bool | None:
+    """``tunnel.relay_enabled`` as stored: ``True``, ``False`` or unset (``None``).
+
+    Unset lets the Crew's credential decide (``remote_control.hosting``). A string
+    or a number left by a hand edit reads as off, never as truthy or as unset.
+    """
+    if raw is None or isinstance(raw, bool):
+        return raw
+    return False
 
 
 def _handle_email_domains(raw: object) -> list[str]:
@@ -649,10 +727,13 @@ def _handle_email_domains(raw: object) -> list[str]:
 
 
 def _relay_viewer_targets(section: SectionReader) -> dict[str, str]:
-    """The viewer's control plane URL, credential reference and Crew domain, or "" for a bad one.
+    """The viewer's control plane URL, credential reference and Crew domain, "" for a bad reference.
 
     The URL carries the person's sign-in, so it is held to the lease URL's rule:
-    https://, or http:// only for a loopback port-forward. The credential setting
+    https://, or http:// only for a loopback port-forward. A value that breaks it is
+    kept as set, with a warning, so the viewer refuses it as not set up instead of
+    reading it as empty (the built-in control plane); every reader checks it again.
+    The credential setting
     names where a credential is and never holds one, so a value that is not
     secret://NAME or an absolute path is dropped, and the warning does not repeat
     it. Imported here, not at module load, so config load pulls in no relay
@@ -669,7 +750,6 @@ def _relay_viewer_targets(section: SectionReader) -> dict[str, str]:
                 "tunnel.relay_viewer_cps_url ignored: %s",
                 problem.replace("lease service", "control plane"),
             )
-            url = ""
         if ref and credential_reference_problem(ref) is not None:
             logger.warning(
                 "tunnel.relay_viewer_credential ignored: it must be secret://NAME or the "
@@ -740,6 +820,7 @@ def _build_slack_config(slack_data: dict) -> SlackConfig:
         tracking_channels=_validate_tracking_channels(section.get("tracking_channels")),
         open_channels=[c for c in section.get("open_channels") if isinstance(c, str)],
         command=section.get("command"),
+        setup_guide_url=str(section.get("setup_guide_url") or "").strip(),
         forward_to_agent_callback=str(
             section.get("forward_to_agent_callback") or section.default("forward_to_agent_callback")
         ).strip(),
@@ -765,17 +846,34 @@ def _build_slack_config(slack_data: dict) -> SlackConfig:
         use_tunnel_url=bool(section.get("use_tunnel_url")),
         show_thinking=bool(section.get("show_thinking")),
         dm_single_session=bool(section.get("dm_single_session")),
+        # Default True: a missing or non-boolean value keeps the built-in page.
+        home_tab_builtin=section.read("home_tab_builtin", _safe_bool),
         home_tab_sessions_per_kind=section.read("home_tab_sessions_per_kind", _safe_int),
         sessions_limit=section.read("sessions_limit", _safe_int),
         # Default False: a missing or unparseable value must mean "open no
         # thread", never the reverse.
         auto_link_sessions=section.read("auto_link_sessions", _safe_bool),
+        # Default False: a missing or unparseable value keeps Slack conversations
+        # out of the session list, as an unset key does.
+        show_in_session_list=section.read("show_in_session_list", _safe_bool),
         # Default False for all three: an unparseable value must never declare the
         # app an agent, open code channels or let a code channel dispatch work.
         agent_sessions=section.read("agent_sessions", _safe_bool),
         code_channel_dispatch=section.read("code_channel_dispatch", _safe_bool),
         code_channels=section.read("code_channels", _safe_bool),
+        # Default False: an unparseable value must never add user scopes or PKCE.
+        slack_mcp=section.read("slack_mcp", _safe_bool),
         code_channel_defaults=_build_code_channel_defaults(slack_data.get("code_channel_defaults")),
+        shared_access=_build_shared_access(slack_data.get("shared_access")),
+    )
+
+
+def _build_shared_access(raw: object) -> SlackSharedAccessConfig:
+    """``slack.shared_access``: on only for a literal ``true``, ids well-formed."""
+    data = _safe_dict(raw)
+    return SlackSharedAccessConfig(
+        enabled=data.get("enabled") is True,
+        user_ids=shared_user_ids(data.get("user_ids")),
     )
 
 
@@ -809,6 +907,8 @@ def _build_code_channel_defaults(raw: object) -> CodeChannelDefaultsConfig:
         model=_code_channel_default_str(data.get("model")),
         reasoning_effort=effort if is_valid_effort(effort) else None,
         approval_mode=_code_channel_approval_mode(data.get("approval_mode")),
+        # Only a real ``true`` is stored on; anything else reads as off (unset).
+        conductor_mode=True if data.get("conductor_mode") is True else None,
     )
 
 
@@ -825,6 +925,17 @@ def _code_channel_approval_mode(raw: object) -> str | None:
     return None
 
 
+def _threshold_pair(section: SectionReader) -> tuple[int, int]:
+    """A channel's ``(soft, hard)`` context thresholds, each change reported by ``read``.
+
+    The soft read is bounded by the hard value, which is what the DTO's
+    ``_normalize_threshold_pair`` would pull it down to, so a soft above hard warns.
+    """
+    hard = section.read("hard_threshold_pct", _threshold_pct, unclamped=_safe_int)
+    soft = section.read("soft_threshold_pct", _safe_int, THRESHOLD_PCT_MIN, hard)
+    return soft, hard
+
+
 def _build_telegram_config(telegram_data: dict) -> TelegramConfig:
     section = SectionReader(TelegramConfig, telegram_data)
     return TelegramConfig(
@@ -832,7 +943,7 @@ def _build_telegram_config(telegram_data: dict) -> TelegramConfig:
         enabled=bool(section.get("enabled")),
         bot_token=str(section.get("bot_token")),
         allowed_user_ids=_coerce_int_ids(section.get("allowed_user_ids")),
-        soft_threshold_pct=section.read("soft_threshold_pct", _threshold_pct),
+        soft_threshold_pct=section.read("soft_threshold_pct", _threshold_pct, unclamped=_safe_int),
         show_thinking=bool(section.get("show_thinking")),
         allow_forum=bool(section.get("allow_forum")),
         voice_replies=bool(section.get("voice_replies")),
@@ -853,6 +964,7 @@ def _build_telegram_config(telegram_data: dict) -> TelegramConfig:
 
 def _build_weixin_config(weixin_data: dict) -> WeixinConfig:
     section = SectionReader(WeixinConfig, weixin_data)
+    soft, hard = _threshold_pair(section)
     return WeixinConfig(
         session_folder=_coerce_session_folder(section.get("session_folder")),
         enabled=bool(section.get("enabled")),
@@ -861,13 +973,14 @@ def _build_weixin_config(weixin_data: dict) -> WeixinConfig:
         base_url=str(section.get("base_url") or section.default("base_url")),
         dm_policy=str(section.get("dm_policy") or section.default("dm_policy")),
         allowed_user_ids=_coerce_opaque_str_ids(section.get("allowed_user_ids")),
-        soft_threshold_pct=section.read("soft_threshold_pct", _threshold_pct),
-        hard_threshold_pct=section.read("hard_threshold_pct", _threshold_pct),
+        soft_threshold_pct=soft,
+        hard_threshold_pct=hard,
     )
 
 
 def _build_whatsapp_config(whatsapp_data: dict) -> WhatsAppConfig:
     section = SectionReader(WhatsAppConfig, whatsapp_data)
+    soft, hard = _threshold_pair(section)
     return WhatsAppConfig(
         session_folder=_coerce_session_folder(section.get("session_folder")),
         enabled=bool(section.get("enabled")),
@@ -875,8 +988,8 @@ def _build_whatsapp_config(whatsapp_data: dict) -> WhatsAppConfig:
         allowed_wa_ids=_coerce_str_ids(section.get("allowed_wa_ids")),
         groups=_coerce_whatsapp_groups(section.get("groups")),
         db_path=str(section.get("db_path")),
-        soft_threshold_pct=section.read("soft_threshold_pct", _threshold_pct),
-        hard_threshold_pct=section.read("hard_threshold_pct", _threshold_pct),
+        soft_threshold_pct=soft,
+        hard_threshold_pct=hard,
         # _safe_bool, not bool(): a hand-edited "false" must not turn on a billed service.
         auto_reply_to_voice=section.read("auto_reply_to_voice", _safe_bool),
     )
@@ -895,7 +1008,7 @@ def _build_discord_config(discord_data: dict) -> DiscordConfig:
         allowed_thread_ids=_coerce_str_ids(section.get("allowed_thread_ids")),
         allowed_channel_ids=_coerce_str_ids(section.get("allowed_channel_ids")),
         auto_thread=bool(section.get("auto_thread")),
-        soft_threshold_pct=section.read("soft_threshold_pct", _threshold_pct),
+        soft_threshold_pct=section.read("soft_threshold_pct", _threshold_pct, unclamped=_safe_int),
         reactions_enabled=bool(section.get("reactions_enabled")),
         show_thinking=bool(section.get("show_thinking")),
     )
@@ -903,6 +1016,7 @@ def _build_discord_config(discord_data: dict) -> DiscordConfig:
 
 def _build_webex_config(webex_data: dict) -> WebexConfig:
     section = SectionReader(WebexConfig, webex_data)
+    soft, hard = _threshold_pair(section)
     return WebexConfig(
         session_folder=_coerce_session_folder(section.get("session_folder")),
         enabled=bool(section.get("enabled")),
@@ -924,13 +1038,14 @@ def _build_webex_config(webex_data: dict) -> WebexConfig:
         ],
         reply_in_thread=bool(section.get("reply_in_thread")),
         wdm_base=str(section.get("wdm_base") or section.default("wdm_base")),
-        soft_threshold_pct=section.read("soft_threshold_pct", _threshold_pct),
-        hard_threshold_pct=section.read("hard_threshold_pct", _threshold_pct),
+        soft_threshold_pct=soft,
+        hard_threshold_pct=hard,
     )
 
 
 def _build_imessage_config(imessage_data: dict) -> IMessageConfig:
     section = SectionReader(IMessageConfig, imessage_data)
+    soft, hard = _threshold_pair(section)
     return IMessageConfig(
         session_folder=_coerce_session_folder(section.get("session_folder")),
         enabled=bool(section.get("enabled")),
@@ -939,13 +1054,14 @@ def _build_imessage_config(imessage_data: dict) -> IMessageConfig:
             h for h in _safe_list(section.get("allowed_handles")) if isinstance(h, str) and h
         ],
         service=str(section.get("service") or section.default("service")),
-        soft_threshold_pct=section.read("soft_threshold_pct", _threshold_pct),
-        hard_threshold_pct=section.read("hard_threshold_pct", _threshold_pct),
+        soft_threshold_pct=soft,
+        hard_threshold_pct=hard,
     )
 
 
 def _build_teams_config(teams_data: dict) -> TeamsConfig:
     section = SectionReader(TeamsConfig, teams_data)
+    soft, hard = _threshold_pair(section)
     return TeamsConfig(
         session_folder=_coerce_session_folder(section.get("session_folder")),
         enabled=bool(section.get("enabled")),
@@ -960,13 +1076,14 @@ def _build_teams_config(teams_data: dict) -> TeamsConfig:
             if isinstance(section.get("allowed_emails"), list)
             else section.default("allowed_emails")
         ),
-        soft_threshold_pct=section.read("soft_threshold_pct", _threshold_pct),
-        hard_threshold_pct=section.read("hard_threshold_pct", _threshold_pct),
+        soft_threshold_pct=soft,
+        hard_threshold_pct=hard,
     )
 
 
 def _build_wecom_config(wecom_data: dict) -> WeComConfig:
     section = SectionReader(WeComConfig, wecom_data)
+    soft, hard = _threshold_pair(section)
     return WeComConfig(
         session_folder=_coerce_session_folder(section.get("session_folder")),
         # _safe_bool, not bool(): `bool("false")` is True, so a JSON string
@@ -981,13 +1098,14 @@ def _build_wecom_config(wecom_data: dict) -> WeComConfig:
         ],
         allow_all_users=section.read("allow_all_users", _safe_bool),
         ws_url=str(section.get("ws_url")),
-        soft_threshold_pct=section.read("soft_threshold_pct", _threshold_pct),
-        hard_threshold_pct=section.read("hard_threshold_pct", _threshold_pct),
+        soft_threshold_pct=soft,
+        hard_threshold_pct=hard,
     )
 
 
 def _build_feishu_config(feishu_data: dict) -> FeishuConfig:
     section = SectionReader(FeishuConfig, feishu_data)
+    soft, hard = _threshold_pair(section)
     return FeishuConfig(
         enabled=section.read("enabled", _safe_bool),
         allowed_open_ids=_coerce_opaque_str_ids(section.get("allowed_open_ids")),
@@ -997,8 +1115,8 @@ def _build_feishu_config(feishu_data: dict) -> FeishuConfig:
         # to the parse (and dedupe + strip the opaque ou_/oc_ ids).
         allow_group=section.read("allow_group", _safe_bool),
         allowed_group_ids=_coerce_opaque_str_ids(section.get("allowed_group_ids")),
-        soft_threshold_pct=section.read("soft_threshold_pct", _safe_int),
-        hard_threshold_pct=section.read("hard_threshold_pct", _safe_int),
+        soft_threshold_pct=soft,
+        hard_threshold_pct=hard,
         session_folder=_coerce_session_folder(section.get("session_folder")),
     )
 

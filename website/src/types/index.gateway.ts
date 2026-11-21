@@ -141,6 +141,13 @@ export interface StatusData {
    */
   update_bundled_by_app?: boolean
   /**
+   * The command the sign-in sentences name in place of the catalog's
+   * `kirocrew token`: on a container gateway, `docker exec kirocrew kirocrew
+   * token`, run on the host. Empty, or absent on older gateways, keeps the
+   * catalog's command. Read through `api/signInCommand.ts`.
+   */
+  sign_in_command?: string
+  /**
    * Commit distance from a git checkout's upstream, both directions. Diverged
    * (both > 0) reports `update_available: false` exactly like a current
    * checkout — the destructive apply paths must never be offered local
@@ -311,6 +318,13 @@ export interface UpdateCheckResult {
   commits_behind?: number
   error_code?: string | null
   unavailable_reason?: string | null
+  /**
+   * Container installs only: the newer release whose image the gateway
+   * confirmed on GHCR (a 200 manifest), and its release-notes page. Absent
+   * whenever that confirmation did not happen.
+   */
+  image_available_version?: string
+  image_release_notes_url?: string
   remediation?: { kind?: string; message?: string; command?: string } | null
   current_version?: string
   auto_update?: boolean
@@ -363,6 +377,14 @@ export interface SessionStorageBatch {
   sessions: number; bytes: number
 }
 
+/** At least what Claude Code's own store keeps for the Claude chats this instance
+ *  can still resume. Another program's files, which Storage never moves, so no
+ *  session row and no other total includes it. */
+export interface ClaudeCodeStorage {
+  bytes: number
+  sessions: number
+}
+
 /**
  * What sessions cost on disk, and what may be reclaimed.
  *
@@ -376,6 +398,7 @@ export interface SessionStorageReport {
   reclaimable_sessions: number; reclaimable_bytes: number
   /** Non-empty when this instance must not reclaim — show it instead of the action. */
   reclaim_blocked_reason: string
+  claude_code?: ClaudeCodeStorage
   buckets: SessionStorageBucket[]
   trash: {
     bytes: number
@@ -441,6 +464,7 @@ export interface SessionInventoryList {
   total_sessions: number
   reclaimable_bytes: number
   reclaim_blocked_reason: string
+  claude_code?: ClaudeCodeStorage
   /** Every conversation, plus only the LARGEST replay-only sessions — see `background`. */
   sessions: SessionInventoryItem[]
   /** The replay-only group as a whole. `listed` is how many of `sessions` it

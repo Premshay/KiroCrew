@@ -48,7 +48,7 @@ own repo.
 
 | Field | Rules |
 |-------|-------|
-| `name` | Required. Kebab-case, matched against `^[a-z0-9]+(?:-[a-z0-9]+)*$`, unique across all apps. This is the install id and the on-disk directory name. `system` is reserved (it would shadow the `system.*` notification-channel namespace), as are `library` (the dashboard serves `/apps/library` as a static page), `registry`, `registries`, `blob`, `install` and `register` (shared `/api/apps/<name>` routes registered ahead of the per-app catch-all), and the Windows device stems `con`, `prn`, `aux`, `nul`, `com1`–`com9` and `lpt1`–`lpt9` (the name becomes a directory, and Windows resolves those inside every directory). Names that merely resemble one — `console`, `com10`, `null-app` — are fine. All are refused on every platform, so an app that installs on Linux also installs on Windows. |
+| `name` | Required. Kebab-case, matched against `^[a-z0-9]+(?:-[a-z0-9]+)*$`, unique across all apps. This is the install id and the on-disk directory name. `system` is reserved (it would shadow the `system.*` notification-channel namespace), as are `library` (the dashboard serves `/apps/library` as a static page), `registry`, `registries`, `blob`, `install`, `register` and `market` (shared `/api/apps/<name>` routes registered ahead of the per-app catch-all), and the Windows device stems `con`, `prn`, `aux`, `nul`, `com1`–`com9` and `lpt1`–`lpt9` (the name becomes a directory, and Windows resolves those inside every directory). Names that merely resemble one — `console`, `com10`, `null-app` — are fine. All are refused on every platform, so an app that installs on Linux also installs on Windows. |
 | `version` | Required. Semver (`major.minor.patch`, optionally with a pre-release or build suffix). Bump on every release. |
 | `displayName` | Required. Rendered in a fixed-width row that truncates, so keep it short. |
 | `description` | Required. Plain text, no markdown. Discover's list row shows one truncated line; the feature cards clamp to two; the detail page shows it in full. Two or three sentences is the useful range. |
@@ -631,6 +631,9 @@ POST /api/apps/register
 ```
 
 The call is idempotent: registering again with a newer version updates the entry.
+With `agent.apps_ui_protected_copy` on (off by default), the dashboard runs the UI
+scripts (`.js`, `.mjs`) that were in the app's folder at its last registration, so
+an app that changes its UI registers again to ship it.
 `resources` and `lifecycle` default to `app` when omitted; the gateway always
 records `origin` as `external` and ignores any `origin` in the body. Use this when the app has its own build or package system, needs
 runtime-dynamic agent configuration, or manages its own agent, skill, and MCP
@@ -650,15 +653,19 @@ installed one.
 
 - Patch for fixes, minor for features, major for breaking changes (agent config
   schema, MCP tool interface).
-- `minKiroCrewVersion` is checked on install and update; too-old gateways get a
-  clear error telling the user to update Kiro Crew first.
+- `minKiroCrewVersion` is checked on install and update, by the gateway that serves
+  the request; a too-old gateway refuses with its own version and says to update
+  Kiro Crew, then restart that gateway. `kirocrew app install` names the version
+  of the gateway that decided.
 - Users update from the store or via `POST /api/apps/{name}/update`. For a
   registry-sourced app the update runs its preflight, stops the backend and
   deregisters the app's resources, then re-clones, rebuilds, and re-runs
   `onInstall`. If that install fails, the old version is restored: an enabled app
   is re-registered and restarted, while a disabled app stays stopped and
   unregistered. `kirocrew app update <name> [--source <dir>]` runs the same
-  request from a terminal through a running gateway.
+  request from a terminal through a running gateway; it is not available on
+  native Windows, which has no dashboard Unix socket, so use the Update button
+  there.
 
 ## 14. Review checklist
 

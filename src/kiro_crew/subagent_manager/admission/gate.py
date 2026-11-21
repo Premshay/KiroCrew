@@ -257,9 +257,41 @@ class _GateMixin(ManagerComponent):
         # second half of a memory read (``_memory_reading``) is a re-entry too.
         _memory_reentry = _memory_reading is not None
         if batch_id and not _from_queue and not _store_accepted and not _memory_reentry:
+            _owner = (app, parent_session_key)
+            _recorded_owner = self._manager._batch_owner.get(batch_id, _owner)
+            # Check and claim without yielding: the route's early check can
+            # precede another caller's first submission. Owner-only waves may
+            # still span parents; an app's wave never crosses this boundary.
+            if _recorded_owner != _owner and (
+                app or (_recorded_owner is not None and _recorded_owner[0])
+            ):
+                try:
+                    sel().log_tool_invocation(
+                        session_key=parent_session_key,
+                        source="subagent",
+                        tool_name="spawn_run",
+                        outcome="rejected_batch_owner",
+                        metadata={"agent": agent},
+                    )
+                except Exception:
+                    logger.debug("SEL audit failed for batch-owner rejection", exc_info=True)
+                # Not this wave's member: no count, expected-total change or
+                # completion announcement into the existing wave's parent.
+                return self._manager._announce_rejection(
+                    SubagentInfo(
+                        id=agent_id,
+                        task=redact_credentials(redact_exfiltration_urls(task or "")[0])[0],
+                        agent=agent,
+                        parent_session_key=parent_session_key,
+                        done=True,
+                        error="spawn refused: batch belongs to another app or session",
+                    )
+                )
             _bs = self._manager._batch_submitted.setdefault(batch_id, [0, max(0, int(batch_total))])
             _bs[0] += 1
             self._manager._batch_progress_ts[batch_id] = time.monotonic()
+            if self._manager._batch_owner.setdefault(batch_id, _owner) != _owner:
+                self._manager._batch_owner[batch_id] = None
         # --- Task guard: refuse empty/whitespace-only tasks (defense in depth).
         # The HTTP handler (api_spawn) and MCP tool schemas validate too, but
         # direct Python callers reach this choke point unvalidated. An empty
@@ -454,6 +486,7 @@ class _GateMixin(ManagerComponent):
                     task=_redacted_task,
                     agent=agent,
                     parent_session_key=parent_session_key,
+                    app=app,
                     done=True,
                     error=(
                         f"spawn refused: a sub-agent at depth {_depth} would exceed the "
@@ -488,6 +521,7 @@ class _GateMixin(ManagerComponent):
                     id=agent_id,
                     task=_redacted_task,
                     parent_session_key=parent_session_key,
+                    app=app,
                     done=True,
                     error="memory_unavailable: the parent's memory mode could not be established",
                     batch_id=batch_id,
@@ -523,6 +557,7 @@ class _GateMixin(ManagerComponent):
                     memory_mode=_memory_mode,
                     agent=agent,
                     parent_session_key=parent_session_key,
+                    app=app,
                     done=True,
                     error=(
                         str(exc)
@@ -573,6 +608,7 @@ class _GateMixin(ManagerComponent):
                     memory_mode=_memory_mode,
                     agent=agent,
                     parent_session_key=parent_session_key,
+                    app=app,
                     done=True,
                     error=f"spawn refused: {cwd_err}",
                     batch_id=batch_id,
@@ -623,6 +659,7 @@ class _GateMixin(ManagerComponent):
                     memory_mode=_memory_mode,
                     agent=agent,
                     parent_session_key=parent_session_key,
+                    app=app,
                     done=True,
                     error=f"spawn refused by governance: {gov_spawn_err}",
                     batch_id=batch_id,
@@ -682,6 +719,7 @@ class _GateMixin(ManagerComponent):
                     memory_mode=_memory_mode,
                     agent=agent,
                     parent_session_key=parent_session_key,
+                    app=app,
                     done=True,
                     error=f"spawn refused: {allowlist_err}",
                     error_code=AGENT_NOT_AVAILABLE_CODE,
@@ -1220,8 +1258,8 @@ class _GateMixin(ManagerComponent):
                 memory_detail = f"{unknown_note}; need {min_mem:.1f} GB"
             else:
                 memory_detail = (
-                    f"low memory: {avail_gb:.1f} GB available, need {min_mem:.1f} GB "
-                    f"({candidate_price or 0.0:.2f} GB for this start)"
+                    f"low memory: {avail_gb:.1f} GB free, needs {min_mem:.1f} GB; "
+                    "close other apps to free some"
                 )
             # A floor wait carries no pressure clock (the hold below is not
             # evaluated for it): one an earlier hold started is dropped, so time
@@ -1300,6 +1338,7 @@ class _GateMixin(ManagerComponent):
                     memory_mode=_memory_mode,
                     agent=agent,
                     parent_session_key=parent_session_key,
+                    app=app,
                     done=True,
                     error=QUEUED_WAIT_EXPIRED_TEXT,
                     batch_id=batch_id,
@@ -1416,6 +1455,7 @@ class _GateMixin(ManagerComponent):
                 memory_mode=_memory_mode,
                 agent=agent,
                 parent_session_key=parent_session_key,
+                app=app,
                 done=True,
                 error=MEMORY_PRESSURE_NEVER_STARTED,
                 batch_id=batch_id,

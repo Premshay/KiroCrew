@@ -13,7 +13,7 @@ that ignored either -- switching to a hardcoded model, or switching on nothing -
 passes a single happy-path assertion and fails both of these.
 
 The rest is WHOSE turn gets routed. The point runs for a normal dashboard chat turn
-of a slot whose owner picked ``Auto (Jev)``, and for nothing else: a cron delivery,
+of a slot whose owner picked ``Auto (decision model)``, and for nothing else: a cron delivery,
 a sub-agent turn, an app injection and an autonudge wake each already resolve their
 model through their own tier, and none of them has an owner watching the price.
 """
@@ -28,7 +28,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from test_decisions_strip_rides_message import _quiet_sel, _runner_state, _settle, _slot
+from test_decisions_strip_rides_message import (  # noqa: F401 - the fixture is used by name
+    _quiet_sel,
+    _runner_state,
+    _settle,
+    _slot,
+    generous_decision_log_append,
+)
 from turn_harness import ScriptedProvider, SlotSpec, TurnContext, TurnScript, run_turn
 
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, AcpEvent
@@ -41,6 +47,8 @@ from kiro_crew.decisions.points import model_route as mr
 from kiro_crew.decisions.types import Answer
 from kiro_crew.hooks import HOOK_EVENT_USER_PROMPT_SUBMIT
 from kiro_crew.providers.base import LLMEvent
+
+pytestmark = pytest.mark.usefixtures("generous_decision_log_append")
 
 ADVERTISED = ["model-a", "model-b", "model-c"]
 
@@ -118,8 +126,9 @@ def _turn_client(state, client) -> None:
 
 async def _run(tmp_path, slot, message="please redesign the scheduler", **kwargs):
     # ``_directive_user_origin`` defaults to what the dashboard's own send passes
-    # (`not bool(request_app)` in `api_chat_send`), because "a normal chat turn" is
-    # what most of these tests mean. An app-authored dispatch overrides it to False.
+    # (`_person_send` in `_api_chat_send`: no app and not agent-origin), because
+    # "a normal chat turn" is what most of these tests mean. An app-authored
+    # dispatch overrides it to False.
     kwargs.setdefault("_directive_user_origin", True)
     state, client = _runner_state(tmp_path)
     _turn_client(state, client)

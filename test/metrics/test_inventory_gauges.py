@@ -347,8 +347,26 @@ def test_config_toggles_reports_zero_and_one():
     with patch.object(KiroCrewConfig, "load", return_value=cfg):
         toggles = ig.read_config_toggles()
     assert toggles
-    assert set(toggles) == {key for key, _, _ in ig.CONFIG_TOGGLES}
+    assert set(toggles) == {key for key, _, _ in ig.CONFIG_TOGGLES} | {
+        ig.PREVIEW_CHAT_RUNTIME_SHARING_KEY
+    }
     assert set(toggles.values()) <= {0, 1}
+
+
+def test_preview_toggle_reports_the_chat_runtime_sharing_preview():
+    """Adoption of the preview reads 1 only when stored True, and 0 in an LTS build."""
+    from kiro_crew.acp.chat_runtime_sharing import CHAT_RUNTIME_SHARING_PREVIEW
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    key = ig.PREVIEW_CHAT_RUNTIME_SHARING_KEY
+    cfg = KiroCrewConfig()
+    with patch.object(KiroCrewConfig, "load", return_value=cfg):
+        assert ig.read_config_toggles()[key] == 0
+    cfg.dashboard.feature_previews = {CHAT_RUNTIME_SHARING_PREVIEW: True}
+    with patch.object(KiroCrewConfig, "load", return_value=cfg):
+        assert ig.read_config_toggles()[key] == 1
+        with patch("kiro_crew.edition_locks.local_enable_locked", return_value=True):
+            assert ig.read_config_toggles()[key] == 0
 
 
 def test_config_toggles_omits_an_unresolvable_key():
@@ -357,7 +375,7 @@ def test_config_toggles_omits_an_unresolvable_key():
     cfg = KiroCrewConfig()
     with patch.object(ig, "CONFIG_TOGGLES", (("ghost", "telemetry", "no_such_field"),)):
         with patch.object(KiroCrewConfig, "load", return_value=cfg):
-            assert ig.read_config_toggles() is None
+            assert "ghost" not in ig.read_config_toggles()
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +433,30 @@ def test_knowledge_probe_never_creates_the_database(tmp_path):
             assert ig.read_knowledge_documents() is None
         assert not (tmp_path / "workspace" / "knowledge" / "knowledge.db").exists()
         assert not (tmp_path / "workspace").exists()
+    finally:
+        ig.reset_for_testing()
+
+
+def test_knowledge_probe_reads_the_exact_file_when_the_path_has_uri_characters(tmp_path):
+    """'#' and '%41' in the path must reach SQLite quoted, not as URI syntax.
+
+    '?' is left out because Windows forbids it in a file name.
+
+    Unquoted, '#' truncates the path (and ``mode=ro`` with it), so SQLite creates an
+    empty file beside the folder, and '%41' is decoded onto the sibling 'hasApct'.
+    """
+    ig.reset_for_testing()
+    try:
+        for name, sibling in (("has#hash", None), ("has%41pct", "hasApct")):
+            root = tmp_path / name
+            _make_knowledge_db(root, 3)
+            if sibling:
+                _make_knowledge_db(tmp_path / sibling, 7)
+            before = sorted(p.name for p in tmp_path.iterdir())
+            ig.reset_for_testing()
+            with patch("kiro_crew.config.paths.config_dir", return_value=root):
+                assert ig.read_knowledge_documents() == 3, name
+            assert sorted(p.name for p in tmp_path.iterdir()) == before, name
     finally:
         ig.reset_for_testing()
 
@@ -758,7 +800,7 @@ def test_members_count_agrees_with_the_roster_dashboard_created_rule():
 
     from kiro_crew.dashboard.handlers import members_roster
 
-    assert "is_person_created_crewmate" in inspect.getsource(members_roster.api_members)
+    assert "is_person_created_crewmate" in inspect.getsource(members_roster._build_roster)
     assert "count_person_created_crewmates" in inspect.getsource(ig.read_members)
 
 

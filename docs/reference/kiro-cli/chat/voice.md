@@ -5,7 +5,8 @@
 
 Kiro Crew supports hands-free interaction through voice input (speech-to-text)
 and voice output (text-to-speech). Input works in the dashboard and on supported
-messaging attachments; output works in the dashboard, Slack, and Telegram.
+messaging attachments; output works in the dashboard, Slack, Telegram, and
+WhatsApp.
 
 ## Voice Input (Speech-to-Text)
 
@@ -34,7 +35,7 @@ fallback).
 ### Messaging Voice Notes
 
 When STT is enabled, audio and voice attachments received through Slack, Discord,
-Teams, Telegram, Webex, WeCom, Weixin, and WhatsApp are automatically transcribed
+Feishu, Teams, Telegram, Webex, WeCom, Weixin, and WhatsApp are automatically transcribed
 through the shared attachment path. Kiro Crew responds to the transcribed text as
 if it had been typed. A channel may impose its own attachment-size and media-type
 limits before transcription.
@@ -82,7 +83,7 @@ Once the recognizer and decoder are available, there is no separate transcriptio
 program or provider-specific runtime to install. `kirocrew doctor` reports the
 recognizer, model, and resolved decoder.
 
-The other two providers, the full setting list and the retired providers are in
+The other providers (`apple`, `transcribe`, `codex`, and `off`), the full setting list and the retired providers are in
 Kiro Crew's own [configuration reference](../../../../src/kiro_crew/docs/configuration.md).
 
 ### Choose the spoken language
@@ -146,7 +147,7 @@ Pocket is supplied by the local deployment. If selecting Pocket or clicking
 Speak reports an unavailable voice service, the deployment owner must restore
 the local Pocket runtime; no AWS credential is involved.
 
-The `piper` provider was removed ([#23154](https://github.com/kirodotdev/KiroCrew/issues/23154)): its engine and voice models were installed unpinned and unverified, and the engine is GPL-licensed. A config that still names `piper`, or still carries `piper_model`, speaks with `system` and logs one warning per gateway start; set `provider` to `system` (or `polly`) in `config.json` to silence it. The `piper_*` keys are ignored and nothing on disk is removed; delete a Piper install or voice files yourself if you no longer want them.
+There is no `piper` provider: its engine and voice models would be installed unpinned and unverified, and the engine is GPL-licensed. A config that still names `piper`, or still carries `piper_model`, speaks with `system` and logs one warning per gateway start; set `provider` to `system` (or `polly`) in `config.json` to silence it. The `piper_*` keys are ignored and nothing on disk is removed; delete a Piper install or voice files yourself if you no longer want them.
 
 Two playback modes are available:
 
@@ -248,13 +249,13 @@ Settings are in **Settings > Voice**, or directly in
 | `enabled` | `false` | Turn on voice replies for **every** Kiro Crew response (text-triggered). Also seeds the `auto_reply_to_voice` default — see below. |
 | `provider` | `"piper"` | TTS backend: `"piper"` (local, offline, best quality), `"system"` (the host's built-in engine, nothing to install), `"pocket"` (local on-demand replay) or `"polly"` (AWS, cloud, and billed). An unrecognized value falls back to `piper` with a warning logged: reaching for a paid service is not a choice a typo may make for you. If the key is ABSENT but `piper_model` is set, Piper is kept, so an existing Piper install is not silently downgraded on upgrade. |
 | `auto_reply_to_voice` | _follows `enabled`_ | **Voice-triggered**: when the user sends a voice memo, auto-respond with voice. Defaults to whatever `enabled` is — set explicitly to override. |
-| `rate` | `100%` | 50%–200%. Shared by `polly` and `system` |
+| `rate` | `100%` | A percentage such as `120%`; Settings offers 80%–150%, and a malformed value falls back to `100%`. Shared by `polly` and `system` |
 | **Built-in-engine-specific** | | ignored by the other providers |
 | `system_voice` | _(OS default)_ | The engine's own voice selector: a voice name for `say` and Windows, a language code for `espeak-ng`. Pick one in **Settings > Voice** rather than typing it |
 | **Polly-specific** | | ignored by the other providers; Pocket uses only `voice_id` |
 | `voice_id` | `Ruth` | Any [Amazon Polly voice](https://docs.aws.amazon.com/polly/latest/dg/voicelist.html); Pocket's supplied local voice is `michael` |
 | `engine` | `generative` | `generative`, `neural`, `long-form`, `standard` |
-| `pitch` | `+0%` | -20% to +20% (neural/standard only) |
+| `pitch` | `+0%` | A signed percentage such as `+10%`; Slack offers -20% to +20% (neural/standard only) |
 | `aws_profile` | _(empty)_ | AWS CLI profile; empty = default credentials |
 | `region` | _(empty)_ | AWS region for Polly; empty = CLI default |
 | **Piper-specific** | | ignored by the other providers |
@@ -319,7 +320,7 @@ Responses are cleaned for natural speech before synthesis:
   1. Run `aws configure --profile polly` (or your credential provider) in your
      terminal to set up a named profile.
   2. In **Settings > Voice**, enter `polly` in the
-     **AWS Profile** field (or set `"aws_profile": "polly"` in config.json).
+     **AWS Profile (Amazon Polly)** field (or set `"aws_profile": "polly"` in config.json).
   3. Leave the profile blank to use your default AWS CLI credentials
      (`~/.aws/credentials` default profile or environment variables).
 

@@ -68,6 +68,14 @@ _MEMBER_OWNERS = frozenset(
 )
 
 
+def _host_announces_mcp_starts(acp_backend: str) -> bool:
+    """Whether this host sends MCP-init frames that end the session drain early."""
+    try:
+        return bool(harness_for(acp_backend).notification_aliases.mcp_init)
+    except ValueError:
+        return True
+
+
 class AcpRuntime:
     """Owns one kiro-cli acp subprocess with single-reader demux.
 
@@ -100,6 +108,8 @@ class AcpRuntime:
     _root_identity = _rt_tree._root_identity
     _root_identity_holds = _rt_tree._root_identity_holds
     refresh_process_tree = _rt_tree.refresh_process_tree
+    wait_tree_recorded = _rt_tree.wait_tree_recorded
+    _record_tree_in_background = _rt_tree._record_tree_in_background
     _snapshot_descendants = _rt_tree._snapshot_descendants
     _rescan_descendants_later = _rt_tree._rescan_descendants_later
     _signal_tree = _rt_tree._signal_tree
@@ -147,6 +157,7 @@ class AcpRuntime:
     _start_mount_check = _rt_setup._start_mount_check
     # ``session/new`` end to end: ``kiro_crew.acp.runtime_session_create``.
     create_session = _rt_create.create_session
+    _create_session_with_harness_state = _rt_create._create_session_with_harness_state
     _collect_late_start = _rt_create._collect_late_start
     _teardown_late_session = _rt_create._teardown_late_session
     start_collectors = _rt_create.start_collectors
@@ -154,6 +165,7 @@ class AcpRuntime:
     probe_advertised_models = _rt_create.probe_advertised_models
     # ``session/load`` end to end: ``kiro_crew.acp.runtime_session_load``.
     load_session = _rt_load.load_session
+    _load_session_with_harness_state = _rt_load._load_session_with_harness_state
     _wait_managed_mcp = _rt_load._wait_managed_mcp
     _park_in_start_agent = _rt_load._park_in_start_agent
     # The sessions held and how each leaves: ``kiro_crew.acp.runtime_session_registry``.
@@ -167,7 +179,6 @@ class AcpRuntime:
     release_session = _rt_registry.release_session
     delete_session_record = _rt_registry.delete_session_record
     keep_record_on_teardown = _rt_registry.keep_record_on_teardown
-    chat_turn_gate = _rt_registry.chat_turn_gate
     _session_teardown_method = _rt_registry._session_teardown_method
     _mcp_init_progress = _rt_registry._mcp_init_progress
     _session_start_stalled = _rt_registry._session_start_stalled
@@ -283,6 +294,7 @@ class AcpRuntime:
     #: ``__init__`` (a test double, a restored instance) reads as having none.
     _launch_agent = ""
     _harness_pin = ""
+    _background_qos = False
 
     def __init__(
         self,
@@ -310,6 +322,7 @@ class AcpRuntime:
         forward_ssh_auth_sock: bool | None = None,
         agent_env: dict[str, str] | None = None,
         kas_telemetry: bool | None = None,
+        background_qos: bool = False,
     ):
         if work_dir:
             self._work_dir = Path(work_dir)
@@ -343,6 +356,13 @@ class AcpRuntime:
         # under. None for a runtime no provider built (the background runtime,
         # a review pool), whose sessions' app is then not known.
         self._governance_scope = governance_scope
+        # True for a runtime whose role is background work, fixed by the surface
+        # that builds it (the sub-agent companion runtime, a task run's runtime via
+        # ``LLMProvider.background_qos``): it never hosts a person's own chat
+        # turn, so with
+        # ``agent.windows_background_qos`` on, its spawn is marked background on
+        # Windows (``kiro_crew.windows_background_qos``).
+        self._background_qos = background_qos
         self._acp_backend = acp_backend
         self._model_switch_method = model_switch_method
         # The Bot pin of the session this process was started for, as stored
@@ -361,6 +381,9 @@ class AcpRuntime:
         # The agent.env snapshot this spawn's handshake judged telemetry on, handed
         # to launch so the child gets the same values; None lets launch read it.
         self._spawn_agent_env: dict[str, str] | None = None
+        # The spec this spawn's handshake judged, handed to the MCP switch-off so
+        # both judge one read; None lets the switch-off read it.
+        self._spawn_spec: dict[str, Any] | None = None
         # Resolved on FIRST USE, never here: ``ACP_BACKENDS_KNOWN`` admits
         # backends the shared-process runtime has no harness for, and provider
         # safety constructs a runtime for every one of them to prove the reader
@@ -377,6 +400,9 @@ class AcpRuntime:
         self._kas_host_auth = False
         self._session_model: str | None = None
         self._session_meta: Mapping[str, Any] | None = None
+        # Whether THIS process is Crew's own KAS engine bundle (no kiro-cli),
+        # copied from the spawn plan. The turn gates read it for a live session.
+        self._kas_engine_bundle = False
         # Answers this process's ``_kiro/secret/*`` requests when its handshake
         # declared ``secretStorage`` (``agent.kas_persist_mcp_sign_in``); None
         # otherwise, and those requests then get -32601. Set at each handshake.
@@ -391,6 +417,10 @@ class AcpRuntime:
         # runtime until a callback succeeds or the reason changes: a signed-out
         # engine re-asks about twice a second, and one line says it all.
         self._kas_host_auth_failure_logged: str | None = None
+        # kas_host_auth.token_digest of the last access token this runtime's
+        # callback served, never the token: lets a fail-closed start renew the
+        # very token the engine is holding (kas_host_auth.sign_in_refused).
+        self._kas_served_token_digest: str | None = None
         # The one MCP sign-in in flight on this process, as (session_id,
         # server_name). The engine's consent-URL request names neither, so at
         # most one sign-in runs at a time and its URL goes to the session that
@@ -444,6 +474,16 @@ class AcpRuntime:
         # opts out so hot one-liner paths (chat titles, suggestions, STT
         # endpointing) don't pay a full ceiling wait that can never be armed.
         self._expect_mcp_reports = expect_mcp_reports
+        # A host that names no MCP-init method (goose, claude-agent-acp, codex-acp
+        # send plain ``session/update`` only) can never arm the ceiling either, so
+        # its sessions skip that wait: the drain reads both fields. Only the drain:
+        # the spec's switched-off servers are still recorded off
+        # ``_expect_mcp_reports`` alone. An unknown backend keeps the wait: the
+        # spawn refuses it later, with the harness's own error.
+        self._host_sends_mcp_init = _host_announces_mcp_starts(acp_backend)
+        # Set at each spawn: True once this process switched MCP off for a
+        # tool-less agent, so no server of any session on it can report.
+        self._mcp_switched_off = False
         self._sandbox_cleanup: str | None = None
         self._bound_workspace_fd: int | None = None
         self._spawn_work_dir = str(self._work_dir)
@@ -617,6 +657,10 @@ class AcpRuntime:
         # binary THIS process is executing, which can differ from the one on
         # disk after an in-place upgrade. Empty until the handshake completes.
         self._agent_version = ""
+        # Per-session state a harness with ``per_session_state`` prepared before each
+        # session's request (``HarnessAdapter.prepare_session``), by session id, ended
+        # with the session (``HarnessAdapter.end_session``). Empty on every other host.
+        self._session_harness_states: dict[str, Any] = {}
         # Entitlement probe state (probe_advertised_models): single-flight lock
         # plus a short-TTL cache of the last non-empty answer.
         self._entitlement_probe_lock = asyncio.Lock()
@@ -629,10 +673,14 @@ class AcpRuntime:
         # The one deferred scan a spawn schedules when its own saw no
         # descendant (_snapshot_descendants). Cancelled by the kill.
         self._descendant_rescan_task: asyncio.Task[None] | None = None
+        # The background descendant passes still running
+        # (_record_tree_in_background). Every kill waits for them.
+        self._start_tree_scans: set[asyncio.Task[None]] = set()
         # Two independent clocks so a failure never extends the life of an old
-        # success: ``_result_at`` is stamped ONLY when a non-empty result is
-        # stored (that result may be replayed until it expires), while
-        # ``_attempt_at`` is stamped on EVERY completed attempt incl.
+        # success: ``_entitlement_probe_result_at`` is stamped ONLY when a
+        # non-empty result is stored (that result may be replayed until it
+        # expires), while ``_entitlement_probe_attempt_at`` is stamped on EVERY
+        # completed attempt incl.
         # failure/empty (it suppresses re-opening a session within the TTL but
         # never replays a stale result).
         self._entitlement_probe_result_at = 0.0
@@ -705,6 +753,14 @@ class AcpRuntime:
         # and could not be repaired; empty otherwise. Set and cleared by
         # ``_spawn_admitted_repairing_kas_extract`` alone, once per spawn.
         self._kas_extract_broken_message = ""
+        # Whether other chats may join this process (``RuntimeOwnership.acquire``):
+        # set by a KAS start from the engine it ran; True for every other host,
+        # where chat sharing's own membership set decides.
+        self.chat_joinable = True
+        # Whether this process stops taking chats once any chat leaves it
+        # (``RuntimeOwnership.release``): set by a shared codex placement, whose
+        # departed sessions leave their MCP fleet running; False everywhere else.
+        self.chat_closes_on_departure = False
         # The server path from kiro-cli's ``failed to canonicalize KAS server path``
         # line, latched by ``_drain_stderr`` before the first session is ready
         # (whatever ``recording_allowed`` says) and cleared by a revive.
@@ -724,6 +780,9 @@ class AcpRuntime:
         # also the safe default for the classifier, since a spawn that never
         # reached the wrap cannot have been refused by it.
         self._sandbox_wrapped_by_crew = False
+        # Whether the harness said its tools run under its sole engine child
+        # (``SpawnPlan.engine_is_child``), recorded per spawn by the launch.
+        self._engine_is_child = False
         # The mask set this spawn asked for, so a trusted corroboration run can
         # exercise the same mounts rather than a weaker profile.
         self._sandbox_hidden_dirs: tuple[str, ...] = ()
@@ -814,11 +873,6 @@ class AcpRuntime:
         # Sessions whose teardown must keep the stored record while a re-injection
         # load runs (``keep_record_on_teardown``).
         self._record_keeping_sessions: set[str] = set()
-        # Serializes CHAT co-tenant turns on a shared kiro-cli process
-        # (``chat_turn_gate``). Held only by shared chat sessions; a subagent turn
-        # is exempt, because it runs while its principal's turn is still open and
-        # would deadlock on the lock the principal holds.
-        self._chat_turn_lock = asyncio.Lock()
         self._dropped_frames_flushed_at: float = 0.0
         # Traffic belongs to one session; another tenant must not extend its life.
         self._session_activity_at: dict[str, float] = {}
@@ -979,6 +1033,18 @@ class AcpRuntime:
         return harness
 
     @property
+    def kas_spawn_route(self) -> Any:
+        """The KAS route THIS runtime's process was spawned on, or ``None``.
+
+        ``None`` before a spawn and on every other harness. The sign-in messages
+        for a failure of this runtime name it (``host_auth.signed_out_message``'s
+        ``route``), not the process-wide last spawn, which a second chat's spawn
+        can move between this one's spawn and its error. Reads the cached harness
+        only: asking for a route never resolves one.
+        """
+        return getattr(getattr(self, "_harness_resolved", None), "spawn_route", None)
+
+    @property
     def uses_kiro_identity_store(self) -> bool:
         """True when this runtime's process signs in from kiro-cli's own store.
 
@@ -1042,6 +1108,15 @@ class AcpRuntime:
     #: because every later session start scans again. Nothing waits on it.
     _DESCENDANT_RESCAN_DELAY = EMPTY_WALK_RETRY_DELAY
 
+    #: How long a kill waits for a background descendant pass still running
+    #: (``wait_tree_recorded``) before it gives up on it, cancels it and acts on
+    #: the record the earlier passes wrote, as a kill that ran before the pass
+    #: did. One pass at 64 MCP servers takes about 1 s on macOS, but its walk
+    #: is a ``pgrep`` per process and a ``ps`` per pid, each bounded at 2 s, so
+    #: a hung one has no useful bound of its own. Equal to the pre-teardown
+    #: refresh's bound (``process_identity.TREE_REFRESH_TIMEOUT``).
+    _KILL_TREE_WAIT_SECS = 3.0
+
     #: Why a teardown reached nothing, per ``_root_identity`` verdict. "holds" is
     #: reachable here too: the tree kill ran and the root exited under it, which
     #: is a race, not an identity failure.
@@ -1093,6 +1168,15 @@ class AcpRuntime:
         harness's wording while the layer the operator must change is Crew's.
         """
         return self._sandbox_wrapped_by_crew
+
+    @property
+    def engine_is_child(self) -> bool:
+        """Whether this runtime's harness relays to a sole engine child that runs the tools.
+
+        Read off the last spawn's plan; the stalled-shell cleanup pins that engine as
+        the shell's parent.
+        """
+        return self._engine_is_child
 
     @property
     def sandbox_mode(self) -> str:

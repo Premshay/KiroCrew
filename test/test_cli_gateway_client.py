@@ -15,7 +15,7 @@ import socket
 import sys
 import urllib.error
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from cli_helpers import (  # noqa: F401 -- the autouse fixture registers by import
@@ -128,10 +128,12 @@ class TestLogout:
     ):
         """The gateway's 500 reason is printed, not only its status."""
 
-        def _cannot_persist():
+        async def _cannot_persist():
             raise OSError("disk full")
 
-        monkeypatch.setattr("kiro_crew.dashboard.token_auth.revoke_all_sessions", _cannot_persist)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.token_auth.revoke_all_sessions_async", _cannot_persist
+        )
         code = await self._logout_against_the_real_route(
             monkeypatch, server_secret="the-secret", cli_secret="the-secret"
         )
@@ -144,8 +146,8 @@ class TestLogout:
     @pytest.mark.asyncio
     async def test_a_stale_secret_is_named(self, monkeypatch, capsys):
         """A refused secret prints the gateway's reason after the status."""
-        revoke = MagicMock()
-        monkeypatch.setattr("kiro_crew.dashboard.token_auth.revoke_all_sessions", revoke)
+        revoke = AsyncMock()
+        monkeypatch.setattr("kiro_crew.dashboard.token_auth.revoke_all_sessions_async", revoke)
         code = await self._logout_against_the_real_route(
             monkeypatch, server_secret="the-real-one", cli_secret="a-stale-one"
         )
@@ -419,6 +421,22 @@ class TestStatus:
         out = capsys.readouterr().out
         assert "running" in out
         assert "unexpected response" in out
+
+    @pytest.mark.parametrize("body", [b"[]", b"null", b'"ok"', b"42"])
+    def test_status_non_object_json_reports_an_unexpected_response(self, capsys, body):
+        """Valid JSON that is not an object parses, so it must not reach the ``.get`` reads."""
+        import io
+
+        from kiro_crew.cli_server import _status
+
+        raised = None
+        with patch("kiro_crew.cli_server.loopback_urlopen", return_value=io.BytesIO(body)):
+            try:
+                _status(self._make_args())
+            except Exception as exc:  # noqa: BLE001 -- the traceback is the defect
+                raised = exc
+        assert raised is None, repr(raised)
+        assert "unexpected response" in capsys.readouterr().out
 
 
 class TestStatusAgainstAClosedPort:
@@ -992,7 +1010,7 @@ class TestSpawnCliAuth:
         with pytest.raises(SystemExit) as excinfo:
             _spawn(args)
         assert excinfo.value.code == 1
-        out = capsys.readouterr().out
+        out = capsys.readouterr().err
         assert "Error" in out
         assert "gateway not running" not in out
 
@@ -1009,7 +1027,7 @@ class TestSpawnCliAuth:
         with pytest.raises(SystemExit) as excinfo:
             _spawn(argparse.Namespace(spawn_action="list", port=5476))
         assert excinfo.value.code == 1
-        out = capsys.readouterr().out
+        out = capsys.readouterr().err
         assert "busy" in out
         assert "gateway not running" not in out
 
@@ -1029,7 +1047,7 @@ class TestSpawnCliAuth:
         with pytest.raises(SystemExit) as excinfo:
             _spawn_run(args, "http://localhost:5476")
         assert excinfo.value.code == 1
-        out = capsys.readouterr().out
+        out = capsys.readouterr().err
         assert "busy" in out
         assert "spawn list" in out
         assert "gateway not running" not in out

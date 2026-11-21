@@ -332,7 +332,8 @@ def _malloc_trim() -> bool:
         trim.argtypes = [ctypes.c_size_t]
         trim.restype = ctypes.c_int
         return bool(trim(0))
-    except (AttributeError, OSError):
+    except (AttributeError, OSError, TypeError):
+        # TypeError: on Windows ``ctypes.CDLL(None)`` fails on ``'/' in None``.
         return False
 
 
@@ -1287,6 +1288,33 @@ def _linux_available_mib() -> int:
     return 0
 
 
+#: The kernel's memory pressure-stall file (PSI), Linux 4.20 and later.
+_LINUX_MEMORY_PSI_PATH = "/proc/pressure/memory"
+
+
+def linux_memory_psi_full_avg10(path: str = _LINUX_MEMORY_PSI_PATH) -> float | None:
+    """The ``full avg10`` figure of the memory PSI file, or None when unreadable.
+
+    The share of the last 10 seconds in which every runnable task stalled on
+    memory. On a swapless host reclaim stalls begin while ``MemAvailable`` still
+    reads high, because it counts page cache the kernel is already fighting to
+    keep, so this sees the start of thrash earlier. None (an older kernel, macOS,
+    Windows, a malformed line) means "no reading", never "no pressure".
+    """
+    try:
+        with open(path, encoding="ascii") as handle:
+            for line in handle:
+                if not line.startswith("full "):
+                    continue
+                for field in line.split()[1:]:
+                    name, _, value = field.partition("=")
+                    if name == "avg10":
+                        return float(value)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    return None
+
+
 def host_total_mib() -> int:
     """Total physical RAM in MiB, or 0 when it cannot be determined.
 
@@ -1304,8 +1332,28 @@ def host_total_mib() -> int:
             return pages * page_size // _MIB_BYTES
     except (AttributeError, OSError, ValueError):
         pass
+    if IS_MACOS:
+        # macOS builds without ``SC_PHYS_PAGES`` in ``os.sysconf_names``: the kernel's
+        # own byte count, through the same in-process sysctl handle as below.
+        return _darwin_memsize_bytes() // _MIB_BYTES
     mem = system_memory()  # GlobalMemoryStatusEx: (total, available)
     return (mem[0] // _MIB_BYTES) if mem else 0
+
+
+def _darwin_memsize_bytes() -> int:
+    """``hw.memsize`` (physical memory in bytes) on macOS, or 0 on any failure."""
+    libc = _darwin_sysctl_handle()
+    if libc is None:
+        return 0
+    value = ctypes.c_uint64(0)
+    size = ctypes.c_size_t(ctypes.sizeof(value))
+    try:
+        result = libc.sysctlbyname(b"hw.memsize", ctypes.byref(value), ctypes.byref(size), None, 0)
+    except (OSError, ValueError, ctypes.ArgumentError):
+        return 0
+    if result != 0 or size.value != ctypes.sizeof(value):
+        return 0
+    return int(value.value)
 
 
 def host_available_mib() -> int:
@@ -1325,8 +1373,20 @@ def host_available_mib() -> int:
     if IS_MACOS:
         return _macos_available_mib()
     if IS_WINDOWS:
-        mem = system_memory()  # GlobalMemoryStatusEx: (total, available)
-        return (mem[1] // _MIB_BYTES) if mem else 0
+        # A new process must commit what it maps, so free physical RAM is capped
+        # by commit headroom (ullAvailPageFile: commit limit minus commit charge).
+        # After a successful call the answer is at least 1 MiB: 0 means "unknown"
+        # here, and an exhausted host must read as full, not as unmeasured.
+        try:
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            stat = _MemoryStatusEx()
+            stat.dwLength = ctypes.sizeof(_MemoryStatusEx)
+            if not kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return 0
+            avail, commit = int(stat.ullAvailPhys), int(stat.ullAvailPageFile)
+        except Exception:
+            return 0
+        return max(1, min(avail, commit) // _MIB_BYTES)
     return 0
 
 

@@ -642,6 +642,8 @@ describe('every api method issues one well-formed /api request', () => {
     updateInstance: ['sw-1', {}, { signal: CALLER_SIGNAL }],
     chatSlotDetail: ['sw-1', undefined, undefined, CALLER_SIGNAL],
     sendChat: ['sw-1', 'sw-2', 'sw-3', CALLER_SIGNAL],
+    // `sessionsSearchMessages(params, signal)`: the query string is built from `params`.
+    sessionsSearchMessages: [{ q: 'sw-1', agent: 'sw-2', role: 'user', since: 1 }, CALLER_SIGNAL],
     spawnStatus: ['sw-1', { signal: CALLER_SIGNAL }],
     fileSearch: ['sw-1', 'sw-2', CALLER_SIGNAL],
     pathComplete: ['sw-1', 'sw-2', 'sw-3', CALLER_SIGNAL],
@@ -652,6 +654,8 @@ describe('every api method issues one well-formed /api request', () => {
     sharedCrewSessions: [{ creator: 'mine', q: 'sw-1', cursor: 'sw-2', limit: 50 }],
     sharedCrewCancelWork: ['sw-1', 3],
     sessionArchiveRead: ['sw-1', CALLER_SIGNAL],
+    // `removeMcpBodyField(row)`: the query string is the row's three fields.
+    removeMcpBodyField: [{ server: 'sw-1', tool: 'sw-2', field: 'sw-3' }],
   }
 
   it('covers the whole surface (guards against the table silently shrinking)', () => {
@@ -679,7 +683,8 @@ describe('every api method issues one well-formed /api request', () => {
     expect(fetchMock, `${name} issued the wrong request count`).toHaveBeenCalledTimes(expectedRequests)
     const { url, init } = call(expectedRequests - 1)
     expect(typeof url, `${name} did not pass a string URL`).toBe('string')
-    expect(url.startsWith('/api/'), `${name} escaped the /api prefix: ${url}`).toBe(true)
+    // The Crew API Owner routes (`/v1/crew/owner/...`) are the one other gateway prefix.
+    expect(url.startsWith('/api/') || url.startsWith('/v1/crew/owner/'), `${name} escaped the /api prefix: ${url}`).toBe(true)
     for (const junk of ['undefined', '[object Object]', 'NaN', '/null']) {
       expect(url.includes(junk), `${name} leaked ${junk} into ${url}`).toBe(false)
     }

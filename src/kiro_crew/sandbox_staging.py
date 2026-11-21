@@ -1,7 +1,8 @@
 """Materialise the mask targets the launcher binds over crew-home leaves.
 
 The plain masked directories, the live-target pointer, an empty ``.env``, a ``{}``
-refresh-chain store, the md-notebook state and the auth-store staging links: each target
+refresh-chain store, the token-signing key, the md-notebook state and the auth-store
+staging links: each target
 is created before the launcher binds over it, its legacy temp files are swept, and an
 unfit live-target pointer is reported. A new mask target goes here. One of the owners
 ``kiro_crew.sandbox`` is carved into: every name here stays readable and patchable as
@@ -18,9 +19,10 @@ import stat
 from pathlib import Path
 from typing import NamedTuple
 
+from kiro_crew.apps import credential_masks
 from kiro_crew.atomic_write import fsync_dir
 from kiro_crew.config.paths import config_dir
-from kiro_crew.sandbox_aliases import _masked_crew_home_roots
+from kiro_crew.sandbox_aliases import _first_linked_component_below, _masked_crew_home_roots
 from kiro_crew.sandbox_leaves import (
     _AUTH_STORE_STAGING_LEAF,
     _CREW_HOME_PREFIXES,
@@ -109,6 +111,118 @@ def _materialize_maskable_dirs(established: list[str] | None = None) -> list[str
             ) from exc
         created.append(target)
         _note_established(established, target)
+    return created
+
+
+def _materialize_declared_mask_dirs(established: list[str] | None = None) -> list[str]:
+    """Create each absent declared directory inside its app's existing data directory.
+
+    The directory counterpart for :mod:`kiro_crew.apps.credential_masks`' directory
+    entries. The namespace launcher's mask loop skips an absent directory, so a directory
+    the app's backend creates after an agent spawned would be in view of that agent for
+    the rest of its session. So every declared directory exists before every Linux spawn,
+    created (0700) in each data directory the app has: ``apps/<name>/data/`` and the
+    lifecycle's move-aside ``apps/.<name>-data-tmp/``, which holds the data while ``data/``
+    is away (both spellings are masked, and either can be the one moved back). Only the
+    declared directory itself, never ``apps/<name>`` or either data directory: the
+    lifecycle moves its data aside and back by rename, and a ``data/`` made here while it
+    is away would turn the move back into a move INTO it. Only under the live data home.
+    Seatbelt needs nothing here: its denies hold for a name that does not exist yet.
+
+    An app whose tree is on disk with its data directory at neither spelling refuses the
+    spawn: it is mid-install, in the instant between publishing the tree and creating
+    ``data/`` (``install_app`` does both before any record write that can fail), or an
+    install was killed there, and the ``data/`` it gets next would hold the directory
+    unmasked for the rest of this agent's session. With no tree either, nothing of the app is on disk and the
+    entry is skipped (``app-kit-platform.md`` §37 records what a session started then sees).
+
+    Fail-closed like :func:`_materialize_maskable_dirs`: a link above the name or at it, a
+    non-directory at the name, or a creation failure other than the benign race refuses
+    the spawn, because launching anyway would leave the directory unmasked once the
+    backend creates it. Every declared directory this pass saw present is noted in
+    *established*, so the launcher requires its mask.
+    """
+    created: list[str] = []
+    entries = sorted(
+        (app, credential_masks.crew_leaf(app, entry), credential_masks.staged_crew_leaf(app, entry))
+        for app, declared in credential_masks.declared_masks().items()
+        for entry in declared
+        if credential_masks.is_directory_entry(entry)
+    )
+    if not entries:
+        return created
+    try:
+        root = str(config_dir())
+    except Exception as exc:
+        raise SandboxCeilingUnsealable(
+            f"cannot resolve the crew data home to create the declared mask directories: {exc}"
+        ) from exc
+
+    def in_data_dir(leaf: str) -> str | None:
+        """*leaf* in the data home when the data directory holding it is a real directory.
+
+        Refuses the spawn on a link at any component from the data home down, and on a data
+        directory that cannot be stat'ed, so nothing is created through a link or guessed.
+        """
+        target = os.path.join(root, leaf)
+        linked = _first_linked_component_below(root, leaf)
+        if linked is not None:
+            raise SandboxCeilingUnsealable(
+                f"the declared mask directory {safe_terminal_line(target)} passes through a "
+                f"component that is a LINK ({safe_terminal_line(linked)}), so it cannot be "
+                "created where the mask binds. Replace the link with a real directory."
+            )
+        try:
+            data_is_dir = stat.S_ISDIR(os.lstat(os.path.dirname(target)).st_mode)
+        except FileNotFoundError:
+            data_is_dir = False
+        except OSError as exc:
+            raise SandboxCeilingUnsealable(
+                f"cannot stat the data directory of the declared mask directory "
+                f"{safe_terminal_line(target)}: {safe_terminal_line(str(exc))}"
+            ) from exc
+        return target if data_is_dir else None
+
+    for app, *leaves in entries:
+        targets = [path for leaf in leaves if (path := in_data_dir(leaf))]
+        if not targets and os.path.lexists(os.path.join(root, credential_masks.APPS_LEAF, app)):
+            raise SandboxCeilingUnsealable(
+                f"app {app!r} declares the credential-mask directory "
+                f"{safe_terminal_line(os.path.join(root, leaves[0]))}, but its data directory "
+                "is missing: the app is being installed, or an install of it stopped part-way. "
+                "Launching now would leave that directory unmasked once the data directory is "
+                "created. Retry when the install finishes; if this persists, install "
+                f"{app!r} again (uninstall it first if it is listed as installed)."
+            )
+        for target in targets:
+            try:
+                info = os.lstat(target)
+            except FileNotFoundError:
+                info = None
+            except OSError as exc:
+                raise SandboxCeilingUnsealable(
+                    f"cannot stat the declared mask directory {safe_terminal_line(target)}: "
+                    f"{safe_terminal_line(str(exc))}"
+                ) from exc
+            if info is not None:
+                if not stat.S_ISDIR(info.st_mode):
+                    _require_real_dir_nofollow(target)  # raises, naming what is there
+                _note_established(established, target)
+                continue
+            try:
+                os.mkdir(target, 0o700)
+            except FileExistsError:
+                # Something won the create race: it must be a real directory, judged
+                # without following a link.
+                _require_real_dir_nofollow(target)
+            except OSError as exc:
+                raise SandboxCeilingUnsealable(
+                    f"cannot create the declared mask directory {safe_terminal_line(target)}: "
+                    f"{safe_terminal_line(str(exc))}"
+                ) from exc
+            else:
+                created.append(target)
+            _note_established(established, target)
     return created
 
 
@@ -236,6 +350,38 @@ def _materialize_refresh_chains_mask_target(
     secret, so there is nothing to stage either. See security.md, *Refresh-chain store*.
     """
     return _create_absent_mask_target("refresh_chains.json", b"{}", established)
+
+
+def _materialize_signing_key_mask_target(established: list[str] | None = None) -> str | None:
+    """Create the token-signing key when there is none, so its mask can mount.
+
+    The same gap on the key that signs every dashboard token, which the gateway creates at
+    its first start: a sandbox spawned before then (``kirocrew chat`` needs no gateway)
+    could create it, and the gateway adopts any full-length key it finds. A stub is no
+    absent-equivalent, since a short key refuses the boot, so this runs the gateway's own
+    create path and leaves the key the gateway would have made. Held off while a
+    pre-upgrade staging temp is in the root: it may be the key's last name, which the
+    legacy sweep keeps for the operator to rename. See security.md, *Token-signing key*.
+    """
+    root = str(config_dir())
+    target = os.path.join(root, _AUTH_STORE_PUBLISHED_KEY_LEAF)
+    created = False
+    try:
+        if not os.path.lexists(target) and not any(
+            name.startswith(_AUTH_STORE_LEGACY_TEMP_PREFIX) and name.endswith(".tmp")
+            for name in os.listdir(root)
+        ):
+            # Imported here: only an absent key needs the dashboard's key module.
+            from kiro_crew.dashboard.token_secret import _load_or_create_secret
+
+            _load_or_create_secret()
+            created = True
+        if not stat.S_ISREG(os.lstat(target).st_mode):
+            return None
+    except OSError:
+        return None
+    _note_established(established, target)
+    return target if created else None
 
 
 def _create_absent_mask_target(
@@ -497,9 +643,12 @@ def _md_notebook_degraded_mask_dirs() -> list[str]:
     whole purpose.
 
     When a component of the chain is a planted link the calculus inverts. The Notes
-    backend does not start while this list is non-empty (``apps/backend.py``), so nothing
-    writes into the namespace-only stand-in this mask leaves, where a note would be lost on
-    restart; hiding the directory costs nothing that still works. What it buys is the one exposure skipping leaves behind: a legacy staging orphan
+    backend does not start while this list is non-empty
+    (``md_notebook_state.backend_start_refusal``, the start gate of Notes' row in
+    ``apps/legacy_state_moves`` that ``apps/backend.py`` asks), so nothing writes into the
+    namespace-only stand-in this mask leaves, where a note would be lost on restart; hiding
+    the directory costs nothing that still works. What it buys is the one exposure skipping
+    leaves behind: a legacy staging orphan
     holding real PAT bytes that :func:`_sweep_one_md_notebook_state_dir` cannot delete
     through a link, and that the three leaf masks do not cover because its name is neither
     ``pat`` nor a state file. A directory mask covers every name inside it, orphans
@@ -1149,7 +1298,16 @@ def _materialize_md_notebook_mask_targets(established: list[str] | None = None) 
 
 
 def _migrate_md_notebook_legacy_state() -> list[str]:
-    """Run the Notes builtin's one-time legacy-state move before this sandbox launches.
+    """Run the Notes builtin's first one-time state move before this sandbox launches.
+
+    The bare legacy names into ``md-notebook-staging/`` (:mod:`kiro_crew.md_notebook_state`),
+    a directory every build masks, so it is safe while a sandbox of any build runs. The
+    second move, out of that directory into the app's own ``data/state/``, is NOT run here:
+    an older build's sandbox masks the first directory but not the second, so that move
+    waits until no such sandbox is alive, which only the gateway's callers of Notes' row in
+    ``apps/legacy_state_moves`` check (``md_notebook_state.sealed_legacy_state``: the Notes
+    backend's start, and adoption before and after it swaps the record). Until it seals,
+    this creates the empty ``data/state/`` so the sandbox about to start masks it.
 
     Spawn prep runs it, not only the Notes backend's own spawn, so the first pass and its
     marker that closes promotion happen as early as possible, before an agent of this build
@@ -1164,8 +1322,8 @@ def _migrate_md_notebook_legacy_state() -> list[str]:
     logged and the pass stays unsealed for the next spawn to retry. No agent can plant a
     bare state name meanwhile: :func:`_materialize_md_notebook_mask_targets` runs right
     after this and stubs every bare name, so its mask always mounts, and the Notes backend
-    does not start until the pass is sealed (``sealed_default_legacy_state`` in
-    ``apps/backend.py``). An absent data home is left absent: there is nothing to move.
+    does not start until the pass is sealed. An absent data home is left absent: there is
+    nothing to move.
     """
     # Local, not top-level: every module-level name here is an owner name the
     # ``kiro_crew.sandbox`` facade inventory forwards, and a module alias is not one.
@@ -1184,8 +1342,16 @@ def _migrate_md_notebook_legacy_state() -> list[str]:
         # where a write would land, so it writes nothing. The Notes backend's own writer
         # refuses the same chain, so nothing on this host writes Notes state at all.
         return []
+    app_state_dir = Path(root).joinpath(*mns.APP_STATE_PARTS)
     try:
-        return mns.migrate_legacy_state(state_dir, Path(root).joinpath(*mns.LEGACY_DIR_PARTS))
+        moved = mns.migrate_legacy_state(state_dir, Path(root).joinpath(*mns.LEGACY_DIR_PARTS))
+        if not (state_dir / mns.APP_MOVE_MARKER).exists() and not carveout_chain_has_planted_link(
+            str(app_state_dir / mns.STATE_FILE_NAMES[0])
+        ):
+            # The second move's destination exists before this sandbox starts, so this
+            # sandbox masks it.
+            mns.ensure_app_state_dir(app_state_dir)
+        return moved
     except OSError as exc:
         # Log and continue: the stubs planted next keep every bare name masked, and the
         # Notes backend stays down until a later pass seals.

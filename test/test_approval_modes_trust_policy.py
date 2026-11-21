@@ -428,12 +428,16 @@ class TestOtherEntryPoints:
     @pytest.mark.asyncio
     async def test_a_typed_trust_reply_approves_once_and_says_so(self):
         from kiro_crew.messaging import approval as ap
+        from kiro_crew.messaging import session_trust as st
 
         ap.reset_for_tests()
         _install(OWNER_RULE)
+        sessions = MagicMock()
         entry = ap.open_approval("whatsapp:1", "r1")
-        assert ap.deliver_verdict("whatsapp:1", ap.TRUST) == ap.RECEIPT_APPROVED
+        assert ap.deliver_verdict("whatsapp:1", ap.TRUST, sessions=sessions) == ap.RECEIPT_APPROVED
         assert await entry.future == ap.APPROVE
+        sessions.set_approval_policy.assert_not_called()
+        assert "whatsapp:1" not in st._trusted_sessions
         ap.reset_for_tests()
 
     def test_editing_a_saved_auto_job_still_saves(self):
@@ -611,16 +615,32 @@ async def test_with_no_rule_trust_stays_allowed_through_every_pending_moment(mon
     assert amp._resolve() == frozenset()
 
 
-def test_with_no_rule_a_first_read_without_a_context_allows_trust(monkeypatch):
-    """_bootstrap with current_context() raising: the store loads, finds no rule."""
+def test_a_first_read_whose_context_fails_denies_trust_and_retries(monkeypatch):
+    """_bootstrap with current_context() raising: the policy was not read, so deny."""
     gp.reset_store()
 
     def _no_context():
         raise RuntimeError("no context")
 
-    monkeypatch.setattr(ctx_mod, "current_context", _no_context)
-    assert amp.session_mode_permitted("trust") is True
-    assert amp.session_mode_permitted("trust_reads") is True
+    with monkeypatch.context() as patched:
+        patched.setattr(ctx_mod, "current_context", _no_context)
+        assert amp.session_mode_permitted("trust") is False
+        assert amp.session_mode_permitted("trust_reads") is False
+        amp.ensure_resolved()
+        assert amp.session_mode_permitted("trust") is False, "a failed read is never cached"
+    assert amp.session_mode_permitted("trust") is True, "the next read tries again"
+
+
+def test_a_first_read_on_a_host_whose_context_cannot_compose_denies_trust(monkeypatch):
+    """A non-standalone host with no installed policy: its rule cannot be read."""
+
+    def _not_composed():
+        raise ctx_mod.PlatformCompositionError("companion not loaded")
+
+    monkeypatch.setattr(ctx_mod, "current_context", _not_composed)
+    assert amp.session_mode_permitted("trust") is False
+    assert amp.session_mode_permitted("trust_reads") is False
+    assert amp.session_mode_permitted("normal") is True
 
 
 @pytest.mark.asyncio
@@ -782,17 +802,17 @@ def test_a_late_grant_under_a_deny_holds_nothing(tmp_path):
     assert slot._trust_reads is False, "a denied Reads write was never held"
 
 
-def test_a_typed_trust_grant_is_revoked_by_a_deny():
+@pytest.mark.asyncio
+async def test_a_typed_trust_grant_is_revoked_by_a_deny():
     """A text-reply Trust goes through the shared grant, so a deny revokes it."""
+    from kiro_crew.messaging import approval as ap
     from kiro_crew.messaging import session_trust as st
-    from kiro_crew.messaging.approval import TextReplyApprovalDecider
 
     _install(None)
+    ap.reset_for_tests()
     sessions = MagicMock()
-    decider = TextReplyApprovalDecider.__new__(TextReplyApprovalDecider)
-    decider._sessions = sessions
-    decider.session_key = "whatsapp:1"
-    decider._grant_session_trust()
+    ap.open_approval("whatsapp:1", "r1")
+    assert ap.deliver_verdict("whatsapp:1", ap.TRUST, sessions=sessions) == ap.RECEIPT_TRUSTED
     assert st.is_session_trusted("whatsapp:1") is True
     sessions.set_approval_policy.assert_called_with("whatsapp:1", "auto")
     _install(OWNER_RULE)

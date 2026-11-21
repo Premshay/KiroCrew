@@ -24,7 +24,7 @@ import re
 import subprocess as subprocess_mod
 from typing import Any, Collection
 
-from kiro_crew import acp_tool_gate
+from kiro_crew import acp_tool_gate, platform_compat
 from kiro_crew.acp import launch as launch_mod
 from kiro_crew.acp.harness.base import ProcessAdapter, ProcessSession, SpawnContext, SpawnPlan
 from kiro_crew.acp.harness_tool_names import (
@@ -162,10 +162,13 @@ def _opencode_reported_major(session: ProcessSession, argv: list[str]) -> int | 
     )
     env["PATH"] = augmented_path(env.get("PATH", ""))
     try:
-        completed = subprocess_mod.run(
+        # In its own process group, so a timeout ends everything the probe started.
+        completed = platform_compat.run_killing_tree_on_timeout(
             argv,
             cwd=session._spawn_work_dir,
             env=env,
+            start_new_session=platform_compat.IS_POSIX,
+            creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -626,10 +629,13 @@ def _verify_opencode_routing(
     env["PATH"] = augmented_path(env.get("PATH", ""))
     env[_ENV_OPENCODE_CONFIG_CONTENT] = config_content
     try:
-        completed = subprocess_mod.run(
+        # In its own process group, so a timeout ends everything the probe started.
+        completed = platform_compat.run_killing_tree_on_timeout(
             argv,
             cwd=session._spawn_work_dir,
             env=env,
+            start_new_session=platform_compat.IS_POSIX,
+            creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -670,6 +676,8 @@ def _verify_opencode_routing(
         return servers_issue, _opencode_config_mcp_servers_remedy()
     read_back = session._harness_read_back()
     read_back.config_mcp_servers = config_servers
+    configured_model = resolved.get("model")
+    read_back.config_model = configured_model.strip() if isinstance(configured_model, str) else ""
     seeded_denies = _opencode_seeded_deny_rules(config_content, setting_key)
     # Which of Crew's deny rules the harness's own resolution keeps in force. A rule
     # that lost is normally not a refusal: the projection withholds its server.
@@ -929,10 +937,6 @@ class OpencodeLaunch(ProcessAdapter):
             extra_hidden_dirs=hidden,
             extra_expose_files=expose,
         )
-
-    def session_mcp_servers(self, session: ProcessSession) -> list[dict[str, Any]]:
-        """The opencode session's own ``mcpServers`` entries, warmed by the spawn."""
-        return session._opencode_session_mcp_servers()
 
     def apply_spawn_env(self, env: dict[str, str], *, spawned_binary: str | None = None) -> None:
         """Apply the seed the read-back verified, unconditionally.

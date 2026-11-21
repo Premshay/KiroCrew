@@ -13,7 +13,7 @@ from __future__ import annotations
 import secrets
 from typing import Any
 
-from kiro_crew import work_preview
+from kiro_crew import resource_status, work_preview
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.session_ledger import _store_name
 from kiro_crew.work_ledger_records import (
@@ -22,6 +22,7 @@ from kiro_crew.work_ledger_records import (
     CODE_DEPTH_EXCEEDED,
     CODE_DUPLICATE_ITEM,
     CODE_GOAL_CONCURRENCY_CAP_REACHED,
+    CODE_HOST_MEMORY_CRITICAL,
     CODE_INVALID_ACTION,
     CODE_INVALID_STATUS,
     CODE_INVALID_VALUE,
@@ -55,6 +56,7 @@ from kiro_crew.work_ledger_rules import (
     _require_artifacts,
     _require_choice,
     _require_count,
+    _require_discussion,
     _require_pr,
     _require_text,
     _require_wake_at,
@@ -225,7 +227,9 @@ def ensure_conductor(
             parent_item=parent_item,
             created_at=_now_iso(),
             generation=secrets.token_hex(8),
+            goal_id=secrets.token_hex(8),
         )
+        record.round_started_at = record.created_at
         _write_record(directory / _CONDUCTOR_FILE, record.to_dict())
         try:
             atomic_write(directory / _KEY_FILE, slot_key + "\n", mode=0o600)
@@ -396,9 +400,15 @@ def _write_goal(
             # before the counter starts the goal's count after its records.
             current.created_total = len(_stored_item_ids(slot_key))
         _settle_goal_base(current)
+        if new_goal or not current.goal_id:
+            # A goal of its own: its rounds share this id (see ConductorRecord.goal_id).
+            current.goal_id = secrets.token_hex(8)
+            current.round_started_at = _now_iso()
         if new_goal:
             current.goal_items_base = current.created_total
         if checked_round is not None:
+            if checked_round != current.round:
+                current.round_started_at = _now_iso()
             current.round = checked_round
         if checked_concurrency is not None:
             current.concurrency_cap = checked_concurrency
@@ -442,6 +452,7 @@ def _create_item(
         )
     with _existing_conductor_lock(slot_key):
         live = _admit_create_locked(slot_key)
+        _refuse_if_host_critical()
         if checked_round is None:
             checked_round = live.round
         item_id = mint_item_id()
@@ -500,18 +511,40 @@ def _admit_create_locked(slot_key: str) -> ConductorRecord:
             field="items",
         )
     # The goal's own fan-out bound, only on a board that recorded a goal (a queue
-    # board never does). A person decides past it.
+    # board never does). A bound below the store's is one the user set.
     if live.goal_version > 0 and len(open_items) >= live.concurrency_cap:
         raise WorkLedgerError(
             f"this goal holds {len(open_items)} open items and its concurrency cap "
-            f"is {live.concurrency_cap}. Dispatch nothing new until one lands; to "
-            "run more at once, ask the user, and if they agree raise the cap with "
-            "work_ledger_record action=goal concurrency_cap=<new cap> "
+            f"is {live.concurrency_cap}. Dispatch nothing new until one lands: wait "
+            "for a seat, do not ask to raise it. Only a bound the user sets changes "
+            "it, with work_ledger_record action=goal concurrency_cap=<new cap> "
             f"(at most {MAX_GOAL_CONCURRENCY_CAP})",
             code=CODE_GOAL_CONCURRENCY_CAP_REACHED,
             field="concurrency_cap",
         )
     return live
+
+
+def _refuse_if_host_critical() -> None:
+    """Refuse a create while host memory is critical. Writes nothing.
+
+    rfc-work-ledger-resource-pressure §3.5 (the part not withdrawn), under the admission
+    contract: critical refuses; tight, unknown and ``agent.admission_gate: false``
+    admit. The conductor checks ``resource_status`` before dispatch; this refusal is
+    the only code backstop. A live probe, not the cached
+    verdict: that cache refreshes only when asked, so the first create after memory
+    recovered would be judged on a stale refusal. This runs off the loop (the route
+    calls the store through ``asyncio.to_thread``) and the probe is one memory read.
+    Checked after the caps, so a board at a cap still hears about the cap.
+    """
+    decision = resource_status.admission_check()
+    if not decision.admitted:
+        raise WorkLedgerError(
+            f"create refused: {decision.reason}. Dispatch nothing new until memory is "
+            "no longer critical",
+            code=CODE_HOST_MEMORY_CRITICAL,
+            field="host_memory",
+        )
 
 
 def create_bound_item(
@@ -720,14 +753,15 @@ def apply_worker_report(
     pr: Any = None,
     reason: Any = None,
     wake_at: Any = None,
+    discussion: Any = None,
 ) -> dict[str, Any]:
     """Write the fields the WORKER owns: ``status``, ``reason``, ``wake_at``,
-    ``summary``, ``artifacts``, ``pr`` and ``last_report_at``. Nothing else is
-    reachable from here.
+    ``summary``, ``artifacts``, ``pr``, ``discussion`` and ``last_report_at``.
+    Nothing else is reachable from here.
 
     ``reason`` rides only on ``blocked`` / ``question``, and ``wake_at`` (when the
-    worker will resume) only on ``progress``. Every report replaces both, so a later
-    report without one clears it.
+    worker will resume) only on ``progress``. Every report replaces those two and
+    ``discussion``, so a later report without one clears it.
 
     No ``verdict``, ``state``, ``acceptance``, ``decision`` or ``round`` parameter,
     so a worker cannot accept itself or widen its bar; ``status: done`` only
@@ -759,6 +793,7 @@ def apply_worker_report(
                 field="reason",
             )
     checked_wake_at = _require_wake_at(wake_at, checked_status)
+    checked_discussion = _require_discussion(discussion)
     checked_id = _require_item_id(item_id)
 
     with item_lock(slot_key, checked_id, create=False):
@@ -772,14 +807,52 @@ def apply_worker_report(
         item.status = checked_status
         item.reason = checked_reason
         item.wake_at = checked_wake_at
+        item.discussion = checked_discussion
         item.summary = checked_summary
         item.artifacts = checked_artifacts
         if checked_pr is not None:
             item.pr = checked_pr
         item.last_report_at = _now_iso()
+        # Set only by a remote filing; a local report replaces it, as the fold does.
+        item.received_at = None
         event = _commit_item_locked(
             slot_key, item, "report", checked_summary, status=checked_status
         )
+        return {"item": item, "event": event}
+
+
+def apply_guard_report(slot_key: str, item_id: str, *, summary: Any) -> dict[str, Any] | None:
+    """The gateway's ``question`` report on a worker's item after the memory guard
+    stopped one of that worker's process trees (rfc-host-memory-guard.md §4.4).
+
+    ``status: question`` with no ``reason``: re-planning is the conductor's call, a
+    ``question`` always wakes it, and no person must act. The item's ``artifacts``,
+    ``pr`` and ``discussion`` are carried forward, so the worker's pointers survive;
+    ``wake_at`` is cleared as every non-progress report clears it. The worker's next
+    own report replaces this one. *slot_key* and *item_id* come from the worker's own
+    binding (:func:`read_binding`), resolved by the caller.
+    """
+    checked_summary = _require_text(summary, MAX_SUMMARY_CHARS, "summary")
+    checked_id = _require_item_id(item_id)
+    with item_lock(slot_key, checked_id, create=False):
+        item = read_work_item(slot_key, checked_id)
+        if item is None:
+            raise WorkLedgerError(
+                f"unknown item {checked_id!r}", code=CODE_UNKNOWN_ITEM, field="item_id"
+            )
+        if item.is_terminal:
+            raise WorkLedgerError(f"item {checked_id!r} is {item.state}", code=CODE_ITEM_CLOSED)
+        if item.status == "done" or item.reason is not None:
+            # A ``done`` waits on the conductor's acceptance, and a reason names who
+            # must act; a question here would replace either. None: nothing written.
+            return None
+        item.status = "question"
+        item.reason = None
+        item.wake_at = None
+        item.summary = checked_summary
+        item.last_report_at = _now_iso()
+        item.received_at = None
+        event = _commit_item_locked(slot_key, item, "report", checked_summary, status="question")
         return {"item": item, "event": event}
 
 
@@ -891,8 +964,10 @@ def apply_acceptance_update(
         if item.is_terminal:
             raise WorkLedgerError(f"item {checked_id!r} is {item.state}", code=CODE_ITEM_CLOSED)
         item.acceptance = checked_acceptance
-        # A pending run belongs to the bar it measured; the new bar starts its own.
+        # A pending run and a verdict belong to the bar they measured; the new bar
+        # starts with neither, so ``close accepted`` waits for its own pass.
         item.pending_since = None
+        item.verdict = None
         event = _commit_item_locked(
             slot_key, item, "decision", "acceptance promoted by the conductor"
         )

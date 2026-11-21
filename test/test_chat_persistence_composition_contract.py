@@ -36,6 +36,7 @@ from pathlib import Path
 import composition_contract_checks
 import pytest
 from chat_test_helpers import _make_state
+from redaction_structured_cases import github_classic
 from source_corpus import repo_files_named, repo_root
 
 import kiro_crew
@@ -416,7 +417,7 @@ _SIGNATURES: dict[str, str] = {
     "_on_config_change": "(change: 'object') -> 'None'",
     "_pin_private_agent_assignment": "(session_key: 'str', agent: 'str', config: 'KiroCrewConfig', *, conversation_log=None, native_context: 'bool' = False, authorized_store: 'str | None' = None, memory_mode: 'str' = 'persistent', validate_only: 'bool' = False) -> 'str'",
     "_prefetch_recent_session": "(conv_log: 'ConversationLog', key: 'str', session: 'dict', *, folders_only: 'bool', cutoff: 'float | None', row_tail: 'Callable[[ConversationLog, str, dict, str, tuple[str, str] | None], list[dict] | None] | None' = None) -> 'tuple[dict | None, list[dict] | None, tuple[str, str] | None, str | None, bool, list[dict] | None]'",
-    "_prefetch_rehydrate_inputs": "(conv_log: 'ConversationLog', history_key: 'str', *, adopt_closed: 'bool' = False, kiro_model_map: 'dict[str, str] | None' = None, with_status: 'bool' = False) -> 'tuple[dict, bool, list[dict] | None, dict[str, str] | None, tuple[str, str] | None, str | None, bool]'",
+    "_prefetch_rehydrate_inputs": "(conv_log: 'ConversationLog', history_key: 'str', *, adopt_closed: 'bool' = False, kiro_model_map: 'dict[str, str] | None' = None, with_status: 'bool' = False, tail_window_above: 'int | None' = None) -> 'tuple[dict, bool, list[dict] | None, dict[str, str] | None, tuple[str, str] | None, str | None, bool]'",
     "_queue_snapshot_is_stale": "(slot: '_ChatSlot', queue_write_basis: 'str') -> 'bool'",
     "_read_mcp_app_claims": "(session_key: 'str') -> 'list[set[str]]'",
     "_read_open_slots_keys": "() -> 'list[object]'",
@@ -1153,7 +1154,7 @@ def _scenario_full_save(state) -> dict:
     _rows(
         slot,
         ("user", "hello", 6, {"mid": "m-1", HUMAN_TURN_META_KEY: True}),
-        ("assistant", "the key is AKIAIOSFODNN7EXAMPLE", 7, {"mid": "m-2"}),
+        ("assistant", f"the key is {github_classic(seed=29)}", 7, {"mid": "m-2"}),
         ("system", "a notice", 8, {"mid": "m-3"}),
     )
     ok = cp._save_slot_to_history(state, slot, force=True)
@@ -1310,7 +1311,7 @@ _GOLDEN: dict[str, dict] = {
     },
     "empty_window_merge": {
         "file": (
-            '{"_type": "metadata", "created_at": "2026-01-02T03:04:05", "last_consolidated": 0, "title": "New", "rotation_generation": 4, "other_layer": "kept", "folder_id": "folder-2", "tags": ["a", "b"], "pinned": false, "mutes_opened": false, "muted": false, "mode": "", "artifact": "", "reasoning_effort": "", "color_index": null, "color_hex": "", "color_theme": "", "memory_mode": "persistent", "model": "", "queued_prompts": [], "autocompact_pct": null, "turn_timeout_secs": null, "title_low_signal": false, "workspace": "default", "memory_store": "", "agent_kind": "", "runtime_agent": "", "crew_mode_agent": "", "app_agent_owner": "", "project": "", "declared_goal": "", "session_checkpoint": null, "checkpoint_freshness": {"activity_generation": 0, "covered_generation": 0, "overdue": false}, "session_timeline": [], "peer_channel_inbox": [], "post_restart_continuation": "", "turn_in_flight_generation": 0, "turn_in_flight_prompt": null, "tab_id": "tab-golden-empty", "closed": true, "closed_at": 1767225600.0, "closed_id": "golden-close-id", "dismissed_source_links": [], "deferred_notes": []}\n'
+            '{"_type": "metadata", "created_at": "2026-01-02T03:04:05", "last_consolidated": 0, "title": "New", "rotation_generation": 4, "other_layer": "kept", "folder_id": "folder-2", "tags": ["a", "b"], "pinned": false, "mutes_opened": false, "muted": false, "mode": "", "artifact": "", "reasoning_effort": "", "color_index": null, "color_hex": "", "color_theme": "", "memory_mode": "persistent", "model": "", "queued_prompts": [], "autocompact_pct": null, "turn_timeout_secs": null, "title_low_signal": false, "workspace": "default", "memory_store": "", "agent_kind": "", "runtime_agent": "", "crew_mode_agent": "", "app_agent_owner": "", "project": "", "project_picked": false, "declared_goal": "", "session_checkpoint": null, "checkpoint_freshness": {"activity_generation": 0, "covered_generation": 0, "overdue": false}, "session_timeline": [], "peer_channel_inbox": [], "post_restart_continuation": "", "turn_in_flight_generation": 0, "turn_in_flight_prompt": null, "tab_id": "tab-golden-empty", "closed": true, "closed_at": 1767225600.0, "closed_id": "golden-close-id", "dismissed_source_links": [], "deferred_notes": []}\n'
         ),
         "ok": True,
     },

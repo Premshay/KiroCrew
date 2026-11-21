@@ -11,11 +11,16 @@ const test = require("node:test");
 const assert = require("node:assert");
 
 const {
+  CAPABILITIES,
   MAX_SHORTCUTS,
   MAX_WINDOWS,
+  approvedCapabilities,
   canonicalAccelerator,
   desktopDeclarations,
+  hostOwnsAppWindows,
+  keyPressChords,
   parseDesktopDeclaration,
+  pressedChord,
 } = require("../app-window-host-rules");
 
 const VALID = {
@@ -194,4 +199,145 @@ test("only enabled, available apps with a valid block are served", () => {
   assert.deepStrictEqual(lines, ["app-window-host: bad: desktop declaration refused"]);
   assert.deepStrictEqual([...desktopDeclarations({ apps: rows }).keys()], ["on"]);
   assert.strictEqual(desktopDeclarations("nope").size, 0);
+  assert.strictEqual(served.get("on").enabledHere, true);
+});
+
+test("disabledToo lists an app switched off here, marked so; nothing else joins", () => {
+  const rows = [
+    { name: "on", enabled: true, manifest: { desktop: VALID } },
+    { name: "off", enabled: false, manifest: { desktop: VALID } },
+    { name: "unset", manifest: { desktop: VALID } },
+    { name: "skipped", enabled: false, unavailable: { reason: "x" }, manifest: { desktop: VALID } },
+    { name: "plain", enabled: false, manifest: {} },
+    { name: "bad", enabled: false, manifest: { desktop: { windows: "no" } } },
+  ];
+  const listed = desktopDeclarations(rows, () => {}, { disabledToo: true });
+  assert.deepStrictEqual([...listed.keys()], ["on", "off", "unset"]);
+  assert.deepStrictEqual([...listed.values()].map((d) => d.enabledHere), [true, false, false]);
+  assert.deepStrictEqual([...desktopDeclarations(rows).keys()], ["on"], "the default is enabled only");
+});
+
+test("the window host owns an app's windows exactly when its record declares a desktop block", () => {
+  const rows = [
+    { name: "hosted", enabled: true, manifest: { desktop: VALID } },
+    { name: "hosted-off", enabled: false, manifest: { desktop: VALID } },
+    // A block this shell refuses (a newer grammar) still says the record is the host's.
+    { name: "newer", enabled: true, manifest: { desktop: { windows: [{ id: "w", entry: "w.mjs", kind: "future" }] } } },
+    { name: "legacy", enabled: true, manifest: { name: "legacy" } },
+    { name: "no-manifest", enabled: true },
+  ];
+  for (const name of ["hosted", "hosted-off", "newer"]) assert.strictEqual(hostOwnsAppWindows(rows, name), true, name);
+  for (const name of ["legacy", "no-manifest", "absent"]) assert.strictEqual(hostOwnsAppWindows(rows, name), false, name);
+  assert.strictEqual(hostOwnsAppWindows({ apps: rows }, "hosted"), true);
+  // A body this shell cannot read is not an answer either way.
+  for (const body of [null, "nope", {}, { apps: "x" }]) assert.strictEqual(hostOwnsAppWindows(body, "hosted"), null);
+});
+
+test("a capability is served only when the manifest declares it AND the row approves it", () => {
+  const row = (declared, grant) => ({
+    name: "cap-app",
+    enabled: true,
+    manifest: { desktop: { windows: [{ id: "w", entry: "w.mjs", kind: "panel" }] }, permissions: { desktopCapabilities: declared } },
+    ...(grant === undefined ? {} : { desktopCapabilitiesGrant: grant }),
+  });
+  const caps = (r) => desktopDeclarations([r]).get("cap-app").capabilities;
+  assert.deepStrictEqual(CAPABILITIES, ["screenCapture", "localFiles", "gatewayChoice"]);
+  assert.deepStrictEqual(caps(row([...CAPABILITIES], { approved: [...CAPABILITIES] })), [...CAPABILITIES]);
+  assert.deepStrictEqual(caps(row(["localFiles", "screenCapture"], { approved: ["screenCapture"] })), ["screenCapture"]);
+  // Approved but no longer declared, unknown names, a gateway with no grant row.
+  assert.deepStrictEqual(caps(row([], { approved: ["localFiles"] })), []);
+  assert.deepStrictEqual(caps(row(["everything"], { approved: ["everything"] })), []);
+  assert.deepStrictEqual(caps(row(["localFiles"])), []);
+  assert.deepStrictEqual(caps(row("localFiles", { approved: "localFiles" })), []);
+  assert.deepStrictEqual(approvedCapabilities({}, {}), []);
+});
+
+test("a shortcut's per-platform default overrides its accelerator on the platforms it names", () => {
+  const raw = {
+    windows: [{ id: "pet", entry: "pet.mjs", kind: "overlay" }],
+    shortcuts: [{
+      id: "toggle",
+      accelerator: "Alt+Shift+M",
+      platformAccelerators: { macos: "CommandOrControl+Shift+M" },
+      window: "pet",
+    }],
+  };
+  const on = (platform) => parseDesktopDeclaration(raw, platform).shortcuts[0];
+  assert.deepStrictEqual(on("darwin"), {
+    id: "toggle", accelerator: "CommandOrControl+Shift+M", chord: "CommandOrControl+Shift+M", window: "pet",
+  });
+  assert.deepStrictEqual(on("linux"), { id: "toggle", accelerator: "Alt+Shift+M", chord: "Alt+Shift+M", window: "pet" });
+  assert.strictEqual(on("win32").accelerator, "Alt+Shift+M");
+  assert.strictEqual(desktopDeclarations([{ name: "a", enabled: true, manifest: { desktop: raw } }], () => {}, { platform: "darwin" })
+    .get("a").shortcuts[0].accelerator, "CommandOrControl+Shift+M");
+});
+
+test("a per-platform default is held to every shortcut rule, on every platform", () => {
+  const base = (shortcuts) => ({ windows: [{ id: "pet", entry: "pet.mjs", kind: "overlay" }], shortcuts });
+  const refused = [
+    // A single-modifier chord, an unknown platform, a non-object.
+    [{ id: "a", accelerator: "Alt+Shift+M", platformAccelerators: { macos: "CommandOrControl+C" }, window: "pet" }],
+    [{ id: "a", accelerator: "Alt+Shift+M", platformAccelerators: { darwin: "Alt+Shift+N" }, window: "pet" }],
+    [{ id: "a", accelerator: "Alt+Shift+M", platformAccelerators: ["Alt+Shift+N"], window: "pet" }],
+    // The fallback itself must be valid even when every platform overrides it.
+    [{
+      id: "a", accelerator: "M",
+      platformAccelerators: { macos: "Alt+Shift+M", windows: "Alt+Shift+M", linux: "Alt+Shift+M" },
+      window: "pet",
+    }],
+    // Two shortcuts on one chord on any one platform.
+    [
+      { id: "a", accelerator: "Alt+Shift+M", platformAccelerators: { linux: "Alt+Shift+N" }, window: "pet" },
+      { id: "b", accelerator: "Alt+Shift+N", platformAccelerators: { linux: "Alt+Shift+O" }, window: "pet" },
+      { id: "c", accelerator: "Alt+Shift+P", platformAccelerators: { linux: "Shift+Alt+O" }, window: "pet" },
+    ],
+  ];
+  for (const shortcuts of refused) {
+    for (const platform of ["darwin", "linux", "win32"]) {
+      assert.strictEqual(parseDesktopDeclaration(base(shortcuts), platform), null, JSON.stringify(shortcuts));
+    }
+  }
+});
+
+test("NEGATIVE: a desktop block asks the shell for nothing beyond its windows and shortcuts", () => {
+  assert.strictEqual(parseDesktopDeclaration({ ...VALID, legacyMachinePrefs: { gatewayChoice: "petInstance" } }), null);
+});
+
+test("a chord is the keys it presses on the platform, whatever its spelling", () => {
+  assert.strictEqual(pressedChord("CommandOrControl+Shift+M", "darwin"), "Cmd+Shift+M");
+  assert.strictEqual(pressedChord("Shift+Super+M", "darwin"), "Cmd+Shift+M");
+  assert.strictEqual(pressedChord("CommandOrControl+Shift+M", "linux"), "Ctrl+Shift+M");
+  assert.strictEqual(pressedChord("control+shift+m", "win32"), "Ctrl+Shift+M");
+  assert.strictEqual(pressedChord("Super+Alt+F5", "win32"), "Alt+Super+F5");
+  assert.strictEqual(pressedChord("CommandOrControl+C", "linux"), "", "a chord the rule refuses presses nothing");
+});
+
+test("a native key press spells its chord from the key's position and its character", () => {
+  const down = (fields) => ({ type: "keyDown", key: "", code: "", ...fields });
+  // macOS: Option changes the character, so the position names the key.
+  assert.deepStrictEqual(
+    keyPressChords(down({ code: "KeyJ", key: "\u00d4", meta: true, alt: true, shift: true }), "darwin"),
+    ["Alt+Cmd+Shift+J"],
+  );
+  assert.deepStrictEqual(keyPressChords(down({ code: "KeyJ", key: "j", meta: true, alt: true }), "linux"), ["Alt+Super+J"]);
+  // Another layout: the position and the character both count.
+  assert.deepStrictEqual(keyPressChords(down({ code: "KeyQ", key: "a", control: true, alt: true }), "win32"), [
+    "Alt+Ctrl+Q", "Alt+Ctrl+A",
+  ]);
+  assert.deepStrictEqual(keyPressChords(down({ code: "Digit7", key: "&", control: true, shift: true }), "linux"), ["Ctrl+Shift+7"]);
+  assert.deepStrictEqual(keyPressChords(down({ code: "F12", key: "F12", control: true, alt: true }), "linux"), ["Alt+Ctrl+F12"]);
+  assert.deepStrictEqual(keyPressChords(down({ code: "ArrowLeft", key: "ArrowLeft", alt: true, shift: true }), "linux"), ["Alt+Shift+Left"]);
+  assert.deepStrictEqual(keyPressChords(down({ code: "Space", key: " ", control: true, alt: true }), "linux"), ["Alt+Ctrl+Space"]);
+  for (const input of [
+    down({ code: "ShiftLeft", key: "Shift", shift: true, alt: true }),
+    down({ code: "KeyJ", key: "j", alt: true, shift: true, isAutoRepeat: true }),
+    { type: "keyUp", code: "KeyJ", key: "j", alt: true, shift: true },
+    { type: "rawKeyDown", code: "KeyJ", key: "j", alt: true, shift: true },
+    null,
+  ]) {
+    assert.deepStrictEqual(keyPressChords(input, "linux"), [], JSON.stringify(input));
+  }
+  // What a press spells is compared with what a request presses.
+  const [chord] = keyPressChords(down({ code: "KeyM", key: "M", meta: true, shift: true }), "darwin");
+  assert.strictEqual(chord, pressedChord("Shift+CmdOrCtrl+M", "darwin"));
 });

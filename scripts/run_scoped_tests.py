@@ -52,6 +52,14 @@ Backend, as the union of:
 * the cross-surface set ``ci-surface-tests.py`` computes, when the OTHER surface
   changed. That one is CI's own reduction rather than a second answer invented here
 
+minus the ``test/`` files this platform does not collect. Every target here is
+named explicitly on the pytest command line, and an explicit path bypasses
+``test/conftest.py``'s ``pytest_ignore_collect`` hook, so without this
+subtraction a suite that ``test/windows-collect-ignore.txt`` keeps out of every
+Windows run would be re-enabled by the very gate meant to run only what is
+related. The set subtracted is the hook's own (``platform_collect_ignore_helpers``):
+the same list file, the same platform rule, the same ``test/<name>``-only reach.
+
 Frontend is the same shape over vitest specs, re-rooted to ``cwd=website``.
 
 The set is never silently swapped for the full suite because it came out large:
@@ -83,6 +91,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import importlib
 import os
 import re
 import shutil
@@ -90,8 +99,27 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
+from types import ModuleType
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# The collector's own platform ignore list, through the collector's own reader.
+# `test/conftest.py` re-exports that helper's `pytest_ignore_collect` hook, and the
+# helper lives beside it, so `test/` joins sys.path the way
+# scripts/new_test_stability_scope.py already puts it there. One list, one
+# platform rule, shared by the hook and by every selector that names files
+# explicitly. Loaded on first use, not at import: the helper needs pytest and
+# kiro_crew, and scripts/leaf_test_scope.py imports this module in CI's
+# dependency-free `changes` job.
+_TEST_DIR = str(REPO_ROOT / "test")
+
+
+def _collect_ignore() -> ModuleType:
+    """The collector's helper module (one cached object, so a patch on it sticks)."""
+    if _TEST_DIR not in sys.path:
+        sys.path.insert(0, _TEST_DIR)
+    return importlib.import_module("platform_collect_ignore_helpers")
+
 
 # A change to any of these can affect anything, so no reduction is defensible.
 # Matched on the FILE NAME or on a PATH PREFIX, never as a bare substring:
@@ -355,7 +383,7 @@ class SelectionUntrustworthy(Exception):
 
 
 class LauncherMissing(SelectionUntrustworthy):
-    """A surface's test runner is not installed here (``npm``/``npx`` off PATH).
+    """A surface's test runner is not installed here (``node``/``npm`` off PATH).
 
     A subclass so a caller driving BOTH surfaces can tell "this box cannot run
     vitest at all" from "this selection is not to be trusted": the first is an
@@ -585,7 +613,7 @@ def backend_argv(targets: list[str] | None) -> list[str]:
 
 
 def _node_launcher(name: str) -> str:
-    """Absolute path to ``npm``/``npx``, resolved the way this repo already does.
+    """Absolute path to ``node``/``npm``, resolved the way this repo already does.
 
     ``subprocess.run([...], shell=False)`` cannot execute a bare ``npm`` on native
     Windows, because what exists on PATH is ``npm.cmd`` -- the gate would die with
@@ -600,6 +628,10 @@ def _node_launcher(name: str) -> str:
     return found
 
 
+#: vitest's bin as `npm ci` installs it, relative to website/.
+VITEST_ENTRY = "./node_modules/vitest/vitest.mjs"
+
+
 def frontend_argv(targets: list[str] | None) -> list[str]:
     if not targets:
         return [_node_launcher("npm"), "--prefix", "website", "test"]
@@ -610,9 +642,13 @@ def frontend_argv(targets: list[str] | None) -> list[str]:
     # `validated_targets` is the real protection and is strictly stronger anyway:
     # it rejects a leading `-` outright rather than asking the runner to stop
     # parsing.
+    # Node runs vitest's own entry point out of website/node_modules (the
+    # runner's cwd), so only the lockfile's vitest can run. A bare `npx vitest`
+    # downloads whatever the registry serves without the install, and
+    # `npx --no-install vitest` still prefers a globally installed vitest.
     return [
-        _node_launcher("npx"),
-        "vitest",
+        _node_launcher("node"),
+        VITEST_ENTRY,
         "run",
         *validated_targets(targets, REPO_ROOT / "website"),
     ]
@@ -628,9 +664,9 @@ def frontend_argv(targets: list[str] | None) -> list[str]:
 ARGV_CHAR_LIMIT = 24_000
 
 # 32,767 is the CreateProcess ceiling, and the backend runner (`sys.executable
-# -m pytest`) is launched that way -- but the frontend runner is `npx`, and what
-# `shutil.which("npx")` returns on a Windows checkout is `npx.cmd`, a batch-file
-# shim. A `.cmd`/`.bat` shim is run THROUGH cmd.exe, whose command line is
+# -m pytest`) is launched that way -- but a Node launcher can resolve to a
+# batch-file shim on a Windows checkout (`npm.cmd`, or a version manager's
+# `node.cmd`). A `.cmd`/`.bat` shim is run THROUGH cmd.exe, whose command line is
 # capped at ~8,191 chars, far below CreateProcess's. A batch sized by
 # ARGV_CHAR_LIMIT (24,000) sails under CreateProcess but blows through cmd.exe,
 # so the whole selected set lands in one argv and the gate dies with "The
@@ -750,6 +786,19 @@ def _referencing_tests(paths: list[str], tree: tuple[str, ...], root: Path) -> l
     return [rel for rel in tree if rel not in changed and matcher.search(_read_text(root, rel))]
 
 
+def platform_uncollected_targets() -> frozenset[str]:
+    """Backend targets ``test/conftest.py`` would refuse to collect on this host.
+
+    Read at call time from the hook's own ``PLATFORM_IGNORED`` rather than copied
+    at import, so a test that installs a platform's list the way
+    ``test_platform_collect_ignore.py`` does sees the selector follow it. The
+    reach is the hook's: ``test/<name>`` only, never a same-named file in a
+    subdirectory or under the apps-builtins root, which no conftest excludes and
+    the platform collects fine.
+    """
+    return frozenset(f"test/{name}" for name in _collect_ignore().PLATFORM_IGNORED)
+
+
 def related_targets(
     surface: str, paths: list[str], root: Path = REPO_ROOT
 ) -> tuple[list[str], str]:
@@ -788,6 +837,17 @@ def related_targets(
         if cross:
             notes.append(f"{len(cross)} cross-surface (ci-surface-tests.py)")
             selected |= cross
+
+    if surface == "backend":
+        # Every target below is handed to pytest as an explicit path, and an
+        # explicit path bypasses the `pytest_ignore_collect` hook that keeps a
+        # platform's listed suites out of a recursive run. A suite the list keeps
+        # off this platform must not come back through the related set, whichever
+        # of the three sources above named it.
+        uncollected = selected & platform_uncollected_targets()
+        if uncollected:
+            notes.append(f"{len(uncollected)} not collected on this platform")
+            selected -= uncollected
 
     # A path named by the diff can be one the diff DELETED. Dropping it here keeps
     # a deletion from tripping validated_targets' "target vanished" refusal, which
@@ -1035,7 +1095,10 @@ def _self_test() -> int:
     except SelectionUntrustworthy:
         pass
     fe = frontend_argv(["src/test/i18nGateTable.test.ts"])
-    check("frontend reduced argv is vitest run", [Path(fe[0]).stem, *fe[1:3]] == ["npx", "vitest", "run"])
+    check(
+        "frontend reduced argv runs the locked vitest entry point with node",
+        [Path(fe[0]).stem, *fe[1:3]] == ["node", VITEST_ENTRY, "run"],
+    )
     # Regression trap: `vitest run -- <paths>` silently stops filtering and runs
     # the WHOLE suite (measured: 1,474 files / 22,939 tests) while the gate still
     # reports a narrow scope.
@@ -1105,6 +1168,37 @@ def _self_test() -> int:
     picked, _ = related_targets("backend", [diff_test])
     check("a changed test file is itself selected", diff_test in picked)
 
+    # A platform's collect-ignore list applies to the related set exactly as the
+    # conftest hook applies it to a recursive run, so a suite the list keeps off
+    # this platform is not re-enabled by being named explicitly. Checked under
+    # the Windows list on every host, then under an empty list, so the verdict
+    # is the same on Linux, macOS and Windows runners.
+    collect_ignore = _collect_ignore()
+    listed = sorted(collect_ignore.platform_ignore_names("win32"))
+    check("the windows list parses to something", bool(listed))
+    listed_rel = f"test/{listed[0]}"
+    _real_ignored = collect_ignore.PLATFORM_IGNORED
+    try:
+        collect_ignore.PLATFORM_IGNORED = frozenset(listed)
+        check(
+            "an uncollected list file is a test/ path",
+            listed_rel in platform_uncollected_targets(),
+        )
+        win_picked, win_verdict = related_targets("backend", [listed_rel])
+        check(
+            "a listed suite named by the diff is dropped under its platform list",
+            listed_rel not in win_picked,
+        )
+        check("the verdict says why", "not collected on this platform" in win_verdict)
+        collect_ignore.PLATFORM_IGNORED = frozenset()
+        open_picked, open_verdict = related_targets("backend", [listed_rel])
+        check(
+            "the same suite is selected when the platform lists nothing", listed_rel in open_picked
+        )
+        check("no list, no note", "not collected" not in open_verdict)
+    finally:
+        collect_ignore.PLATFORM_IGNORED = _real_ignored
+
     fe_targets, _ = related_targets("frontend", ["website/src/App.tsx"])
     check("the frontend related set is website-relative", all(not p.startswith("website/") for p in fe_targets))
     check("the frontend related set excludes the electron lane", all(not p.startswith("electron/") for p in fe_targets))
@@ -1145,7 +1239,7 @@ def _self_test() -> int:
     check("a small set is one batch", len(argv_batches(backend_argv, [real])) == 1)
     check("no targets, no batches", argv_batches(backend_argv, []) == [])
     fe_batches = argv_batches(frontend_argv, ["src/test/i18nGateTable.test.ts"])
-    check("frontend batching goes through frontend_argv", len(fe_batches) == 1 and "vitest" in fe_batches[0])
+    check("frontend batching goes through frontend_argv", len(fe_batches) == 1 and VITEST_ENTRY in fe_batches[0])
 
     # #22727: the frontend launcher on Windows is `npx.cmd`, a batch-file shim run
     # through cmd.exe, whose command line is capped at ~8,191 -- far below
@@ -1206,13 +1300,17 @@ def _self_test() -> int:
         return build
 
     # Pick a prefix of the real specs that is one batch under 24,000 but over
-    # cmd.exe's limit -- exactly the #22727 shape.
+    # cmd.exe's limit -- exactly the #22727 shape. The joined length grows by one
+    # space plus the spec per target, so it is summed here; rebuilding the argv
+    # per spec re-validated every earlier spec on disk each time (quadratic).
+    # The batching calls below still build and validate the chosen subset.
     fe_subset: list[str] = []
+    length = len(" ".join(frontend_argv(fe_tree[:1]))) - len(fe_tree[0]) - 1
     for spec in fe_tree:
-        trial = fe_subset + [spec]
-        if len(" ".join(frontend_argv(trial))) > ARGV_CHAR_LIMIT:
+        length += len(spec) + 1
+        if length > ARGV_CHAR_LIMIT:
             break
-        fe_subset = trial
+        fe_subset.append(spec)
     check("the repro subset is a realistic size", len(fe_subset) > 50)
     bare_batches = argv_batches(_fe_build("/usr/bin/npx"), fe_subset)
     check(
@@ -1231,8 +1329,8 @@ def _self_test() -> int:
         "the cmd clamp never trims or falls back to the full suite",
         "--prefix" not in [tok for b in cmd_batches for tok in b],
     )
-    # Patch the launcher RESOLVER so the real `frontend_argv` resolves `npx` to a
-    # `.cmd` shim, as it would on a native Windows checkout, and confirm the clamp
+    # Patch the launcher RESOLVER so the real `frontend_argv` resolves `node` to a
+    # `.cmd` shim, as a Windows version manager's shim would, and confirm the clamp
     # fires through the production path rather than only through the fake-launcher
     # builder above.
     _real_which = shutil.which

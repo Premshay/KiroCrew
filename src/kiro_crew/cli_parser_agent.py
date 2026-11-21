@@ -56,6 +56,7 @@ def register_chat_parser(sub: _Commands, _jail_opts: argparse.ArgumentParser) ->
 Examples:
   kirocrew chat                      # Interactive mode
   kirocrew chat -m 'check my CRs'    # Single message
+  git diff | kirocrew chat -m -      # Single message read from stdin
   kirocrew chat --model claude-opus  # Use specific model
 
 Tool permission prompt (same keys as kiro-cli chat):
@@ -66,11 +67,69 @@ Tool permission prompt (same keys as kiro-cli chat):
         formatter_class=_fmt,
         parents=[_jail_opts],
     )
-    chat_parser.add_argument("-m", "--message", help="Single message (non-interactive)")
+    chat_parser.add_argument(
+        "-m",
+        "--message",
+        help=(
+            "Single message (non-interactive); '-' reads it from a piped stdin, up to 1 MiB "
+            "(not with --headless, which takes --message-file)"
+        ),
+    )
     chat_parser.add_argument(
         "--model", help="Model to use (default: from config; `kirocrew models` lists the names)"
     )
     chat_parser.add_argument("--agent", help="Agent to use (default: from config)")
+    # --headless (rfc-builtin-eval.md §12): one unattended run on the local gateway.
+    headless = chat_parser.add_argument_group("headless run (kirocrew chat --headless)")
+    headless.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run one unattended task on the running gateway of this data home and exit with "
+        "a result code; never reads the terminal. A request for a person ends the run (exit 3)",
+    )
+    headless.add_argument(
+        "--message-file", dest="message_file", metavar="PATH", help="Read the seed from a file"
+    )
+    headless.add_argument(
+        "--mode",
+        choices=["chat", "conductor"],
+        default=None,
+        help="chat (default) or conductor: open the chat in conductor mode, on the agent "
+        "agent.crew_mode_agent resolves to",
+    )
+    headless.add_argument(
+        "--approval-mode",
+        dest="approval_mode",
+        choices=["trust"],
+        default="",
+        help="trust: auto-approve tools on the chat this run opens (audited); workers it "
+        "creates inherit it. Unset: a tool approval ends the run as an ask",
+    )
+    headless.add_argument(
+        "--until-done",
+        dest="until_done",
+        action="store_true",
+        help="Stay through patrol, monitor and worker wakes until every work-ledger item is "
+        "finished (conductor) or nothing ran for --idle-grace",
+    )
+    headless.add_argument(
+        "--idle-grace",
+        dest="idle_grace",
+        type=float,
+        default=None,
+        metavar="SECS",
+        help="With --until-done, quiet seconds that count as done (default 900)",
+    )
+    headless.add_argument("--cwd", metavar="DIR", help="Project directory for the chat (absolute)")
+    headless.add_argument(
+        "--timeout", type=float, default=0, metavar="SECS", help="Wall-clock cap (exit 4)"
+    )
+    headless.add_argument(
+        "--budget", type=float, default=0, metavar="CREDITS", help="Kiro credit cap (exit 5)"
+    )
+    headless.add_argument(
+        "--json", action="store_true", help="Print the run's result as one JSON object"
+    )
 
 
 def register_models_parser(sub: _Commands) -> None:
@@ -108,6 +167,7 @@ Examples:
   kirocrew cron update <job-id> --approval-mode auto
   kirocrew cron update <job-id> --agent oncall-agent
   kirocrew cron remove <job-id>
+  kirocrew cron history <job-id> --status error
 """,
         formatter_class=_fmt,
     )
@@ -132,6 +192,8 @@ Examples:
   kirocrew cron add "standup" "post the standup" --cron "0 9 * * MON-FRI" --timezone Europe/Paris
   kirocrew cron add "version-check" "" --every 3600 --script ~/.kiro/crew/crons/check.py:run \\
       --no-persistent-session --minimal-context
+  kirocrew cron add "board" "" --every 1800 --script ~/.kiro/crew/crons/board.py:run \\
+      --agent <bot-name> --no-persistent-session --minimal-context
   kirocrew cron add "disk" "" --every 600 --command "df -h /" --timeout 30 --timeout-secs 60
   kirocrew cron add "reminder" "call the vet" --at "tomorrow 9am"
 """,
@@ -165,18 +227,21 @@ Examples:
         "timezone, else 'local'; refused with --every (an interval has no wall clock).",
     )
     cron_add.add_argument("--channel", help="Slack channel ID to post results to")
-    # One job KIND per job. A script or command job never launches an agent,
-    # so --agent alongside either would be dead configuration; argparse refuses
-    # the pair up front instead of persisting a field nothing reads.
+    # One job KIND per job: --script and --command are exclusive here. --agent
+    # sits outside the group because a --script job may name a Bot, which binds
+    # the job to that Bot (its ctx.crew_log_append feeds the Bot's Dashboard
+    # page); _cron_add refuses --agent with --command, and with --script unless
+    # the name resolves to a Bot.
     cron_add_kind = cron_add.add_mutually_exclusive_group()
-    cron_add_kind.add_argument(
+    cron_add.add_argument(
         "--agent",
         dest="agent",
         default="",
         help="Agent name for this job (e.g. 'customer360-code-agent'). "
         "Empty or omitted uses agent.default_agent, or the kirocrew agent "
         "when that is unset or not eligible (e.g. a default that restricts "
-        "subagents).",
+        "subagents). With --script it must name a Bot: the job is bound to "
+        "that Bot, so ctx.crew_log_append() records land on its Dashboard page.",
     )
     cron_add_kind.add_argument(
         "--script",
@@ -325,7 +390,7 @@ Examples:
         help=_ALERT_AFTER_HELP,
     )
     cron_update.add_argument("--cron", dest="cron_expr", help="New cron expression")
-    cron_update.add_argument("--channel", help="New channel ID")
+    cron_update.add_argument("--channel", help='New channel ID ("" clears it)')
     cron_update.add_argument(
         "--agent",
         dest="agent",
@@ -411,6 +476,35 @@ Examples:
     cron_resume.add_argument("job_id", help="Job ID to resume")
     cron_trigger = cron_sub.add_parser("trigger", help="Trigger a cron job immediately")
     cron_trigger.add_argument("job_id", help="Job ID to trigger")
+    cron_history = cron_sub.add_parser("history", help="Show a job's past runs (read-only)")
+    history_target = cron_history.add_mutually_exclusive_group(required=True)
+    history_target.add_argument("job_id", nargs="?", default=None, help="Job ID whose runs to show")
+    history_target.add_argument(
+        "--all",
+        action="store_true",
+        help="Read every job's runs from the cross-job index, newest first",
+    )
+    cron_history.add_argument(
+        "-n",
+        "--limit",
+        type=positive_int,
+        default=20,
+        help="How many runs to show (default: 20)",
+    )
+    cron_history.add_argument(
+        "--status",
+        choices=("success", "failure", "timeout", "cancelled", "error"),
+        default=None,
+        help="Keep only runs with this status; 'error' keeps every run that did not succeed",
+    )
+    cron_history.add_argument(
+        "--run",
+        dest="run_id",
+        default=None,
+        metavar="RUN_ID",
+        help="Print that one run's full record, trace included (needs a job id)",
+    )
+    cron_history.add_argument("--json", action="store_true", help="Machine-readable output")
 
     cron_adopt = cron_sub.add_parser(
         "adopt",
@@ -441,6 +535,24 @@ Examples:
     cron_preview.add_argument(
         "--env", "-e", action="append", metavar="K=V", help="Extra env vars (repeatable)"
     )
+
+
+def register_resource_subs_parser(sub: _Commands) -> None:
+    """``kirocrew resource-subs``: dispatched by ``cli_resource_subs.resource_subs``."""
+    parser = cli_help.add_command(
+        sub,
+        "resource-subs",
+        epilog="""
+Examples:
+  kirocrew resource-subs list
+  kirocrew resource-subs remove rsub_0123456789abcdef
+""",
+        formatter_class=_fmt,
+    )
+    actions = parser.add_subparsers(dest="resource_subs_action")
+    actions.add_parser("list", help="List every session's MCP resource subscriptions")
+    remove = actions.add_parser("remove", help="Remove one subscription by its id")
+    remove.add_argument("subscription_id", help="The id `list` shows (rsub_...)")
 
 
 def register_spawn_parser(sub: _Commands) -> None:
@@ -966,12 +1078,10 @@ def register_memory_parser(sub: _Commands) -> None:
         "--stage",
         default=None,
         choices=[
-            "rule_authority_order",
             "relevance_rule",
-            "lesson_fold",
-            "kind_routing",
             "lesson_origin_gate",
             "lesson_tier_policy",
+            "fact_origin_gate",
             "member_lesson_dedup",
             "dream",
         ],
@@ -1059,6 +1169,28 @@ def register_agent_parser(sub: _Commands) -> None:
         "file", nargs="?", help="Bare file name in the agents directory, e.g. PkgA-helper.json"
     )
     agent_pin.add_argument("--clear", action="store_true", help="Remove the pin for this name")
+    agent_validate = agent_sub.add_parser(
+        "validate",
+        help=(
+            "Check agent specs offline (unknown fields, wrong value shapes, malformed "
+            "tools entries); exits 1 on a problem"
+        ),
+    )
+    agent_validate.add_argument(
+        "path",
+        nargs="?",
+        help="Spec file, or a directory of specs (default: the user-level agents directory)",
+    )
+    agent_validate.add_argument(
+        "--allow-unknown-fields",
+        action="store_true",
+        help="Do not report top-level fields this release does not list",
+    )
+    agent_validate.add_argument(
+        "--print-schema",
+        action="store_true",
+        help="Print the JSON Schema of an agent spec and exit",
+    )
     agent_reset_model = agent_sub.add_parser(
         "reset-model",
         help="Clear an agent spec's pinned model so it tracks the shipped default again",
@@ -1071,6 +1203,32 @@ def register_agent_parser(sub: _Commands) -> None:
         # resolver itself compares against in resolve_effective_model.
         default="kirocrew",
         help="Kiro agent spec to reset (default: kirocrew)",
+    )
+
+
+def register_trace_parser(sub: _Commands) -> None:
+    trace_parser = cli_help.add_command(
+        sub,
+        "trace",
+        epilog="""
+Examples:
+  kirocrew trace show 3f2a9c1e5b7d4a6c8e0f1a2b3c4d5e6f
+  kirocrew trace show <session key>
+""",
+        formatter_class=_fmt,
+    )
+    trace_sub = trace_parser.add_subparsers(dest="trace_action", required=True)
+    trace_show = trace_sub.add_parser(
+        "show",
+        help="Print one turn's spans as a waterfall",
+        description=(
+            "Read <data home>/traces/spans-*.jsonl (written while telemetry.traces_enabled "
+            "is on) and print the most recent trace holding KEY: its model calls, tool "
+            "calls, sub-agents and the gaps between them. Reads files only."
+        ),
+    )
+    trace_show.add_argument(
+        "key", help="A turn id, a session key or id, an ACP session id or a trace id"
     )
 
 

@@ -51,11 +51,12 @@ DNS rebinding, unauthenticated remote access, and the rest) is in
 | Boundary | Trusted side | Untrusted side | Enforced by |
 |---|---|---|---|
 | Gateway process ↔ agent subprocess | Kiro Crew gateway | `kiro-cli` + every tool/MCP descendant | OS sandbox (`sandbox.py`), env scrub, cgroup scope |
-| Agent tool request ↔ execution | the PreToolUse gate's decision | the tool call as the model phrased it | `hooks.py:HookManager.on_tool_call` |
+| Agent tool request ↔ execution | the PreToolUse gate's decision | the tool call as the model phrased it | `hook_runtime/hook_manager.py:HookManager.on_tool_call` |
 | Operator ceiling ↔ agent | keystone files under the data home | every agent read/write path | `security.is_sensitive_path` / `is_sensitive_write_path` |
 | Agent output ↔ any human or external service | nothing | all agent-derived text | `redact_credentials` / `redact_exfiltration_urls` / `StreamRedactor` |
 | Browser ↔ dashboard | authenticated session | any other origin or host | token auth, CSRF Origin check, Host allowlist |
-| Slack workspace ↔ gateway | owner + allowlisted users | every other Slack sender | owner lock, `is_allowed_user`, Enterprise Grid check |
+| Slack workspace ↔ gateway | owner, plus `slack.shared_access` users when the owner turns it on (off by default; they act as the owner) | every other Slack sender | owner lock, `is_allowed_user` / `is_shared_user`, Enterprise Grid check |
+| Remote gateway ↔ a connected computer (preview `connected_computers`) | the local user's native consent and the one folder it picked | every request the remote gateway sends | local grant store + OS fence per command (`bwrap` + seccomp on Linux; none, so unavailable, on macOS and Windows), scoped credential proof-of-possession (bearer never sent) plus nonce-bound, directional sequenced MACs on every frame after `hello` on its own connect route (exempt from the dashboard gate only while the preview is on; off, that path meets the gate and then 404s like any unserved path), and authenticated heartbeats so a relay dropping the tail cannot hold a connection open (a missed deadline interrupts, never refuses); only an authenticated `admitted` resets back-off and only an authenticated `refusal` naming an explicit end (revoked, removed, replaced, another computer) ends a grant (close codes and upgrade statuses are relay-forgeable and never read); sharing renews automatically over SSH, before or after expiry, presenting the old credential, accepted iff the device record is still active at that credential's `cgen`; Disconnect, Remove and a local Off's queued forget write the revocation on the record at once, and a dashboard logout neither accepts, revokes nor ends a connector credential (every dashboard sink refuses its audience); terminal states persist on the grant, a failed write retried while it stays stopped ([providers](../system-specs/modules/providers.md#connected-computers-handshake-and-confinement)) |
 
 The single most important structural property: **the PreToolUse gate is
 Kiro Crew's own gate, not the agent's.** Denied commands and the governance
@@ -188,9 +189,9 @@ described honestly for the tier it runs at:
   `is_sensitive_bash_command` deliberately matches no paths: a text matcher
   cannot hold against `python -c open(...)`, `awk`, a variable or a `cd`, and
   every spelling it did close denied ordinary commands whenever the fenced
-  spelling appeared as data. The path regexes were removed for that reason
-  (#9183), and the recovered command of a sandboxed shell is exempt from the
-  path tier (#11223). The enforcement point for a shell's `open()` is the OS
+  spelling appeared as data. The path regexes were removed for that reason,
+  and the recovered command of a sandboxed shell is exempt from the
+  path tier. The enforcement point for a shell's `open()` is the OS
   sandbox.
 - The OS sandbox's **default `standard` tier leaves `~/.aws`, `~/.ssh` and
   `~/.kube` visible** (`sandbox._STANDARD_DIRS` omits them on purpose) so the
@@ -432,35 +433,45 @@ someone deciding which bucket it belongs in.
 
 The memory recovery, record editor, and member recall/copy APIs each register
 their own output boundary. Their response fields pass through the shared
-credential and exfiltration-URL chain before reaching the dashboard or MCP caller.
+credential redaction, inside URLs too, before reaching the dashboard or MCP caller.
 
-- `redact_credentials()` runs four passes:
-  1. Fixed patterns: cloud access key IDs and secret keys, private-key blocks,
-     chat and forge tokens, package-registry tokens, JWTs, `Authorization: Bearer`
-     headers, and database connection URIs carrying embedded credentials.
-  2. Base64: it decodes base64-looking chunks and re-runs pass 1 on the bytes.
-  3. Bare secret key: an entropy and shape heuristic for an unlabelled
-     40-character cloud secret key, with exemptions for shapes it would otherwise
-     misread (digests, document links, code literals and others).
-  4. Token parameter: the value of a `token` URL parameter, keyed on the name.
+- `redact_credentials()` masks what the rule table decides is a credential, then
+  the few classes no table row reads yet (Telegram and Discord bot tokens, npm and
+  PyPI tokens, OpenAI `sk-proj-` keys, the `Authorization: Bearer` token) by fixed
+  pattern, then the value of a `token` URL parameter, keyed on the name. The table
+  (`security/redaction_structured/`) reads vendor tokens by published format
+  (checksums where published), private-key blocks, signed JWTs, a cloud secret key
+  beside its key ID or after its label, session tokens after their label,
+  passwords in URL userinfo, Basic-auth and API-key header values, session cookies,
+  labelled values such as `password=`, credential-type URL parameters, webhook URL
+  secrets, and base64 or hex runs that decode to one of these. It never masks an
+  identifier (a cloud access key ID, an account ID, an ARN, a request id, a UUID, a
+  git object name), a documentation example key, a public certificate or SSH key,
+  an image data URI, an OAuth `code` or `state`, an unsigned JWT or a token that
+  fails its format check, and it does not guess a secret from a run's entropy.
 
-  Key-value matching is JSON-aware and value classes stop at JSON structural
-  delimiters, so a match in compact JSON does not run into the next field. A
-  labelled match replaces the label together with the value, so
-  `{"AccessKeyId": "..."}` becomes `{"[REDACTED: credential]"}`.
-- `redact_exfiltration_urls()` / `scan_exfiltration_urls()` judge the payload
-  first. A credential in a URL is an unconditional floor; long query strings,
-  base64 blobs and heavy URL-encoding are heuristics. A flagged URL is replaced
-  with a redaction marker. Some destinations get narrower treatment: a valid S3
+  Only the value is replaced: the label, header name, URL scheme, host, path and
+  other parameters stay, so `{"Authorization": "Bearer <tok>"}` becomes
+  `{"Authorization": "Bearer [REDACTED: credential]"}`.
+- `redact_exfiltration_urls()` masks the credential values inside a URL the same
+  way and leaves the rest of the URL as written; a URL is never replaced whole.
+  `scan_exfiltration_urls()` is a request-blocking decision: it judges the payload
+  of a URL in a command. A credential in a URL is an unconditional floor; long
+  query strings, base64 blobs and heavy URL-encoding are heuristics, and a flagged
+  URL refuses the request. Some destinations get narrower treatment: a valid S3
   presigned URL is exempt; the ACP OAuth banner path spares standard OAuth
   parameters at approved authorization endpoints; Kiro Crew's own Slack app-create
-  link keeps only its alias under the heuristics; and a companion's exact hosts and
-  a reader's allowed hosts (*Allow for this host*, kept per workspace in a
-  read-only leaf) skip only the length and base64 heuristics. The credential
-  checks still run on those last three.
-- The owner's switch (Settings → Security) applies only inside the Files view,
-  and there it turns all credential redaction off. A code-text scope spares two
-  source-code shapes from pass 3 and nothing else.
+  link keeps only its alias under the heuristics; and a companion's exact hosts
+  skip only the length and base64 heuristics. The credential checks still run on
+  those last two. The dashboard never loads a remote markdown image on its own: it
+  draws a click-to-load placeholder.
+- The owner's one setting (Settings → Security → Redaction) turns credential
+  redaction on or off on the output paths that open a seam (chat, the saved
+  transcript, channel egress, the conversation replayed into the agent's prompt,
+  the log-record filter) and in the owner's Files view. It is off by default; a
+  host whose policy governs any scope keeps it on unless the top policy tier names
+  `capabilities.credential_redaction_off`. Every blocking gate, and every
+  redaction call outside a seam, redacts whichever way it is set.
 - `redact()` composes both in order for a single call site.
 - `StreamRedactor` handles the case per-chunk redaction structurally cannot: a
   credential split across a streaming boundary, where neither fragment matches on
@@ -731,6 +742,15 @@ assembled at runtime (string concatenation, a base64 blob, an indirect `eval
 the signing credential is the keystone path floor, which these rules do not
 replace.
 
+**A connected computer runs whatever turn its chat runs.** A chat bound to the
+owner's own computer (feature preview `connected_computers`) is bound by the
+owner alone, but each later turn in it is not re-checked against who sent it, so
+a shared-crew collaborator, an app agent or a channel message admitted into that
+chat reaches the computer's shared folder through the same approval gate. The
+obvious fix, refusing every turn whose initiator is not the owner, needs the
+initiator on every turn path, which unattributed single-user turns do not carry
+yet; it is an open decision, not an oversight.
+
 **No audit dashboard.** SEL events are queryable over the API
 (`/api/sel/events`, `/api/sel/verify`) but there is no UI to browse, filter or
 alert on them, so tamper detection and anomaly spotting are manual.
@@ -741,14 +761,14 @@ process that confinement actually took effect (for example by attempting to read
 a canary that should be hidden). A confinement that loads but does not enforce
 would not be noticed.
 
-**Base64 credential detection has a floor.** Only base64 chunks at or above the
-minimum length are decoded and re-checked, so a shorter encoded fragment, or one
-split across messages, can pass. Cross-message correlation would extend it.
+**Encoded credential detection has a floor.** Only an encoded run at or above the
+`encoded_credential` row's minimum length is decoded and re-read, so a shorter
+encoded fragment, or one split across messages, can pass.
 
-**A bare secret key is a guess.** Pass 3 judges an unlabelled 40-character run by
-entropy and shape, which cannot tell a random secret from a random digest, so it
-carries exemptions and still misreads some benign values. The recorded direction
-replaces it with case-insensitive labels and key-ID pairing; see
+**A credential no table row reads stays as written.** The rule table masks
+values that are credentials by their published format or their label, never a run
+judged by its entropy, so an unlabelled secret in a format the table does not
+know reaches the output; see
 [the redaction tier decision](../decisions/2026-10-20-redaction-classifies-by-what-a-value-can-do.md).
 
 **Write protection covers Kiro Crew's own trust root, not the user's shell
@@ -766,10 +786,8 @@ not thread, semantics). macOS and Linux hosts without delegation have no hard
 per-subtree process/memory ceiling; they retain the file-descriptor cap and
 post-failure reapers. See [`resource-protection.md`](resource-protection.md).
 
-**Launcher self-poisoning by the same user is accepted, not defended (CWE-345;
-tracked as CWE-778 by
-[#371](https://github.com/kirodotdev/KiroCrew/pull/371) /
-[#417](https://github.com/kirodotdev/KiroCrew/issues/417)).** The resolved
+**Launcher self-poisoning by the same user is accepted, not defended (CWE-345,
+also classed as CWE-778).** The resolved
 `kiro-cli` launcher is executed in place with no signature, hash, ownership or
 install-source check — the only gate is `platform_compat.is_executable_file`
 (`kiro_cli.py`) — so an agent running as the invoking user can overwrite its own
@@ -815,7 +833,11 @@ Chromium performs its own resolution to connect. `route.continue()` in
 validated, so a name that answers public then private across those two
 resolutions is the window. It cannot be closed at the route layer without
 aborting **all** cross-origin subresources, which would drop legitimate CDN
-fonts and images from the rendered screenshot. **Status: ACCEPTED, bounded.**
+fonts and images from the rendered screenshot. A WebSocket to a host other than
+the pinned base has the same window: the guard's `routeWebSocket` handler checks
+the host once and then calls `ws.connectToServer()`, which also takes no
+address, so the browser resolves the name again to connect
+(accepted as the same class). **Status: ACCEPTED, bounded.**
 Reaching it requires an attacker to control both a critiqued page and a rebinding
 DNS name; the base-host and same-host vectors are already closed. The complete
 fix is below-the-browser egress filtering independent of Chromium's resolver — a
@@ -826,8 +848,7 @@ mechanism is a per-platform infrastructure decision (macOS vs Linux vs CI, the
 privilege model, and fail-open vs fail-closed when the layer is unavailable), so
 it is tracked as a design item on #17748 rather than shipped here.
 
-**A sandboxed command's detached descendants are not bound to its lifetime
-([#5883](https://github.com/kirodotdev/KiroCrew/issues/5883)).** The Linux
+**A sandboxed command's detached descendants are not bound to its lifetime.** The Linux
 launcher unshares only the user and mount namespaces. It deliberately adds no
 PID namespace: an earlier PID-namespace version broke session identity, which is
 keyed on host pids, and seccomp denies the host-wide `kill(-1)` broadcast

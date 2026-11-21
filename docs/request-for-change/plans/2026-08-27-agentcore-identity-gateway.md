@@ -1,7 +1,7 @@
 # AgentCore Identity and Gateway Implementation Plan
 
-> **Partial implementation on main.** 4 of 30 checklist steps are done: the
-> Task 1 documentation steps. At `e281ecaf33`, `platform/agentcore_schema.py`
+> **Partial implementation on main.** 4 of 29 checklist steps are done: the
+> Task 1 documentation steps. On main, `platform/agentcore_schema.py`
 > and the AWS-free `AgentIdentityProvider` core seam ship; the AWS adapter,
 > IAM helpers, Gateway attachment, consent flow, and Settings surfaces do not.
 > Its spec is
@@ -473,7 +473,8 @@ tests exist.
 
 **Files:**
 
-- Modify: `src/kiro_crew/security.py` (consent-host allowlist reuse of
+- Modify: the `src/kiro_crew/security/` package (a single `security.py`
+  until #9183 split it; consent-host allowlist reuse of
   `oauth_endpoints.json`; do not add a second file unless the existing
   keystone cannot express AgentCore consent hosts)
 - Modify: dashboard handler + a small Settings / modal component

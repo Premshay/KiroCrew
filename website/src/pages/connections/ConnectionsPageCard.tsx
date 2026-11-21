@@ -13,12 +13,17 @@
  */
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
 import { OverlayPortal } from '../../components/overlayRoot'
-import { useTranslation } from 'react-i18next'
+import { useCopyAck } from '../../components/FilePathMenu'
+import { copyToClipboard } from '../../utils/clipboard'
+import { docSectionHref } from '../../utils/docsLink'
+import { Trans, useTranslation } from 'react-i18next'
 import { motion, useReducedMotion } from 'framer-motion'
 import {
   AlertTriangle,
+  Check,
   CheckCircle2,
   CircleDashed,
+  Copy,
   ExternalLink,
   KeyRound,
   Link2,
@@ -37,12 +42,18 @@ import { Btn } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
 import ProviderLogo, { PROVIDER_LOGO_SLUGS } from './ProviderLogo'
 import type { ConnectionProvider } from './registry'
-import { isGoogleSlug } from './connectionsLinks'
+import { isGoogleSlug, MCP_SERVERS_HREF } from './connectionsLinks'
+import { Link } from 'react-router-dom'
+import { settingsPath } from '../../components/settingsPath'
+
+/** The Settings entry of the preview that turns on Crew's own sign-in
+ *  (its id in `settingsRegistry.gen.ts`). */
+const CREW_SIGN_IN_SETTING_ID = 'developer.mcp-sign-in-by-kiro-crew'
 // The loopback pre-check lives in `utils/loopbackReturnAddress` (shared with
 // the chat banner's relay affordance).
 import { isValidLoopbackReturnAddress, normalizeLoopbackReturnAddress } from '../../utils/loopbackReturnAddress'
 import { isElectron } from '../../lib/electron'
-import { useImeGuard } from '../../hooks/useImeGuard'
+import { useDocumentImeLatch, useImeGuard } from '../../hooks/useImeGuard'
 import {
   errorIndicatesProviderRejection,
   type ConnectionAction,
@@ -100,6 +111,15 @@ interface ConnectionCardProps {
    *  on the connected row; it never removes an action, because the sign-in runs
    *  on Kiro CLI and its grant is real for Kiro CLI chats. */
   backendLacksOauth?: boolean
+  /** The `needs-configuration` card is waiting for Crew's own sign-in, not for an
+   *  OAuth app: its instruction and its link point at that setting. */
+  needsCrewSignIn?: boolean
+  /** The `needs-configuration` card whose configured entry Crew's sign-in does not
+   *  serve: no Connect, no OAuth app step and no step to turn that sign-in on. */
+  crewSignInNotOwned?: boolean
+  /** The mint refuses this card's sign-in, grant or not (the status row's
+   *  `crewMintRefused`): no Connect or Reconnect, the setup line in their place. */
+  crewMintRefused?: ConnectionStatus['crewMintRefused']
   /** True on a connected row while chats run on KAS: a KAS chat signs in once
    *  when the user names the server, so the row says which word to type. */
   signInInChat?: boolean
@@ -164,6 +184,7 @@ const PREREQUISITE_KEYS = {
   'google-sheets': 'pages.connectionsPage.prerequisite_google_sheets',
   'google-docs': 'pages.connectionsPage.prerequisite_google_docs',
   'google-slides': 'pages.connectionsPage.prerequisite_google_slides',
+  slack: 'pages.connectionsPage.prerequisite_slack',
 } as const
 
 /**
@@ -182,21 +203,35 @@ const PREREQUISITE_KEYS = {
  * needs attention) or carry a form (the remote return-address relay) -- copy
  * about what an action will do or needs is neither, and goes here.
  */
-function PrerequisiteTip({ label, heading, text, redirect }: {
+function PrerequisiteTip({ label, heading, text, redirect, link }: {
   label: string
   heading: string
-  text: string
-  /** Where this card's sign-in returns, shown as selectable lines an org admin
-   *  can be handed (`signInRedirect` on the status row). */
+  /** A plain string, or a `Trans` when a step links somewhere. */
+  text: ReactNode
+  /** Where this card's sign-in returns, each value with its own copy control, so
+   *  an org admin can be handed the whole address (`signInRedirect` on the
+   *  status row). */
   redirect?: { caption: string; values: string[] }
+  /** A docs page the caveat points at, opened in a new tab. */
+  link?: { href: string; label: string }
 }) {
   const [pinned, setPinned] = useState(false)
   const [hovered, setHovered] = useState(false)
   const btnRef = useRef<HTMLButtonElement>(null)
   const tipRef = useRef<HTMLDivElement>(null)
   const hoverOff = useRef<number | undefined>(undefined)
+  // Set while focus leaves the bubble back to the icon, so that one focus does
+  // not reopen it and the next Tab moves on past the icon.
+  const leaving = useRef(false)
   const tipId = useId()
+  const headingId = useId()
   const open = pinned || hovered
+  // A bubble with a link or a copy control is something to operate, not just
+  // read, so it is a non-modal dialog the icon's Tab moves into.
+  const interactive = !!(link || redirect)
+  // IMEs cycle candidates with Tab, so a Tab the bubble re-aims is claimed
+  // first: one the IME owns keeps its composition (see useDocumentImeLatch).
+  const tipImeLatch = useDocumentImeLatch(open && interactive)
 
   // WCAG 1.4.13 hoverable: the pointer must be able to travel from the icon
   // into the bubble, so hover-off waits a short grace instead of dismissing
@@ -210,6 +245,15 @@ function PrerequisiteTip({ label, heading, text, redirect }: {
     hoverOff.current = window.setTimeout(() => setHovered(false), 120)
   }
   useEffect(() => () => window.clearTimeout(hoverOff.current), [])
+
+  const focusables = () =>
+    Array.from(tipRef.current?.querySelectorAll<HTMLElement>('a[href], button') ?? [])
+  const backToIcon = () => {
+    leaving.current = true
+    setPinned(false)
+    setHovered(false)
+    btnRef.current?.focus()
+  }
 
   useEffect(() => {
     // Gated on `open`, not `pinned`: a tip opened by keyboard focus alone must
@@ -227,15 +271,17 @@ function PrerequisiteTip({ label, heading, text, redirect }: {
       setHovered(false)
     }
     const onKey = (e: globalThis.KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setPinned(false)
-        setHovered(false)
-      }
+      if (e.key !== 'Escape') return
+      if (tipRef.current?.contains(document.activeElement)) backToIcon()
+      setPinned(false)
+      setHovered(false)
     }
     // The bubble is position:fixed and computed once, so scrolling the gallery
     // would detach it from its icon — dismiss instead (capture phase, so any
-    // scrolling ancestor counts, not just the window).
-    const onScroll = () => {
+    // scrolling ancestor counts, not just the window). Scrolling the bubble's
+    // own capped content is not a gallery scroll.
+    const onScroll = (e: Event) => {
+      if (tipRef.current?.contains(e.target as Node)) return
       setPinned(false)
       setHovered(false)
     }
@@ -251,15 +297,21 @@ function PrerequisiteTip({ label, heading, text, redirect }: {
 
   // Bottom-anchored above the icon so bubble height never matters; clamped to
   // the viewport the same way InfoTip clamps, falling below only when the icon
-  // sits within bubble reach of the top edge.
+  // sits within bubble reach of the top edge. A bubble with controls is capped
+  // to the room on the chosen side and scrolls inside that cap, so it never runs
+  // off the screen; Tab into it moves focus, and so the scroll, to each control.
+  // A text-only bubble has no focus stop to scroll with, so it stays uncapped.
   const pos = () => {
     if (!btnRef.current) return { top: 0, left: 0 }
     const r = btnRef.current.getBoundingClientRect()
     const tipW = 300
     let left = r.left + r.width / 2 - tipW / 2
     left = Math.max(8, Math.min(left, window.innerWidth - tipW - 8))
-    if (r.top > 132) return { bottom: window.innerHeight - r.top + 6, left }
-    return { top: r.bottom + 6, left }
+    const above = r.top > 132
+    const room = above ? r.top - 14 : window.innerHeight - r.bottom - 14
+    const cap = interactive ? { maxHeight: room } : {}
+    if (above) return { bottom: window.innerHeight - r.top + 6, left, ...cap }
+    return { top: r.bottom + 6, left, ...cap }
   }
 
   return (
@@ -270,35 +322,65 @@ function PrerequisiteTip({ label, heading, text, redirect }: {
         aria-label={label}
         aria-expanded={open}
         aria-describedby={open ? tipId : undefined}
+        aria-controls={open && interactive ? tipId : undefined}
         onClick={e => { e.stopPropagation(); setPinned(p => !p) }}
+        onKeyDown={e => {
+          // The bubble renders in a portal at the end of the document, so Tab
+          // would skip it: carry focus into its first control instead.
+          if (e.key !== 'Tab' || e.shiftKey || !open) return
+          const first = focusables()[0]
+          if (!first) return
+          if (!tipImeLatch.claimSyntheticKey(e)) return
+          e.preventDefault()
+          setPinned(true)
+          first.focus()
+        }}
         onMouseEnter={holdHover}
         onMouseLeave={releaseHover}
-        onFocus={holdHover}
+        onFocus={() => { if (leaving.current) leaving.current = false; else holdHover() }}
         onBlur={releaseHover}
         className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-warn transition-colors hover:text-warn-text hover:bg-warn-subtle"
       >
         <AlertTriangle className="h-4 w-4" aria-hidden="true" />
       </button>
       {open && <OverlayPortal>{
-        /* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- the mouse listeners implement WCAG 1.4.13 "hoverable" (pointer may cross into the tooltip without it dismissing); keyboard users have their own complete path on the button (focus opens, Escape dismisses), so there is no keyboard operation to mirror here */
+        /* eslint-disable-next-line jsx-a11y/no-static-element-interactions -- the role is set per render (dialog or tooltip), which the rule cannot read; the mouse listeners implement WCAG 1.4.13 "hoverable" (pointer may cross into the tooltip without it dismissing); the keyboard path is the icon's Tab into the bubble and Tab / Shift+Tab / Escape back out */
         <div
           ref={tipRef}
           id={tipId}
-          role="tooltip"
+          role={interactive ? 'dialog' : 'tooltip'}
+          aria-labelledby={interactive ? headingId : undefined}
           onMouseEnter={holdHover}
           onMouseLeave={releaseHover}
-          className="fixed z-[9999] max-w-[300px] whitespace-normal rounded-lg border border-warn/30 p-2.5 text-[12px] leading-relaxed text-text"
+          // Focus inside the bubble (a click on a copy button, or Tab) pins it,
+          // so the pointer leaving does not unmount the control that holds focus.
+          onFocus={() => setPinned(true)}
+          onKeyDown={e => {
+            if (e.key !== 'Tab') return
+            const items = focusables()
+            const at = items.indexOf(document.activeElement as HTMLElement)
+            // Out past either end goes back to the icon, closing the bubble.
+            if ((e.shiftKey && at === 0) || (!e.shiftKey && at === items.length - 1)) {
+              if (!tipImeLatch.claimSyntheticKey(e)) return
+              e.preventDefault()
+              backToIcon()
+            }
+          }}
+          className={`fixed z-[9999] max-w-[300px] ${interactive ? 'overflow-y-auto' : ''} whitespace-normal rounded-lg border border-warn/30 p-2.5 text-[12px] leading-relaxed text-text`}
           style={{ ...pos(), backgroundColor: 'var(--card)', boxShadow: 'var(--shadow-lg)' }}
         >
-          <span className="block font-medium text-text-strong">{heading}</span>
+          <span id={headingId} className="block font-medium text-text-strong">{heading}</span>
           {text && <span className="mt-0.5 block">{text}</span>}
           {redirect && (
             <>
               <span className="mt-1.5 block text-muted">{redirect.caption}</span>
-              {redirect.values.map(value => (
-                <code key={value} className="mt-0.5 block select-all break-all font-mono text-[11px] text-text-strong">{value}</code>
-              ))}
+              {redirect.values.map(value => <RedirectValue key={value} value={value} />)}
             </>
+          )}
+          {link && (
+            <a href={link.href} target="_blank" rel="noopener noreferrer" className="mt-1.5 inline-flex items-center gap-1 font-medium text-accent hover:text-accent-hover">
+              {link.label} <ExternalLink className="lucide-inline" aria-hidden="true" />
+            </a>
           )}
         </div>
       }</OverlayPortal>}
@@ -306,8 +388,58 @@ function PrerequisiteTip({ label, heading, text, redirect }: {
   )
 }
 
+/** One redirect address with a button that copies exactly that value. The
+ *  confirmation is a text swap with no animation, so it reads the same with
+ *  reduced motion, and it is announced through a polite live region. A copy the
+ *  browser refuses says so and asks the user to select the text instead; it
+ *  offers no agent hand-off, which would navigate to chat and drop a return
+ *  address typed on a waiting card. */
+function RedirectValue({ value }: { value: string }) {
+  const { t } = useTranslation()
+  // A refusal stays on screen until a later copy succeeds or the user dismisses
+  // it, not only for the acknowledgment's moment. It is set from each attempt's
+  // own result, so a repeated failure shows again after a dismiss.
+  const [failed, setFailed] = useState(false)
+  const copyRef = useRef<HTMLButtonElement>(null)
+  // The shared acknowledgment: `copied` / `failed`, reset after a moment.
+  const { copyStatus, copyPath } = useCopyAck(value, async () => {
+    const ok = await copyToClipboard(value)
+    setFailed(!ok)
+    return ok
+  })
+  const copied = copyStatus === 'copied'
+  return (
+    <>
+      <span className="mt-0.5 flex items-start gap-1.5">
+        <code className="min-w-0 flex-1 select-all break-all font-mono text-[11px] text-text-strong">{value}</code>
+        <button
+          ref={copyRef}
+          type="button"
+          onClick={() => void copyPath()}
+          aria-label={t('pages.connectionsPage.copy_redirect_address', { address: value })}
+          className="inline-flex shrink-0 items-center gap-1 rounded px-1 py-0.5 text-[11px] text-text hover:bg-bg-hover hover:text-text-strong"
+        >
+          {copied ? <Check className="h-3.5 w-3.5 text-ok" aria-hidden="true" /> : <Copy className="h-3.5 w-3.5" aria-hidden="true" />}
+          <span aria-live="polite">{copied ? t('pages.connectionsPage.redirect_address_copied') : ''}</span>
+        </button>
+      </span>
+      {failed && (
+        <ErrorNotice
+          variant="inline"
+          message={t('pages.connectionsPage.redirect_address_copy_failed')}
+          askAgent={false}
+          // Focus goes back to this address's copy button, not the page body,
+          // so the bubble keeps its keyboard path (Tab, Escape) after dismissal.
+          onDismiss={() => { copyRef.current?.focus(); setFailed(false) }}
+          className="mt-0.5"
+        />
+      )}
+    </>
+  )
+}
+
 /** A card's status label, also shown on the closed Google entry. */
-function ConnectionStateBadge({ state }: { state: ConnectionCardState }) {
+function ConnectionStateBadge({ state, managedInMcpServers = false }: { state: ConnectionCardState; managedInMcpServers?: boolean }) {
   const { t } = useTranslation()
   const stateMeta: Record<ConnectionCardState, { label: string; icon: ReactNode; tone: string }> = {
     'not-connected': {
@@ -347,7 +479,11 @@ function ConnectionStateBadge({ state }: { state: ConnectionCardState }) {
       tone: 'bg-bg-hover text-muted',
     },
   }
-  const meta = stateMeta[state]
+  // An entry Crew's sign-in does not own has nothing left to configure here, so
+  // it keeps the muted tone but says where the entry is managed instead.
+  const meta = managedInMcpServers && state === 'needs-configuration'
+    ? { ...stateMeta[state], label: t('pages.connectionsPage.managed_in_mcp_servers'), icon: <Settings2 className="w-3.5 h-3.5" aria-hidden="true" /> }
+    : stateMeta[state]
   return (
     <span className={`inline-flex shrink-0 items-center gap-1 text-[11px] font-medium ${meta.tone}`}>
       {meta.icon}
@@ -370,6 +506,9 @@ function ConnectionCard({
   grantSharedWith,
   grantSharedUnconfirmed,
   backendLacksOauth = false,
+  needsCrewSignIn = false,
+  crewSignInNotOwned = false,
+  crewMintRefused,
   signInInChat = false,
   crewHeld = false,
   signInRedirect,
@@ -693,14 +832,54 @@ function ConnectionCard({
         values: redirectValues,
       }
     : undefined
+  // The provider's org-admin checklist, when the registry names one, is a link
+  // in the same tip as the caveat that sends the user there.
+  const adminGuide = docSectionHref(provider.org_admin_guide)
+  const link = adminGuide ? { href: adminGuide, label: t('pages.connectionsPage.org_admin_checklist_link') } : undefined
   const prerequisiteTip = prerequisiteText || redirect ? (
     <PrerequisiteTip
       label={t('pages.connectionsPage.prerequisites_for_provider', { provider: provider.name })}
       heading={t('pages.connectionsPage.before_you_connect')}
       text={prerequisiteText}
       redirect={redirect}
+      link={link}
     />
   ) : null
+  const notOwnedHelp = (
+    <span className="text-[12px] text-muted" data-testid="crew-sign-in-not-owned">
+      <Trans
+        i18nKey="pages.connectionsPage.crew_sign_in_not_owned_help"
+        values={{ provider: provider.name }}
+        components={{ mcpLink: <Link to={MCP_SERVERS_HREF} className="underline hover:text-accent" /> }}
+      />
+    </span>
+  )
+  const crewSignInSetup = (
+    <>
+      <PrerequisiteTip
+        label={t('pages.connectionsPage.prerequisites_for_provider', { provider: provider.name })}
+        heading={t('pages.connectionsPage.before_you_connect')}
+        text={(
+          <Trans
+            i18nKey="pages.connectionsPage.needs_crew_sign_in_help"
+            values={{ provider: provider.name }}
+            components={{ settingsLink: <Link to={settingsPath({ tab: 'agent' })} className="underline hover:text-accent" /> }}
+          />
+        )}
+      />
+      <Link
+        to={settingsPath({ tab: 'developer', sub: 'feature-previews', highlight: CREW_SIGN_IN_SETTING_ID })}
+        className="inline-flex items-center gap-1.5 rounded-md bg-accent px-2.5 py-1.5 text-[12px] font-medium text-accent-fg hover:opacity-90"
+      >
+        <Settings2 className="w-3.5 h-3.5" aria-hidden="true" />
+        {t('pages.connectionsPage.open_crew_sign_in_setting')}
+      </Link>
+    </>
+  )
+  // What stands in for Connect and Reconnect while the mint refuses this card: a
+  // press would change the entry and then get 409 `crew_sign_in_required`.
+  const mintRefusedHelp = crewMintRefused === 'not_owned' ? notOwnedHelp
+    : crewMintRefused === 'sign_in_off' ? crewSignInSetup : null
   const runRelay = async () => {
     // Normalize a scheme-less mobile paste (#7406) and submit the normalized
     // form, mirroring the chat banner's relay affordance.
@@ -719,6 +898,14 @@ function ConnectionCard({
   // Google entry opens for the same states.
   const forcedOpen = state === 'waiting-for-approval' || state === 'needs-attention' || state === 'not-verified'
   const open = expand === undefined || expand.expanded || forcedOpen
+  // The name toggles only when toggling changes what the card shows. A forced
+  // open card cannot close, and a card with no OAuth app part already shows
+  // its whole action row closed while it is not connected or needs setup, so
+  // a chevron there would point at nothing.
+  // An entry Crew's sign-in does not own never uses the OAuth app, so its card has no app part.
+  const oauthPart = crewSignInNotOwned ? undefined : oauthPanel
+  const showsMoreOpen = oauthPart !== undefined || (state !== 'not-connected' && state !== 'needs-configuration')
+  const toggle = expand !== undefined && !forcedOpen && showsMoreOpen ? expand : undefined
   const reduceMotion = useReducedMotion()
   return (
     <motion.article
@@ -727,7 +914,7 @@ function ConnectionCard({
       id={`connection-${provider.slug}`}
       hidden={hidden}
       data-state={state}
-      className={`relative flex flex-col rounded-lg border bg-card p-3.5 shadow-sm transition-colors ${open && oauthPanel !== undefined ? 'xl:col-span-2 2xl:col-span-3 ' : ''}${
+      className={`relative flex flex-col rounded-lg border bg-card p-3.5 shadow-sm transition-colors ${open && oauthPart !== undefined ? 'xl:col-span-2 2xl:col-span-3 ' : ''}${
         highlighted ? 'border-accent ring-1 ring-accent/40' : state === 'needs-attention' ? 'border-danger/40' : 'border-border'
       }`}
     >
@@ -745,12 +932,12 @@ function ConnectionCard({
           )}
         </span>
         <h3 className="m-0 min-w-0 flex-1 truncate text-[14px] font-semibold text-text-strong">
-          {expand ? (
+          {toggle ? (
             <button
               type="button"
-              onClick={expand.onToggle}
+              onClick={toggle.onToggle}
               aria-expanded={open}
-              aria-controls={expand.panelId}
+              aria-controls={toggle.panelId}
               className="inline-flex max-w-full items-center gap-1 border-none bg-transparent p-0 text-left font-semibold text-text-strong hover:text-accent"
             >
               <span className="min-w-0 truncate">{provider.name}</span>
@@ -758,7 +945,7 @@ function ConnectionCard({
             </button>
           ) : provider.name}
         </h3>
-        <ConnectionStateBadge state={state} />
+        <ConnectionStateBadge state={state} managedInMcpServers={crewSignInNotOwned} />
       </header>
 
       {/* A two-line FLOOR with a three-line ceiling, not a fixed height. The
@@ -795,11 +982,13 @@ function ConnectionCard({
               {t('pages.connectionsPage.documentation')} <ExternalLink className="w-3 h-3" aria-hidden="true" />
             </a>
             <div className="flex items-center gap-2">
-              {prerequisiteTip}
-              <Btn primary onClick={() => void startMint(onConnect)} disabled={!!busy}>
-                {busy === 'connect' && <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />}
-                {busy === 'connect' ? t('pages.connectionsPage.connecting') : t('pages.connectionsPage.connect')}
-              </Btn>
+              {mintRefusedHelp ?? <>
+                {prerequisiteTip}
+                <Btn primary onClick={() => void startMint(onConnect)} disabled={!!busy}>
+                  {busy === 'connect' && <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />}
+                  {busy === 'connect' ? t('pages.connectionsPage.connecting') : t('pages.connectionsPage.connect')}
+                </Btn>
+              </>}
             </div>
           </div>
         )}
@@ -926,7 +1115,15 @@ function ConnectionCard({
               {/* Not on a Google product row: its OAuth app is the shared part
                   below the rows, and this tip names a Configure button the row
                   does not have. */}
-              {expand && !open && (
+              {/* An entry Crew's sign-in does not own gets none of the blocks
+                  below: the mint refuses it, and its sign-in is already on. One
+                  line says why there is no Connect and links to the entry. */}
+              {crewSignInNotOwned && notOwnedHelp}
+              {/* No Connect and no OAuth app step yet: this provider's client
+                  never leaves the vault, so the card can connect only once Crew
+                  does the sign-in. The link opens the switch that turns that on. */}
+              {needsCrewSignIn && !crewSignInNotOwned && crewSignInSetup}
+              {!needsCrewSignIn && !crewSignInNotOwned && expand && !open && (
                 <PrerequisiteTip
                   label={t('pages.connectionsPage.prerequisites_for_provider', { provider: provider.name })}
                   heading={t('pages.connectionsPage.before_you_connect')}
@@ -937,7 +1134,7 @@ function ConnectionCard({
                   which opens in place on this card. Only the owner can save it. */}
               {/* Shown only while closed: once open, the form below is the
                   next step and the name toggle closes the card. */}
-              {expand && !open && oauthPanel !== undefined && (
+              {!needsCrewSignIn && !crewSignInNotOwned && expand && !open && oauthPanel !== undefined && (
                 <Btn
                   primary
                   onClick={expand.onToggle}
@@ -971,11 +1168,13 @@ function ConnectionCard({
               </span>
             </div>
             <div className="flex items-center justify-end gap-2">
-              {prerequisiteTip}
-              <Btn primary onClick={() => void startMint(onReconnect)} disabled={!!busy}>
-                {busy === 'connect' ? <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" /> : <KeyRound className="w-3.5 h-3.5" aria-hidden="true" />}
-                {busy === 'connect' ? t('pages.connectionsPage.connecting') : t('pages.connectionsPage.connect')}
-              </Btn>
+              {mintRefusedHelp ?? <>
+                {prerequisiteTip}
+                <Btn primary onClick={() => void startMint(onReconnect)} disabled={!!busy}>
+                  {busy === 'connect' ? <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" /> : <KeyRound className="w-3.5 h-3.5" aria-hidden="true" />}
+                  {busy === 'connect' ? t('pages.connectionsPage.connecting') : t('pages.connectionsPage.connect')}
+                </Btn>
+              </>}
             </div>
           </div>
         )}
@@ -1086,15 +1285,17 @@ function ConnectionCard({
               askAgent={handOffAllowed}
             />
             <div className="flex items-center justify-end gap-2">
-              {prerequisiteTip}
               {/* Reconnect runs the mint, which moves the card to
                   waiting-for-approval and unmounts this button; the handoff
                   there lands focus on Cancel. It has no in-flight state of its
                   own to stay mounted for -- hence native `disabled`. */}
-              <Btn primary onClick={() => void startMint(onReconnect)} disabled={!!busy}>
-                {busy === 'connect' ? <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" /> : <RotateCw className="w-3.5 h-3.5" aria-hidden="true" />}
-                {busy === 'connect' ? t('pages.connectionsPage.reconnecting') : t('pages.connectionsPage.reconnect')}
-              </Btn>
+              {mintRefusedHelp ?? <>
+                {prerequisiteTip}
+                <Btn primary onClick={() => void startMint(onReconnect)} disabled={!!busy}>
+                  {busy === 'connect' ? <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" /> : <RotateCw className="w-3.5 h-3.5" aria-hidden="true" />}
+                  {busy === 'connect' ? t('pages.connectionsPage.reconnecting') : t('pages.connectionsPage.reconnect')}
+                </Btn>
+              </>}
             </div>
           </div>
         )}
@@ -1102,9 +1303,9 @@ function ConnectionCard({
 
       {/* Hidden, not unmounted, while closed: closing the card keeps a typed
           but unsaved Client ID and secret. */}
-      {oauthPanel !== undefined && (
+      {oauthPart !== undefined && (
         <div className="mt-3 border-t border-border pt-3" hidden={!open}>
-          {oauthPanel}
+          {oauthPart}
         </div>
       )}
 

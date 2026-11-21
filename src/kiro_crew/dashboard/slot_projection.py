@@ -7,6 +7,7 @@ from collections import deque
 from collections.abc import Callable, Sequence
 from typing import Any
 
+from kiro_crew.apps.hidden_sessions import listed_surface
 from kiro_crew.dashboard.agent_welcome import welcome_preview
 from kiro_crew.dashboard.slot_preparing import is_preparing, preparing_caption
 from kiro_crew.dashboard.slot_queue_repository import is_held_queue_entry
@@ -15,6 +16,8 @@ from kiro_crew.history_schema import transcript_sort_key
 from kiro_crew.safety_override import safety_override, yolo_policy_permits
 from kiro_crew.session_lifecycle import STOP_DECLINED_ESCALATION_SECS
 from kiro_crew.shared_crew.attribution import public_attribution_of_slot
+from kiro_crew.shared_crew.participants import dropped as participants_dropped
+from kiro_crew.shared_crew.participants import ordered as ordered_participants
 
 
 def _admission_queued(slot_key: str) -> bool:
@@ -106,6 +109,22 @@ def _history_key(slot: Any) -> str:
         return str(slot_history_key(slot) or "")
     except (AttributeError, TypeError):
         return ""
+
+
+def _running_turn_pin(slot: Any) -> tuple[str, bool] | None:
+    """The running turn's own project and whether it is a scratch fallback.
+
+    The pin carries the turn generation it was taken in, so one left by an
+    earlier turn is never read as the project of the turn running now. The flag
+    is true while the chat still stores the hidden scratch folder the turn fell
+    back from: then the directory differs from ``project`` with no pick made.
+    A pick made over that folder moves ``project``, so the flag drops and the
+    chip shows the pick as pending, also after a reload.
+    """
+    pin = getattr(slot, "_turn_project_pin", None)
+    if pin is None or not slot.turn_running or pin[0] != slot._turn_generation:
+        return None
+    return pin[1], bool(pin[2]) and slot.project == pin[2]
 
 
 def resolved_row_identity(slot: Any) -> str:
@@ -308,6 +327,7 @@ class SlotProjection:
         parse_cls_meta: Callable[[str], dict | None],
         is_turn_interrupted: Callable[[list[dict]], bool],
         is_interruption_stale: Callable[[list[dict], float], bool],
+        newest_error_is_sign_in: Callable[[list[dict]], bool],
         is_system_notice: Callable[[str, dict], bool],
         latest_transcript_ts: Callable[..., str | None],
         last_message_preview: Callable[[str], str],
@@ -347,6 +367,7 @@ class SlotProjection:
                 strip_options=strip_options,
                 is_system_notice=is_system_notice,
                 last_message_preview=last_message_preview,
+                retry_kind=_cu.TRANSIENT_RETRY_KIND,
             ),
         )
         last_ts = summary.last_ts
@@ -389,6 +410,7 @@ class SlotProjection:
         # dashboard turn would tell the open pane, which already saw that turn
         # end, that this running row is stale, and the pane would stay idle --
         # no Stop, and Resume offered on a reply still being written.
+        turn_pin = _running_turn_pin(slot)
         turn_identity: dict[str, object] = (
             {}
             if turn_in_flight and not slot.turn_running
@@ -421,6 +443,8 @@ class SlotProjection:
         # Still `interrupted` for the row and the composer; only the bulk Resume
         # leaves it out (the sidebar's count and `collect_interrupted_idle`).
         interrupted_stale = interrupted and is_interruption_stale(rows, time.time())
+        # The row then names the sign-in first, as the composer's hint does.
+        interrupted_by_sign_in = interrupted and newest_error_is_sign_in(rows)
 
         pending_approval_info: dict[str, str] | None = None
         if slot_pending:
@@ -503,7 +527,7 @@ class SlotProjection:
             "model": slot.model,
             "runtime_agent": getattr(slot, "runtime_agent", ""),
             # Whether this session's turns ask Jev which model tier to run on
-            # (the picker's "Auto (Jev)" entry). Shipped on every slot, not only
+            # (the picker's "Auto (decision model)" entry). Shipped on every slot, not only
             # the routed ones, so the picker branches on a field that is always
             # present: an absent key and "the owner picked a model by hand" would
             # otherwise be the same reading, and a stale client would show a
@@ -524,7 +548,8 @@ class SlotProjection:
             "served_model": slot.served_model,
             "reasoning_effort": slot.reasoning_effort,
             "mode": slot.mode,
-            "surface": slot.mode,
+            # An app's mode lists as plain while the app may not hide it.
+            "surface": listed_surface(slot.mode),
             "workspace": slot.workspace,
             "project": slot.project,
             # Relay-archive marker. Shipped on every slot so the frontend can
@@ -555,6 +580,11 @@ class SlotProjection:
                 slot.turn_running and getattr(slot, "_wake_starting_task", None) is slot.task
             ),
             **turn_identity,
+            # The directory the running turn's process works in, which a
+            # mid-reply pick does not move (``project`` follows the pick). Null
+            # when no dashboard turn runs or it has not claimed its session yet.
+            "turn_project": turn_pin[0] if turn_pin else None,
+            "turn_project_fallback": bool(turn_pin and turn_pin[1]),
             # An automatic compaction in flight on this session. Separate from
             # `running` because it is NOT a dashboard turn: the composer reads
             # idle while it holds the session, which without this field looks
@@ -584,10 +614,18 @@ class SlotProjection:
             "pending_approval_info": pending_approval_info,
             "last_activity_ts": last_activity_ts,
             "last_agent_ts": last_agent_ts,
+            # The newest row that badges this chat when no window saw it, by the live per-mode rule.
+            "unread_ts": (
+                (last_agent_ts if pending_approval or needs_input else summary.last_reply_ts)
+                if slot.mode == "member"
+                else summary.last_unread_ts
+            ),
+            "unread_failed": slot.mode != "member" and summary.unread_failed,
             "waiting_for_input": waiting_for_input,
             "needs_input": needs_input,
             "interrupted": interrupted,
             "interrupted_stale": interrupted_stale,
+            "interrupted_by_sign_in": interrupted_by_sign_in,
             "stop_state": slot._stop_state,
             "wait_state": slot._wait_state,
             "created": slot.created_at,
@@ -664,4 +702,13 @@ class SlotProjection:
             # Shared Crew creator (``shared_crew.attribution``), public shape:
             # no issuer or subject. Legacy and unstamped slots read as Unknown.
             "attribution": public_attribution_of_slot(slot),
+            # Shared Crew participants (``shared_crew.participants``): the people
+            # who have written here, creator first, then most recent. Display only.
+            "participants": ordered_participants(slot),
+            # How many the list's cap dropped; the row's "+N" counts them too.
+            "participants_dropped": participants_dropped(slot),
+            # A code-channel conductor's workers at a glance, for the sidebar row:
+            # ``{"state", "label", "counts"}`` (see ``board.model.work_aggregate``),
+            # or ``None`` for every other session. Counts and fixed words only.
+            "work_aggregate": getattr(slot, "_work_aggregate", None),
         }

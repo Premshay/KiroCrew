@@ -256,12 +256,12 @@ def _refuse_credential_shaped_name(name: str) -> None:
     would put it exactly where this check exists to keep it out of.
     """
     from kiro_crew.platform.context import redact_via_context
+    from kiro_crew.security import refuses
 
-    redacted = redact_via_context(name)
-    if redacted == name:
+    if not refuses(name, redact_via_context):
         return
     raise _refuse(
-        f"model.types.{redacted}",
+        f"model.types.{redact_via_context(name)}",
         "is shaped like a credential, so it is refused as a field NAME. Field "
         "names are served in the package's field list and written into the "
         "page's data island, where only values are redacted -- rename the field",
@@ -607,16 +607,15 @@ def _validate_model(raw: Any) -> dict[str, Any]:
     return {"types": fields}
 
 
+#: The attribute name a page binds a field with, as :data:`_HTML_BINDING_RE` reads it.
+_BINDING_RUN = "data-dashboard-field"
 #: A text binding in an agent-written page, in either quote an author may have typed.
 #:
 #: MIRRORS :data:`kiro_crew.dashboard_frame.BINDING_ATTRIBUTE`, pinned equal by test.
-#: Matched with a regex rather than parsed, because this check runs on the artifact
-#: write path and pulling in the html parser there would put it behind every caller of
-#: :mod:`kiro_crew.artifacts`. The cost is a page that MENTIONS the attribute in its own
-#: prose being read as binding it -- a refusal the author can act on, where the parse's
-#: own cost would be paid by every artifact write in the product.
-#: The attribute name a page binds a field with, as :data:`_HTML_BINDING_RE` reads it.
-_BINDING_RUN = "data-dashboard-field"
+#: A regex, not a parse: this runs on the artifact write path, and the html parser
+#: would then load for every caller of :mod:`kiro_crew.artifacts`. The cost is that
+#: a page which only MENTIONS the attribute in its prose is read as binding it, a
+#: refusal the author can act on.
 _HTML_BINDING_RE = re.compile(
     r"data-dashboard-field\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'>=`]+))"
 )
@@ -883,14 +882,15 @@ def theme_stylesheet(raw: Any) -> str:
 def validate_package(raw: Any) -> dict[str, Any]:
     """Return the CANONICAL form of a dashboard package, or raise saying why not.
 
-    Canonical means: the five top-level keys in a fixed order, model fields and
+    Canonical means: the five top-level keys in a fixed order (and ``widgets``
+    when the package has any, :mod:`.dashboard_widgets`), model fields and
     theme tokens in sorted key order, each field holding only the keys its catalog
     entry names, and the view as its one page. Two packages that mean the same thing therefore
     serialize to the same bytes, which is what makes
     :func:`layout_changed` able to answer by comparison.
     """
     package = _an_object(raw, "package")
-    _check_keys(package, "package", ("kind", "bound_to", "model", "view", "theme"))
+    _check_keys(package, "package", ("kind", "bound_to", "model", "view", "theme", "widgets"))
     kind = package.get("kind")
     if kind != DASHBOARD_KIND:
         raise _refuse("kind", f"must be {DASHBOARD_KIND!r}, got {kind!r}")
@@ -905,13 +905,21 @@ def validate_package(raw: Any) -> dict[str, Any]:
     # MCP client can drop ``{"tokens": {}}`` before it reaches the gateway.
     raw_theme = package.get("theme")
     theme = _validate_theme({"tokens": {}} if raw_theme is None else raw_theme)
-    return {
+    out: dict[str, Any] = {
         "kind": DASHBOARD_KIND,
         "bound_to": bound_to,
         "model": model,
         "view": view,
         "theme": theme,
     }
+    if "widgets" in package:
+        from kiro_crew.artifact_store.dashboard_widgets import validate_widgets
+
+        # An empty list stores no key, so it canonicalizes to the package without one.
+        widgets = validate_widgets(package["widgets"], model["types"])
+        if widgets:
+            out["widgets"] = widgets
+    return out
 
 
 #: How a field's source is spelled for a reader: the fold and the dotted path it walks,
@@ -975,11 +983,9 @@ def _decode_package(content: str) -> Any:
     """
     if not isinstance(content, str) or not content.strip():
         raise _refuse("package", "is empty: a dashboard artifact stores a JSON package")
-    # The submitted text is scanned before it is MEASURED, because measuring it
-    # encodes it. A surrogate reaches a package two ways and each is caught at
-    # the point it becomes a code point: written literally by a Python caller it
-    # is already one here, and written as the escape ``\\ud800`` it is six ASCII
-    # characters until the decoder below turns it into one.
+    # Scanned before it is measured, because measuring encodes it. A surrogate
+    # passed literally by a Python caller is a code point here already; the escape
+    # ``\\ud800`` only becomes one in the decoder, so the result is scanned again.
     _refuse_lone_surrogates(content)
     if len(content.encode("utf-8")) > MAX_PACKAGE_BYTES:
         raise _refuse(
@@ -992,20 +998,17 @@ def _decode_package(content: str) -> Any:
     except ValueError as exc:
         raise _refuse("package", f"is not valid JSON: {exc}") from None
     except RecursionError:
-        # The byte cap above bounds a package's SIZE, not its DEPTH, and the two
-        # come apart: a few thousand ``[`` are small enough to pass the cap and
-        # deep enough that the decoder runs out of stack. ``RecursionError``
-        # is a ``RuntimeError``, so the ``ValueError`` arm does not see it, and
-        # letting it escape turns a refusable package into a 500 at every caller
-        # that answers an ``ArtifactValidationError`` with a 400.
+        # The byte cap bounds SIZE, not DEPTH: a few thousand ``[`` pass the cap
+        # and still exhaust the decoder's stack. ``RecursionError`` is not a
+        # ``ValueError``, so without this arm a refusable package becomes a 500
+        # where callers answer ``ArtifactValidationError`` with a 400.
         raise _refuse(
             "package",
             "nests deeper than the JSON decoder can follow: a layout is a few "
             "levels of objects and arrays, so this is not one",
         ) from None
-    # Before any validator touches a string: a validator that measures a string
-    # in bytes, and the serializer that writes one, both encode, and an encode
-    # that meets an unpaired surrogate raises where nothing catches it.
+    # Before any validator runs: byte-measuring validators and the serializer
+    # both encode, and encoding an unpaired surrogate raises where nothing catches it.
     _refuse_lone_surrogates(raw)
     return raw
 
@@ -1063,17 +1066,21 @@ def canonical_package_content(content: str) -> str:
 
 
 def _layout_fingerprint(package: Mapping[str, Any]) -> str:
-    """sha256 over the canonical ``model`` + ``view`` + ``theme`` of a package.
+    """sha256 over the canonical ``model`` + ``view`` + ``theme`` (+ ``widgets``) of a package.
 
     ``bound_to`` is NOT in it, on purpose: a rebind moves the dashboard, it does
     not restyle it, and a version exists to let someone go back to a layout.
-    Values are not in it because they were never in the package.
+    Values are not in it because they were never in the package. ``widgets`` is
+    layout too, so a widgets-only edit is a new version; it is hashed only when
+    present, so a package without widgets keeps the fingerprint it always had.
     """
     layout = {
         "model": package.get("model"),
         "view": package.get("view"),
         "theme": package.get("theme"),
     }
+    if "widgets" in package:
+        layout["widgets"] = package["widgets"]
     blob = json.dumps(layout, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
@@ -1102,7 +1109,7 @@ def revert_package(stored_content: str, target_content: str) -> str:
     and a version from before a rebind carries the OLD binding, so a plain
     content restore would quietly hand this crewmate's page to whoever that
     stale binding names. The live binding therefore wins, and only
-    ``model`` / ``view`` / ``theme`` come back from the target.
+    ``model`` / ``view`` / ``theme`` / ``widgets`` come back from the target.
 
     Unparseable live content (nothing valid stored yet) falls back to the
     target's own binding: there is no live binding to preserve.

@@ -24,6 +24,8 @@ import ConversationCard, { readCardRef } from './ConversationCard'
 import { answerWindow } from './ChangeCard'
 import type { ChatMessage } from '../types'
 import { CardAuthorContext, cardProposer } from './cardAuthor'
+import { mergeRenderers, resolveRenderer } from '../app-sdk/messageRenderers'
+import { createTranscriptRenderers } from '../pages/chat/transcriptRenderers'
 
 const L = (k: string, v?: Record<string, unknown>) => i18nT(`components.changeCards.${k}`, v)
 const SLOT = 'slot-A'
@@ -279,7 +281,7 @@ describe('shared change card layout', () => {
   })
 
   it("labels the reason with the crewmate that proposed the card, read from the card's slot", async () => {
-    server.use(http.get('*/api/members', () => HttpResponse.json({ members: [
+    server.use(http.get('*/v1/crew/owner/bots', () => HttpResponse.json({ members: [
       { name: 'scout-agent', slug: 'scout', slot_key: SLOT, running: false, display_name: 'Scout' },
       { name: 'pebble', slug: 'pebble', slot_key: 'slot-other', running: false },
     ] })))
@@ -293,7 +295,7 @@ describe('shared change card layout', () => {
   it('keeps a typed secret when the proposer resolves after the card is drawn', async () => {
     let release!: () => void
     const gate = new Promise<void>(r => { release = r })
-    server.use(http.get('*/api/members', async () => {
+    server.use(http.get('*/v1/crew/owner/bots', async () => {
       await gate
       return HttpResponse.json({ members: [{ name: 'scout', slug: 'scout', slot_key: SLOT, running: false, display_name: 'Scout' }] })
     }))
@@ -320,7 +322,7 @@ describe('shared change card layout', () => {
   })
 
   it('says so beside the card when the crewmate list cannot be read, and keeps the card', async () => {
-    server.use(http.get('*/api/members', () => HttpResponse.json({ error: 'roster down' }, { status: 500 })))
+    server.use(http.get('*/v1/crew/owner/bots', () => HttpResponse.json({ error: 'roster down' }, { status: 500 })))
     pending = [card({ reason: 'You asked for shorter replies.' })]
     renderCards()
     expect(await screen.findByTestId('change-card-roster-error', {}, ROSTER_CHAIN)).toBeInTheDocument()
@@ -329,7 +331,7 @@ describe('shared change card layout', () => {
   })
 
   it('keeps the product name for a card the main assistant proposed, and while the roster is unknown', async () => {
-    server.use(http.get('*/api/members', () => HttpResponse.json({ members: [
+    server.use(http.get('*/v1/crew/owner/bots', () => HttpResponse.json({ members: [
       { name: 'scout', slug: 'scout', slot_key: 'member-scout', running: false, display_name: 'Scout' },
     ] })))
     pending = [card({ reason: 'You asked for shorter replies.' })]
@@ -922,6 +924,38 @@ describe('one-shot schedule', () => {
 })
 
 describe('a card in the conversation', () => {
+  it('draws a card a repeated proposal showed again live only at its newest row', async () => {
+    pending = [card()]
+    const first = row(card())
+    const again = { ...first, meta: { ...first.meta, mid: 'm-c1-again' } }
+    const rows = [first, again]
+    const entries = mergeRenderers(createTranscriptRenderers({ slot: SLOT }))
+    qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <Provider store={reduxStore}>
+        <QueryClientProvider client={qc}>
+          <MemoryRouter>
+            {rows.map((m, index) => (
+              <div key={String(m.meta?.mid)}>
+                {resolveRenderer(m, entries)?.render(m, {
+                  index, messages: rows, running: false, key: `k${index}`, hideCardOwnedOAuth: false,
+                  autoDeniedIds: new Set<string>(), wrapper: c => c, row: c => c,
+                })}
+              </div>
+            ))}
+          </MemoryRouter>
+        </QueryClientProvider>
+      </Provider>,
+    )
+    const [earlier, newest] = screen.getAllByTestId('conversation-card')
+    expect(await within(newest).findByTestId('change-card-apply')).toBeTruthy()
+    const line = within(earlier).getByTestId('change-card-record')
+    expect(line.getAttribute('data-card-status')).toBe('moved')
+    expect(line.textContent).toBe('Shown again below: Shorter replies')
+    expect(within(earlier).queryByRole('button')).toBeNull()
+    expect(screen.getAllByTestId('change-card-apply')).toHaveLength(1)
+  })
+
   it('turns into its result line IN PLACE when the gateway reports it applied', async () => {
     pending = [card()]
     renderCards()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from types import SimpleNamespace
 from typing import cast
@@ -41,8 +42,9 @@ def _mock_state(slot: _ChatSlot | None = None, provider: object = None) -> Dashb
     state.sessions.get_provider = MagicMock(return_value=provider)
     if isinstance(provider, MagicMock):
         # A spec double answers every method with a mock; these sessions advertise
-        # no ultracode switch.
+        # no ultracode or Fast mode switch.
         provider.ultracode_enabled.return_value = None
+        provider.fast_mode_enabled.return_value = None
     return state
 
 
@@ -493,8 +495,7 @@ class TestChatSlotReasoningEffort:
     async def test_failed_reset_spares_concurrent_writes(self):
         # Commit-after-reset: the failure path touches nothing, so a value
         # written by a concurrent actor while the reset was failing survives
-        # -- restoring captured priors (the old rollback shape) would
-        # silently erase it.
+        # -- restoring captured priors instead would silently erase it.
         slot = _ChatSlot("test")
         slot.reasoning_effort = "high"
         state = _mock_state(slot)
@@ -883,7 +884,7 @@ class TestChatSlotReasoningEffortLiveProvider:
             state.sessions.record_effort_override.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_a_relaunch_refusal_keeps_the_old_level_and_does_not_reset(self):
+    async def test_a_relaunch_refusal_keeps_the_old_level_and_does_not_reset(self, caplog):
         """A relaunching harness put the prior level back; saving the refused one would
         cold-start on it and fail the same way on every later message."""
         from kiro_crew.providers.acp import AcpProvider
@@ -892,17 +893,26 @@ class TestChatSlotReasoningEffortLiveProvider:
         provider.supports_effort = MagicMock(return_value=True)
         provider.has_active_turn = MagicMock(return_value=False)
         provider.switches_by_relaunch = True
-        provider.change_effort = AsyncMock(side_effect=RuntimeError("cannot run that effort"))
+        provider.change_effort = AsyncMock(
+            side_effect=RuntimeError("cannot run that effort: /home/u/private internal.example.net")
+        )
         slot = _ChatSlot("test")
         slot.reasoning_effort = "low"
         state = _mock_state(slot, provider=provider)
-        async with TestClient(TestServer(_make_app(state))) as client:
-            resp = await client.post(
-                "/api/chat/slots/test/reasoning-effort",
-                json={"reasoning_effort": "high"},
-            )
-            assert resp.status == 400
-            assert (await resp.json())["code"] == "effort_refused"
+        with caplog.at_level(logging.WARNING):
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.post(
+                    "/api/chat/slots/test/reasoning-effort",
+                    json={"reasoning_effort": "high"},
+                )
+                assert resp.status == 400
+                # A fixed sentence: the exception text stays out of the body.
+                assert await resp.json() == {
+                    "error": "The agent did not accept the reasoning effort change.",
+                    "code": "effort_refused",
+                }
+        # The owner's log keeps the detail.
+        assert "/home/u/private" in caplog.text
         assert slot.reasoning_effort == "low"
         state.sessions.reset.assert_not_called()
 

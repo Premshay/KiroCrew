@@ -22,6 +22,8 @@ import {
 vi.mock('../../api/client', () => ({
   api: {
     members: vi.fn(),
+    // The owner check behind Import from file (`useViewerIsNotOwner`): the owner.
+    viewerOwnerOk: vi.fn(() => Promise.resolve(true)),
     // The roster's team grouping reads the team list; "no teams" keeps the
     // list flat, which is the shape every case here was written against.
     teams: { list: vi.fn(() => Promise.resolve({ teams: [] })), create: vi.fn(), update: vi.fn(), remove: vi.fn() },
@@ -1013,7 +1015,7 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
         Object.defineProperty(ev, 'source', { value: win })
         window.dispatchEvent(ev)
       })
-      expect(said.at(-1)).toEqual({ type: 'mc-frame-wheel-armed', on: true })
+      expect(said.at(-1)).toEqual({ type: 'mc-frame-wheel-armed', on: true, natural: null })
       // Below the desktop width the swipe stops listening: the frame is disarmed,
       // so it no longer cancels the browser's own swipe over it.
       const real = window.matchMedia
@@ -1026,7 +1028,7 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
         })) as typeof window.matchMedia
         window.dispatchEvent(new Event('resize'))
       })
-      await waitFor(() => expect(said.at(-1)).toEqual({ type: 'mc-frame-wheel-armed', on: false }))
+      await waitFor(() => expect(said.at(-1)).toEqual({ type: 'mc-frame-wheel-armed', on: false, natural: null }))
       expect(heard).toEqual([])
     })
 

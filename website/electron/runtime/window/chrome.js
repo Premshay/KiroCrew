@@ -104,7 +104,9 @@ function createWindowChrome({
         return;
       }
       nativeTheme.themeSource = resolveThemeSource(pref, mode);
-      if (mode === "dark" || mode === "light") updateWindowsTitleBarOverlay(win, mode);
+      // data-mode can be a Remote Crew's lent mode; the caption buttons keep the
+      // person's own, which themeSource now holds (#40254).
+      if (mode === "dark" || mode === "light") updateWindowsTitleBarOverlay(win);
     }).catch(() => {});
   }
 
@@ -211,7 +213,11 @@ function createWindowChrome({
     focusCursorWatch.watch(win, watching);
   }
 
-  function setThemeMode(pref) {
+  function setThemeMode(pref, sender) {
+    // themeSource is process-wide and a focused dashboard window re-syncs it on
+    // focus, so a background window's push must not re-pin the focused one.
+    const focused = BaseWindow.getFocusedWindow();
+    if (focused && focused._mcView && focused !== windowForWebContents(sender)) return;
     if (pref === "system" || pref === "dark" || pref === "light") {
       nativeTheme.themeSource = resolveThemeSource(pref, "");
     }

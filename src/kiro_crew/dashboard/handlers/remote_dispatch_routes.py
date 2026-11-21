@@ -78,9 +78,14 @@ logger = logging.getLogger(__name__)
 CREW_VERBS = ("create", "send", "read", "stop", "close")
 
 #: The create fields a crew create carries. Anything else a local create takes
-#: (folder, agent_kind, reasoning_effort, autocompact_pct, dry_run) names a
-#: local-only behaviour and is refused rather than dropped.
-_CREATE_FIELDS = frozenset({"crew", "title", "agent", "model", "work_item"})
+#: (folder, reasoning_effort, autocompact_pct, dry_run) names a local-only
+#: behaviour and is refused rather than dropped. ``agent_kind`` crosses with its
+#: one local value, ``template``, so a ``kirocrew-worker`` lands on the peer's
+#: shared template even where a crew member carries that name. ``requires`` is
+#: read on this hub only (``remote_placement``) and never sent to the peer.
+_CREATE_FIELDS = frozenset(
+    {"crew", "title", "agent", "agent_kind", "model", "work_item", "requires"}
+)
 
 #: A peer slot key this hub will put in a path: one plain segment. A peer is
 #: untrusted, and its create reply names the key every later path is built from,
@@ -212,9 +217,9 @@ async def authorize_remote_dispatch(request: web.Request, verb: str) -> str:
     3. The slot was not opened on another caller's behalf (``_created_by`` or
        ``_lineage_minted``): a worker cannot reach a crew, so dispatch stays one
        level deep, and is not a crew member's own thread (``owner_only``).
-    4. The session is persistent (``ephemeral_caller``) and is an Ultra Mode chat
-       (``crew_mode.slot_is_crew_mode_root``, the Ultra Mode agent lock's own
-       predicate; ``ultra_mode_only``).
+    4. The session is persistent (``ephemeral_caller``) and is a conductor mode chat
+       (``crew_mode.slot_is_crew_mode_root``, the conductor mode agent lock's own
+       predicate; ``conductor_mode_only``).
     5. The session is not bound to a private member memory store
        (``private_memory``).
     6. A ``user`` claim, when present, is the owner.
@@ -270,10 +275,10 @@ async def authorize_remote_dispatch(request: web.Request, verb: str) -> str:
     from kiro_crew import crew_mode
 
     if not crew_mode.slot_is_crew_mode_root(slot):
-        # The predicate the Ultra Mode agent lock uses (``crew_mode_locked``).
-        _audit(caller_key, verb, "denied", error=ULTRA_MODE_ONLY)
+        # The predicate the conductor mode agent lock uses (``crew_mode_locked``).
+        _audit(caller_key, verb, "denied", error=CONDUCTOR_MODE_ONLY)
         raise CrewCallError(
-            403, ULTRA_MODE_ONLY, "remote dispatch runs only from an Ultra Mode chat"
+            403, CONDUCTOR_MODE_ONLY, "remote dispatch runs only from a conductor mode chat"
         )
     try:
         fenced = await asyncio.to_thread(private_memory_store_for_session, caller_key)
@@ -311,8 +316,8 @@ async def authorize_remote_dispatch(request: web.Request, verb: str) -> str:
     return slot_key
 
 
-#: The refusal for a caller tab that is not an Ultra Mode chat.
-ULTRA_MODE_ONLY = "ultra_mode_only"
+#: The refusal for a caller tab that is not a conductor mode chat.
+CONDUCTOR_MODE_ONLY = "conductor_mode_only"
 
 #: The refusal while a non-owner dashboard user is possible on this gateway.
 OWNER_UNVERIFIABLE = "crew_owner_unverifiable"
@@ -638,6 +643,18 @@ async def _create(
             raise CrewCallError(
                 400, "crew_field_invalid", f"{name} carries text that cannot leave this machine"
             )
+    # The local create's rule, checked before any peer call: one value, and only
+    # beside an explicit agent (an omitted agent is the peer's default, which a
+    # kind cannot qualify).
+    agent_kind = body.get("agent_kind", "")
+    if agent_kind not in ("", "template"):
+        raise CrewCallError(400, "invalid_agent_kind", 'agent_kind must be "template"')
+    if agent_kind and not fields["agent"]:
+        raise CrewCallError(
+            400,
+            "agent_kind_requires_agent",
+            "agent_kind qualifies an explicit agent; name the agent too",
+        )
     # The cap check and the record each take the cap lock, which a retire holds
     # from evict to restore: the cap never reads a record a retire is settling.
     # The peer call between them is not held, so creates still run side by side.
@@ -658,6 +675,8 @@ async def _create(
     create: dict[str, Any] = {"memory_mode": memory_mode}
     if fields["agent"]:
         create["agent"] = fields["agent"]
+    if agent_kind:
+        create["agent_kind"] = agent_kind
     if fields["model"]:
         create["model"] = fields["model"]
     work_item_id = ""
@@ -705,6 +724,11 @@ async def _create(
             # The latest decision did not reach the new worker; it holds the one
             # the create carried until the next decide.
             result["decision_error"] = payload["decision_error"]
+        # The bind's default-patrol outcome: that patrol's tick is what pulls this
+        # worker's reports, so the reply says whether one runs (RFC §2).
+        for name in ("patrol", "patrol_reason", "patrol_note"):
+            if isinstance(payload, dict) and isinstance(payload.get(name), str):
+                result[name] = payload[name]
     if fields["title"]:
         # The session exists from here on: a failed rename is reported beside its
         # key, never as a refusal that would hide a session the caller must close.
@@ -752,42 +776,123 @@ async def _send(mgr: Any, instance_id: str, slot: str, body: dict[str, Any]) -> 
     return {"target": slot, "crew": instance_id, "delivered": True, "steered": steered}
 
 
-async def _read(mgr: Any, instance_id: str, slot: str, limit: int) -> dict[str, Any]:
+def _int_field(payload: dict[str, Any], name: str) -> int | None:
+    value = payload.get(name)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+async def _read(
+    mgr: Any, instance_id: str, slot: str, limit: int, since: int | None = None
+) -> dict[str, Any]:
+    """Read a crew session's tail, or its rows from *since* on.
+
+    Positions are the peer's own: ``GET api/chat/slots/{s}?limit=L`` answers the
+    rows ``[next_before, total)`` of its collapsed wire rows, so row ``i`` of the
+    page sits at ``next_before + i``. The peer's ``from``/``since``/``digest``
+    cursor (``slot_detail_delta``) is not used: it needs a digest only the peer
+    can compute, and it always re-sends the page's last row. ``since=N`` is a
+    plain older-page read instead, ``before=N+L&limit=L``, which answers the rows
+    ``[N, N+L)`` (fewer at the end), so a since read is one peer GET like a tail
+    read. ``next_since`` stops before the first in-flight row (a streaming fold, a
+    pending approval): those rows are replaced when they land, and a cursor past
+    them would skip the finished reply, as the local read's cursor does.
+    """
+    from kiro_crew.dashboard.chat_persistence import _TRANSIENT_ROLES
+
+    params = {"limit": str(limit)}
+    if since is not None:
+        params["before"] = str(since + limit)
     status, payload = await peer_call(
-        mgr,
-        instance_id,
-        "GET",
-        f"api/chat/slots/{quote(slot, safe='')}",
-        params={"limit": str(limit)},
+        mgr, instance_id, "GET", f"api/chat/slots/{quote(slot, safe='')}", params=params
     )
     if not 200 <= status < 300:
         raise _peer_error(status, payload, "could not read the crew session")
     if not isinstance(payload, dict):
         raise CrewCallError(502, "crew_reply_malformed", "the crew's read reply is not an object")
     rows = payload.get("messages")
-    messages = []
-    for row in rows if isinstance(rows, list) else []:
+    rows = rows if isinstance(rows, list) else []
+    first, total = _int_field(payload, "next_before"), _int_field(payload, "total")
+    span = (first, total) if first is not None and total is not None and first <= total else None
+    if since is not None:
+        if span is None:
+            raise CrewCallError(
+                502, "crew_reply_malformed", "the crew's read reply carries no row positions"
+            )
+        first, total = span
+        if since > total:
+            # Same refusal as the local read: a rewind or regenerate shrank the
+            # transcript, so the held position points past its end.
+            raise CrewCallError(
+                409,
+                "cursor_unavailable",
+                "that crew session is shorter than your cursor (it was rewound or "
+                "regenerated); read without since to get the latest messages",
+            )
+        if first > since:
+            # shortcut: the crew cut its page by bytes (oldest rows first), so
+            # [since, first) did not fit; a smaller limit reaches them, and
+            # limit=1 always does (the newest row of a page is always sent).
+            raise CrewCallError(
+                409,
+                "crew_page_cut",
+                "the messages at your cursor are too large for one page; "
+                "read again with a smaller limit",
+            )
+    messages: list[dict[str, Any]] = []
+    cursor: int | None = None
+    for offset, row in enumerate(rows):
         if not isinstance(row, dict):
             continue
         role = row.get("role")
+        role = role if isinstance(role, str) else ""
+        index = span[0] + offset if span is not None else None
+        if index is not None and since is not None and index < since:
+            continue
+        if role in _TRANSIENT_ROLES and cursor is None:
+            cursor = index
+        if since is not None and cursor is not None:
+            # A since read stops at the in-flight row: the next read starts there.
+            break
         content = row.get("content")
         if isinstance(content, list):
             content = "\n".join(
                 str(b.get("text", "")) for b in content if isinstance(b, dict) and b.get("text")
             )
-        messages.append(
-            {
-                "role": role if isinstance(role, str) else "",
-                "content": content if isinstance(content, str) else "",
-            }
-        )
-    return {
+        out: dict[str, Any] = {"role": role, "content": content if isinstance(content, str) else ""}
+        if index is not None:
+            out["index"] = index
+        messages.append(out)
+    if since is None:
+        messages = messages[-limit:]
+    result: dict[str, Any] = {
         "target": slot,
         "crew": instance_id,
         "title": payload.get("title") if isinstance(payload.get("title"), str) else "",
         "running": payload.get("running") is True,
-        "messages": messages[-limit:],
+        "messages": messages,
     }
+    if span is not None:
+        first, total = span
+        # A peer row that renders as nothing (an empty streaming fold) holds a
+        # position but is not sent, so the page is short of its span; positions
+        # after it then read low, which re-sends a row rather than skipping one.
+        end = first + len(rows) if since is None else min(since + limit, total, first + len(rows))
+        result["total"] = total
+        if cursor is not None:
+            result["streaming"] = True
+        if since is None and result["running"]:
+            # A tail read of a running session issues no cursor. An in-flight
+            # row can sit BEFORE the page: a segment cut deferred for an open
+            # construct keeps the chunk run in place while tool rows land after
+            # it, and the later cut deletes that run, so every row after it
+            # moves down one. No position this page sees is safe to resume
+            # from, so the caller reads the tail again. A since read can resume:
+            # its rows from since on are all on its page, and since itself came
+            # from an idle read or an earlier since read, so no in-flight row
+            # sits below it.
+            return result
+        result["next_since"] = cursor if cursor is not None else max(end, since or 0)
+    return result
 
 
 async def _stop(mgr: Any, instance_id: str, slot: str) -> dict[str, Any]:
@@ -840,6 +945,18 @@ async def _close(
     return {"target": slot, "crew": instance_id, "closed": True}
 
 
+def _read_since(raw: object) -> int | None:
+    if raw in (None, ""):
+        return None
+    try:
+        since = int(str(raw))
+    except ValueError:
+        raise CrewCallError(400, "invalid_pagination", "since must be an integer") from None
+    if since < 0:
+        raise CrewCallError(400, "invalid_since", "since must be >= 0")
+    return since
+
+
 def _read_limit(raw: object) -> int:
     if raw in (None, ""):
         return 20
@@ -878,7 +995,7 @@ async def handle_crew_call(request: web.Request, verb: str, body: dict[str, Any]
         )
     state: DashboardState = request.app["state"]
     crew_ref = clean_crew_ref(body.get("crew"))
-    slot, limit, name = "", 20, ""
+    slot, limit, since, name = "", 20, None, ""
     try:
         caller = await authorize_remote_dispatch(request, verb)
         if verb == "create" and not has_crew(body):
@@ -895,18 +1012,17 @@ async def handle_crew_call(request: web.Request, verb: str, body: dict[str, Any]
         mgr = _manager(state)
         if verb == "read":
             limit = _read_limit(body.get("limit"))
-            if body.get("since") not in (None, ""):
-                raise CrewCallError(
-                    400,
-                    "crew_field_unsupported",
-                    "session_read_message with crew= does not take since",
-                )
+            since = _read_since(body.get("since"))
         board = session_ledger.ledger_key(declared)
         if verb != "create":
             slot = await _fenced_target_or_item(
                 state, caller, board, instance_id, body.get("target"), verb
             )
         await check_version(mgr, instance_id)
+        if verb == "create" and body.get("requires") is not None:
+            from kiro_crew.dashboard.handlers import remote_placement
+
+            await remote_placement.check_crew_requires(mgr, instance_id, name, body["requires"])
         if verb == "create" and body.get("work_item") is not None:
             # Counted in flight so a placement running meanwhile sees it (wave 5).
             from kiro_crew.dashboard.handlers import remote_placement
@@ -918,7 +1034,7 @@ async def handle_crew_call(request: web.Request, verb: str, body: dict[str, Any]
         elif verb == "send":
             result = await _send(mgr, instance_id, slot, body)
         elif verb == "read":
-            result = await _read(mgr, instance_id, slot, limit)
+            result = await _read(mgr, instance_id, slot, limit, since)
         elif verb == "stop":
             result = await _stop(mgr, instance_id, slot)
         elif verb == "close":

@@ -13,6 +13,7 @@ and board rows, and binds ``_session_tools`` so it reads and patches as
 from __future__ import annotations
 
 from kiro_crew.config.sections import AUTOCOMPACT_PCT_MAX, AUTOCOMPACT_PCT_MIN
+from kiro_crew.mcp_crew_list import crew_list_tool
 from kiro_crew.mcp_dashboard_session_runs import (
     _run_session_adopt,
     _run_session_broadcast,
@@ -31,6 +32,7 @@ from kiro_crew.mcp_dashboard_session_runs import (
     _run_session_rename,
     _run_session_retry,
     _run_session_revive,
+    _run_session_run_queued,
     _run_session_send,
     _run_session_set_color,
     _run_session_set_model,
@@ -388,7 +390,7 @@ def _session_tools() -> tuple[Tool, ...]:
                 "check runs again; if the target has become channel-linked or otherwise "
                 "out of reach by then, the change is dropped. A model or effort the "
                 "user picks in the meantime wins. The conversation is kept. 'auto', "
-                "'Auto (Jev)' and sessions bound to a remote crew are refused."
+                "'Auto (decision model)' and sessions bound to a remote crew are refused."
             ),
             schema={
                 "type": "object",
@@ -909,9 +911,12 @@ def _session_tools() -> tuple[Tool, ...]:
             name="session_status",
             description=(
                 "List the sessions YOU stood up and what each one is doing right "
-                "now — the roster a conductor patrols. Each row is `working` (a "
-                "turn is in flight, wait), `queued` (idle with messages that will run "
-                "on their own), "
+                "now — the roster a conductor patrols. Each live row's `activity` "
+                "names its turn, turn admission, running or queued sub-agents, workflow, "
+                "synthesis, "
+                "preparation, compaction or automation. Its status is `working` "
+                "when current execution is active, `queued` when an idle session "
+                "has messages or sub-agents that will start on their own, "
                 "`idle` (open and doing nothing — this is the one that needs a "
                 "decision), `closed` (the crew log recorded a DELIBERATE tab close "
                 "and the dashboard no longer holds it: a worker that FINISHED and "
@@ -1174,5 +1179,41 @@ def _session_tools() -> tuple[Tool, ...]:
             run=_run_session_queue,
             identity="strict",
             routes=("POST /api/session-control/queue",),
+        ),
+        crew_list_tool(),
+        Tool(
+            name="session_run_queued",
+            description=(
+                "Run one of YOUR queued messages on a session you manage now, instead of "
+                "after the turn in front of it: the queue card's Run now button. On a "
+                "RUNNING target this STOPS the current turn, like session_stop: the turn's "
+                "work is discarded, your message runs next (ahead of the rest of the queue, "
+                "and even while the target's sub-agents are still out), and the rest of the "
+                "queue is kept. On an IDLE target (one held by attached sub-agents) your "
+                "message starts at once and nothing is stopped. `queue_id` is required: take "
+                "it from session_queue's listing. Only an entry you queued with session_send "
+                "qualifies; a person's queued message, or another session's, is refused. An "
+                "idle target where a person is editing a queued message or a conversation "
+                "reset is pending refuses it (queue_held); try again shortly. A "
+                "stop card appears in the target's transcript. Safe to re-send: a repeat "
+                "while the stop is still pending changes nothing and never hard-kills."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Session key from list_sessions, or its exact title.",
+                    },
+                    "queue_id": {
+                        "type": "string",
+                        "description": "Queue entry id from session_queue's listing.",
+                    },
+                },
+                "required": ["target", "queue_id"],
+            },
+            run=_run_session_run_queued,
+            identity="strict",
+            routes=("POST /api/session-control/run-queued",),
         ),
     )

@@ -4,12 +4,14 @@ import asyncio
 import json
 import os
 import sys
+from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from test_member_essential_context import env as _essential_env
 
+from kiro_crew import prompt_trace
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
@@ -25,7 +27,11 @@ from kiro_crew.acp.types import (
     AcpEvent,
 )
 from kiro_crew.config.loader import KiroCrewConfig
-from kiro_crew.member_essential_context import MemberEssentialContextError, documents_for_member
+from kiro_crew.member_essential_context import (
+    ESSENTIAL_MAX_CHARS,
+    MemberEssentialContextError,
+    documents_for_member,
+)
 from kiro_crew.members import (
     member_briefing_path,
     member_briefing_supported,
@@ -225,6 +231,27 @@ async def test_actual_wire_fresh_and_twenty_unchanged_warm_turns(env):
     sizes = [len(m.encode("utf-8")) for m in messages]
     print(f"WIRE_BYTES fresh={sizes[0]} warm={sizes[1:]} total={sum(sizes)} envelopes=1")
     env.forbidden.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_prompt_as_sent_is_the_text_the_wire_received(env, monkeypatch):
+    """The Context tab's record is the receipt-swapped text, never the assembled one."""
+    monkeypatch.setattr(prompt_trace, "_sessions", OrderedDict())
+    monkeypatch.setattr(prompt_trace, "_total", 0)
+    target = provider(env.project)
+    await send(target, build(env, target, fresh=True))
+    warm = build(env, target)
+    prompt_trace.expect(target, warm, "unit", 2)
+    await send(target, warm)
+    assert HEADER in warm
+    assert prompt_trace.read("unit", 2) == target.client.messages[-1]
+    assert HEADER not in target.client.messages[-1]
+    # Another stream drops the report, so a later send is never filed as turn 3.
+    later = build(env, target)
+    prompt_trace.expect(target, later, "unit", 3)
+    await send(target, "/context")
+    await send(target, later)
+    assert prompt_trace.read("unit", 3) is None
 
 
 @pytest.mark.asyncio
@@ -553,7 +580,7 @@ async def test_budget_and_source_tails_remain_complete_before_wire_dedup(env):
     await send(target, build(env, target, model_window=32_000))
     assert body in target.client.messages[0]
     assert HEADER not in target.client.messages[1]
-    path.write_text("x" * 64_001, encoding="utf-8")
+    path.write_text("x" * (ESSENTIAL_MAX_CHARS + 1), encoding="utf-8")
     # The budget is still checked on the complete envelope before wire dedup;
     # an over-budget guide now drops out whole and is named, instead of
     # refusing the turn, and the changed snapshot is delivered again.
@@ -561,7 +588,7 @@ async def test_budget_and_source_tails_remain_complete_before_wire_dedup(env):
     assert len(target.client.messages) == 3
     assert "x" * 1_000 not in target.client.messages[2]
     assert "[Essential source: essential-context#omitted]" in target.client.messages[2]
-    assert f"{path} (64,001 characters)" in target.client.messages[2]
+    assert f"{path} ({ESSENTIAL_MAX_CHARS + 1:,} characters)" in target.client.messages[2]
 
 
 @pytest.mark.asyncio
@@ -1170,3 +1197,50 @@ def test_subagent_template_dir_admits_no_absolute_declared_resource(env, tmp_pat
     _absolute_sources_template(env, resources=[f"file://{resource}"])
     with pytest.raises(MemberEssentialContextError, match="resource.md"):
         _subagent_build(env, tmp_path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("founder,joiner", [(False, True), (True, False)])
+async def test_the_member_projection_follows_the_session_not_the_process(
+    env, monkeypatch, founder, joiner
+):
+    """On a shared KAS runtime the process's member flag is its founder's, so each
+    session states its own: a Bot session on it gets its member resource documents
+    and a plain session on it gets none, whichever session founded the process."""
+    from kiro_crew.acp.runtime import AcpRuntime
+    from kiro_crew.acp.types import METHOD_SESSION_NEW
+    from kiro_crew.config.paths import kiro_agents_dir
+
+    path = env.project / ".kiro/agents/writer-template.json"
+    agents = kiro_agents_dir()
+    agents.mkdir(parents=True, exist_ok=True)
+    (agents / path.name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    rt = AcpRuntime(
+        work_dir=env.project,
+        agent="writer-template",
+        acp_backend=ACP_BACKEND_KAS,
+        member_context=founder,
+    )
+    rt._initialized = True
+    rt._expect_mcp_reports = False
+
+    async def transport(method, params, timeout=None):
+        if method == METHOD_SESSION_NEW:
+            return {
+                "sessionId": "member-flag-proof",
+                "modes": {
+                    "currentModeId": "writer-template",
+                    "availableModes": [{"id": "writer-template", "name": "Writer"}],
+                },
+            }
+        return {}
+
+    monkeypatch.setattr(rt, "_send_and_await", transport)
+    handle = await rt.create_session(
+        cwd=env.project, agent="writer-template", mcp_servers=[], member_context=joiner
+    )
+    try:
+        projected = "\n".join(handle.native_context_documents.values())
+        assert ("Declared guide: examples must be reproducible." in projected) is joiner
+    finally:
+        rt._session_queues.clear()

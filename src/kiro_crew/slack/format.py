@@ -11,6 +11,7 @@ from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any, Callable, NamedTuple, Sequence
 
+from kiro_crew import redaction_seams
 from kiro_crew.constants import OPTIONS_RE_LINE, relocate_glued_tail_marker
 from kiro_crew.messaging.display_safety import (
     DISPLAY_SETTLING_PASSES,
@@ -22,8 +23,10 @@ from kiro_crew.messaging.display_safety import (
     slack_mrkdwn_reading,
     strip_ansi,
 )
+from kiro_crew.messaging.graphemes import joins_previous
 from kiro_crew.messaging.markup import flatten_mermaid_body
 from kiro_crew.messaging.renderer import MIRROR_ECHO_LABEL, cap_choices, format_overflow
+from kiro_crew.messaging.split import rebalance_fenced_cuts
 from kiro_crew.messaging.tables import _MAX_INDENT as _TABLE_MAX_INDENT
 from kiro_crew.messaging.tables import _cells as _table_cells
 from kiro_crew.messaging.tables import (
@@ -32,6 +35,7 @@ from kiro_crew.messaging.tables import (
     _is_row_candidate,
     _table_run_end,
 )
+from kiro_crew.option_marker_scan import option_labels
 from kiro_crew.platform.context import redact_via_context
 from kiro_crew.security.exfil import redact_exfiltration_urls
 from kiro_crew.security.redaction import redact_credentials
@@ -448,13 +452,14 @@ def extract_options(text: str) -> tuple[str, list[str]]:
     m = _OPTIONS_RE.search(text)
     if not m:
         return text, []
-    choices = [c.strip() for c in m.group("labels").split("|") if c.strip()]
+    choices = option_labels(m.group("labels"))
     before = text[: m.start()].rstrip()
     after = text[m.end() :].strip()
     cleaned = before + ("\n" + after if after else "") if before else after
     return cleaned, choices
 
 
+@redaction_seams.in_seam(redaction_seams.CHANNELS)
 def _redact_choices(
     choices: list[str],
     redactor: Callable[[str], str] | None,
@@ -1269,7 +1274,10 @@ def split_message(text: str, limit: int = SLACK_MSG_LIMIT) -> list[str]:
 
     Splits at the line break :func:`~kiro_crew.slack.break_point.last_break`
     picks (at least a quarter into the chunk, or one before a line that fits one
-    post whole); with none that counts, it cuts where the limit falls.
+    post whole); with none that counts, it cuts where the limit falls. A cut
+    inside a fenced code block closes the block in its post and reopens it in the
+    next one (:func:`~kiro_crew.messaging.split.rebalance_fenced_cuts`), so each
+    post shows the code as code.
     """
     if len(text) <= limit:
         return [text]
@@ -1285,20 +1293,96 @@ def split_message(text: str, limit: int = SLACK_MSG_LIMIT) -> list[str]:
         # loop would spin forever. Keep at least one character of progress per
         # iteration so the function always terminates regardless of `limit`.
         chunk_limit = max(1, limit - len(CONTINUATION))
-        cut = last_break(text, chunk_limit, ("\n",))
-        if cut <= 0:
-            # The last post carries no CONTINUATION, so a remainder up to
-            # ``limit`` still goes out whole after an early line break.
-            early = text.rfind("\n", 0, chunk_limit)
-            fits = early > 0 and len(text[early:].lstrip("\n")) <= limit
-            cut = early if fits else chunk_limit
-        remainder = text[cut:].lstrip("\n")
+        cut, closer, remainder = _fenced_cut(text, chunk_limit, limit)
+        if closer and len(text[:cut]) + len(closer) > chunk_limit:
+            # The closer has to fit in the post too, so cut again short of it.
+            cut, closer, remainder = _fenced_cut(text, max(1, chunk_limit - len(closer)), limit)
         if remainder:
-            parts.append(text[:cut] + CONTINUATION)
+            parts.append(text[:cut] + closer + CONTINUATION)
         else:
             parts.append(text[:cut])
         text = remainder
     return parts
+
+
+def _fenced_cut(text: str, chunk_limit: int, limit: int) -> tuple[int, str, str]:
+    """Where :func:`split_message` cuts *text*: the cut, the fence closer, the rest.
+
+    The closer is ``""`` when the cut is outside every fenced block. Inside one it
+    is the block's closer on a new line, and the rest starts with the block's
+    opener line, so the next post opens the block again.
+    """
+    cut = last_break(text, chunk_limit, ("\n",))
+    if cut <= 0:
+        # The last post carries no CONTINUATION, so a remainder up to
+        # ``limit`` still goes out whole after an early line break.
+        early = text.rfind("\n", 0, chunk_limit)
+        fits = early > 0 and len(text[early:].lstrip("\n")) <= limit
+        cut = early if fits else _hard_cut(text, chunk_limit)
+    sealed = _sealed_at(text, cut)
+    if sealed is None and cut < chunk_limit:
+        # The cut holds no more than the reopened opener, so the next line is too
+        # long for one post: cut inside it, as a line with no break is cut.
+        cut = _hard_cut(text, chunk_limit, past=cut)
+        sealed = _sealed_at(text, cut)
+        if sealed is None and cut < chunk_limit:
+            # Moving back to a token's ``<`` still left only the opener, so the
+            # token cannot be kept whole here: cut at the limit and seal it.
+            cut = chunk_limit
+            sealed = _sealed_at(text, cut)
+    if sealed is None:
+        return cut, "", text[cut:].lstrip("\n")
+    return cut, *sealed
+
+
+def _hard_cut(text: str, chunk_limit: int, past: int = 0) -> int:
+    """Where a line too long for one post is cut: at the limit, never in a token.
+
+    A cut inside a Slack ``<...>`` token (a link, a mention, a channel) moves
+    back to its ``<``, because either half of a torn token posts as raw text: the
+    head's link is no link and the next post opens with ``label>``. A token
+    longer than a whole post cannot move whole, so it is cut where the limit
+    falls. The move never goes back to *past* or before it, so a cut already
+    ruled out stays ruled out. A cut that would split one visible character (a
+    flag, a ZWJ emoji, a mark on its base) moves left to that character's start,
+    by the rule the shared splitter uses (``messaging.graphemes``).
+    """
+    cut = chunk_limit
+    while cut > past + 1 and cut < len(text) and joins_previous(text, cut):
+        cut -= 1
+    if cut < len(text) and joins_previous(text, cut):
+        # The whole reach is one run of joining marks: no boundary to step back
+        # to, so cut at the limit rather than posting one mark at a time.
+        cut = chunk_limit
+    opened = text.rfind("<", 0, cut)
+    line_start = text.rfind("\n", 0, cut)
+    if opened > max(text.rfind(">", 0, cut), line_start, past, 0):
+        closed = text.find(">", cut)
+        newline = text.find("\n", cut)
+        fits = closed - opened < chunk_limit
+        if closed != -1 and (newline == -1 or closed < newline) and fits:
+            cut = opened
+    return cut
+
+
+def _sealed_at(text: str, cut: int) -> tuple[str, str] | None:
+    """The fence closer and the rest of *text* for a cut at *cut*.
+
+    The closer is ``""`` outside every fenced block. ``None`` means the cut is
+    inside one but the reopened rest would not be shorter than *text*.
+    """
+    remainder = text[cut:].lstrip("\n")
+    if not remainder:
+        return "", remainder
+    # The newlines the cut drops stay on the head, so its last line counts as
+    # finished when the fence state at the cut is read.
+    head = text[: len(text) - len(remainder)]
+    sealed, reopened = rebalance_fenced_cuts([head, remainder])
+    if sealed == head:
+        return "", remainder
+    if len(reopened) >= len(text):
+        return None
+    return "\n" + sealed[len(head) :].lstrip("\n"), reopened
 
 
 def _slack_client_display(text: str) -> str:
@@ -1467,6 +1551,7 @@ def _render_blocks(
     return out, changed
 
 
+@redaction_seams.in_seam(redaction_seams.CHANNELS)
 def render_for_slack(
     text: str,
     *,
@@ -1621,6 +1706,7 @@ class SlackRender(NamedTuple):
     redacted: bool
 
 
+@redaction_seams.in_seam(redaction_seams.CHANNELS)
 def render_one_for_slack(
     text: str,
     *,

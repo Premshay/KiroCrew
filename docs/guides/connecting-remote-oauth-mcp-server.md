@@ -5,9 +5,9 @@ Crew desktop app — the class of server you reach over `https://`, whose tools
 you unlock by signing in through a browser, as opposed to a **local stdio**
 server you launch with a `command`. The worked example is Miro's remote MCP
 ([`https://mcp.miro.com/`](https://mcp.miro.com/)), the flow that motivated this
-guide. Miro is now also a curated **Connections** provider, so the built-in card
+guide. Miro is also a curated **Connections** provider, so the built-in card
 or MCP-table **Sign in** action is the shortest path; the manual flow below
-remains useful for a custom Miro entry and applies to any OAuth-backed remote
+is for a custom Miro entry and applies to any OAuth-backed remote
 server (Linear, Notion, Atlassian, a self-hosted OIDC-fronted service, …).
 
 The short version is five moves, and every one of them has a trap that reads
@@ -212,7 +212,10 @@ dashboard.
 A server whose own `oauth` block names a `clientSecret` cannot sign in on the
 Kiro Agent harness: Kiro Crew never sends a client secret to it. Its row reads
 **Sign-in unavailable** and says so. A new chat on Kiro Agent says the same in a
-notice that stays at the top of the chat.
+notice that stays at the top of the chat. A server at the url of a vendor that has
+not admitted Kiro yet (Figma, Canva, Dropbox and Square, which the Connections page
+hides) reads **Sign-in unavailable** on Kiro Agent too, with a line naming the
+vendor, unless its `oauth` block names a `clientId` of your own.
 
 ## Complete the browser flow and select a team/tenant
 

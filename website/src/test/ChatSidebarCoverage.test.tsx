@@ -106,7 +106,6 @@ import ChatSidebar from '../pages/ChatSidebar'
 import { requestSlotReveal } from '../store/chatSlice'
 import { sseSlots, updateSlot } from '../store/dashboardSlice'
 import { stubAppConfirm } from './appConfirmStub'
-import { turnOnCrewModePreview } from './crewModePreview'
 
 interface TestSlot {
   key: string
@@ -475,7 +474,6 @@ describe('ChatSidebar — Switch All Sessions panel', () => {
   })
 
   it('names a failed session the list hides, a Crew Mode worker, by its title (#11231)', async () => {
-    turnOnCrewModePreview()
     const slots = [
       { key: 'k-root', title: 'Crew root', running: false, messages: 1, crew_mode_root: true },
       { key: 'k-w', title: 'Worker W', running: false, messages: 1, crew_root: 'k-root' },
@@ -489,7 +487,6 @@ describe('ChatSidebar — Switch All Sessions panel', () => {
   })
 
   it('counts a hidden Crew Mode worker in the failed-session retry label', async () => {
-    turnOnCrewModePreview()
     const slots = [
       { key: 'k-root', title: 'Crew root', running: false, messages: 1, crew_mode_root: true },
       { key: 'k-w', title: 'Worker W', running: false, messages: 1, crew_root: 'k-root' },
@@ -505,7 +502,6 @@ describe('ChatSidebar — Switch All Sessions panel', () => {
   })
 
   it('keeps Retry enabled when the only failed session is a hidden Crew Mode worker (#11231)', async () => {
-    turnOnCrewModePreview()
     const slots = [
       { key: 'k-root', title: 'Crew root', running: false, messages: 1, crew_mode_root: true },
       { key: 'k-w', title: 'Worker W', running: false, messages: 1, crew_root: 'k-root' },
@@ -567,7 +563,6 @@ describe('ChatSidebar — Switch All Sessions panel', () => {
   })
 
   it('does not label a switch as a retry when a hidden Crew Mode worker becomes eligible (#11231)', async () => {
-    turnOnCrewModePreview()
     const slots = [
       { key: 'k-a', title: 'Idle A', running: false, messages: 1 },
       { key: 'k-root', title: 'Crew root', running: false, messages: 1, model: 'auto', crew_mode_root: true },
@@ -993,6 +988,25 @@ describe('ChatSidebar — Older Sessions pane', () => {
     expect(screen.getByText('Unfiled hit')).toBeTruthy()
     fireEvent.click(screen.getByLabelText('Expand Alpha results'))
     expect(screen.getByText('Filed hit')).toBeTruthy()
+  })
+
+  it('groups a search hit filed inside a hidden Bot home under its folder', async () => {
+    // No listed session sits in the Bot's home, so the Sessions list draws no
+    // row for it; History still names the folder the hit was filed in.
+    mocks.sessionsSearch.mockResolvedValue({
+      sessions: [{ key: 'h-bot', title: 'Bot hit', modified: daysAgo(2), folder_id: 'f-bot-child' }],
+    })
+    const botFolders = [
+      ...FOLDERS,
+      { id: 'f-bot', name: 'Radar', order: 9, mate_home: true, owner_app: 'member:radar' },
+      { id: 'f-bot-child', name: 'Radar inbox', order: 0, parent_id: 'f-bot' },
+    ]
+    renderSidebar({ history: HISTORY, folders: botFolders })
+    openHistory()
+    fireEvent.change(screen.getByPlaceholderText('Search older sessions…'), { target: { value: 'hit' } })
+    expect(await screen.findByText('Bot hit')).toBeTruthy()
+    expect(screen.getByLabelText('Collapse Radar inbox results')).toBeTruthy()
+    expect(screen.queryByLabelText('Collapse Unfiled results')).toBeNull()
   })
 
   it('exposes the resize separator only while the pane is open', () => {

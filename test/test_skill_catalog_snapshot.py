@@ -34,6 +34,7 @@ from kiro_crew import skills as skills_module
 from kiro_crew.skill_runtime import catalog as catalog_module
 from kiro_crew.skill_search_index import SKILL_SEARCH_INDEX_FILENAME, SkillSearchIndex
 from kiro_crew.skills import SkillsLoader, _trusted_skill_roots
+from kiro_crew.testing.clock import ManualClock
 from kiro_crew.testing.wait import wait_until
 
 _WAIT = 30.0
@@ -747,7 +748,9 @@ class TestInvalidation:
 
         Read off the connection rather than timed: the busy timeout in force when
         the drop's ``BEGIN IMMEDIATE`` runs is the base one, so no per-drop wait is
-        longer. With a zero base the held write lock refuses the drop at once.
+        longer. With a zero base the held write lock refuses the drop at once. The
+        re-walk the invalidation queues is not run: its store opens a second
+        ``BEGIN IMMEDIATE`` on the spy, and landing the drop it would restore trust.
         """
         monkeypatch.setattr(skill_search_index_module, "_BUSY_TIMEOUT_SECS", 0)
         _skill(harness.root, "alpha")
@@ -756,12 +759,10 @@ class TestInvalidation:
         _await(lambda: loader._load_catalog_snapshot("") is not None, "the snapshot")
         index = loader._search_index
         assert index is not None
-        conn = index._db()
-        assert conn is not None
-        spy = _BusyTimeoutAtBegin(conn)
+        spy = _BusyTimeoutAtBegin(index._db())
         monkeypatch.setattr(index, "_db", lambda: spy)
-        holder = opened(SkillSearchIndex(index._path))
-        held = holder._db()
+        monkeypatch.setattr(loader, "_request_catalog_refresh", lambda _key: None)
+        held = opened(SkillSearchIndex(index._path))._db()
         assert held is not None
         held.execute("BEGIN IMMEDIATE")
         try:
@@ -1147,6 +1148,37 @@ class TestInvalidation:
             index.close()
 
 
+def _record_build_waits(loader: SkillsLoader, monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record this thread's waits on *loader*'s catalog build instead of taking them.
+
+    Each wait advances the catalog's :class:`ManualClock` by its timeout and finds
+    the build unfinished, so the budget ends on the code's own waits, not host speed.
+    """
+    clock = ManualClock()
+    clock.install(monkeypatch, catalog_module)
+    thread = threading.get_ident()
+    waits: list[float] = []
+    request = loader._request_catalog_refresh
+
+    def _request(key: str) -> object:
+        done = request(key)
+        if done is None:
+            return None
+
+        def wait(timeout: float | None = None) -> bool:
+            if threading.get_ident() != thread:
+                return done.wait(timeout)
+            assert timeout is not None, "an unbounded wait on the catalog build"
+            waits.append(timeout)
+            clock.advance(timeout)
+            return done.is_set()
+
+        return types.SimpleNamespace(wait=wait)
+
+    monkeypatch.setattr(loader, "_request_catalog_refresh", _request)
+    return waits
+
+
 class TestAnUnfinishedFirstWalk:
     def test_it_reports_building_rather_than_no_skills(self, harness, monkeypatch, instant_budget):
         loader = harness.loader()
@@ -1192,20 +1224,16 @@ class TestAnUnfinishedFirstWalk:
         """
         loader = harness.loader()
         harness.stub_walk(loader, monkeypatch, rows=[])
-        # A budget long enough that a second wait would be unmistakable.
         monkeypatch.setattr(skills_module, "_COLD_CATALOG_WAIT_SECS", 0.4)
+        waits = _record_build_waits(loader, monkeypatch)
 
-        first = time.monotonic()
         assert loader._iter() == []
-        waited = time.monotonic() - first
+        assert waits == [pytest.approx(0.4, abs=1e-6)], f"the first call's waits: {waits}"
         assert loader.catalog_status() == "building"
 
-        second = time.monotonic()
+        del waits[:]
         assert loader._iter() == []
-        again = time.monotonic() - second
-        # Compared against the FIRST call's own wait, not a fixed duration, so the
-        # assertion does not depend on this host's speed.
-        assert again < waited / 4, f"the second call waited {again:.3f}s after {waited:.3f}s"
+        assert waits == [], f"the second call waited on the build: {waits}"
 
 
 class TestAnExactKeyReadDoesNotWaitForDiscovery:

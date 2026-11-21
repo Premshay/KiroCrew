@@ -25,12 +25,13 @@ Writes: ``_acp_client``, ``_active_turn_session_key``, ``_approval_futures``,
 ``_question_pending``, ``_queue``, ``_queue_persist_inflight``, ``_queue_persist_owed``,
 ``_queue_persisted_sig``, ``_queue_repository``, ``_regenerate_target``,
 ``_rejection_reasons``, ``_responsive``, ``_side``,
-``_restored_turn_marker``, ``_stop_declined_at``, ``_stop_escalated_card_id``, ``_stop_event_id``,
+``_restored_turn_marker``, ``_run_started_at``, ``_run_started_turns``,
+``_stop_declined_at``, ``_stop_escalated_card_id``, ``_stop_event_id``,
 ``_stop_generation``, ``_stop_state_raw``, ``_subagent_delivery_pending``, ``_swap_in_flight``,
-``_synthesis_recheck``, ``_task``, ``_trust``, ``_trust_reads``, ``_trust_scope``,
+``_synthesis_recheck``, ``_task``, ``_task_started_at``, ``_trust``, ``_trust_reads``, ``_trust_scope``,
 ``_trusted_pattern_deadlines``, ``_trusted_patterns``, ``_turn_admission_reserved``,
 ``_turn_generation``, ``_turn_in_flight_generation``, ``_turn_in_flight_prompt``, ``_turn_lineage``,
-``_turn_reply_mids``, ``_turns_started``, ``_unsent_resends``, ``_unstarted_generation``,
+``_turn_project_pin``, ``_turn_reply_mids``, ``_turns_started``, ``_unsent_resends``, ``_unstarted_generation``,
 ``_wake_starting_task``,
 ``_window_swap_applying``, ``_window_swap_epoch``, ``credential_evidence``,
 ``event``,
@@ -119,6 +120,7 @@ def retire_stateless_questions_for_turn(self: _ChatSlot) -> list[str]:
         try:
             self._on_question_retired(self.key, retired)  # type: ignore[operator]
         except Exception:
+            # A failing listener must not stop the append.
             pass
     return retired
 
@@ -282,14 +284,14 @@ def init_turns_fields(self: _ChatSlot) -> None:
     # The current segment's text as the model wrote it, before any
     # redaction. The run loop redacts each streamed delta on its own, which
     # can leave pieces of a value a delta boundary cut; the flush saves THIS
-    # copy redacted as one text instead (``chat_runner._redact_segment``).
+    # copy redacted as one text instead (``chat_turn.segment_flush._redact_segment``).
     # Memory only, never persisted, dropped at each flush.
     self.segment_raw_text = ""
     # The hash of the same segment as it streamed (each delta after its own
     # redaction), and each value that redaction replaced, with its tag. The
     # flush saves the raw copy redacted as one text only when the hash
     # proves it is the copy of the streamed text, and withholds it when it
-    # still holds one of these values (``chat_runner._redact_segment``). Memory only,
+    # still holds one of these values (``chat_turn.segment_flush._redact_segment``). Memory only,
     # dropped with the raw copy.
     self.segment_shown_sha = hashlib.sha256()
     self.segment_removed = {}
@@ -304,6 +306,15 @@ def init_turns_fields(self: _ChatSlot) -> None:
     # None after teardown, so consumers that span awaits cannot distinguish
     # "stayed idle" from "ran and finished" by comparing task references.
     self._turn_generation = 0
+    # When the running run's first turn started (``run_clock.now()``); None
+    # between runs. Stamped by the ``task`` setter, cleared by the run's final
+    # ``chat_done``.
+    self._run_started_at = None
+    # ``_turns_started`` at that stamp; -1 (never equal to it) while unstamped.
+    self._run_started_turns = -1
+    # When the task holding the slot was set (``run_clock.now()``); None while
+    # none is. A person's message restamps the run from it at the dispatch gates.
+    self._task_started_at = None
     # ``(generation, first generation)`` of the latest dispatch that was a turn's
     # own retry (``queue_drain``), so it counts as that turn, not a new one.
     self._turn_lineage = (0, 0)
@@ -330,6 +341,11 @@ def init_turns_fields(self: _ChatSlot) -> None:
     # says it. A refused wake leaves its finished task here, which matches no
     # later ``task``.
     self._wake_starting_task = None
+    # The directory the running turn's process works in, with the
+    # ``_turn_generation`` it belongs to. A project pick made mid-reply moves
+    # ``project`` at once, so the summary's ``turn_project`` reads this
+    # instead; a pin from an earlier generation names no running turn.
+    self._turn_project_pin = None
     # Wire seq of the newest chat_chunk this slot has emitted, across turns:
     # the counter never restarts, so a client's replay floor (the seq its
     # transcript already holds) orders every later chunk above it without
@@ -509,6 +525,13 @@ def init_turns_fields(self: _ChatSlot) -> None:
     # and summarize, however many local commands or cancelled replays it
     # also ran.
     self._cycle_reached_provider = False
+    # The exit record (``_TurnExit``) of the dashboard runner, set by its exit
+    # guard for the runner's whole turn and compare-and-cleared there, so an
+    # older runner cannot clear a successor's. A Stop that finds no provider
+    # turn to cancel reads the record's ``reached_provider`` to tell a turn
+    # still preparing from a dispatched one, and ends only the former
+    # (``turn_stop._cancel_preparing_runner``), clearing the record first.
+    self._preparing_turn = None
     # Queued sub-agent completions whose delivery tombstone is still owed:
     # queue-id -> the agent ids whose ``result.txt`` that row promises. A
     # completion routed into a BUSY slot is queued, so the parent's context
@@ -777,6 +800,27 @@ def register_approval(
     mid = row_mid(permission_row)
     if mid:
         self._approval_instances[request_id] = (future, mid)
+    # A code-channel conductor's worker: its channel's work board shows the wait
+    # while it lasts and clears it when answered (one dict lookup otherwise). The
+    # board is a bystander here: nothing it does may fail the registration, so a
+    # future without done-callbacks (a test double) only skips the clearing hop.
+    from kiro_crew.slack.code_channels.board import note_session_turn
+
+    note_session_turn(self.key)
+    # A code channel's own session: the channel shows suspended while it waits.
+    # A bystander as well: nothing it does may fail the registration.
+    try:
+        from kiro_crew.slack.code_channels.status import note_approval as _note
+    except Exception:  # pragma: no cover - a broken install must not block approvals
+        _note = None  # type: ignore[assignment]
+    note_approval = _note
+    if note_approval is not None:
+        note_approval(self.key, pending=True, request_id=request_id)
+    add_done = getattr(future, "add_done_callback", None)
+    if callable(add_done):
+        add_done(lambda _done: note_session_turn(self.key))
+        if note_approval is not None:
+            add_done(lambda _done: note_approval(self.key, pending=False, request_id=request_id))
 
 
 def approval_instance(self: _ChatSlot, request_id: str, message: dict | None = None) -> str | None:

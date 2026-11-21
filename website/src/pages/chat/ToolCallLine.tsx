@@ -50,6 +50,7 @@ import { useReportRowActive } from './rowActivity'
 import { toolRailColor } from '../../utils/toolRailColor'
 import { useSecondClock } from '../../hooks/useSecondClock'
 import { toolReturned } from '../../utils/toolReturned'
+import { stripToolCallLead } from '../../lib/toolRowContract'
 
 // Lazy so the rarely-shown answers card stays out of the App chunk. A chunk
 // that fails to load shows one block in the card's place, with Try Again and
@@ -264,9 +265,9 @@ function readToolEntry(s: RootState, slot: string | undefined, message: ChatMess
   }
 
   // Auto-denied detection. When a security-policy deny rule or hook blocks a
-  // tool, the gateway appends a SECOND tool message — "🚫 <title> …" —
+  // tool, the gateway appends a SECOND tool message — "Refused: <title> …" —
   // sharing this pill's tool_call_id. That message never renders (TurnBlock
-  // hides every tool message not starting with 🔧), so the visible 🔧 pill
+  // hides every tool message not starting with Tool:), so the visible Tool: pill
   // must find its hidden sibling to know the call was blocked. Its CONTENT is
   // used too: the row carries "— Blocked by security policy: <reason>", and the
   // Output panel leads with its own LOCALIZED sentence and follows with the
@@ -277,7 +278,7 @@ function readToolEntry(s: RootState, slot: string | undefined, message: ChatMess
   // rule fired — yields that sentence as the NOTICE, and the panel shows it
   // in place of the localized line rather than contradicting it. A row with
   // neither (hook blocked) shows the localized line alone. The interactive
-  // user-reject path also appends a 🚫 message, but that flow ALSO resolves
+  // user-reject path also appends a Refused: message, but that flow ALSO resolves
   // a permission message as rejected — wasRejectedByPerm() takes precedence
   // below, so a user rejection still shows red, not amber.
   const denySibling = denySiblingContent(index, toolCallId, message)
@@ -372,7 +373,7 @@ function readToolEntry(s: RootState, slot: string | undefined, message: ChatMess
     toolKind: (message.meta?.kind as string | undefined) || '',
     // Historical rows have no log entry; the message content is the only
     // carrier. Harmless either way — a replayed wait is never in flight.
-    toolName: message.content.replace(/^🔧\s*/, ''),
+    toolName: stripToolCallLead(message.content),
     // Persisted by _tool_meta (chat_turn/tool_rows.py) since the title-derivation
     // change; rows written before it read '' and derive from the title.
     trustedToolName: (message.meta?.tool_name as string | undefined) || '',
@@ -408,7 +409,7 @@ function readWaitState(s: RootState, slot: string | undefined, waitSlotKey: stri
   // belonging to a different ACP session on this same slot would take.
   const last = selectToolRowIndex(msgs, log).lastToolMsg
   if (!last || last.meta?.tool_call_id !== toolCallId) return null
-  return isWaitToolTitle(last.content.replace(/^🔧\s*/, '')) ? ws : null
+  return isWaitToolTitle(stripToolCallLead(last.content)) ? ws : null
 }
 
 /** Every store fact a tool row draws, read in ONE subscription. Each mounted
@@ -510,7 +511,7 @@ function ToolCallLineBody({ message, running: _running, slot, onFileOpen, disclo
   // `i18nT` output would otherwise stay in the previous locale after a switch.
   const langGen = useLanguageGeneration()
   const dispatch = useAppDispatch()
-  const label = message.content.replace(/^🔧\s*/, '')
+  const label = stripToolCallLead(message.content)
   const toolCallId = message.meta?.tool_call_id as string | undefined
   // Jev's risk annotation for this call, validated at the read. The raw field is
   // returned off the message unchanged (`toolRiskFieldOf`), so the memo's
@@ -802,10 +803,15 @@ function ToolCallLineBody({ message, running: _running, slot, onFileOpen, disclo
   // folded either. Density relief is per-card (the fold chip below) plus the
   // size caps in presentToolDiff.
   const denied = isRejected || isAutoDenied
-  // Images an image-mode read looked at, previewed under the row. Not for a
-  // rejected or auto-denied call: the agent never read them, and a preview
-  // would say it had.
-  const imagePaths = useMemo(() => (denied ? [] : extractToolImagePaths(input)), [denied, input])
+  // Images a read looked at, previewed under the row. Not for a rejected or
+  // auto-denied call: the agent never read them, and a preview would say it had.
+  // `read_path_arg` is the backend's mark naming the argument a read call's one
+  // file is in (Claude Code's Read), written with the row and never by the agent.
+  const readPathArg = typeof message.meta?.read_path_arg === 'string' ? message.meta.read_path_arg : ''
+  const imagePaths = useMemo(
+    () => (denied ? [] : extractToolImagePaths(input, readPathArg)),
+    [denied, input, readPathArg],
+  )
   // An edit run's diffs, one per call in order, read from each member's
   // persisted input: editRuns admitted every member on exactly that input as a
   // card-sized, untruncated diff. A run the lead's own log entry calls denied

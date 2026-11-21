@@ -8,6 +8,7 @@ with nothing on its tab gets no card (``test_dashboard_default_by_slug``).
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -216,6 +217,54 @@ def test_an_unreadable_record_still_counts_as_asked(home: Path) -> None:
     assert page_offer.was_asked(SLUG) is True
 
 
+_PAGE_OFFER_LOGGER = "kiro_crew.dashboard.page_offer"
+
+
+def _page_offer_warnings(caplog: Any) -> list[logging.LogRecord]:
+    return [
+        r for r in caplog.records if r.name == _PAGE_OFFER_LOGGER and r.levelno == logging.WARNING
+    ]
+
+
+@pytest.mark.parametrize(
+    ("unreadable", "error_class"),
+    [
+        # A healthy record caught mid-replace on Windows reads as a sharing violation.
+        pytest.param("permission", "PermissionError", id="a_locked_record"),
+        pytest.param("corrupt", "JSONDecodeError", id="a_corrupt_record"),
+    ],
+)
+def test_an_unreadable_record_logs_the_error_that_folded_it(
+    home: Path, monkeypatch: Any, caplog: Any, unreadable: str, error_class: str
+) -> None:
+    path = page_offer.record_path(SLUG)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if unreadable == "corrupt":
+        path.write_text("{not json", encoding="utf-8")
+    else:
+        path.write_text(json.dumps({"asked": True}), encoding="utf-8")
+        real_read_text = Path.read_text
+
+        def locked(self: Path, *args: Any, **kwargs: Any) -> str:
+            if self == path:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", locked)
+    with caplog.at_level(logging.WARNING, logger=_PAGE_OFFER_LOGGER):
+        assert page_offer.read_record(SLUG) == {}
+    (record,) = _page_offer_warnings(caplog)
+    assert error_class in record.getMessage()
+    assert record.exc_info is None
+    assert page_offer.was_asked(SLUG) is True
+
+
+def test_a_missing_record_logs_nothing(home: Path, caplog: Any) -> None:
+    with caplog.at_level(logging.DEBUG, logger=_PAGE_OFFER_LOGGER):
+        assert page_offer.read_record(SLUG) is None
+    assert [r for r in caplog.records if r.name == _PAGE_OFFER_LOGGER] == []
+
+
 def test_the_yes_wake_writes_saves_and_applies_with_one_message() -> None:
     text = page_offer.write_prompt("Goal board")
     assert "saved with dashboard_save and then put live with dashboard_apply" in text
@@ -226,6 +275,10 @@ def test_the_yes_wake_writes_saves_and_applies_with_one_message() -> None:
     assert "offer_dashboard_page" not in text
     # The same look and variables the build line names.
     assert "a page worth returning to" in text and "var(--text)" in text and "var(--bg)" in text
+
+
+#: Whether each page-offer request marked its card step's own wake (no second note).
+_OWN_WAKES: list[bool] = []
 
 
 async def _client(monkeypatch: Any, *, armed: bool, page: Any = None) -> TestClient:
@@ -241,7 +294,11 @@ async def _client(monkeypatch: Any, *, armed: bool, page: Any = None) -> TestCli
         if armed:
             request[route.REQ_CARD_PAGE_OFFER_APPLY] = True
             request[route.REQ_CARD_PAGE_OFFER_PAGE] = page
-        return await handler(request)
+        resp = await handler(request)
+        from kiro_crew.dashboard.mate_user_actions import REQ_CARD_OWN_WAKE
+
+        _OWN_WAKES.append(request.get(REQ_CARD_OWN_WAKE) is True)
+        return resp
 
     app = web.Application(middlewares=[arm])
     app["state"] = object()
@@ -279,6 +336,8 @@ async def test_the_yes_starts_one_write_wake_and_writes_nothing(
     finally:
         await client.close()
     assert woken == [(SLUG, MEMBER)]
+    # The write wake is the card's note: the card hook sends no second one.
+    assert _OWN_WAKES[-1] is True
     # The yes only marks the record pending, and off the event loop: it is an fsync.
     assert page_offer.read_record(SLUG) == {
         "replaces": "Goal board",

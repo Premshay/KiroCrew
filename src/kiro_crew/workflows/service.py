@@ -38,7 +38,6 @@ from kiro_crew.agent_sdk.drivers.acp_vocab import (
     AcpRequestTimeout,
     AcpRuntimeDead,
 )
-from kiro_crew.apps.manager import TASK_RUNNER_APP, TASK_RUNNER_DISABLED_MESSAGE, app_disabled
 from kiro_crew.config import live
 from kiro_crew.context_assembly.markers import neutralize_untrusted_text
 from kiro_crew.llm_helpers import (
@@ -52,6 +51,7 @@ from kiro_crew.llm_helpers import (
 from kiro_crew.member_memory_auth import private_memory_store_for_session
 from kiro_crew.start_priority import StartPriority
 from kiro_crew.task_planner import decompose_yaml
+from kiro_crew.taskrunner_switch import task_runner_off
 from kiro_crew.workflow_memory import (
     _RUN_ID_MAX,
     WorkflowMemoryError,
@@ -1681,9 +1681,9 @@ class WorkflowService:
                     "error": "task runner is not available for this workflow",
                     "unavailable": True,
                 }
-            # Task Runner plans and runs it, so it obeys Task Runner's Library switch.
-            if await asyncio.to_thread(app_disabled, TASK_RUNNER_APP):
-                return {"error": TASK_RUNNER_DISABLED_MESSAGE, "app_disabled": True}
+            # Task Runner plans and runs it, so it obeys Task Runner's switch.
+            if (refusal := await asyncio.to_thread(task_runner_off)) is not None:
+                return {"error": refusal, "app_disabled": True}
             started = await self._task_runner.start_workflow_definition(
                 definition,
                 input_text=effective_input,
@@ -1734,6 +1734,18 @@ class WorkflowService:
             # gateway stop froze, whose driver task has already finished.
             if runner is not None and hasattr(runner, "cancel"):
                 runner.cancel(handle.task_id, exact=True)
+        elif (
+            not cancelled
+            and handle is not None
+            and handle.status == STATUS_PAUSED
+            and handle.driver == "taskrunner"
+            and handle.task_id
+            and runner is not None
+            and hasattr(runner, "cancel_paused")
+        ):
+            # A paused run has no driver task, so the registry has nothing to cancel;
+            # the TaskRunner ends it and says whether it did.
+            return bool(await runner.cancel_paused(handle.task_id))
         return cancelled
 
     @admission_errors
@@ -1868,6 +1880,8 @@ class WorkflowService:
             name=f"{prior.name} ({label})",
             args=prior.args,
             budget_total=prior.budget_total,
+            fallback_title=prior.fallback_title,
+            fallback_folder_id=prior.fallback_folder_id,
             author=origin,
             session_key=origin,
             replay_results=replay_results,

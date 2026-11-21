@@ -34,6 +34,7 @@ from kiro_crew.dashboard.handlers.mcp_gateway_routes import (
     _launch_specs_for,
     _local_overlay_section,
     _overlay_shadowed_keys,
+    declared_launch,
 )
 from kiro_crew.dashboard.handlers.mcp_probe import _probe_currency
 from kiro_crew.dashboard.state import DashboardState
@@ -237,6 +238,14 @@ def _stub_eligibility(
     return eligible, skipped
 
 
+def _set_cwd_bindings(section: dict, bindings: Mapping[str, str]) -> None:
+    """Write ``mcp_gateway.cwd_use_launch`` sorted, or drop the key when empty."""
+    if bindings:
+        section["cwd_use_launch"] = {n: bindings[n] for n in sorted(bindings)}
+    else:
+        section.pop("cwd_use_launch", None)
+
+
 async def api_mcp_gateway_server_launches(request: web.Request) -> web.Response:
     from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 
@@ -313,6 +322,14 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
 
     Returns ``{ok, name, stub, ...}`` for the single form and
     ``{ok, names, stub, ...}`` for the batch form.
+
+    ``cwd_use`` (``uses_cwd`` / ``not_used``, single form only) records the
+    operator's answer to "does this server work on the project's files?" in
+    ``mcp_gateway.cwd_use``; sent without ``stub`` it records only that. A
+    routed backend runs in one fixed folder outside the project, so ``stub: true``
+    is refused (``cwd_unconfirmed``) for a server that is not Kiro Crew's own and
+    is not answered ``not_used``, and this route is the only writer of the launch
+    approvals the rewriter needs before it wraps a server.
     """
     # Body-scope import, like the sibling gates in this package
     # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
@@ -323,18 +340,36 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
     denied = await require_owner_dashboard_request(request, "mcp_gateway_set_stub")
     if denied is not None:
         return denied
+    from kiro_crew.config.integration_sections import (
+        _CWD_ANSWERS,
+        _CWD_NOT_USED,
+        _CWD_USES,
+        _resolve_cwd_use,
+        _resolve_cwd_use_launch,
+        effective_cwd_answer,
+    )
     from kiro_crew.config.loader import (  # noqa: F811
         ConfigReadError,
         ConfigWriteRefused,
         config_path,
         update_config_locked,
     )
+    from kiro_crew.config.resolution import _deep_merge
+
+    # Kiro Crew's own servers are routed without the working-folder question:
+    # the rewriter always re-derives their launch from the install
+    # (``rewriter_launch._repair_control_plane_entry``), so none reads the folder.
+    from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
 
     body, body_err = await read_bounded_json(request)
     if body_err is not None:
         return body_err
     assert body is not None  # read_bounded_json returns (dict, None) on success
-    name = str(body.get("name", "")).strip()
+    raw_name = body.get("name", "")
+    name = str(raw_name).strip()
+    # Saved as before (back-compat), but a non-string name is logged: ``null`` or
+    # ``123`` becomes the server name ``"None"`` / ``"123"`` with no other trace.
+    name_not_string = body.get("names") is None and not isinstance(raw_name, str)
     raw_names = body.get("names")
     stub = body.get("stub")
     batch = raw_names is not None
@@ -371,7 +406,25 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
         if not _is_valid_mcp_name(name):
             return web.json_response({"error": "invalid server name"}, status=400)
         names = [name]
-    if not isinstance(stub, bool):
+    # The operator's answer to "does this server work on the project's files?"
+    # (``mcp_gateway.cwd_use``). Sent alone (no ``stub``) it records the answer;
+    # sent with ``stub`` it is recorded in the same write.
+    cwd_answer = body.get("cwd_use")
+    if cwd_answer is not None:
+        if batch or not isinstance(cwd_answer, str) or cwd_answer not in _CWD_ANSWERS:
+            return web.json_response(
+                {
+                    "error": "cwd_use must be uses_cwd or not_used, for one server",
+                    "code": "cwd_use_invalid",
+                },
+                status=400,
+            )
+        if name in KIROCREW_BIN_MCP_SERVERS:
+            return web.json_response(
+                {"error": "this server is not asked", "code": "cwd_use_not_asked"},
+                status=400,
+            )
+    if (stub is None and cwd_answer is None) or (stub is not None and not isinstance(stub, bool)):
         return web.json_response({"error": "stub must be a boolean"}, status=400)
     if batch and stub:
         return web.json_response(
@@ -553,14 +606,21 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
     from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
 
     async with _MCP_GATEWAY_APPLY_LOCK:
-        overlay = _local_overlay_section()
+        overlay = await asyncio.to_thread(_local_overlay_section)
         # BOTH keys this handler can write. The decision lands in
         # ``stub_overrides``, and ``config.local.json`` wins the deep merge
         # per-key, so an overlay that names it would shadow the base write: the
         # click would answer 200 while the gateway kept routing the previous way.
         # That is the same silent never-takes-effect failure the guard prevents
         # for the roster, so the check covers this key too.
-        shadowed = _overlay_shadowed_keys(overlay, ("stub_servers", "stub_overrides"))
+        shadowed = _overlay_shadowed_keys(
+            overlay,
+            (
+                "stub_servers",
+                "stub_overrides",
+                *(("cwd_use", "cwd_use_launch") if cwd_answer is not None else ()),
+            ),
+        )
         if shadowed:
             return web.json_response(
                 {
@@ -576,7 +636,9 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
             )
 
         revoked_snapshot = None
-        if not stub:
+        # An answer that the server uses the folder also forgets its approval, so
+        # a later edit that loses the answer cannot bring it back routed.
+        if stub is False or (stub is None and cwd_answer == _CWD_USES):
             try:
                 revoked_snapshot = await asyncio.to_thread(revoke, names)
             except OSError as exc:
@@ -593,6 +655,17 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
         async def _restore_revoked() -> None:
             if revoked_snapshot is not None:
                 await asyncio.to_thread(restore, revoked_snapshot)
+
+        # The launch each name declares now, which a ``not_used`` answer is bound
+        # to. A scan that fails reads as "cannot tell", which keeps every answer
+        # exactly as it reads today rather than asking again.
+        current_launch: dict[str, str | None] = {}
+        if cwd_answer is not None or stub:
+            try:
+                rows = await asyncio.to_thread(_collect_server_rows)
+                current_launch = {n: declared_launch(rows.get(n)) for n in names}
+            except Exception:
+                logger.warning("mcp server scan for the cwd answer failed", exc_info=True)
 
         # Read here, off the loop, so ``list_servers()`` and its own config reads
         # stay out of the locked read-modify-write below.
@@ -616,7 +689,45 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
             if not isinstance(section, dict):
                 refused["code"] = "mcp_gateway_not_object"
                 return None
+            if cwd_answer is not None:
+                answers = _resolve_cwd_use(section)
+                answers[name] = cwd_answer
+                section["cwd_use"] = {n: answers[n] for n in sorted(answers)}
+                bindings = _resolve_cwd_use_launch(section)
+                bindings.pop(name, None)
+                launch_now = current_launch.get(name)
+                if cwd_answer == _CWD_NOT_USED and launch_now:
+                    bindings[name] = launch_now
+                _set_cwd_bindings(section, bindings)
+            if stub is None:
+                resolved["eligible"] = []
+                return data
             written = list(names)
+            if stub:
+                # Routing runs the server in one fixed folder outside the
+                # project, so only a server the operator said does not use the
+                # folder is routed. Read here, under the lock, from the same deep
+                # merge of config.json and config.local.json the loader reads.
+                # A ``not_used`` answer counts only for the launch it was given
+                # for (``effective_cwd_answer``); an answer with no binding, or a
+                # launch that cannot be read, counts as it does today.
+                merged = _deep_merge(section, overlay)
+                answers = _resolve_cwd_use(merged)
+                bindings = _resolve_cwd_use_launch(merged)
+                unconfirmed = [
+                    n
+                    for n in written
+                    if n not in KIROCREW_BIN_MCP_SERVERS
+                    and effective_cwd_answer(answers.get(n), bindings.get(n), current_launch.get(n))
+                    != _CWD_NOT_USED
+                ]
+                if unconfirmed and not resolve_eligibility:
+                    refused["code"] = "cwd_unconfirmed"
+                    return None
+                written = [n for n in written if n not in unconfirmed]
+                resolved["cwd_skipped"] = [
+                    {"name": n, "reason": "cwd_unconfirmed"} for n in unconfirmed
+                ]
             if resolve_eligibility and stub:
                 # Effective value, so the overlay's `enabled` wins the same way the
                 # deep merge gives it to the runtime. The overlay is a hand-edited
@@ -627,7 +738,7 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
                     overlay["enabled"] if "enabled" in overlay else section.get("enabled", False)
                 )
                 written, skipped = _stub_eligibility(
-                    names,
+                    written,
                     sharing_on=sharing_on,
                     probe_current=probe_current,
                     # Effective value, read the same way as ``enabled`` just above:
@@ -650,6 +761,7 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
                 # A name with no launch to approve would be stubbed with nothing
                 # the gateway may run for it.
                 skipped = [
+                    *resolved["cwd_skipped"],
                     *skipped,
                     *(
                         {"name": n, "reason": "launch_unresolved"}
@@ -666,6 +778,28 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
                     resolved["eligible"] = []
                     return None
             resolved["eligible"] = written
+            if stub:
+                # An answer recorded before bindings existed is bound to the
+                # launch it routes now, in this same write, so it is not asked
+                # again and a later change of launch is.
+                # Answers are read merged, as the eligibility check above reads
+                # them, so an answer kept in config.local.json is bound too. An
+                # overlay that owns the bindings is left alone: a base write
+                # would be shadowed.
+                own = _resolve_cwd_use_launch(section)
+                answered = _resolve_cwd_use(_deep_merge(section, overlay))
+                adopt: dict[str, str] = {}
+                for n in written if "cwd_use_launch" not in overlay else ():
+                    launch_now = current_launch.get(n)
+                    if (
+                        launch_now
+                        and n not in own
+                        and n not in KIROCREW_BIN_MCP_SERVERS
+                        and answered.get(n) == _CWD_NOT_USED
+                    ):
+                        adopt[n] = launch_now
+                if adopt:
+                    _set_cwd_bindings(section, {**own, **adopt})
             # Freeze the alias through the SAME helper the sharing toggle uses, so
             # both writers leave the file in one shape. On a legacy install the
             # effective set comes from the deprecated `poolable_servers`, and reading
@@ -713,6 +847,19 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
         if refused.get("code") == "mcp_gateway_not_object":
             await _restore_revoked()
             return web.json_response({"error": "mcp_gateway is not an object"}, status=500)
+        if refused.get("code") == "cwd_unconfirmed":
+            await _restore_revoked()
+            _log_stub_rejection("cwd_unconfirmed")
+            return web.json_response(
+                {
+                    "error": (
+                        "answer whether this server works on the project's files "
+                        "before sharing it. Nothing was changed."
+                    ),
+                    "code": "cwd_unconfirmed",
+                },
+                status=409,
+            )
 
         # Turning a stub on approves the launches resolved above for the names written.
         decided = list(resolved.get("eligible") or [])
@@ -788,4 +935,10 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
             "skipped": resolved.get("skipped") or [],
             "sharing_on": resolved.get("sharing_on"),
         }
+    if name_not_string:
+        logger.warning(
+            "mcp gateway set-stub: name is a %s, not a string; saved as %r",
+            type(raw_name).__name__,
+            name,
+        )
     return web.json_response({"ok": True, **subject, "stub": stub, **outcome, **applied})

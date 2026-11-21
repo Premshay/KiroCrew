@@ -5,11 +5,11 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import json
 import time
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Literal
 
+from kiro_crew.agent_sdk.backends import ACP_BACKEND_OPENCODE
 from kiro_crew.agent_sdk.spec_hooks import post_tool_identity, spec_keys_notice
 from kiro_crew.dashboard.chat_utils import _broadcast_auto_tool, open_construct_at_end
 from kiro_crew.dashboard.deny_override import (
@@ -36,6 +36,7 @@ from kiro_crew.hooks import (
     TOOL_DENY,
     ToolHookResult,
     hook_gate_kwargs,
+    hook_tool_input,
     identity_grant_covers_child,
     unattended_turn,
 )
@@ -47,6 +48,7 @@ from kiro_crew.permission_floor import OUTCOME_REJECTED_TRANSPORT_FLOOR  # noqa:
 from kiro_crew.security.deny_waiver import deny_key_description
 from kiro_crew.security.readonly_bash import command_invokes_git, is_read_only_bash
 from kiro_crew.tool_gate_busy import hook_gate_busy
+from kiro_crew.tool_row_prefix import tool_row
 from kiro_crew.trust_patterns import (
     GrantEnded,
     approval_command,
@@ -162,7 +164,7 @@ def _spec_confirm_hooks_notice(agent: str, count: int) -> str:
     """The session-start notice for ``confirm: true`` spec hooks this backend skips."""
     hooks = "hook asks" if count == 1 else "hooks ask"
     return (
-        f"ℹ️ Agent {agent} has {count} {hooks} to be confirmed before running. "
+        f"Note: Agent {agent} has {count} {hooks} to be confirmed before running. "
         "This backend cannot ask, so they do not run in this session."
     )
 
@@ -170,7 +172,7 @@ def _spec_confirm_hooks_notice(agent: str, count: int) -> str:
 def _spec_hooks_run_nowhere_notice(agent: str, events: list[str]) -> str:
     """The session-start notice for spec hooks that nothing runs on this backend."""
     return (
-        f"ℹ️ Agent {agent} has hooks on {', '.join(events)}. This backend does not run "
+        f"Note: Agent {agent} has hooks on {', '.join(events)}. This backend does not run "
         "an agent's hooks, so they have no effect in this session."
     )
 
@@ -183,7 +185,7 @@ def _spec_withheld_hooks_notice(agent: str, *, user_hooks_run: bool) -> str:
     notice say some still run; otherwise it names where a trusted hook can go.
     """
     lead = (
-        f"ℹ Project hooks for agent {agent} do not run in this session: Crew does "
+        f"Note: Project hooks for agent {agent} do not run in this session: Crew does "
         "not run commands from a project checkout."
     )
     if user_hooks_run:
@@ -200,7 +202,7 @@ def _project_hook_files_notice() -> str:
     silently.
     """
     return (
-        "ℹ️ This project has hook files in .kiro/hooks that do not run in this "
+        "Note: This project has hook files in .kiro/hooks that do not run in this "
         "session: Crew cannot read this backend's workspace-trust decision, so it "
         "does not run commands from a project checkout. Your own ~/.kiro/hooks "
         "files still run."
@@ -326,10 +328,11 @@ def _native_crew_should_auto_approve(native_tracker, state, slot) -> bool:
     auto-approve — regardless of the ``auto_approve_subagent_tools`` hook,
     the slot's trust, or yolo. Only when a crew is active do those signals grant
     approval; with all three false the tool still falls through to the normal
-    interactive/trust gate rather than being silently approved here.
+    interactive/trust gate rather than being silently approved here. A background
+    card (a Claude Code Workflow agent, which runs no crew tool) is never a crew.
     """
     has_active_crew = bool(native_tracker) and any(
-        not info.get("done") for info in native_tracker.values()
+        not info.get("done") and not info.get("background") for info in native_tracker.values()
     )
     if not has_active_crew:
         return False
@@ -451,7 +454,7 @@ def _conductor_own_child_call(state: Any, slot: Any, event: Any) -> bool:
     vouched-creator fence as the read exemption (:func:`_targets_own_child`), and
     ``agent.conductor_own_child_verbs`` must be on. Unlike the read exemption it does
     not wait for ``crew_mode.APPROVAL_ROUTING_LIVE``: it is keyed on the agent, so
-    it serves a Bot conductor in an ordinary tab and the Ultra Mode team lead alike.
+    it serves a Bot conductor in an ordinary tab and a conductor mode chat alike.
     Deny rules and PreToolUse hooks have already run by the time it is consulted.
     """
     if (getattr(slot, "agent", "") or "") not in _CONDUCTOR_OWN_CHILD_AGENTS:
@@ -557,13 +560,35 @@ def _pay_permission_cut(turn: _ChatTurn) -> None:
         turn._turn_flushed_visible_text = _turn_flushed_visible_text
 
 
-def _audit_card_turn_decline(*, session_key: str, slot: Any, event: Any, tier: str) -> None:
-    """Record that an auto-approve was withheld because the turn is a Dashboard card's.
+def _audit_card_turn_decline(
+    *,
+    session_key: str,
+    slot: Any,
+    event: Any,
+    tier: str,
+    held: bool = False,
+    web_term: str = "",
+) -> None:
+    """Record that an auto-approve was withheld because the turn is a Dashboard card's,
+    the call is under a held Bot limit, or an organisation's ``ask`` rule names its web
+    term (*web_term*, ``web_ask_rule.needs_person``).
 
     Written only for the tiers that decide without asking anyone (the hook
     auto-approve list and session trust or YOLO), where the grant WOULD have applied.
     ``tier`` names which one. The title is redacted like every other tool row.
     """
+    if held:
+        error = (
+            "the call falls under a Bot limit that could not be applied as written, "
+            "so a person must approve it"
+        )
+        reason = "bot_limit_held"
+    elif web_term:
+        error = "the organization's policy asks before this web tool, so a person must approve it"
+        reason = "web_ask_rule"
+    else:
+        error = "the turn was started by a Dashboard card, which never inherits an auto-approval"
+        reason = "card_origin_turn"
     sel().log_tool_invocation(
         session_key=session_key,
         agent=slot.agent or "kirocrew",
@@ -572,8 +597,8 @@ def _audit_card_turn_decline(*, session_key: str, slot: Any, event: Any, tier: s
         tool_kind=event.tool_kind,
         outcome="auto_approve_declined",
         request_id=event.request_id,
-        error="the turn was started by a Dashboard card, which never inherits an auto-approval",
-        metadata={"reason": "card_origin_turn", "tier": tier},
+        error=error,
+        metadata={"reason": reason, "tier": tier},
     )
 
 
@@ -654,6 +679,24 @@ async def _decide_permission_request(turn: _ChatTurn, event) -> Literal[_Flow.CO
     # spec pre-allows (``allowedTools``) never raises a permission request, so it never
     # reaches this function and is outside the rule.
     _card_turn = turn._card_origin
+    # A moved Bot's limit its worker could not carry exactly (``mate_held_rules``):
+    # a call it covers is never approved without a person either, so it takes the
+    # same path as a card's turn and reaches the approval card.
+    from kiro_crew import mate_held_rules
+
+    _held = await asyncio.to_thread(
+        mate_held_rules.held_for, event, session_key=session_key, agent=slot.agent or ""
+    )
+    # An LTS organisation's ``ask`` rule on the web term this KAS request is for
+    # (``web_ask_rule``): KAS asks so a person answers, so it takes the same path.
+    from kiro_crew import web_ask_rule
+
+    _web_ask = web_ask_rule.needs_person(event)
+    turn._web_ask = _web_ask
+    _card_turn = _card_turn or bool(_held) or bool(_web_ask)
+    # Read by _on_permission_prompt's timeout note: no auto-approve, YOLO included,
+    # answers this request.
+    turn._no_auto_approve = _card_turn
     # Drain the key as soon as its permission decision begins. The
     # stream handles one decision at a time, so one bounded key is
     # enough for every approval arm below and in _on_permission_prompt;
@@ -694,6 +737,8 @@ async def _decide_permission_request(turn: _ChatTurn, event) -> Literal[_Flow.CO
     # needs that sentence once.
     _declined_grant_notices: dict[str, str] = {}
     turn._declined_grant_notices = _declined_grant_notices
+    if _web_ask:
+        _declined_grant_notices["web_ask_rule"] = web_ask_rule.card_notice(_web_ask)
     # Backend-subagent request whose SECURITY context is absent
     # (structured params missing, or shell with no recoverable
     # command — see AcpEvent.child_low_fidelity): every
@@ -736,7 +781,8 @@ async def _decide_permission_request(turn: _ChatTurn, event) -> Literal[_Flow.CO
     # and a mutated title would store junk pattern entries for
     # exactly the requests that need the clearest presentation.
     _child_lf_warning = (
-        "⚠️ UNVERIFIED child request (security context " "missing — title is agent-authored): "
+        "Warning: UNVERIFIED child request (security context "
+        "missing — title is agent-authored): "
         if _child_low_fidelity
         else ""
     )
@@ -840,7 +886,7 @@ async def _decide_permission_request(turn: _ChatTurn, event) -> Literal[_Flow.CO
             await _reject_attributed(client, event.request_id, attribution="steered")
             slot.append(
                 "tool",
-                f"🚫 {_deny_title} — {_deny_msg}",
+                tool_row("refused", f"{_deny_title} — {_deny_msg}"),
                 "msg msg-tool",
                 meta=_tool_meta(event),
             )
@@ -912,7 +958,12 @@ async def _decide_permission_request(turn: _ChatTurn, event) -> Literal[_Flow.CO
                 )
         if _card_turn and tool_result.action == TOOL_AUTO_APPROVE:
             _audit_card_turn_decline(
-                session_key=session_key, slot=slot, event=event, tier="hook_auto_approve"
+                session_key=session_key,
+                slot=slot,
+                event=event,
+                tier="hook_auto_approve",
+                held=bool(_held),
+                web_term=_web_ask,
             )
             tool_result = ToolHookResult(action=TOOL_ALLOW)
         if tool_result.action == TOOL_AUTO_APPROVE:
@@ -971,10 +1022,7 @@ async def _decide_permission_request(turn: _ChatTurn, event) -> Literal[_Flow.CO
                 # Declarative auto-approve must NOT bypass scripted
                 # PreToolUse hooks — those are the audit/policy gate
                 # and exit-2 BLOCKED takes precedence over auto-approve.
-                try:
-                    _parsed_input = json.loads(event.tool_input) if event.tool_input else None
-                except Exception:
-                    _parsed_input = None
+                _parsed_input = hook_tool_input(event.raw_tool_params, event.tool_input)
                 try:
                     pre_hook_results = await _fire(
                         turn,
@@ -1061,10 +1109,7 @@ async def _decide_permission_request(turn: _ChatTurn, event) -> Literal[_Flow.CO
                 refusal_reasons=_refusal_reasons,
             )
             return _Flow.CONTINUE
-        try:
-            _parsed_input = json.loads(event.tool_input) if event.tool_input else None
-        except Exception:
-            _parsed_input = None
+        _parsed_input = hook_tool_input(event.raw_tool_params, event.tool_input)
         try:
             pre_hook_results = await _fire(
                 turn,
@@ -1114,6 +1159,12 @@ async def _decide_permission_request(turn: _ChatTurn, event) -> Literal[_Flow.CO
     # A card turn (words a page chose) never inherits this native-crew auto-approve
     # either, so it is excluded here as it is from every other auto-approve rung.
     _claude_backend = is_claude_backend_name(capabilities_of(client).backend)
+    # An opencode ``task`` card is drawn from the parent's own tool row
+    # (``client_native_children._opencode_task_events``): its requests name no
+    # child either, so an open card must not approve the parent's calls.
+    _unattributed_children = (
+        _claude_backend or capabilities_of(client).backend == ACP_BACKEND_OPENCODE
+    )
     _own_worker_call = not _claude_backend and _crew_root_own_worker_call(state, slot, event)
     _own_child_call = (
         not _claude_backend
@@ -1126,7 +1177,7 @@ async def _decide_permission_request(turn: _ChatTurn, event) -> Literal[_Flow.CO
             _own_worker_call
             or _own_child_call
             or (
-                not _claude_backend
+                not _unattributed_children
                 and _native_crew_should_auto_approve(_native_tracker, state, slot)
             )
         )
@@ -1211,6 +1262,8 @@ async def _decide_permission_request(turn: _ChatTurn, event) -> Literal[_Flow.CO
         else slot._trusted_patterns
     )
     if _tp_live and _child_grant_eligible and not event.tool_input_redacted and not _card_turn:
+        from kiro_crew import browser_host_trust as _browser_host_trust
+
         _tp_command = approval_command(
             event.tool_input or "",
             is_shell=event.is_shell,
@@ -1218,6 +1271,7 @@ async def _decide_permission_request(turn: _ChatTurn, event) -> Literal[_Flow.CO
             mcp_server_name=event.mcp_server_name,
             raw_tool_params=event.raw_tool_params,
             path_scope_trusted=event.path_scope_trusted,
+            browser_page_url=_browser_host_trust.page_url_for(event, session_key, client, state),
         )
         matched = _matches_trusted_pattern(_tp_command, _tp_live) if _tp_command else None
         _tp_path = (
@@ -1313,6 +1367,12 @@ async def _decide_permission_request(turn: _ChatTurn, event) -> Literal[_Flow.CO
             if matched and _tp_deadlines
             else None
         )
+        # A host grant: the op route checks the tab is still on that host. A note that
+        # cannot be kept leaves the call to the card instead.
+        if matched and not _browser_host_trust.note_host_approval(
+            session_key, _tp_command, event.raw_tool_params
+        ):
+            matched = None
         if matched:
             try:
                 validated_tool = _validate_tool_name(
@@ -1363,7 +1423,7 @@ async def _decide_permission_request(turn: _ChatTurn, event) -> Literal[_Flow.CO
                 _tool_title, _ = redact_credentials(_tool_title)
                 slot.append(
                     "tool",
-                    f"🔧 {_tool_title}",
+                    tool_row("call", _tool_title),
                     "msg msg-tool",
                     # `_tool_meta` for parity with every other rung: same
                     # `_MAX_TOOL_PURPOSE` cap (a hand-rolled 200-char cap
@@ -1398,7 +1458,14 @@ async def _decide_permission_request(turn: _ChatTurn, event) -> Literal[_Flow.CO
     if _card_turn and (slot_trusted or yolo_active):
         # A card turn takes neither grant. Cleared HERE, before the trust-reads and
         # trust rungs read them, so the unconditional rung below stays as it is.
-        _audit_card_turn_decline(session_key=session_key, slot=slot, event=event, tier="trust")
+        _audit_card_turn_decline(
+            session_key=session_key,
+            slot=slot,
+            event=event,
+            tier="trust",
+            held=bool(_held),
+            web_term=_web_ask,
+        )
         slot_trusted = False
         yolo_active = False
     if (
@@ -1454,7 +1521,7 @@ async def _decide_permission_request(turn: _ChatTurn, event) -> Literal[_Flow.CO
             _tool_title = _broadcast_auto_tool(state, slot, event)
             slot.append(
                 "tool",
-                f"🔧 {_tool_title}",
+                tool_row("call", _tool_title),
                 "msg msg-tool",
                 meta=_tool_meta(event),
             )
@@ -1498,10 +1565,7 @@ async def _decide_permission_request(turn: _ChatTurn, event) -> Literal[_Flow.CO
             )
             return _Flow.CONTINUE
         if not turn._pre_tool_hooks_fired:
-            try:
-                _parsed_input = json.loads(event.tool_input) if event.tool_input else None
-            except Exception:
-                _parsed_input = None
+            _parsed_input = hook_tool_input(event.raw_tool_params, event.tool_input)
             try:
                 pre_hook_results = await _fire(
                     turn,
@@ -1580,6 +1644,8 @@ _OVERRIDE_WITHHELD_FIELDS = (
     "trust_base_grantable",
     "base_command",
     "is_read_only",
+    "always_allow_tool_grantable",
+    "always_allow_tool_ref",
 )
 
 
@@ -1698,7 +1764,12 @@ async def _refuse_overridden_call(turn: _ChatTurn, event: Any, reason: str, *, w
     )
     await _steer_policy_notice(turn.client, title, shown_reason, _refusal_notices, slot, turn.state)
     await _reject_attributed(turn.client, event.request_id, attribution="steered")
-    slot.append("tool", f"🚫 {title} — {shown_reason}", "msg msg-tool", meta=_tool_meta(event))
+    slot.append(
+        "tool",
+        tool_row("refused", f"{title} — {shown_reason}"),
+        "msg msg-tool",
+        meta=_tool_meta(event),
+    )
     turn.state.broadcast_ws(
         "activity_event",
         {"slot": slot.key, "kind": "permission", "text": f"Blocked: {title} — {shown_reason}"},
@@ -1715,7 +1786,7 @@ def _note_override_used(slot: Any, offer: DenyOverrideOffer) -> None:
     """
     shown = deny_key_note_label(_redact_display_text(offer.key))
     if offer.scope == "session":
-        text = f"⚠️ Security rule {shown} overridden for the rest of this session."
+        text = f"Warning: Security rule {shown} overridden for the rest of this session."
     else:
-        text = f"⚠️ Security rule {shown} overridden for this one call."
+        text = f"Warning: Security rule {shown} overridden for this one call."
     slot.append("system", text, "msg msg-info")

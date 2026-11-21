@@ -12,6 +12,7 @@
 import type { QueryClient } from '@tanstack/react-query'
 import { noteSendRevision, sendStateQueryKey } from '../../api/sendRace'
 import type { Activity, MemoryChange, SendState, SharedCrewActivityFrame, SharedCrewServerFrame, TypingLease } from '../../api/sharedCrew'
+import { requestRefresh } from '../../lib/pollRule'
 import { mergeDecision, mergeWork, type DecisionsResponse, type PresenceResponse, type WorkListResponse } from '../../api/sharedCrewUi'
 
 export const sharedCrewKeys = {
@@ -21,8 +22,6 @@ export const sharedCrewKeys = {
   people: ['shared-crew', 'people'] as const,
   mode: ['shared-crew', 'mode'] as const,
   viewer: ['shared-crew', 'viewer'] as const,
-  sessionsAll: ['shared-crew', 'sessions'] as const,
-  sessions: (creator: string, q: string) => ['shared-crew', 'sessions', creator, q] as const,
   work: (sessionKey: string) => ['shared-crew', 'work', sessionKey] as const,
   presence: (sessionKey: string) => ['shared-crew', 'presence', sessionKey] as const,
   decisions: (sessionKey: string) => ['shared-crew', 'decisions', sessionKey] as const,
@@ -30,6 +29,10 @@ export const sharedCrewKeys = {
   typingLease: (sessionKey: string) => ['shared-crew', 'typing-lease', sessionKey] as const,
   memoryChanges: ['shared-crew', 'memory-changes'] as const,
 }
+
+/** The People read's id in `lib/pollRule` and the shortest gap between its pushed re-reads. */
+export const PEOPLE_POLL_ID = 'shared-crew:people'
+export const PEOPLE_REFRESH_MS = 2_000
 
 /** How many recent memory changes the cache keeps, newest first. */
 export const MEMORY_CHANGES_KEPT = 20
@@ -59,13 +62,13 @@ export function applySharedCrewFrame(queryClient: QueryClient, data: unknown): v
     case 'shared_crew.presence': {
       const value: PresenceResponse = { type: frame.type, schema_version: frame.schema_version, session_key: frame.session_key, entries: frame.entries ?? [] }
       setFrameData(queryClient, sharedCrewKeys.presence(frame.session_key), value)
-      void queryClient.invalidateQueries({ queryKey: sharedCrewKeys.people })
+      requestRefresh(queryClient, PEOPLE_POLL_ID, sharedCrewKeys.people, PEOPLE_REFRESH_MS)
       return
     }
     case 'shared_crew.work': {
       const work = frame.work
       if (!work?.work_id) return
-      void queryClient.invalidateQueries({ queryKey: sharedCrewKeys.people })
+      requestRefresh(queryClient, PEOPLE_POLL_ID, sharedCrewKeys.people, PEOPLE_REFRESH_MS)
       // The chat reads its work list by tab key; the record names its session.
       const keys = new Set([work.session_key, frame.slot_key].filter((k): k is string => !!k))
       for (const key of keys) {
@@ -103,7 +106,7 @@ export function applySharedCrewFrame(queryClient: QueryClient, data: unknown): v
       return
     }
     case 'shared_crew.people':
-      void queryClient.invalidateQueries({ queryKey: sharedCrewKeys.people })
+      requestRefresh(queryClient, PEOPLE_POLL_ID, sharedCrewKeys.people, PEOPLE_REFRESH_MS)
       return
     case 'shared_crew.memory_change': {
       const change = frame.change

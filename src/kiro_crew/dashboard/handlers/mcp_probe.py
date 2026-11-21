@@ -26,6 +26,7 @@ from kiro_crew.agent_discovery import _read_agent_spec
 from kiro_crew.agent_spec_format import iter_agent_spec_files
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
+from kiro_crew.dashboard.handlers.mcp_agent_sync import _builtin_mcp_server_names
 from kiro_crew.dashboard.handlers.mcp_config_files import (
     _GLOBAL_MCP_JSON,
     _KIRO_GLOBAL_SURFACE,
@@ -308,7 +309,12 @@ def _read_global_mcps() -> Any:
         return {}
 
 
-def _stamp_config_state(d: dict[str, Any], global_mcps: Any, kirocrew_mcps: Any) -> None:
+def _stamp_config_state(
+    d: dict[str, Any],
+    global_mcps: Any,
+    kirocrew_mcps: Any,
+    builtin_names: frozenset[str] = frozenset(),
+) -> None:
     """Stamp the config-derived fields onto one serialized server row.
 
     ``enabled`` folds every place a disable can live -- the Kiro-global
@@ -374,6 +380,8 @@ def _stamp_config_state(d: dict[str, Any], global_mcps: Any, kirocrew_mcps: Any)
     spec = _config_entry_for(global_mcps, name) or {}
     kc_spec = _config_entry_for(kirocrew_mcps, name)
     d["kirocrewManaged"] = kc_spec is not None
+    # One of Kiro Crew's own servers: the table locks its off switch.
+    d["builtin"] = name in builtin_names
     shared_off = mcp_entry_is_muted(spec)
     store_off = mcp_entry_is_muted(kc_spec)
     is_disabled = shared_off or store_off or d.get("disabled") is True
@@ -469,6 +477,7 @@ async def _run_mcp_probe(sessions: SessionManager | None) -> None:
 
         global_mcps: dict[str, Any] = await asyncio.to_thread(_read_global_mcps)
         kirocrew_mcps = await asyncio.to_thread(_kirocrew_mcp_servers)
+        builtin = await asyncio.to_thread(_builtin_mcp_server_names)
 
         # Route through probe_all() so the fan-out is bounded by its
         # PROBE_MAX_CONCURRENCY semaphore. An
@@ -480,7 +489,7 @@ async def _run_mcp_probe(sessions: SessionManager | None) -> None:
         for s in probed:
             d = s.to_dict()
             spec = global_mcps.get(s.name, {})
-            _stamp_config_state(d, global_mcps, kirocrew_mcps)
+            _stamp_config_state(d, global_mcps, kirocrew_mcps, builtin)
             if isinstance(spec, dict) and spec.get("disabledTools"):
                 d["disabledTools"] = spec["disabledTools"]
             result.append(d)
@@ -511,12 +520,13 @@ async def api_mcp_servers(request: web.Request) -> web.Response:
     global _mcp_probe_in_progress
     from kiro_crew.mcp_discovery import list_servers  # circular import
 
+    # Off the loop: it reads every scope's config file, like the other reads here.
+    servers = await asyncio.to_thread(list_servers)
+
     # Kick off a background re-probe if the handler cache is stale,
     # so the next request gets fresh results.
     now = time.time()
     stale = now - _mcp_probe_ts > _MCP_PROBE_CACHE_SECS
-
-    servers = list_servers()
 
     # Overlay handler-level probe cache (last successful probe results)
     # so that "outdated" from the expired discovery cache is replaced with
@@ -567,6 +577,7 @@ async def api_mcp_servers(request: web.Request) -> web.Response:
     # file I/O (``read_text`` + ``json.loads``), and this handler runs for every
     # page load -- a slow data-home mount would stall the loop and its heartbeat.
     kirocrew_mcps = await asyncio.to_thread(_kirocrew_mcp_servers)
+    builtin = await asyncio.to_thread(_builtin_mcp_server_names)
     result: list[dict] = []
     for s in servers:
         d = s.to_dict()
@@ -593,7 +604,7 @@ async def api_mcp_servers(request: web.Request) -> web.Response:
             d["status"] = cached.get("status", d["status"])
             d["tools"] = cached.get("tools", d["tools"])
             d["error"] = cached.get("error", d["error"])
-        _stamp_config_state(d, global_mcps, kirocrew_mcps)
+        _stamp_config_state(d, global_mcps, kirocrew_mcps, builtin)
         err = d.get("error")
         if err:
             from kiro_crew.security import redact
@@ -611,6 +622,7 @@ async def api_mcp_servers(request: web.Request) -> web.Response:
     if result:
         await asyncio.to_thread(_annotate_quarantine, result)
         await asyncio.to_thread(_annotate_owner_sign_in, result)
+        await asyncio.to_thread(_annotate_unconfigured_connection, result)
         await _annotate_kas_chat_sign_in(result)
         await asyncio.to_thread(_annotate_agent_drops, result)
 
@@ -687,6 +699,7 @@ async def api_mcp_active(request: web.Request) -> web.Response:
             if bindings.kiro_agent:
                 agent = bindings.kiro_agent
         except Exception:
+            # Without a readable config, the agent name stays as given.
             pass
 
     # Non-kirocrew agent: read from agent config. The lookup walks the agents
@@ -711,7 +724,7 @@ async def api_mcp_active(request: web.Request) -> web.Response:
             {"error": "MCP config is busy; retry", "code": "mcp_config_busy"}, status=503
         )
     kirocrew_mcps = await asyncio.to_thread(_kirocrew_mcp_servers)
-    servers = list_servers()
+    servers = await asyncio.to_thread(list_servers)
     result: list[dict] = []
     for s in servers:
         # The launch predicate (fail-closed) over the Kiro-global file AND the
@@ -735,6 +748,36 @@ async def api_mcp_active(request: web.Request) -> web.Response:
         if builtin not in names:
             result.insert(0, {"name": builtin, "enabled": True})
     return web.json_response(result)
+
+
+async def _probed_rows(servers: list[Any], overlapped_shutdown: bool) -> list[dict[str, Any]]:
+    """The rows a probe answers with: config state stamped, verdicts recorded, annotated.
+
+    One sequence for ``POST /api/mcp/probe`` and ``POST /api/mcp/probe/{name}``, so
+    a row a single-server Test swaps into the page carries every field the full
+    probe gives it. Raises ``PermissionError`` when ``mcp.json`` stays held; each
+    caller answers that as its own 503.
+    """
+    global_mcps: dict[str, Any] = await asyncio.to_thread(_read_global_mcps)
+    kirocrew_mcps = await asyncio.to_thread(_kirocrew_mcp_servers)
+    builtin = await asyncio.to_thread(_builtin_mcp_server_names)
+    result: list[dict[str, Any]] = []
+    for s in servers:
+        d = s.to_dict()
+        spec = global_mcps.get(s.name, {})
+        _stamp_config_state(d, global_mcps, kirocrew_mcps, builtin)
+        if isinstance(spec, dict) and spec.get("disabledTools"):
+            d["disabledTools"] = spec["disabledTools"]
+        result.append(d)
+    if result:
+        if not overlapped_shutdown:
+            await asyncio.to_thread(_record_probe_verdicts, result)
+        await asyncio.to_thread(_annotate_quarantine, result)
+        await asyncio.to_thread(_annotate_owner_sign_in, result)
+        await asyncio.to_thread(_annotate_unconfigured_connection, result)
+        await _annotate_kas_chat_sign_in(result)
+        await asyncio.to_thread(_annotate_agent_drops, result)
+    return result
 
 
 async def api_mcp_probe(request: web.Request) -> web.Response:
@@ -767,7 +810,7 @@ async def api_mcp_probe(request: web.Request) -> web.Response:
         logger.debug("shareability evaluation failed; probe result unaffected", exc_info=True)
     # Read global mcp.json for enabled/disabledTools state
     try:
-        global_mcps: dict[str, Any] = await asyncio.to_thread(_read_global_mcps)
+        result = await _probed_rows(servers, overlapped_shutdown)
     except PermissionError:
         logger.warning(
             "POST /api/mcp/probe: mcp.json stayed unreadable after retries", exc_info=True
@@ -775,22 +818,6 @@ async def api_mcp_probe(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "MCP config is busy; retry", "code": "mcp_config_busy"}, status=503
         )
-    kirocrew_mcps = await asyncio.to_thread(_kirocrew_mcp_servers)
-    result: list[dict[str, Any]] = []
-    for s in servers:
-        d = s.to_dict()
-        spec = global_mcps.get(s.name, {})
-        _stamp_config_state(d, global_mcps, kirocrew_mcps)
-        if isinstance(spec, dict) and spec.get("disabledTools"):
-            d["disabledTools"] = spec["disabledTools"]
-        result.append(d)
-    if result:
-        if not overlapped_shutdown:
-            await asyncio.to_thread(_record_probe_verdicts, result)
-        await asyncio.to_thread(_annotate_quarantine, result)
-        await asyncio.to_thread(_annotate_owner_sign_in, result)
-        await _annotate_kas_chat_sign_in(result)
-        await asyncio.to_thread(_annotate_agent_drops, result)
     _mcp_probe_cache[:] = result
     _mcp_probe_ts = time.time()
     return web.json_response(result)
@@ -943,6 +970,7 @@ async def api_mcp_probe_cached(request: web.Request) -> web.Response:
     if result:
         await asyncio.to_thread(_annotate_quarantine, result)
         await asyncio.to_thread(_annotate_owner_sign_in, result)
+        await asyncio.to_thread(_annotate_unconfigured_connection, result)
         await _annotate_kas_chat_sign_in(result)
         await asyncio.to_thread(_annotate_agent_drops, result)
     # Decided and armed after the last await -- same three constraints as the
@@ -1048,9 +1076,68 @@ def _annotate_owner_sign_in(rows: list[dict]) -> None:
             continue
         row["ownerSignIn"] = (
             isinstance(name, str)
-            and is_signable_name(name)
+            and is_signable_name(name, {"url": url})
             and is_owner_server(config, name, {"url": url})
         )
+
+
+def _annotate_unconfigured_connection(rows: list[dict]) -> None:
+    """Stamp ``connectionUnconfigured`` on a row whose Connections card has no client yet.
+
+    Only for a provider whose source entries hold the user's own client
+    (``oauth_clients.keeps_user_client``, Slack). Until an OAuth Apps record
+    resolves the card cannot sign in, so the table leaves the row to its own chat
+    guidance, where the client the user wrote signs in on Kiro CLI (and on any
+    backend while the ``crew_oauth`` preview is off). Every other row carries no
+    key, so a row served from a cache never keeps a stale one. An unreadable
+    record reads as not configured, which offers no sign-in control at all.
+
+    The row is matched the way the card matches it (slug, and the registry URL
+    without regard to a trailing slash or letter case), so every row the card
+    would own gets the mark. This decides the mark only: binding a client stays
+    with ``oauth_clients.provider_for_server``, which takes the exact URL.
+
+    A marked row also gets ``connectionNeedsApp`` when its chat sign-in cannot
+    start: the entry names no client of its own, or Crew's sign-in serves the
+    entry and has no client to present. The table then names the missing OAuth
+    app instead of sending the user to chat. A configured card whose Crew sign-in
+    is unavailable gets ``connectionNeedsCrewSignIn`` instead, linking to setup,
+    unless the row sends its own credential header and so signs in by itself.
+    """
+    from kiro_crew.connections import crew_oauth
+    from kiro_crew.connections.oauth_clients import keeps_user_client, provider_for_server
+    from kiro_crew.connections.registry import get_provider, is_preregistered
+    from kiro_crew.connections.status import _crew_sign_in_off_slugs, card_url
+    from kiro_crew.dashboard.handlers.connections import _oauth_client_configured
+
+    configured: dict[str, bool] = {}
+    for row in rows:
+        row.pop("connectionUnconfigured", None)
+        row.pop("connectionNeedsApp", None)
+        row.pop("connectionNeedsCrewSignIn", None)
+        name, url = row.get("name"), row.get("url")
+        if not isinstance(name, str) or not isinstance(url, str):
+            continue
+        provider = get_provider(name)
+        if provider is None or not is_preregistered(provider):
+            continue
+        if card_url(url) != card_url(provider["mcp_url"]):
+            continue
+        slug = str(provider["slug"])
+        if not keeps_user_client(slug):
+            continue
+        if slug not in configured:
+            configured[slug] = _oauth_client_configured(provider)
+        if not configured[slug]:
+            row["connectionUnconfigured"] = True
+            headers = row.get("headers")
+            entry = {"url": url, "headers": headers if isinstance(headers, dict) else {}}
+            if not row.get("clientId") or crew_oauth.routed_slug(name, entry, provider_for_server):
+                row["connectionNeedsApp"] = True
+        elif not crew_oauth.has_credential_header(row.get("headers")) and (
+            slug in _crew_sign_in_off_slugs([provider])
+        ):
+            row["connectionNeedsCrewSignIn"] = True
 
 
 async def _annotate_kas_chat_sign_in(rows: list[dict]) -> None:
@@ -1088,3 +1175,51 @@ async def _annotate_kas_chat_sign_in(rows: list[dict]) -> None:
             row["kasChatSignIn"] = mint_kas.KAS_CHAT_SIGN_IN_CHAT
         elif row.get("authGrantPresent") is True and await kas_grant_observed(row["url"]) is False:
             row["kasChatSignIn"] = mint_kas.KAS_CHAT_SIGN_IN_AGAIN
+
+
+async def api_mcp_probe_one(request: web.Request) -> web.Response:
+    """POST /api/mcp/probe/{name} — probe one MCP server and return its live status.
+
+    Read-only for the config: it spawns that one server (or reports a disabled
+    server without spawning it, which ``probe_server`` also enforces) and
+    updates the one row in the probe cache. The returned row carries the same
+    annotations the full probe gives a row, so a row that replaces the old one
+    on the page shows no stale failure or sign-in note. Owner-only, like the
+    full probe.
+    """
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "mcp_probe_one")
+    if denied is not None:
+        return denied
+    from kiro_crew.mcp_discovery import _note_denied_env, list_servers
+    from kiro_crew.mcp_discovery_probe import probe_server
+
+    name = request.match_info["name"]
+    # list_servers reads every scope's config from disk: off the event loop.
+    matches = [s for s in await asyncio.to_thread(list_servers) if s.name == name]
+    if not matches:
+        return web.json_response(
+            {"error": "unknown MCP server", "code": "unknown_mcp_server", "name": name}, status=404
+        )
+    server = matches[0]
+    # probe_server refuses a consent-disabled server itself (no spawn, stale
+    # refusals dropped), so every row takes the same path here.
+    await probe_server(server)
+    # The same post-probe note probe_all gives a failed row, so the row this
+    # returns does not read as a broken server when a policy dropped its env.
+    _note_denied_env(server)
+    overlapped_shutdown = process_shutdown_requested(request.app["state"].sessions)
+    try:
+        rows = await _probed_rows([server], overlapped_shutdown)
+    except PermissionError:
+        logger.warning("POST /api/mcp/probe/%s: mcp.json stayed unreadable", name, exc_info=True)
+        return web.json_response(
+            {"error": "MCP config is busy; retry", "code": "mcp_config_busy"}, status=503
+        )
+    row = rows[0]
+    for i, cached in enumerate(_mcp_probe_cache):
+        if cached.get("name") == name:
+            _mcp_probe_cache[i] = row
+            break
+    return web.json_response(row)

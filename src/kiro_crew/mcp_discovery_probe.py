@@ -60,6 +60,7 @@ from kiro_crew.mcp_gateway.read_limits import resolve_read_buffer_limit
 from kiro_crew.sandbox import (
     CANONICAL_TEMP_KEYS,
     SandboxUnavailableError,
+    app_backend_secret_mask_targets,
     classify_declared_temp_env,
     classify_declared_temp_path,
     create_subprocess_limited,
@@ -694,17 +695,40 @@ async def probe_server(
         # a ``${HOME}/...`` launch path the session can start is not probed
         # literally, failed and quarantined.
         _spawn_args = expand_spec_args(server.args or [], server=server.name)
+        first_party_fixed_argv = _is_first_party_managed_argv(
+            server.name, server.command, server.args or [], server.env or {}
+        )
+        # The wrap shows a centrally governed host's policy cache read-only
+        # (``sandbox_tiers.enterprise_policy_cache_view``); the cache-only marker
+        # that makes the child read it is re-derived after the wrap below.
+        managed_env: dict[str, str] = {}
+        if first_party_fixed_argv:
+            from kiro_crew.agent import policy_cache_only_env
+
+            managed_env = policy_cache_only_env()
+        # A third-party server is code the gateway does not control; only the
+        # package's own managed server (fixed argv) may be left unmasked.
+        secret_mask: tuple[str, ...] = ()
+        if not first_party_fixed_argv:
+            secret_mask = await asyncio.to_thread(app_backend_secret_mask_targets)
         wrapped_argv, env, sandbox_cleanup = await sandboxed_spawn_argv_async(
             [resolved, *_spawn_args],
             mode="standard",
             env=env,
             strip_python_env=True,
             extra_writable_dirs=((str(probe_scratch),) if probe_scratch is not None else ()),
-            first_party_fixed_argv=_is_first_party_managed_argv(
-                server.name, server.command, server.args or [], server.env or {}
-            ),
+            first_party_fixed_argv=first_party_fixed_argv,
+            extra_hidden_dirs=secret_mask,
             _prepare=sandboxed_spawn_argv,
         )
+        if first_party_fixed_argv:
+            # ``sanitize_spec_env`` above strips Kiro Crew's reserved namespace
+            # from every file-declared env, including the values our own managed
+            # MCP specs carry. Re-derive those trusted values only after the
+            # sandbox has scrubbed the launch environment; otherwise a governed
+            # probe starts without its cache-only policy marker and refuses to
+            # initialize even though the gateway has a verified central cache.
+            env.update(managed_env)
         try:
             if probe_scratch is not None:
                 from kiro_crew.mcp_gateway.backend_tmp import tmp_env
@@ -1127,6 +1151,7 @@ async def probe_server(
                     proc.kill()
                     await asyncio.wait_for(proc.wait(), timeout=_PROBE_TEARDOWN_WAIT_SECS)
                 except Exception:
+                    # The kill is best effort; the process-tree reap below still runs.
                     pass
         if proc is not None and platform_compat.IS_POSIX:
             # Reap the probe's ENTIRE process group. The child was spawned with

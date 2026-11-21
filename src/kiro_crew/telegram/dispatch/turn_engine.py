@@ -34,7 +34,7 @@ from kiro_crew.executors import (
     EmbedAdmissionTimeout,
     run_in_embed_pool,
 )
-from kiro_crew.history import mint_row_mid
+from kiro_crew.history import _redact_at_write_boundary, mint_row_mid
 from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY, hook_gate_kwargs
 from kiro_crew.messaging import auto_title, privacy_mode, turn_ceiling
 from kiro_crew.messaging.attachments import IngestLimits, append_attachment_context
@@ -182,6 +182,7 @@ async def _run_turn(
     _turn_provider: object | None = None
     failure_reason: str | None = None
     attachment_temp_paths: list[str] = []
+    attachment_images: list[str] = []
     # Post-compaction re-injection bookkeeping for the finally: whether this
     # turn consumed the one-shot flag, and whether it landed (recorded success).
     _needs_reinjection = False
@@ -396,6 +397,7 @@ async def _run_turn(
                 self.client, msg.attachments, limits=limits
             )
             attachment_temp_paths = list(attachment_result.temp_paths)
+            attachment_images = list(attachment_result.image_paths)
             text = append_attachment_context(text, attachment_result)
         # Fold the replied-to message's quoted content onto the agent-facing
         # text HERE — after activation and command parsing, once per turn (an
@@ -628,18 +630,45 @@ async def _run_turn(
             # writer were skipped.
             dashboard_restricted = await self._session_restricted(session_key)
             if not dashboard_restricted:
+                row_text = text
+                if attachment_images and self.conv_log is not None:
+                    # Stored before both writers below, so the live window and the
+                    # transcript name the same copy: the window re-serializes its
+                    # rows on every flush, so a row naming the temp file this turn
+                    # deletes would replace the copy on disk. A failed store
+                    # writes the row as it came in, rather than no row.
+                    try:
+                        row_text = await asyncio.to_thread(
+                            self.conv_log.store_ingested_images,
+                            session_key,
+                            text,
+                            attachment_images,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Telegram: keeping pictures failed session=%s",
+                            session_key,
+                            exc_info=True,
+                        )
+                # BOTH sinks and BOTH halves: a persist-side scrub is too late.
+                safe_text, safe_reply = await asyncio.to_thread(
+                    lambda: (
+                        _redact_at_write_boundary("user", row_text),
+                        _redact_at_write_boundary("assistant", accumulated),
+                    )
+                )
                 mirror_mids = project_channel_turn_live(
                     self.dashboard_state,
                     session_key,
-                    text,
-                    accumulated,
+                    safe_text,
+                    safe_reply,
                     broadcast_user=True,
                 )
                 await asyncio.to_thread(
                     self._persist_turn,
                     session_key,
-                    text,
-                    accumulated,
+                    safe_text,
+                    safe_reply,
                     is_new_own_session,
                     agent=agent,
                     mirror_mids=mirror_mids,
@@ -647,22 +676,17 @@ async def _run_turn(
                 )
         except Exception:
             logger.warning("Telegram: persist_turn failed session=%s", session_key, exc_info=True)
-        # Auto-title, fire-and-forget. Without it a conversation's name is
-        # frozen at the first forty characters of the first message forever —
-        # the deterministic fallback ``_persist_turn`` writes — and the only
-        # correction is a manual /title. Claim-and-spawn, never awaited: the
-        # answer has already been delivered, so the user waits on nothing.
+        # Auto-title, fire-and-forget. Without it the name stays the first
+        # forty characters of the first message (``_persist_turn``'s fallback)
+        # unless the user runs /title. Claim-and-spawn, never awaited: the
+        # answer is already delivered.
         #
-        # Placed AFTER the persist above, because the record the pin reads is
-        # the one ``_persist_turn`` mints: pinning ahead of it would read
-        # ABSENT on a conversation's first exchange, which the guard refuses,
-        # so a new thread would lose its generated name and pay a second
-        # background turn for it on the next exchange. Both Slack dispatchers
-        # are ordered the same way -- they persist their turn before they pin
-        # -- so an ABSENT pin means the record is genuinely gone rather than
-        # not yet written. It stays OUTSIDE the ``dashboard_restricted``
-        # branch above so titling keeps the conditions it has here and gains
-        # none from that gate.
+        # AFTER the persist above, because the pin reads the record
+        # ``_persist_turn`` mints; before it, a first exchange reads ABSENT, the
+        # guard refuses, and the title costs a second background turn later.
+        # Both Slack dispatchers use the same order, so ABSENT means the record
+        # is really gone. Kept OUTSIDE the ``dashboard_restricted`` branch so
+        # that gate adds no conditions to titling.
         #
         # Isolated like every other bookkeeping step here, so failing even to
         # SPAWN the task never re-records this successful turn as a failure.
@@ -763,12 +787,10 @@ async def _run_turn(
         # replay, not loss, because the next long poll server-confirms the
         # batch it just dispatched.
         #
-        # NOT for a restricted session. ``/incognito`` and ``/temporary`` are a
-        # promise that this conversation persists nothing, and the spool is a
-        # durable file holding the message verbatim. The same predicate that
-        # gates the durable-history write gates this one; a refused restricted
-        # message degrades to the pre-feature loss, which is what the user asked
-        # for by choosing the mode.
+        # NOT for a restricted session: ``/incognito`` and ``/temporary``
+        # promise to persist nothing, and the spool holds the message verbatim.
+        # The predicate that gates the durable-history write gates this one, so
+        # a refused restricted message is simply lost, as the mode asks.
         if not await self._session_restricted(session_key):
             await spool_refused_turn(
                 channel_type="telegram",
@@ -853,15 +875,12 @@ async def _run_turn(
         # get_or_create raised before the semaphore was held. Only release
         # the semaphore if we actually acquired it.
         #
-        # ``close()`` is best-effort and must NEVER prevent the three steps
-        # after it. A renderer that fails to finalize -- a malformed
-        # Telegram response, a socket dropped mid-edit -- would otherwise
-        # skip ALL of them: the session semaphore is never given back (and
-        # because it is keyed by SESSION, every later message in that
-        # conversation blocks forever and the queue never drains), the
-        # ``_active_renderers`` entry leaks, and the attachment temp files
-        # stay on disk. Discord and the shared pipeline guard this the same
-        # way.
+        # ``close()`` is best-effort and must NEVER skip the three steps after
+        # it. If finalize fails (a malformed Telegram response, a dropped
+        # socket), the per-SESSION semaphore would never be released, so every
+        # later message in that conversation blocks and the queue never drains;
+        # the ``_active_renderers`` entry would leak and attachment temp files
+        # stay on disk. Discord and the shared pipeline guard it the same way.
         try:
             await out_renderer.close(failure_reason=failure_reason)
         except Exception:

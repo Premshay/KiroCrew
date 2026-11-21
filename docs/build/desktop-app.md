@@ -53,8 +53,9 @@ The electron-builder configuration lives in
   It performs no timer-driven bitmap work or `Sleep` on the NSIS UI thread;
   Windows CI installs the real artifact, records its duration, and enforces a
   5-minute ceiling. Auto-updates skip the assisted wizard's decision pages but
-  keep its native extraction progress visible, then relaunch Kiro Crew and close
-  automatically. A legacy silent `/S --updated` invocation is converted to the
+  keep its native extraction progress visible, then close automatically,
+  starting Kiro Crew again only when the update was launched with
+  `--force-run` (a Restart now the user asked for). A legacy silent `/S --updated` invocation is converted to the
   same visible update path so the transition works from already-fielded clients.
 - linux targets: `AppImage`, `deb`, `rpm` (category `Development`). One backend
   tree is packaged three times, with `scripts/stamp-distribution.sh` re-run
@@ -114,14 +115,13 @@ otherwise, and `UNIVERSAL=0` is the opt-out.)
 The shipped app carries **no** kiro-cli. It detects the one the user installed
 (`kiro_cli.known_kiro_cli_dirs`), and the first-run gate shows the install and
 sign-in commands until it finds one; the KAS bundle route (next section) needs
-no kiro-cli at all. Bundling was the default from #5130 / #13207 until #22018,
-and it was turned off for three reasons. The bundled copy ranked above every
-system install, so the gate read it as "installed" and users who installed Kiro
-Crew in that window never installed kiro-cli themselves. The copy they ran was
-frozen at `packaging/kiro-cli-version` instead of following upstream, so kiro-cli
-fixes reached them only when someone bumped the pin. And it was the largest
-single payload: ~250 MB of the macOS universal update zip, within ~50 MiB of the
-1 GiB Squirrel cliff (#21716), 100-200 MB on every other platform. Everything
+no kiro-cli at all. Bundling is off for three reasons. A bundled copy ranks above
+every system install, so the gate reads it as "installed" and its users never
+install kiro-cli themselves. The copy is frozen at `packaging/kiro-cli-version`
+instead of following upstream, so kiro-cli fixes reach it only when someone bumps
+the pin. And it is the largest single payload: ~250 MB of the macOS universal
+update zip, within ~50 MiB of the 1 GiB Squirrel cliff, 100-200 MB on every other
+platform. Everything
 below describes the `BUNDLE_KIRO_CLI=1` opt-in; the code paths it names stay in
 the tree and are exercised only by such a build.
 
@@ -262,7 +262,10 @@ version directory. A universal macOS build stages the engine once: its tarball
 is already `darwin-universal`, and `kas_bundle.make_universal_node` fetches the
 other architecture's pinned Node build and `lipo -create`s both into one Mach-O
 at the record's `node_bin` path, probing each slice through `arch -arm64` /
-`arch -x86_64`. The universal build then runs `kas_bundle.trim_for_shipping`:
+`arch -x86_64`. A slice probe that times out is rerun once: the slice that is
+not the host's runs under Rosetta, whose first translation of the new binary
+can outlast the 30-second probe on a loaded runner, and the rerun starts from
+Rosetta's cache. The universal build then runs `kas_bundle.trim_for_shipping`:
 the Node distribution keeps only its binary and `LICENSE` (the engine never
 spawns the distribution's npm, npx or corepack), and the engine loses its C/C++
 sources, headers, source maps and web-tree-sitter's debug build. No reader
@@ -273,9 +276,9 @@ macOS build fails on any symlink or hardlink in it, because the signing service
 refuses a universal bundle with shared trees.
 The Electron shell (`gateway-env.js`, `bundledKasEnvironment`) reads
 `BUNDLED-VERSION` and the install record beside it, and exports the root as
-`KIROCREW_BUNDLED_KAS_DIR` for either architecture. It runs nothing at boot: the route is off by default, the build
-already probed the staged Node, and a copy that cannot run on this machine
-fails at session spawn, only for a user who turned the switch on. A build
+`KIROCREW_BUNDLED_KAS_DIR` for either architecture. It runs nothing at boot: the route is off by default outside
+nightly builds, the build already probed the staged Node, and a copy that cannot
+run on this machine fails at session spawn, only on a build where the switch is on. A build
 without the payload or a source checkout exports nothing, and the backend then
 sees only the data home, exactly as an unbundled build does.
 The two values the shell joins onto the staged tree, the version and the
@@ -292,8 +295,8 @@ install` (or a `--unpinned` test install) wins over the copy the app was built
 with, the same precedence `KIROCREW_KIRO_BIN` has over the bundled kiro-cli.
 `kirocrew kas status` and `kirocrew doctor` say which one answered (`built into
 the app`), the status payload carries `installed.bundled`, and the Settings card
-names where each copy came from: "KAS engine … (included with the app)" for the
-app's copy, "KAS engine … (installed by you)" for the data home's.
+reads "Built-in engine … (included with the app)" for the
+app's copy, plain "Built-in engine …" for the data home's.
 
 The hand-off is asserted against a shipped app, not only the build's staging
 directory. The macOS smoke (`scripts/smoke-macos-install.sh`) checks the
@@ -313,12 +316,15 @@ smoke reads the shell's export off a real gateway child, so a build whose root
 electron-builder moved or dropped fails there rather than on an opted-in user's
 first prompt.
 
-Bundling the engine does not turn the route on: `agent.kas_bundle` keeps its
-default (off) on every platform while the route is in shadow testing, and the
-relay route runs on the kiro-cli the user installed. Nothing in the build,
-the installer or the shell flips the switch; that stays the user's own step. `BUNDLE_KAS=0 make desktop` opts a build out (the payload is ~55 MB
+Bundling the engine does not save `agent.kas_bundle`: unset, the packaged app
+prefers the built-in engine once Kiro Crew is signed in, and a host signed in
+only to kiro-cli keeps the relay until then (`acp/kas_build_default`). Nothing in
+the build, the installer or the shell saves the switch; the KAS row of Settings →
+Agent Harness is where the user chooses. `BUNDLE_KAS=0 make desktop` opts a build out (the payload is ~55 MB
 compressed, ~370 MB extracted per architecture); the switch then needs
-`kirocrew kas install` first, exactly as a pip install does. `KAS_BUNDLE_URL`
+`kirocrew kas install` first, exactly as a pure-wheel pip install does. CI refuses
+`BUNDLE_KAS=0` (`GITHUB_ACTIONS=true`), so no released artifact ships without the
+engine (the engine guarantee, #39623); the opt-out is for local builds. `KAS_BUNDLE_URL`
 names another manifest host (a mirror serving the same bytes; the pin refuses
 anything else).
 
@@ -742,13 +748,26 @@ same way). Key details:
   one, which fails the whole macOS release (see
   [stt-streaming](../system-specs/modules/stt-streaming.md) for how the runtime
   then authenticates a decoder whose bytes signing rewrote).
-- **Feishu SDK bundled** — every backend installs the `[feishu]` extra
-  (`lark-oapi` and its dependencies). Settings shows no `pip` command for a
-  bundled interpreter and each update replaces the whole bundle, so a channel
-  SDK the build leaves out cannot be added later. Windows ships bytecode only
-  for traced import closures, so its build traces `lark_oapi` too: the channel
-  imports it on the gateway loop. macOS does not trace it (see below), so a
-  macOS gateway with the Feishu channel on compiles it in memory at every start.
+- **Feishu SDK installed on first use, not bundled** — `lark-oapi` is about
+  11,000 files per backend that most users never load. The Feishu Settings
+  panel's **Install** (`POST /api/feishu/sdk/install`, `kiro_crew.sdk_extras`)
+  runs the bundle's pip with `--target --no-deps --require-hashes
+  --only-binary :all:` against `sdk_extras_locks/feishu.txt`, into
+  `<data home>/extras/feishu/<cpXY-platform-machine>/`, outside the signed
+  bundle so updates keep it. pip compiles its bytecode there. The install
+  records a hash of the lock's pins; a release that changes a pin in the lock
+  makes the gateway treat the old install as missing and install the new set
+  the same way. pip downloads
+  from the package mirror the user set up for pip, if any, and falls back once
+  to pypi.org when that mirror cannot serve the files. The gateway
+  appends that directory to `sys.path` before it probes or imports the SDK. The
+  `extras` leaf is READONLY in every agent sandbox and fenced from the agent's
+  file tools, like `browser-harness`. Only the three distributions core lacks
+  are locked (`lark-oapi`, `pycryptodome`, `requests-toolbelt`); the rest of
+  its closure is already in the bundle. A channel that is already enabled when
+  the SDK is missing gets it installed in the background at gateway start and
+  is then started (`feishu.gateway._schedule_sdk_install`), so updating from a
+  bundled build keeps Feishu working.
 - **Dashboard bundled** — the SPA is staged into
   `lib/python3.12/site-packages/kiro_crew/static/dist/` inside the bundle.
 - **Pruned** — `__pycache__`, test dirs, and unused stdlib (tkinter, idlelib,
@@ -785,6 +804,10 @@ shell that started it has exited and nothing restarts it, so the app treats it
 as a plain local Kiro Crew gateway, which the failure dialog's force-retry and
 wedge recovery may stop. A job list that cannot be read keeps the
 service-managed verdict.
+On macOS and Linux, a port check that force-retry or wedge recovery cannot run
+(lsof missing, not executable or timed out) is settled with a real bind before
+the gateway starts again, and a port still in use after the start wait shows the
+restart-required dialog.
 A port held by a process this app cannot attribute to itself, which is what a
 local SSH forward to a remote gateway looks like, is reused only when a remote
 crew is recorded for that port; otherwise the supervisor refuses it
@@ -866,7 +889,12 @@ manager brings the gateway straight back, the shell re-checks the new holder
 instead of starting a second one. A failed stop surfaces the start-failure
 dialog, naming the pid still holding the port, instead of spawning into it. SSH
 forwards, other data folders, unknown owners and Windows keep the existing spawn
-path, and a gateway that answers inside the window is reused as before.
+path, and a gateway that answers inside the window is reused as before. When
+that spawn exits and the owner probe had found a program this app did not
+start on the port, the gateway-failure dialog shows the `foreign-holder`
+refusal naming that program, not the bare exit code. A spawn killed by a
+signal keeps its own message: the port refusal exits with code 1, never by a
+signal.
 
 With no gateway to reuse, the shell locates the backend binary via
 [`find-bin.js`](../../website/electron/find-bin.js), spawns it as `kirocrew
@@ -983,6 +1011,112 @@ that each is a whole port in 1..65535 other than the launch port, takes at most
 32 per window, and forwards each from this machine's `127.0.0.1` to the same
 port on the crew host's loopback, the forward the pane's own `ssh -L` hint asks
 the user to run by hand.
+The Windows titlebar menu rides the same ownership boundary, per action rather
+than per channel. `app-menu:items` and `app-menu:execute` in
+[`ipc-registrar.js`](../../website/electron/ipc-registrar.js) resolve whether the
+sender is the local dashboard through the three checks above — the fixed primary
+origin, a window on a local gateway rather than a configured tunnel, and a
+positively identified primary listener — and
+[`windows-menu-model.js`](../../website/electron/windows-menu-model.js) withholds
+only the items that reach outside the sender's own document
+(`LOCAL_ONLY_ROLES`, `LOCAL_ONLY_MENU_IDS`, `LOCAL_ONLY_ITEM_IDS`: clipboard
+reads and writes, DevTools, and window or app lifecycle). `undo`, `redo` and
+`selectall` act on the sender's own document and stay available, so a connection
+window keeps a working menu rather than an empty one.
+
+The two channels answer asymmetrically, by design. `app-menu:items` decides only
+how a row LOOKS, so it may paint from the last positive verdict that
+WebContents earned while a re-probe runs in the background, which keeps opening
+the menu off the netstat and PowerShell round trip. `app-menu:execute` never
+does: every click re-resolves, joins that same single-flight probe, and refuses
+once it finds a foreign holder. The worst a stale paint can produce is one row
+drawn enabled that declines on click — and when the probe PROVES a foreign
+holder that decline is visible, not silent. `app-menu:execute` is a
+request/response `invoke` whose boolean answer is the renderer's only signal
+that its rows are stale, so a refusal makes the dashboard refetch the same menu
+rather than collapse it. That answer exists only on a shell built with this
+gate. An older shell's bridge is still a fire-and-forget `send` that returns
+nothing, and the dashboard is served by the gateway it connects to, so a gateway
+newer than the shell runs this bundle against that older preload. The renderer
+therefore classifies the answer by SHAPE rather than value: a non-thenable
+answer is the legacy bridge, whose main process has already taken the command,
+and strict `true` is required only of a bridge that acknowledges. Without that
+split a shell unable to answer reads as refusing every click, reporting commands
+that ran as failed until the shell itself is upgraded. By then the refused click's own probe has revoked the
+positive, so the rows come back greyed with the footer that names the reason, in
+the popup the user is still looking at.
+
+One refusal greys nothing, deliberately: a probe that comes back INCONCLUSIVE
+inside its paint grace refuses the click but keeps the positive, so the refetch
+repaints the same enabled rows and no footer appears. Greying them there is
+exactly what the grace exists to prevent — a gateway restart would otherwise
+strand the local user on a dead-looking menu. The click is still accounted for:
+the refusal renders an `ErrorNotice` naming the row that did not run, which is
+the only account available while the rows stay live, since the footer cannot
+speak for a row no probe has revoked (`errors-use-error-notice` is blocking).
+Once the grace lapses, or the probe names a foreign holder, the rows grey and
+the footer explains them as well.
+A probe that could not NAME a holder — the owner probe itself failing, the port
+briefly unbound, or a holder whose command line could not be read — is
+inconclusive rather than foreign *for this gate*: it authorizes no menu action,
+and it does not grey the local user's rows over a transient failure. That soft
+reading governs PAINTING only.
+
+`dev-mode-changed` does not share it. It reads the gate strictly, so an
+inconclusive probe refuses the visibility flip exactly as a proven foreign
+holder does, and only a proven local owner may flip the row. A probe outcome is
+never permission anywhere: the inconclusive mark records a WebContents, not the
+document that minted it, so any path reading that mark as a pass hands one
+document the verdict of the one before it — which is how a remote document came
+to inherit the local user's DevTools row. The paint path is sound because it
+reads the same mark to WITHHOLD, where a stale one can only be over-cautious.
+
+What refusing costs is narrower than it looks, and the menu model is what decides
+it. `app-menu.js` builds the `devtools-toggle` item with `visible: true`, so the
+row is already offered before this channel is ever called, and a refusal leaves
+it at that built value rather than hiding it. The dashboard's only caller sends
+`true`, once on mount.
+
+So the capability the strict read protects is the reverse of the obvious one. The
+channel also accepts `false`, and a remote document allowed through could HIDE
+the local user's DevTools row. That is what gating buys here, and it is why an
+inconclusive probe must not pass: a probe outcome is not permission.
+
+The residual cost falls on a desktop shell old enough to build that row hidden
+and reveal it only on this call. There, a single inconclusive probe at mount
+leaves the row hidden for the rest of the session, because the dashboard's sync
+has empty deps and never retries and there is no grace window the way the paint
+path has one. That state is **permanent wherever the owner probe cannot run at
+all**, and not Windows-only: on POSIX hosts `lsofListenPids` rejects on
+`ENOENT`/`EACCES` — `resolveLsof` tries absolute candidates then `PATH` — so a
+machine with no `lsof` returns `"unknown"` on every call. Windows reaches the
+same state through a netstat or PowerShell failure, usually transiently.
+
+It is accepted because it is how every other host-capability channel already
+fails closed. Recovering the row on such a shell wants a retrying sync in the
+renderer, not a softer gate.
+
+Gates 1 and 2 refuse it as before, and any cross-origin main-frame navigation
+invalidates the verdict at once, including one that lands while a probe is still
+in flight.
+
+That reading is specific to the app-menu gate, and the three cases are not
+interchangeable elsewhere. Where the probe found NOTHING holding the port — it
+could not run, or the port was unbound — the boot path still adopts whatever
+answers, because no holder was found to be wary of. Where it DID name a pid and
+only the command line was unreadable the owner is `unidentified`, and that is
+refused alongside a proven `foreign` holder everywhere adoption would disclose a
+credential: adopting posts this machine's `.local_secret`, and the `ssh -L`
+tunnel this classifier exists to recognise presents exactly that way on a host
+where the command-line lookup is broken. Painting a row that later declines
+costs the user a greyed click; handing out the secret cannot be taken back.
+
+Identity on Windows is path-bound. The trusted set holds the bundled launcher's
+own resolved interpreters plus the executables this app spawned, so a gateway run
+from a source checkout's virtualenv is in neither and classifies as a foreign
+holder; the main window's `LOCAL_ONLY` rows are withheld on that build.
+Resolving a virtualenv back to its base prefix through `pyvenv.cfg` would close
+that gap.
 
 Before spawning a **bundled** backend the shell checks that the bundle's Python
 stdlib is fully on disk
@@ -1139,7 +1273,7 @@ every recovery uses, and reconnects the main window to the page it was on
 `gateway:restart` channels, both behind the local-dashboard gate). It does not
 call the gateway's `POST /api/restart`: that replaces the process in place with
 `os.execv`, so on macOS and Linux the port is down while the pid stays, and the
-liveness monitor reads a rebind slower than its three missed probes as a wedge
+liveness monitor reads a rebind slower than its six missed probes as a wedge
 and kills it; on Windows the exec starts a new process and exits the old one,
 so the app loses its child and no longer stops the gateway on quit. A restart
 through the app ends turns that are mid-reply the way quitting does; they keep
@@ -1156,7 +1290,11 @@ control `kirocrew restart` names when it refuses a gateway the app supervises.
 
 When this launch ends with no usable gateway, the shell shows one dialog
 (`gateway-wait.js` renders it; the supervisor's start-failure record decides
-the state). It always offers **Retry**, plus the actions the state allows:
+the state). It always offers **Retry**, plus the actions the state allows. While
+the app waits for the gateway, the splash counts toward the deadline ("Waiting for gateway… 12s of
+120s"). A timeout on a gateway this app spawned and whose process is still
+running is titled "gateway is not answering" and points at the launch log;
+its Retry keeps that process and waits again. The actions:
 
 - **Add Remote Crew** / **Edit Remote Crew** opens the remote-crew form
   (`runtime/gateway/remote-crew-prompt.js`) to save or correct the crew this
@@ -1179,7 +1317,8 @@ carries internal identifiers and boot diagnostics, so the first view is the
 title, the message and the actions. Unfolding it grows the window to fit the
 log pane, and never shrinks a window the user made taller.
 
-The dialog also explains the refusals that start nothing:
+The dialog also explains the refusals that leave this launch without a local
+gateway:
 
 - **`crew-configured`**: the local gateway is on, but a recorded crew owns this
   port, so the shell does not bind it. Start Local Gateway re-execs on a free
@@ -1197,7 +1336,8 @@ The dialog also explains the refusals that start nothing:
   identified as someone else's; it is still refused, because adopting a holder
   no one identified would post this machine's local secret to it. This is the
   one refusal that shows the launch log and Reveal Log, because this launch
-  wrote the holder's pid and command there.
+  wrote the holder's pid and command there. A holder that does not answer
+  reaches this refusal too, once the gateway this launch spawned past it exits.
 
 After a Start Local Gateway click, the record names the outcome so the next
 dialog describes it: the restarted copy never served a gateway (offered again),
@@ -1517,7 +1657,11 @@ it), and `user-restart.js` (Settings → About's Restart gateway).
   decided by [`close-action.js`](../../website/electron/close-action.js)), and
   creates or removes the tray icon to match `showTrayIcon` (decided by
   [`tray-icon.js`](../../website/electron/tray-icon.js), which keeps the icon on
-  Windows and Linux while the close button hides the window); the composition root delegates quit-time
+  Windows and Linux while the close button hides the window), and hides a
+  minimized main window to the tray when `minimizeToTray` is on (decided by
+  [`minimize-to-tray.js`](../../website/electron/minimize-to-tray.js): never on
+  macOS, on Linux only when the session bus has a StatusNotifier tray host, and
+  only while the tray icon shows); the composition root delegates quit-time
   gateway teardown to the supervisor, which performs the graceful shutdown and
   signal escalation contract. On POSIX,
   [`gateway-stop.js`](../../website/electron/gateway-stop.js) lists the child's
@@ -1824,8 +1968,7 @@ before the deferral (on Windows those commands never run; see
 way when it runs the app's own bundled backend. A separately installed one (from
 the CLI, as a service, or reached over an SSH tunnel) follows its own
 `auto_update` ([where to set it](../../src/kiro_crew/docs/configuration.md#turning-it-off-and-updating-by-hand)). A
-container defers to its image. Both updaters running on one install is
-[#15797](https://github.com/kirodotdev/KiroCrew/issues/15797).
+container defers to its image.
 
 Settings → About renders the app's update section in the desktop app's own
 window and the gateway's in a browser. A desktop window also draws the gateway's
@@ -1871,10 +2014,9 @@ ones the packager never reads). The body is optional JSON:
 `relaunchPath` is for an install whose launch path changes with each version,
 such as a version-pinned payload behind a stable launch link. When the app
 relaunches after an apply (the start-time apply, or Restart now) it normally calls Electron's `app.relaunch()`, which
-re-runs the path the app was started as. A macOS app opened from the Dock was
-started as its version's own payload path, so it came back on the version the
-apply had just replaced, and the dashboard kept offering Restart to update
-([#22774](https://github.com/kirodotdev/KiroCrew/issues/22774)). With
+re-runs the path the app was started as. A macOS app opened from the Dock is
+started as its version's own payload path, so it would come back on the version
+the apply just replaced, and the dashboard would keep offering Restart to update. With
 `relaunchPath` set, the app relaunches that executable instead, with the same
 arguments. The value must be absolute or start with `~/`, which is the
 account's home read from the account entry, not from `HOME`. Anything else is
@@ -1968,14 +2110,22 @@ the 2026-11-10 decision "updates never restart a running gateway"):
   apply. The handler therefore holds every quit that arrives while the apply is
   in progress (`event.preventDefault()` and a re-arm), and the apply's own
   `app.exit` is the only exit. The feed lane holds quits for its gateway stop
-  the same way. Pinned by `test/update-second-quit-keeps-apply.test.js`.
+  the same way. Pinned by `website/electron/test/update-second-quit-keeps-apply.test.js`.
 - **An apply the quit left behind is finished at the next app start.** If the
   quit-time apply was interrupted or failed, the arm stays. The next start runs
   it in Electron main (`startup-apply.js`) before the gateway spawns and before
-  any window opens, clears the arm, and relaunches once into the new bundle.
-  First it checks governance: the last recorded verdict, and the policy file
-  read again now (`policy-source.js`: a pinned `updates` check or apply command
-  governs), so a provider installed since the last run is not bypassed. A
+  the main window opens, clears the arm, and relaunches once into the new bundle.
+  While the update command runs, the boot splash shows in its own window
+  (`install-splash.js`) with an "Installing update <version>" line. Closing it
+  only hides it (a quit of the app still quits), and launching the app again
+  (on macOS, reopening it) brings it forward and logs
+  `[update] a launch arrived during the start-time apply`. It is hidden when
+  the apply finishes, before the relaunch or the start of the installed
+  version, and destroyed once the main window opens.
+  First the start-time apply checks governance: the last recorded verdict, and
+  the policy file read again now (`policy-source.js`: a pinned `updates` check
+  or apply command governs), so a provider installed since the last run is not
+  bypassed. A
   provider-governed install, or a policy file that cannot be read, runs no
   marker command at start either; the arm stays and the outcome is `governed`.
   Then it probes whether a gateway is still running (a gateway that outlived the
@@ -2003,6 +2153,16 @@ the 2026-11-10 decision "updates never restart a running gateway"):
   a newer feed, a gateway still running) still brings the app back; the feed
   lane asks for it explicitly on each of those stand-downs, because only
   `quitAndInstall` honors its relaunch flag.
+- **Every apply is logged to `gateway-launch.log`.** `updateCommand` writes
+  `[update] managed update command started (pid N)` when it spawns and
+  `... ended: <outcome>, ran N ms, N bytes of output` when it ends, on quit and
+  at start alike (`managed-exec.js`). The outcome is `exit N`, `timed out after
+  N ms` (the 30 minute ceiling), `killed by <signal>` or `could not run`, and the
+  failure the app records and shows says the same (a timeout reads `timed out
+  after 30 minutes`): a timeout is never reported as `exited 1`. The output text itself is not logged, because an update tool can
+  print credential URLs or tokens. `checkCommand` runs log no such lines, so
+  the 30 second poll stays quiet. Pinned by
+  `test/managed-apply-log.test.js`.
 
 Windows shutdown, restart and sign-out end the app without a quit, so on Windows
 the app shows a "Kiro Crew update ready" notice at session end instead, telling
@@ -2013,12 +2173,15 @@ and not once an install has started.
 
 **A package manager's own update pause holds only if the check command honours
 it**: on this managed lane while the app's update switch is on, and on the
-gateway's policy `check_command` (below) while `auto_update` is on or a policy
-floor forces the update. Neither lane compares versions after an apply: if the
-check still prints a version and the apply command exits 0 having changed
-nothing, the gateway restarts and checks again at boot, and the app runs
-`updateCommand` on every quit, so both loop
-([#15798](https://github.com/kirodotdev/KiroCrew/issues/15798)).
+gateway's policy `check_command` (below), whose answer the dashboard shows as an
+update notice. The gateway's check only reports; its `apply_command` runs when a
+person clicks Update. The app lane re-checks after every apply
+(`applyChangedNothing` in `runtime/update/managed-exec.js`): an `updateCommand`
+that exits 0 while the check still offers the same version is recorded as a
+failed apply ("the install did not change"). On quit the arm stays and the app
+exits without relaunching; the next start's apply fails the same way, clears the
+arm and shows the error, so an apply that changes nothing does not repeat on
+every quit.
 
 The commands run with a **constructed environment**, not the app's own. Only an explicit pass-through set reaches them — `USER`, `LOGNAME`, `TZ`, `TMPDIR`, the `LANG`/`LC_*` locale vars, and the proxy vars — plus a narrowed system-only `PATH` and `cwd=/`. `HOME` is deliberately excluded: Python derives its user-site directory from it, so passing it through would let a planted `sitecustomize.py` run on every `python` start. Everything else is absent by construction, because `shell: true` means a shell interprets the command and a shell reads its environment as code: the loader family (`LD_*`/`DYLD_*`), the interpreter family (`PYTHON*`, `NODE_OPTIONS`), the startup files (`BASH_ENV`, `ENV`), the tracing pair (`SHELLOPTS` plus a command-substituting `PS4`), word splitting (`IFS`), and exported shell functions (`BASH_FUNC_*`, which shadow a command name outright). A packager whose updater needs any other variable must set it inside its own command rather than relying on inheritance.
 

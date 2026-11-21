@@ -209,7 +209,8 @@ async def test_entries_read_signals_truncation_and_pages(routes, arc, monkeypatc
 async def test_entry_text_is_redacted(routes, arc):
     from kiro_crew import arcs
 
-    arcs.append_entry(arc["id"], PEER, {"kind": "FACT", "text": "key sk-ant-api03-" + "A" * 40})
+    secret = "sk-ant-api03-" + "A" * 80
+    arcs.append_entry(arc["id"], PEER, {"kind": "FACT", "text": f"key {secret}"})
     read = await routes.api_arc_entries_read(_get(arc["id"], "entries"))
     assert "sk-ant-api03-AAAA" not in read.text
 

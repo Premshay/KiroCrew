@@ -31,6 +31,7 @@ import { isPeerRow, sessionRowIdentity } from './rowIdentity'
 import type { MemorySourceRow } from '../../lib/agentMemorySource'
 import { sameCrewView, type CodeChannelCrewView } from './codeChannelCrew'
 import type { AgentInfo, FilterDimension, RevealBlockingFilter, SessionFilterKey, SidebarSourceLink, Slot } from './types'
+import { sessionDisplayTitle } from '../../utils/sessionDisplayTitle'
 
 /** What the chip prints. The serializer decides it; this only covers its absence,
  * which means a bundle newer than the gateway it is talking to.
@@ -75,9 +76,10 @@ export interface SidebarRowFilters {
   /** The search box. `folderMatches` is the folders (with their subtrees) whose NAME
    *  the query matched, or null when none did. */
   search: { text: string; folderMatches: ReadonlySet<string> | null }
-  /** The status chips. A paused set keeps its chips and narrows nothing. `hidden` is
-   *  the chips whose eye button is on: their matches are dropped, paused or not. */
-  status: { active: ReadonlySet<SessionFilterKey>; hidden: ReadonlySet<SessionFilterKey>; paused: boolean; recentWindowMs: number }
+  /** The status chips. `paused` is the active ones that keep their chip but narrow
+   *  nothing. `hidden` is the chips whose eye button is on: their matches are
+   *  dropped, paused or not. */
+  status: { active: ReadonlySet<SessionFilterKey>; hidden: ReadonlySet<SessionFilterKey>; paused: ReadonlySet<SessionFilterKey>; recentWindowMs: number }
   /** The filter menu's folder hides. `active` is false while the search box holds
    *  text, so a hidden folder never becomes a search dead end. `pinnedSubtree` is
    *  the folders a folder pin covers (the pinned folders and everything under
@@ -88,6 +90,9 @@ export interface SidebarRowFilters {
    *  vocabulary owns (`useSidebarModels`), already answering true for every row
    *  while nothing is selected; `active` is whether a selection narrows. */
   models: { passes: (slot: Slot) => boolean; active: boolean }
+  /** The Shared Crew "Started by" filter, the same shape as `models`: `passes`
+   *  comes from the creator vocabulary (`useSidebarCreators`). */
+  creators: { passes: (slot: Slot) => boolean; active: boolean }
 }
 
 /** How a reveal drops each dimension. Carried, never called, by this module. */
@@ -95,6 +100,8 @@ export interface SidebarRowClears {
   tags: () => void
   /** Drop the model selection and its direction. */
   models: () => void
+  /** Drop the "Started by" selection. */
+  creators: () => void
   search: () => void
   status: () => void
   /** Un-hide this folder and its ancestor chain; a no-op for `undefined`. */
@@ -235,6 +242,12 @@ export interface RowScene {
   /** The LOCAL Crew Mode root whose worker the chat pane shows, or null. Workers
    *  are not listed, so the root's row is marked as the shown worker's parent. */
   crewParent: string | null
+  /** The chat page is in Split View (`ChatSidebarProps.splitMode`). */
+  splitMode: boolean
+  /** The last open of the active chat failed and has not loaded since
+   *  (`ChatState.slotOpenFailed`): a click on its row retries the open instead
+   *  of toggling. */
+  openFailed: boolean
   shell: RowShell
   /** Local state that only some rows carry, every member keyed by LOCAL slot key. */
   local: {
@@ -289,6 +302,11 @@ export interface SessionRowView {
    *  answer flips, not every row (which carrying `activeSlot` in `rowActions`
    *  would cause). */
   isSidebarActiveSlot: boolean
+  /** A plain click on this row shows or hides the side panel: it is the active
+   *  LOCAL row, outside Split View (lib/reclickPanelToggle). The row's tooltip and
+   *  its click both read this one field, so the tooltip never promises a toggle
+   *  the click will not make. */
+  reclickPanel: boolean
   /** This row is the Crew Mode root whose worker the chat pane shows: not the
    *  active row, but the way the person found the worker, so it stays marked. */
   isCrewParent: boolean
@@ -364,6 +382,10 @@ export interface SidebarRows {
   revealBlockingFilters: RevealBlockingFilter[]
   /** Status-chip badges, counted over every row (the collection the filter renders). */
   statusCounts: Record<SessionFilterKey, number>
+  /** While the "Started by" filter narrows: of the rows every OTHER dimension keeps,
+   *  how many it shows (`matching`) and how many it leaves out (`hidden`). Both 0
+   *  while it is off. */
+  creatorCounts: CreatorCounts
   /** The one order every lane uses: the search relevance while a content search is
    *  active, otherwise the local pinned section first, then the sort key. */
   laneOrder: (a: Slot, b: Slot) => number
@@ -460,6 +482,7 @@ interface BuildMemos {
   isRowStatusHidden: Memo<SidebarRows['isRowStatusHidden']>
   dimensions: Memo<FilterDimension[]>
   statusCounts: Memo<Record<SessionFilterKey, number>>
+  creatorCounts: Memo<CreatorCounts>
   filteredSlots: Memo<Slot[]>
   revealBlockingFilters: Memo<RevealBlockingFilter[]>
   isRowFolderHidden: Memo<SidebarRows['isRowFolderHidden']>
@@ -476,6 +499,9 @@ interface BuildMemos {
 
 const memosOf = new WeakMap<SidebarRows, BuildMemos>()
 const NO_ROWS: Slot[] = []
+
+export interface CreatorCounts { matching: number; hidden: number }
+const NO_CREATOR_COUNTS: CreatorCounts = { matching: 0, hidden: 0 }
 
 // Every closure the model hands out is made by a module-level factory below, from only
 // the values it is declared to read. A closure created inside `buildSidebarRows` would
@@ -599,10 +625,9 @@ function makeDimensions(
   folderOf: SidebarRows['folderOf'],
   clears: SidebarRowClears,
 ): FilterDimension[] {
-  const { tags, models, search, status, folders: folderFilter } = filters
-  // A paused set keeps its chips but narrows nothing, so the whole status dimension
-  // goes inert while the pause is on.
-  const activeStatus = status.paused ? [] : (Object.keys(matches) as SessionFilterKey[]).filter(key => status.active.has(key))
+  const { tags, models, creators, search, status, folders: folderFilter } = filters
+  // A paused filter keeps its chip but narrows nothing, so only the unpaused ones count.
+  const activeStatus = (Object.keys(matches) as SessionFilterKey[]).filter(key => status.active.has(key) && !status.paused.has(key))
   // A pinned session is one the person chose to keep in sight, and the pinned band is
   // the stable top of the list (`laneOrder`). The two property filters (tags, status
   // chips) therefore exempt it: the band stays, the narrowed rows sit under it, and the
@@ -726,7 +751,31 @@ function makeDimensions(
       hides: slot => !models.passes(slot),
       clear: () => clears.models(),
     },
+    {
+      // "Started by". A session property like the model, with no pinned exemption
+      // for the same reason: it is asked to find whose sessions these are.
+      filtersRow: creators.passes,
+      narrows: () => creators.active,
+      exemptsPinned: false,
+      isSearch: false,
+      hides: slot => !creators.passes(slot),
+      clear: () => clears.creators(),
+    },
   ]
+}
+
+/** The "Started by" line's two numbers: the rows every other dimension keeps,
+ *  split by whether this filter shows them. */
+function countCreators(rows: Slot[], dimensions: FilterDimension[], creators: SidebarRowFilters['creators']): CreatorCounts {
+  if (!creators.active) return NO_CREATOR_COUNTS
+  let matching = 0
+  let hidden = 0
+  for (const slot of rows) {
+    if (!dimensions.every(d => d.filtersRow === null || d.filtersRow === creators.passes || d.filtersRow(slot))) continue
+    if (creators.passes(slot)) matching += 1
+    else hidden += 1
+  }
+  return { matching, hidden }
 }
 
 /** Over every row -- the collection the filter RENDERS -- not over the local ones. The
@@ -849,7 +898,7 @@ function makeViews(model: ViewModel): SidebarRows['views'] {
         const key = localKeyOf(slot)
         const { renaming, revealFlash, nativeDragKey } = scene.local
         return {
-          title: slot.title && slot.title !== slot.key ? slot.title : slot.key,
+          title: sessionDisplayTitle(slot),
           // The active, renaming, dragged and revealed rows never stub: each holds state
           // a remount would drop. The dnd-kit clause compares the raw key, as the drag id
           // is one; no peer row can be dragged.
@@ -890,9 +939,10 @@ export function buildSidebarRows(inputs: SidebarRowInputs, previous?: SidebarRow
     makeIsRowStatusHidden(status.hidden, statusMatches.value))
   const dimensions = reuse(prev?.dimensions, [
     status.active, status.paused, status.hidden, tags.resolved, tags.raw, filters.models.passes, filters.models.active,
+    filters.creators.passes, filters.creators.active,
     search.text, search.folderMatches, searchRanks,
     statusMatches.value, isRowStatusHidden.value, folderFilter.hiddenSubtree, folderFilter.pinnedSubtree, slotFolders,
-    clears.tags, clears.models, clears.search, clears.status, clears.folder, clears.hides,
+    clears.tags, clears.models, clears.creators, clears.search, clears.status, clears.folder, clears.hides,
   ], () => makeDimensions(filters, statusMatches.value, isRowStatusHidden.value, searchRanks, folderOf, clears))
 
   // Before the filter pass, as the chip counts always were: both read the clock for a
@@ -900,6 +950,8 @@ export function buildSidebarRows(inputs: SidebarRowInputs, previous?: SidebarRow
   const statusCounts = reuse(prev?.statusCounts, [rows, statusMatches.value], () => countStatus(rows, statusMatches.value))
   const filteredSlots = reuse(prev?.filteredSlots, [rows, dimensions.value, laneOrder.value, frozen], () =>
     frozenList ?? filterRows(rows, dimensions.value, laneOrder.value))
+  const creatorCounts = reuse(prev?.creatorCounts, [rows, dimensions.value, filters.creators.passes, filters.creators.active], () =>
+    countCreators(rows, dimensions.value, filters.creators))
   const listNarrowed = dimensions.value.some(d => d.narrows !== null && d.narrows())
   const pinnedExemptNarrowing = dimensions.value.some(d => d.exemptsPinned && d.narrows !== null && d.narrows())
   const filtersNarrowing = dimensions.value.some(d => !d.isSearch && d.narrows !== null && d.narrows())
@@ -938,6 +990,7 @@ export function buildSidebarRows(inputs: SidebarRowInputs, previous?: SidebarRow
     filtersNarrowing,
     revealBlockingFilters: revealBlockingFilters.value,
     statusCounts: statusCounts.value,
+    creatorCounts: creatorCounts.value,
     laneOrder: laneOrder.value,
     isRowFolderHidden: hidden,
     isRowStatusHidden: isRowStatusHidden.value,
@@ -959,7 +1012,7 @@ export function buildSidebarRows(inputs: SidebarRowInputs, previous?: SidebarRow
   }
   memosOf.set(result, {
     folderOf: folderOfMemo, isPinned: isPinnedMemo, isRunning: isRunningMemo,
-    laneOrder, statusMatches, isRowStatusHidden, dimensions, statusCounts, filteredSlots, revealBlockingFilters,
+    laneOrder, statusMatches, isRowStatusHidden, dimensions, statusCounts, creatorCounts, filteredSlots, revealBlockingFilters,
     isRowFolderHidden, crewRows, main, crew, crewRowCount, flat, ungrouped, board, boardPeerCount, folderTree,
   })
   return result
@@ -995,6 +1048,7 @@ function rowView(slot: Slot, placement: RowPlacement, scene: RowScene, model: Vi
     // when a crew window covers the pane (where isActiveIn is false but the
     // session is still active). Matches the key the drop handler refuses against.
     isSidebarActiveSlot: local !== null && scene.activeSlot === local,
+    reclickPanel: local !== null && !scene.splitMode && !scene.openFailed && isActiveIn(scene, slot),
     isCrewParent: local !== null && !scene.crewWindow && scene.crewParent === local,
     // A crew window covers the chat pane, so no composer is visible to stage a
     // reference into — withhold "Reference in chat" on every row, same reason as
@@ -1041,7 +1095,7 @@ const VIEW_FIELDS: Record<keyof SessionRowView, true> = {
   slot: true, identity: true, localKey: true, peerId: true, peerName: true, scope: true, navScope: true,
   holdContainer: true, showDivider: true, orderStamp: true, rowAnimEnabled: true, rowMotionHeld: true, conductor: true,
   folderConductor: true, crew: true,
-  isActive: true, isSidebarActiveSlot: true, isCrewParent: true, crewWindowCovers: true, isOut: true, isPinned: true, isUnread: true, isRunning: true, recent: true,
+  isActive: true, isSidebarActiveSlot: true, reclickPanel: true, isCrewParent: true, crewWindowCovers: true, isOut: true, isPinned: true, isUnread: true, isRunning: true, recent: true,
   subagentCount: true, subagentApprovalCount: true, digitBadge: true, isRenaming: true, renamingHere: true,
   renameValue: true, revealFlash: true, pinnedOrderIndex: true, drawnOrderIndex: true, pinnedReorderEnabled: true,
   opensElsewhere: true, shell: true,

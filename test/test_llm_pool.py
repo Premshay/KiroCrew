@@ -336,12 +336,41 @@ class TestProviderDetection:
         with patch("pathlib.Path.home", return_value=tmp_path):
             assert _get_provider_type() == "acp"
 
-    def test_reads_claude_code_from_config(self, tmp_path):
+    def test_a_hand_edited_claude_code_reads_as_acp(self, tmp_path):
+        """The schema admits only ``acp``, so the loader turns any other value into
+        ``acp``; the pool reads the raw file and must agree with it."""
         config = tmp_path / ".kirocrew" / "config.json"
         config.parent.mkdir(parents=True)
         config.write_text('{"agent": {"provider": "claude_code"}}')
         with patch("pathlib.Path.home", return_value=tmp_path):
-            assert _get_provider_type() == "claude_code"
+            assert _get_provider_type() == "acp"
+
+    @pytest.mark.asyncio
+    async def test_a_hand_edited_claude_code_still_builds_the_acp_worker(self, tmp_path):
+        config = tmp_path / ".kirocrew" / "config.json"
+        config.parent.mkdir(parents=True)
+        config.write_text('{"agent": {"provider": "claude_code"}}')
+        built: list[str] = []
+
+        def _fake(kind: str):
+            def _make(**_kwargs):
+                built.append(kind)
+                return FakeWorker()
+
+            return _make
+
+        with (
+            patch("pathlib.Path.home", return_value=tmp_path),
+            patch("kiro_crew.knowledge.llm_pool.AcpWorker", side_effect=_fake("acp")),
+            patch("kiro_crew.knowledge.llm_pool.CCWorker", side_effect=_fake("claude_code")),
+            patch("kiro_crew.knowledge.llm_pool._get_acp_backend", return_value=ACP_BACKEND_KIRO),
+        ):
+            pool = LLMPool(pool_size=1)
+            await pool.start()
+            await pool.shutdown()
+
+        assert pool.provider_type == "acp"
+        assert built == ["acp"]
 
     def test_reads_acp_from_config(self, tmp_path):
         config = tmp_path / ".kirocrew" / "config.json"
@@ -450,11 +479,8 @@ class TestReadConfig:
 
     def test_parsers_accept_config_dict(self):
         """provider parser reads the passed dict, no disk access."""
-        data = {
-            "agent": {"provider": "claude_code"},
-            "knowledge": {},
-        }
-        assert _get_provider_type(data) == "claude_code"
+        assert _get_provider_type({"agent": {"provider": "acp"}, "knowledge": {}}) == "acp"
+        assert _get_provider_type({"agent": {"provider": "claude_code"}}) == "acp"
 
     @pytest.mark.parametrize(
         "bad",
@@ -1083,12 +1109,14 @@ class TestAcpWorkerZeroToolConfirmation:
 
     @pytest.mark.asyncio
     async def test_kiro_with_a_shadowed_spec_refuses_to_start_and_sends_nothing(
-        self, tmp_path, caplog
+        self, tmp_path
     ):
         """A project-level spec of the same name that carries tools shadows the
         installed zero-tool one on kiro, which resolves ``--agent`` against the
         workspace first. Nothing native confirms the ban there, so the worker
         must not start, and no prompt may reach the shadowing spec."""
+        from kiro_crew.knowledge.llm_pool import KnowledgeSpecUnconfirmed
+
         client = _zero_tool_client(spec_declares_zero_tools=False)
         client.is_ready = True
         client.backend = ACP_BACKEND_KIRO
@@ -1096,19 +1124,14 @@ class TestAcpWorkerZeroToolConfirmation:
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client) as mk,
-            caplog.at_level("WARNING", logger="kiro_crew.knowledge.llm_pool"),
         ):
             worker = AcpWorker(acp_backend=ACP_BACKEND_KIRO)
-            with pytest.raises(RuntimeError, match="zero-tool spec"):
+            with pytest.raises(KnowledgeSpecUnconfirmed, match="kirocrew-knowledge.*zero-tool spec"):
                 await worker.send_message("untrusted document text")
         assert mk.call_count == 1
         client.shutdown.assert_awaited_once()
         client.send_message.assert_not_awaited()
         assert worker._client is None
-        assert any(
-            "does not declare" in r.getMessage() and "kirocrew-knowledge" in r.getMessage()
-            for r in caplog.records
-        )
 
     @pytest.mark.asyncio
     async def test_unconfirmed_spec_refusal_survives_a_failing_shutdown(self, tmp_path):
@@ -1610,6 +1633,8 @@ class TestWorkerAppliesBindingForkContracts:
 
     @pytest.mark.asyncio
     async def test_bound_claude_without_a_zero_tool_spec_is_refused(self):
+        from kiro_crew.knowledge.llm_pool import KnowledgeSpecUnconfirmed
+
         worker = AcpWorker(sandbox_mode="off")
         with (
             patch(
@@ -1621,7 +1646,7 @@ class TestWorkerAppliesBindingForkContracts:
         ):
             client_cls.return_value = _zero_tool_client()
             client_cls.return_value.spec_zero_tools = False
-            with pytest.raises(RuntimeError, match="did not confirm a zero-tool spec"):
+            with pytest.raises(KnowledgeSpecUnconfirmed, match="did not confirm a zero-tool spec"):
                 await worker.start()
             client_cls.return_value.shutdown.assert_awaited_once()
             assert worker._client is None

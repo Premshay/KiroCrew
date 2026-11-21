@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import base64
 import io
+import mimetypes
 import os
 import random
 import string
+import sys
 import urllib.parse
 from unittest.mock import MagicMock, patch
 
@@ -22,6 +24,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 from dashboard_owner_helpers import NoConfiguredOwner, as_owner
 
+from conftest import requires_symlinks
 from kiro_crew.dashboard.handlers import api_file_download
 
 
@@ -33,14 +36,18 @@ def _make_app() -> web.Application:
 
 @pytest.fixture
 def mock_sel():
-    with patch("kiro_crew.sel.sel") as m, \
-         patch("kiro_crew.dashboard.handlers.files.is_sensitive_path", return_value=False):
+    with (
+        patch("kiro_crew.sel.sel") as m,
+        patch(
+            "kiro_crew.dashboard.handlers.files.is_sensitive_path", return_value=False
+        ),
+    ):
         instance = MagicMock()
         m.return_value = instance
         yield instance
 
 
-# --- Regression: binary content survives the download round-trip ---
+# --- Binary content survives the download round-trip ---
 
 
 # Minimal docx fingerprint: ZIP header + non-UTF-8 bytes. These are exactly
@@ -86,7 +93,11 @@ async def test_content_type_for_known_extensions(tmp_path, mock_sel):
         "doc.docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "report.pdf": "application/pdf",
         "image.png": "image/png",
-        "data.csv": "text/csv",
+        # On Windows the stdlib table merges the registry, where an installed
+        # spreadsheet app can claim .csv (application/vnd.ms-excel).
+        "data.csv": (
+            mimetypes.guess_type("data.csv")[0] if sys.platform == "win32" else "text/csv"
+        ),
     }
     for name, expected in cases.items():
         f = tmp_path / name
@@ -115,7 +126,7 @@ async def test_unknown_extension_falls_back_to_octet_stream(tmp_path, mock_sel):
 @pytest.mark.asyncio
 async def test_text_file_served_when_clean(tmp_path, mock_sel):
     f = tmp_path / "notes.txt"
-    f.write_text("hello world\nno secrets here")
+    f.write_bytes(b"hello world\nno secrets here")
     with patch("kiro_crew.dashboard.handlers._validate_dashboard_path", return_value=str(f)):
         async with TestClient(TestServer(_make_app())) as client:
             resp = await client.get(f"/api/file-download?path={f}")
@@ -133,8 +144,12 @@ async def test_flagged_text_file_is_served_whole(tmp_path, mock_sel):
     f = tmp_path / "leaky.txt"
     f.write_text("ok body")
     redact_path = "kiro_crew.dashboard.handlers.files.redact"
-    with patch("kiro_crew.dashboard.handlers._validate_dashboard_path", return_value=str(f)), \
-            patch(redact_path, return_value="ok body REDACTED"):
+    with (
+        patch(
+            "kiro_crew.dashboard.handlers._validate_dashboard_path", return_value=str(f)
+        ),
+        patch(redact_path, return_value="ok body REDACTED"),
+    ):
         async with TestClient(TestServer(_make_app())) as client:
             resp = await client.get(f"/api/file-download?path={f}")
             assert resp.status == 200
@@ -161,9 +176,15 @@ async def test_sensitive_path_rejected(tmp_path):
     f.write_text("x")
     # Patch is_sensitive_path on the importing module so the alias bound at
     # files.py import-time resolves to the True-returning mock.
-    with patch("kiro_crew.dashboard.handlers._validate_dashboard_path", return_value=str(f)), \
-         patch("kiro_crew.dashboard.handlers.files.is_sensitive_path", return_value=True), \
-         patch("kiro_crew.sel.sel") as m:
+    with (
+        patch(
+            "kiro_crew.dashboard.handlers._validate_dashboard_path", return_value=str(f)
+        ),
+        patch(
+            "kiro_crew.dashboard.handlers.files.is_sensitive_path", return_value=True
+        ),
+        patch("kiro_crew.sel.sel") as m,
+    ):
         m.return_value = MagicMock()
         async with TestClient(TestServer(_make_app())) as client:
             resp = await client.get(f"/api/file-download?path={f}")
@@ -180,6 +201,7 @@ async def test_missing_file_404(tmp_path, mock_sel):
 
 
 @pytest.mark.asyncio
+@requires_symlinks
 async def test_symlink_rejected(tmp_path, mock_sel):
     """O_NOFOLLOW must reject symlinked paths atomically, like api_file_raw."""
     target = tmp_path / "real.docx"
@@ -204,8 +226,10 @@ _FILES = "kiro_crew.dashboard.handlers.files"
 
 @pytest.fixture
 def small_threshold():
-    with patch(f"{_FILES}._DOWNLOAD_SCAN_MAX_BYTES", 512), \
-         patch(f"{_FILES}._STREAM_CHUNK_BYTES", 100):
+    with (
+        patch(f"{_FILES}._DOWNLOAD_SCAN_MAX_BYTES", 512),
+        patch(f"{_FILES}._STREAM_CHUNK_BYTES", 100),
+    ):
         yield 512
 
 
@@ -228,9 +252,11 @@ async def test_a_large_file_streams_whole_with_no_confirmation(
     f = tmp_path / "huge.docx"
     raw = bytes(random.Random(5).randrange(256) for _ in range(2048))
     f.write_bytes(raw)
-    with patch(f"{_FILES}.binary_content_is_flagged") as binary, \
-         patch(f"{_FILES}.wide_content_is_flagged") as wide, \
-         patch(f"{_FILES}.redact") as redact:
+    with (
+        patch(f"{_FILES}.binary_content_is_flagged") as binary,
+        patch(f"{_FILES}.wide_content_is_flagged") as wide,
+        patch(f"{_FILES}.redact") as redact,
+    ):
         status, body, headers = await _get(f)
     assert status == 200
     assert body == raw
@@ -325,8 +351,10 @@ async def test_a_stalled_chunk_read_holds_no_default_worker_and_ends_the_stream(
         return b""
 
     try:
-        with patch(f"{_FILES}._download_read_chunk", hung_read), \
-             patch(f"{_FILES}._DOWNLOAD_CHUNK_STALL_SECS", 0.2):
+        with (
+            patch(f"{_FILES}._download_read_chunk", hung_read),
+            patch(f"{_FILES}._DOWNLOAD_CHUNK_STALL_SECS", 0.2),
+        ):
             status, body, short = await _get_streamed(f)
     finally:
         release.set()
@@ -381,10 +409,12 @@ async def test_after_a_stall_the_handler_returns_and_the_close_is_deferred(
         return await real_probe(fn, *args, **kwargs)
 
     try:
-        with patch(f"{_FILES}._download_read_chunk", hung_read), \
-             patch(f"{_FILES}._DOWNLOAD_CHUNK_STALL_SECS", 0.2), \
-             patch(f"{_FILES}._run_path_probe", spy_probe), \
-             patch("os.fdopen", locked_fdopen):
+        with (
+            patch(f"{_FILES}._download_read_chunk", hung_read),
+            patch(f"{_FILES}._DOWNLOAD_CHUNK_STALL_SECS", 0.2),
+            patch(f"{_FILES}._run_path_probe", spy_probe),
+            patch("os.fdopen", locked_fdopen),
+        ):
             # A handler that awaited the blocked close would never return here;
             # the per-test timeout names that hang.
             status, body, short = await _get_streamed(f)
@@ -442,9 +472,11 @@ async def test_a_small_read_past_its_ceiling_defers_the_close(tmp_path, mock_sel
         return await real_probe(fn, *args, **kwargs)
 
     try:
-        with patch(f"{_FILES}._PATH_PROBE_EXEC_CEILING_SECS", 0.2), \
-             patch(f"{_FILES}._run_path_probe", spy_probe), \
-             patch("os.fdopen", hung_fdopen):
+        with (
+            patch(f"{_FILES}._PATH_PROBE_EXEC_CEILING_SECS", 0.2),
+            patch(f"{_FILES}._run_path_probe", spy_probe),
+            patch("os.fdopen", hung_fdopen),
+        ):
             # A handler that awaited the blocked close would never return here;
             # the per-test timeout names that hang.
             status, _, _ = await _get(f)
@@ -508,7 +540,10 @@ async def test_a_busy_pool_closes_the_file_off_the_event_loop(tmp_path, mock_sel
         return await real_probe(fn, *args, **kwargs)
 
     loop_thread = threading.current_thread()
-    with patch(f"{_FILES}._run_path_probe", busy_on_close), patch("os.fdopen", spy_fdopen):
+    with (
+        patch(f"{_FILES}._run_path_probe", busy_on_close),
+        patch("os.fdopen", spy_fdopen),
+    ):
         status, body, _ = await _get(f)
     assert status == 200
     assert body == b"hello world"
@@ -533,8 +568,10 @@ async def test_a_sensitive_path_over_the_threshold_is_refused(
 ):
     f = tmp_path / "huge.env"
     f.write_bytes(b"x" * 2048)
-    with patch(f"{_FILES}.is_sensitive_path", return_value=True), \
-         patch("kiro_crew.sel.sel") as m:
+    with (
+        patch(f"{_FILES}.is_sensitive_path", return_value=True),
+        patch("kiro_crew.sel.sel") as m,
+    ):
         m.return_value = MagicMock()
         status, _, _ = await _get(f)
     assert status == 403

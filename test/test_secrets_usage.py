@@ -16,6 +16,7 @@ from kiro_crew.config.loader_credentials import CRED_JIRA_API_TOKEN, CREDENTIAL_
 from kiro_crew.dashboard.handlers import secrets_usage
 from kiro_crew.dashboard.handlers.secrets import setup_secrets_routes
 from kiro_crew.secrets import SecretVault
+from kiro_crew.testing.synthetic_credentials import github_classic
 
 _MOD = "kiro_crew.dashboard.handlers.secrets_usage"
 
@@ -54,11 +55,6 @@ def _config(deepseek: dict[str, str] | None = None) -> SimpleNamespace:
         telemetry=SimpleNamespace(traces_enabled=False),
         session_environments=SimpleNamespace(sprites_profiles=[]),
     )
-
-
-@pytest.fixture(autouse=True)
-def _preview_on(_floor_monkeypatch: pytest.MonkeyPatch) -> None:
-    _floor_monkeypatch.setattr(secrets_usage, "_secrets_vault_preview_on", lambda: True)
 
 
 @pytest.fixture()
@@ -161,22 +157,6 @@ async def test_non_owner_is_refused(home: Path) -> None:
     assert data["code"] == "owner_only"
 
 
-@pytest.mark.asyncio
-async def test_preview_off_answers_as_before_the_route_and_scans_nothing(
-    home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(secrets_usage, "_secrets_vault_preview_on", lambda: False)
-    with (
-        patch.object(secrets_usage, "_scan_files", side_effect=AssertionError("scanned")),
-        patch.object(secrets_usage, "_scan_cron_jobs", side_effect=AssertionError("scanned")),
-    ):
-        app = _app(_FakeCrons(_JOBS, broken=True))
-        async with TestClient(TestServer(app)) as client:
-            resp = await client.get("/api/secrets/usage")
-            assert resp.status == 405
-            assert resp.headers["Allow"] == "DELETE"
-
-
 def _crew_oauth_usage(stored: set[str], raw_config: object) -> dict:
     usage: dict = {}
     with patch("kiro_crew.config.loader.read_config_for_update", return_value=raw_config):
@@ -189,8 +169,8 @@ def _owner_record(name: str, url: str) -> dict:
 
 
 def test_an_agent_written_grant_key_and_job_name_are_redacted() -> None:
-    # Built at run time so no credential-shaped literal sits in the source.
-    aws_shaped = "AKIA" + "IOSFODNN7EXAMPLE"
+    # A synthetic GitHub token: a credential under either redaction engine.
+    aws_shaped = github_classic()
     job = SimpleNamespace(name=f"job {aws_shaped}", secret_env={aws_shaped: "CRON_TOKEN"})
     usage: dict[str, list[dict[str, str]]] = {}
     secrets_usage._scan_cron_jobs(usage, frozenset({"CRON_TOKEN"}), [job])

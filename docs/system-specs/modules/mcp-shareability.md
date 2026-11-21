@@ -39,9 +39,42 @@ engine (`mcp_gateway/shareability.py::assess`) is pure — no IO, no config, no 
 
 The bulk stub action consults whichever of the two the global sharing switch makes true of a click, and it does so **server-side, inside the lock hold that performs the write** (`resolve_eligibility` on `POST /api/mcp-gateway/servers/stub`). The client sends candidate names and reads `stubbed` / `skipped` back. This is a placement decision, not a detail: a client can only answer for the moment it read its rows, while sharing is a separate switch another dashboard or the CLI can flip and the verdicts themselves move as measurements land. Deciding in the browser therefore leaves a window between the decision and the write, and each guard against that window — re-read the switch, bypass the query cache, compare-and-set the expected state — closes one instance while leaving the shape that produces them. Resolving inside the hold means one config state decides both, and the eligibility rule has exactly one implementation.
 
+## The working-folder question gates routing
+
+A routed server's backend runs in one fixed folder outside the session sandbox
+(`daemon/launch.py::_backend_work_dir` ignores the session's work dir on purpose:
+an in-sandbox caller must not steer an unsandboxed interpreter's cwd). A server that
+works on the project's files would therefore act on the wrong project once routed.
+No detector decides which servers do: the operator answers per server in MCP
+Management, and the answer is stored in `mcp_gateway.cwd_use` (`uses_cwd`,
+`not_used`, or absent for unanswered).
+
+- `POST /api/mcp-gateway/servers/stub` with `stub: true` refuses
+  (`409 cwd_unconfirmed`, or a `cwd_unconfirmed` skip under
+  `resolve_eligibility`) any server that is not one of Kiro Crew's own
+  (`mcp_cleanup.KIROCREW_BIN_MCP_SERVERS`, whose launch the rewriter re-derives
+  from the install) and is not answered `not_used`. That route is the only writer
+  of launch approvals, and the rewriter wraps a server only for an approved
+  launch, so an unanswered server never gets a live stub on any harness: kiro-cli
+  and KAS read the same overlay.
+- `_resolve_stub_servers` drops a server answered `uses_cwd`, so answering it
+  unroutes it at the next start.
+- A server routed before the question existed keeps its approval and keeps
+  running routed until answered. Its row asks once, and re-approving its launch
+  needs the answer.
+- The answer is keyed by server name. A renamed server is unanswered. A changed
+  launch is refused by the launch approval and runs in the session until it is
+  approved again; the stored answer carries over to that approval.
+- Third-party servers that advertise `kirocrew.caller-identity`, and stdio remote
+  proxies, are asked like any other: the extension says nothing about the folder,
+  and a proxy cannot be told apart from a local server by its command alone.
+
+The answer only gates routing today. Whether `work_dir` joins the pool signature
+for `uses_cwd` servers is a separate decision.
+
 ## Session-bound by construction, which is not the same as "ours"
 
-The `disqualified` reason `session_bound_by_construction` names a server that resolves the calling session from its own PROCESS — an env var, a pid walk — so one backend can only ever serve one session correctly. It is decided by which servers actually consume the injected caller block, not by matching a name against Kiro Crew's managed set, since keying it on authorship would disqualify a managed server that does consume the block. All nine managed servers (`kirocrew-core`, `kirocrew-cron`, `kirocrew-computer`, `kirocrew-dashboard`, `kirocrew-work`, `kirocrew-crew-log`, `kirocrew-debug`, `kirocrew-panel`, `kirocrew-guide`) advertise and consume the block, and all nine are in `_MANAGED_SERVERS_CALLER_AWARE`. Advertising is necessary but not sufficient for the shareable classification, and `kirocrew-computer` is the case that shows why: a caller the gateway cannot name proceeds under `unresolved:<pid>`, each CONNECTION gets its own namespace only from the per-connection nonce, an ADOPTED pre-nonce daemon injects none, and this classification is what `seed.py` turns into a config write. It qualifies because that separation is negotiated at the handshake rather than assumed — `gatewayd` advertises `tenant_nonce`, and a stub that asked to pool this server against a daemon that does not advertise it execs a per-session backend instead (`stub.must_degrade_nonce_blind`). A server that cannot make the guarantee would be named in `_MANAGED_SERVERS_ADVERTISING_BUT_WITHHELD` in `mcp_discovery_managed.py` and stay session-bound; that set is empty. The classification stays per-server because a new managed server starts unadopted.
+The `disqualified` reason `session_bound_by_construction` names a server that resolves the calling session from its own PROCESS — an env var, a pid walk — so one backend can only ever serve one session correctly. It is decided by which servers actually consume the injected caller block, not by matching a name against Kiro Crew's managed set, since keying it on authorship would disqualify a managed server that does consume the block. All eleven managed servers (`kirocrew-core`, `kirocrew-cron`, `kirocrew-computer`, `kirocrew-dashboard`, `kirocrew-work`, `kirocrew-crew-log`, `kirocrew-debug`, `kirocrew-panel`, `kirocrew-guide`, `kirocrew-mate`, `kirocrew-secrets`) advertise and consume the block, and all eleven are in `_MANAGED_SERVERS_CALLER_AWARE`. Advertising is necessary but not sufficient for the shareable classification, and `kirocrew-computer` is the case that shows why: a caller the gateway cannot name proceeds under `unresolved:<pid>`, each CONNECTION gets its own namespace only from the per-connection nonce, an ADOPTED pre-nonce daemon injects none, and this classification is what `seed.py` turns into a config write. It qualifies because that separation is negotiated at the handshake rather than assumed — `gatewayd` advertises `tenant_nonce`, and a stub that asked to pool this server against a daemon that does not advertise it execs a per-session backend instead (`stub.must_degrade_nonce_blind`). A server that cannot make the guarantee would be named in `_MANAGED_SERVERS_ADVERTISING_BUT_WITHHELD` in `mcp_discovery_managed.py` and stay session-bound; that set is empty. The classification stays per-server because a new managed server starts unadopted.
 
 `mcp_discovery.managed_server_is_session_bound` answers from a module-level set, `_MANAGED_SERVERS_CALLER_AWARE`, and deliberately imports nothing: the assessment must answer WITHOUT a handshake (the probe cannot spawn on every host — Windows, macOS >= 26 — and has not run at all before the first probe cycle), and it is consulted on every render, so importing a server module to read its `ADVERTISE_CALLER_IDENTITY` would execute package code from an editable checkout on a path the sandbox never confines. `test/test_mcp_managed_caller_identity.py::test_the_classification_reads_no_module_at_import_time` pins that refusal.
 
@@ -97,7 +130,7 @@ Path: `<records dir>/observed-hazards.json`, a sibling of `hot-keys.json`. Write
 Codes are a closed vocabulary; an unknown code is refused on write and dropped on read, because a typo that silently became a permanent hazard would disqualify a server for ever with no way to read why:
 
 - `unroutable_server_request` — a server-initiated request arrived with no `relatedRequestId` while more than one stub shared the backend. Unroutable without a cross-tenant leak, so the backend is recycled.
-- `unattributable_notification` — a request-scoped notification could not be attributed to a pending call, so it was dropped rather than broadcast.
+- `unattributable_notification` — a request-scoped notification could not be attributed to a pending call, so it was dropped rather than broadcast. A request-scoped frame on a 2026-07-28 `subscriptions/listen` stream (its acknowledgement, a list change) is attributed by the listen id its `_meta` carries (`io.modelcontextprotocol/subscriptionId`): the server saw the gateway's forward id, so the frame goes only to the stub whose pending listen that is, tagged back with the stub's own id (`backend_routing._listen_stream_frame`). A `notifications/resources/updated` on such a stream is still routed by URI only, so it is dropped unless a `resources/subscribe` named that URI.
 
 Both are recorded ONLY for a shared backend (`exclusive_token` empty). A 1:1 backend legitimately owns its single client, so the same frame there proves nothing, and recording it would disqualify servers for behaviour that is correct when unshared.
 
@@ -251,7 +284,8 @@ a new one, which starts unadopted.
 
 `*.listChanged` is deliberately absent from all of the above: those notifications
 are global broadcasts (`backend._GLOBAL_BROADCAST_NOTIFICATIONS`) and are safe to
-fan out to every attached stub.
+fan out to every attached stub. One that arrives on a `subscriptions/listen`
+stream carries that stream's listen id and goes to its listener only.
 
 Degradation detection is by PRESENCE of the capability key: in MCP an empty
 object is the standard way to advertise a capability that takes no sub-options,

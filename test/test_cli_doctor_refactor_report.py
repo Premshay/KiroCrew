@@ -229,6 +229,7 @@ class _Host:
             cli_doctor, "dump_first_stack_lines", lambda p, max_lines=5: ['File "loop.py", 1']
         )
         mp.setattr(cli_doctor, "attribute_dump", lambda p, base: self.attribution)
+        mp.setattr(cli_doctor, "dump_fired_at", lambda p: "2026-11-07T18:28:28Z")
         mp.setattr(cli_doctor, "describe", lambda a: ["surface: cron", "job: nightly"])
         mp.setattr(cli_doctor, "job_pause_state_from_disk", lambda job_id: self.paused)
         mp.setattr(cli_doctor, "machine_hostname", lambda: "devbox")
@@ -255,6 +256,12 @@ class _Host:
         # Same reason: added after the move. The real section walks the host's
         # ledger stores, which no frozen report can pin.
         mp.setattr(workload, "_doctor_ledger_backlog", self._marker("_doctor_ledger_backlog"))
+        # Same reason: it reads the session tree checkpoint's marker under the data home.
+        mp.setattr(
+            workload,
+            "_doctor_session_tree_checkpoint",
+            self._marker("_doctor_session_tree_checkpoint"),
+        )
         mp.setitem(sys.modules, "faiss", None)
         mp.setitem(sys.modules, "amazon_transcribe", None)
         mp.setitem(sys.modules, "amazon_transcribe.client", None)
@@ -296,7 +303,7 @@ class _Host:
         self.dump_age = 0.0
         self.stalls = 0
         self.superseded = False
-        self.attribution = SimpleNamespace(is_cron=False, job=None)
+        self.attribution = SimpleNamespace(is_cron=False, job=None, host_pause_secs=None)
         self.paused: str | None = None
         self.local = True
         self.fts5 = True
@@ -486,6 +493,7 @@ Other Channels
 Loop-stall Crash Dumps
   dumps:       ✅ no crash dumps found (healthy)
   dump dir:    <TMP>/dumps
+  <<_doctor_session_tree_checkpoint>>
 
 Connectivity
   kiro-cli:    ✅ kiro-cli 1.2.3
@@ -790,7 +798,7 @@ Other Channels
                The channel will not start. Set it in Settings > Messaging Channels, or in ~/.kiro/crew/.env
 
 Loop-stall Crash Dumps
-  last dump:   ⚠️  crash-1.dump (2.0h ago)
+  last dump:   ⚠️  crash-1.dump (fired 2026-11-07T18:28:28Z, 2.0h ago)
   MainThread stuck at:
     File "loop.py", 1
   attribution:
@@ -798,6 +806,7 @@ Loop-stall Crash Dumps
     job: nightly
     job is currently auto-paused
   dump dir:    <TMP>/dumps
+  <<_doctor_session_tree_checkpoint>>
 
 Connectivity
   kiro-cli:    ⏭  skipped (not installed)
@@ -866,7 +875,7 @@ def test_a_broken_host_reports_every_issue_in_order_and_exits_one(host, capsys) 
     host.dump_age = 7200.0
     host.stalls = 1
     host.attribution = SimpleNamespace(
-        is_cron=True, job=SimpleNamespace(job_id="job-7", name="nightly")
+        is_cron=True, job=SimpleNamespace(job_id="job-7", name="nightly"), host_pause_secs=None
     )
     host.paused = "auto-paused"
     host.urls["http://127.0.0.1:9999/api/status"] = urllib.error.HTTPError(
@@ -1090,6 +1099,10 @@ Collecting diagnostics bundle (secrets are redacted)...
 """
 
 
+def _pin_bundle_alignment(monkeypatch) -> None:
+    monkeypatch.setattr(services, "_bundle_version_alignment", lambda: "aligned (1.2.3)")
+
+
 def test_bundle_mode_prints_only_the_bundle(host, capsys, monkeypatch) -> None:
     result = SimpleNamespace(
         zip_path=host.tmp / "diag.zip",
@@ -1097,7 +1110,13 @@ def test_bundle_mode_prints_only_the_bundle(host, capsys, monkeypatch) -> None:
         total_redactions=3,
         skipped=["gateway.log"],
     )
-    monkeypatch.setattr(cli_doctor.diagnostics, "collect_bundle", lambda: result)
+    collected: list[dict] = []
+    _pin_bundle_alignment(monkeypatch)
+    monkeypatch.setattr(
+        cli_doctor.diagnostics,
+        "collect_bundle",
+        lambda **kwargs: collected.append(kwargs) or result,
+    )
     monkeypatch.setattr(
         cli_doctor.diagnostics, "terminal_issue_url", lambda r: "https://example.invalid/issues/new"
     )
@@ -1107,6 +1126,7 @@ def test_bundle_mode_prints_only_the_bundle(host, capsys, monkeypatch) -> None:
     assert out == _BUNDLE
     assert code is None
     assert host.calls == []
+    assert collected == [{"version_alignment": "aligned (1.2.3)"}]
 
 
 def test_bundle_mode_prints_the_bundle_when_the_companion_does_not_compose(
@@ -1115,7 +1135,8 @@ def test_bundle_mode_prints_the_bundle_when_the_companion_does_not_compose(
     result = cli_doctor.diagnostics.BundleResult(
         zip_path=host.tmp / "diag.zip", filename="diag.zip"
     )
-    monkeypatch.setattr(cli_doctor.diagnostics, "collect_bundle", lambda: result)
+    _pin_bundle_alignment(monkeypatch)
+    monkeypatch.setattr(cli_doctor.diagnostics, "collect_bundle", lambda **_: result)
 
     def refuse_context():
         raise PlatformCompositionError("companion did not compose")
@@ -1133,9 +1154,10 @@ def test_bundle_mode_prints_the_bundle_when_the_companion_does_not_compose(
 
 
 def test_bundle_mode_exits_one_when_the_bundle_cannot_be_written(host, capsys, monkeypatch) -> None:
-    def refuse():
+    def refuse(**_):
         raise OSError("disk full")
 
+    _pin_bundle_alignment(monkeypatch)
     monkeypatch.setattr(cli_doctor.diagnostics, "collect_bundle", refuse)
 
     out, code = host.run(capsys, bundle=True)

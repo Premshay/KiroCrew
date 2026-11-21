@@ -161,6 +161,9 @@ def test_a_store_database_is_never_opened_with_the_stdlib_driver():
 # above). A new one imports ``sqlite3`` from ``_sqlite_compat``, or adds its row here.
 STDLIB_CONNECT_SITES = {
     "acp/codex_sqlite.py": "Codex's own state database, read to seed a private copy",
+    "agent_sdk/opencode_transcripts.py": (
+        "OpenCode's own session store, to delete a disposable session's rows"
+    ),
     "apps/builtins/auto_research/campaign/storage.py": "the app's campaign database",
     "apps/builtins/aws_control/crew/runtime/container/supervisor/kiro_login.py": (
         "kiro-cli's login store inside the app's container"
@@ -170,6 +173,9 @@ STDLIB_CONNECT_SITES = {
     ),
     "apps/builtins/personal_shopper/backend/store.py": "the app's own database",
     "apps/builtins/personal_shopper/tests/test_store.py": "test fixtures",
+    "browser_harness/credentials.py": (
+        "Kiro's stopped Chromium's own cookie file, to remove the rows the gateway set"
+    ),
     "builtin_skills/security-conductor/scripts/ledger.py": "the skill's ledger, in its own process",
     "builtin_skills/security-conductor/scripts/scope_check.py": (
         "the skill's ledger, in its own process"

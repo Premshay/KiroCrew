@@ -43,6 +43,7 @@ from kiro_crew.acp.types import (
 from kiro_crew.messaging.link import canonical_key
 from kiro_crew.slack import handler as slack_handler
 from kiro_crew.slack import transport_dispatch
+from kiro_crew.testing.synthetic_credentials import SAMPLE_SLACK_BOT_TOKEN
 
 
 def _run_transport(monkeypatch, thread_agent=None, agent_override=None, **extra):
@@ -175,8 +176,8 @@ class TestTransportAdmissionSpool:
         """The ingested *text* inlines temp paths and file contents.
 
         Both refusal points -- the admission gate and a SessionClosingError at
-        dispatch -- must record what the user sent and how many files it had,
-        never the turn's prompt.
+        dispatch -- must record what the user sent, how many files it had and
+        their names, never the turn's prompt.
         """
         from kiro_crew.session_allocation import SessionClosingError
 
@@ -200,22 +201,37 @@ class TestTransportAdmissionSpool:
             monkeypatch.setattr(transport_dispatch, "spool_refused_turn", spool)
             monkeypatch.setattr(transport_dispatch, "_is_slack_restricted", lambda _key: False)
 
-        _run_transport(monkeypatch, spool_text="look at this", spool_attachments=2)
+        _run_transport(
+            monkeypatch,
+            spool_text="look at this",
+            spool_attachments=2,
+            spool_attachment_names=("shot.png", ""),
+        )
 
         assert len(routes) == 1
         assert routes[0].text == "look at this"
         assert routes[0].attachments_dropped == 2
+        assert routes[0].attachment_names == ("shot.png", "")
 
     @pytest.mark.parametrize(
-        ("extra", "text", "dropped"),
+        ("extra", "text", "dropped", "names"),
         [
-            ({"spool_text": "look at this", "spool_attachments": 2}, "look at this", 2),
+            (
+                {
+                    "spool_text": "look at this",
+                    "spool_attachments": 2,
+                    "spool_attachment_names": ("shot.png", ""),
+                },
+                "look at this",
+                2,
+                ("shot.png", ""),
+            ),
             # No pre-ingestion capture (interaction re-dispatch): text as is.
-            ({}, "approve the plan", 0),
+            ({}, "approve the plan", 0, ()),
         ],
     )
     def test_native_admission_spools_the_pre_ingestion_message(
-        self, monkeypatch, extra, text, dropped
+        self, monkeypatch, extra, text, dropped, names
     ):
         turn_text = (
             "hello\n/tmp/kiro-attach-dead.png\n\n[File: notes.txt]\nbody"
@@ -253,6 +269,7 @@ class TestTransportAdmissionSpool:
         assert len(routes) == 1
         assert routes[0].text == text
         assert routes[0].attachments_dropped == dropped
+        assert routes[0].attachment_names == names
 
     def test_session_closing_does_not_spool_restricted_slack_turn(self, monkeypatch, caplog):
         from kiro_crew.session_allocation import SessionClosingError
@@ -532,7 +549,7 @@ def test_member_memory_refusal_redacts_before_posting(monkeypatch):
     from kiro_crew.memory_stores import UnknownMemoryStore
 
     private_path = "/home/alice/.kiro/crew/memory_stores/member-one/memory.db"
-    credential = "AKIAIOSFODNN7EXAMPLE"
+    credential = SAMPLE_SLACK_BOT_TOKEN  # synthetic Slack bot token
     failure = UnknownMemoryStore(f"memory_unavailable: cannot open {private_path}; {credential}")
     monkeypatch.setattr(
         transport_dispatch, "session_store_for_turn", AsyncMock(side_effect=failure)
@@ -623,7 +640,7 @@ class TestTransportErrorText:
 
     def test_classified_acp_error_is_redacted_before_posting(self):
         private_path = "/Users/alice/secret/x"
-        credential = "AKIAIOSFODNN7EXAMPLE"
+        credential = SAMPLE_SLACK_BOT_TOKEN  # synthetic Slack bot token
         err = AcpError(
             f"Backend refused: cannot read {private_path}; key {credential}",
             transient=False,
@@ -634,11 +651,13 @@ class TestTransportErrorText:
         assert private_path not in text and "alice" not in text
         assert credential not in text
 
-    @pytest.mark.parametrize("split", ["AKIA*{}*", "AKIA**{}**", "AKIA_{}_", "AKIA`{}`"])
+    @pytest.mark.parametrize("split", ["{h}*{r}*", "{h}**{r}**", "{h}_{r}_", "{h}`{r}`"])
     def test_a_key_split_by_display_markup_is_redacted(self, split):
-        rest = "IOSFODNN7EXAMPLE"
+        # A synthetic Slack bot token split after its first 4 characters. (No ``_``
+        # in it: the display form drops that as markup.)
+        head, rest = SAMPLE_SLACK_BOT_TOKEN[:4], SAMPLE_SLACK_BOT_TOKEN[4:]
         err = _classified_acp_error(
-            "The monthly usage limit has been reached. key " + split.format(rest)
+            "The monthly usage limit has been reached. key " + split.format(h=head, r=rest)
         )
         assert err.user_worded and rest in str(err)
         text = transport_dispatch._transport_error_text(err)

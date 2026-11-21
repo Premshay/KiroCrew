@@ -45,7 +45,7 @@ model runs**. It is a deliberate, occasional move. If unsure it's worth it, ask 
    `kiro-cli chat --list-models`: it is the Kiro CLI's hosted catalogue, not a route
    this crew uses, and `model=` passes any id from it through unverified. Honor a
    user-supplied roster verbatim. `reasoning_effort` ('low' | 'medium' | 'high' | 'xhigh' | 'max') is
-   batch-wide and wins over the configured role pin — setting it forces one dedicated
+   batch-wide unless a `tasks[]` entry sets it. It wins over the configured role pin — setting it forces one dedicated
    process per subagent (~3-5s start, ~0.55 GB each, against ~200ms and near-zero for
    session sharing), which is worth it for `adversarial` on a high-stakes artifact and
    wasteful for a cheap `vote`.

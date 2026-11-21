@@ -49,6 +49,28 @@ def _resolve(args: argparse.Namespace) -> tuple[str, str]:
     return profile, region
 
 
+def _region_is_unchosen_default(args: argparse.Namespace, region: str) -> bool:
+    """Whether *region* is the default only because nothing chose one.
+
+    ``--region`` chooses a Region, and so does a crew the last launch left on record.
+    """
+    return (
+        not getattr(args, "region", "")
+        and region == DEFAULT_REGION
+        and not LaunchState.load().last_tag
+    )
+
+
+def _note_unchosen_region(args: argparse.Namespace, region: str, verb: str) -> None:
+    """Say that an unchosen Region is the default, since no verb reads the dashboard's."""
+    if _region_is_unchosen_default(args, region):
+        ui.warn(f"No --region given: using Kiro Crew's default Region {region}.")
+        ui.detail(
+            "A Region set in the dashboard (Settings > Remote Crew) is not used here; "
+            f"run `kirocrew cloud {verb} --region <region>` to use it."
+        )
+
+
 def _resolve_tag(args: argparse.Namespace) -> str:
     """Resolve the instance tag: explicit --tag, else the last-launched tag."""
     tag = getattr(args, "tag", "") or ""
@@ -122,9 +144,16 @@ def _resolve_login_target(args: argparse.Namespace, *, inherit: bool) -> "KiroLo
 
 def _cloud_launch(args: argparse.Namespace) -> int:
     profile, region = _resolve(args)
+    skip_login = bool(getattr(args, "no_login", False))
     try:
-        login_target = _resolve_login_target(
-            args, inherit=not getattr(args, "no_inherit_identity", False)
+        # No sign-in, no identity to resolve: --no-login must not fail on a
+        # local whoami it never needs.
+        login_target = (
+            None
+            if skip_login
+            else _resolve_login_target(
+                args, inherit=not getattr(args, "no_inherit_identity", False)
+            )
         )
     except LoginTargetError as exc:
         ui.fail(f"Kiro identity target rejected: {exc}")
@@ -140,6 +169,7 @@ def _cloud_launch(args: argparse.Namespace) -> int:
     except ValidationError as exc:
         ui.fail(f"Invalid launch option: {exc}")
         return 2
+    _note_unchosen_region(args, region, "launch")
     return wizard.launch(
         profile=profile,
         region=region,
@@ -153,11 +183,13 @@ def _cloud_launch(args: argparse.Namespace) -> int:
         ami_id=ami_id,
         extra_packages=extra_packages,
         ssm_kms_key_arn=ssm_kms_key_arn,
+        skip_login=skip_login,
     )
 
 
 def _cloud_list(args: argparse.Namespace) -> int:
     profile, region = _resolve(args)
+    _note_unchosen_region(args, region, "list")
     try:
         rows = ec2.list_instances(profile, region)
     except AWSError as exc:
@@ -320,7 +352,7 @@ def _cloud_login(args: argparse.Namespace) -> int:
         ui.detail(f"Verification code: {prompt.code}")
     # Keep the login daemon polling on the box so approval completes, then wait.
     login_mod.resume_login_daemon(instance_id, profile, region, target=target)
-    with ui.Spinner("Waiting for sign-in approval…"):
+    with ui.Spinner(f"Waiting for sign-in approval (up to {login_mod.signin_wait_limit()})…"):
         signed = login_mod.wait_until_logged_in(instance_id, profile, region, target=target)
     if signed:
         ui.ok(
@@ -692,12 +724,7 @@ def _cloud_doctor(args: argparse.Namespace) -> int:
     reach = iam.reachability_check(profile, region)
     if reach["reachable"]:
         ui.ok(f"AWS reachable — account {reach['account']} · {region}")
-        # Only an unchosen default: --region, or a crew the last launch left there, chose it.
-        if (
-            not getattr(args, "region", "")
-            and region == DEFAULT_REGION
-            and not LaunchState.load().last_tag
-        ):
+        if _region_is_unchosen_default(args, region):
             configured = aws.configured_region(profile)
             if configured and configured != region:
                 ui.warn(
@@ -777,8 +804,7 @@ def handle_cloud(args: argparse.Namespace) -> int:
         ui.detail("launch      Provision + configure an instance (interactive)")
         ui.detail("list        List your KiroCrew cloud instances")
         ui.detail("status      Show one instance's state")
-        ui.detail("tunnel      Open the dashboard SSM tunnel (alias: connect)")
-        ui.detail("connect     Open the dashboard over an SSM tunnel")
+        ui.detail("connect     Open the dashboard over an SSM tunnel (alias: tunnel)")
         ui.detail("login       Sign Kiro in on the instance (fixes chat errors)")
         ui.detail("logout      Sign Kiro out on the instance (switch Kiro account)")
         ui.detail("stop|start  Pause / resume (save cost)")

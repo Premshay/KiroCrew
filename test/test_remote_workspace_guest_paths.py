@@ -239,7 +239,7 @@ def test_a_local_call_through_a_server_named_workspace_keeps_the_gateway_reading
     monkeypatch, reading
 ):
     # Same frame, but the runtime attached no remote workspace: no tag, so the
-    # target is matched as this gateway's path, exactly as before this change.
+    # target is matched as this gateway's path.
     event = _event("read_file", "read", {"path": "/workspace/app/x"}, remote=False)
     assert type(event.raw_tool_params) is dict
     remote = _event("read_file", "read", {"path": "/workspace/app/x"})
@@ -402,7 +402,7 @@ def test_classify_mints_guest_items_only_for_tagged_arguments():
     assert not any(isinstance(item, GuestPath) for _, item in plain)
     # An unverifiable spelling keeps its literal pair and adds the marker beside it.
     odd = classify_tool_args("edit", GuestPathParams({"path": "$X/y"}, root=ROOT))
-    assert [type(item) for _, item in odd] == [GuestPath, str]
+    assert [type(item) for _, item in odd] == [GuestPath, matching._Marker]
 
 
 def test_a_guest_item_never_dedupes_into_a_plain_twin():

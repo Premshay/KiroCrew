@@ -277,6 +277,7 @@ async def _reacquire_and_validate(
     *,
     wait_if_busy: bool = True,
     reservation: object | None = None,
+    refuse_looser_tier: bool = True,
 ) -> bool:
     """Acquire outside the registry lock, revalidate identity and meet the key's ending fence again."""
     return await self._allocation_boundary()._reacquire_and_validate(
@@ -284,12 +285,29 @@ async def _reacquire_and_validate(
         sess,
         wait_if_busy=wait_if_busy,
         reservation=reservation,
+        refuse_looser_tier=refuse_looser_tier,
     )
 
 
 async def _evict_stale_session(self: SessionManager, key: str, sess: "_Session") -> None:
     """Evict and close the exact stale session."""
     await self._allocation_boundary()._evict_stale_session(key, sess)
+
+
+async def recycle_if_sandbox_tightened(self: SessionManager, key: str) -> bool:
+    """End *key*'s session if ``agent.sandbox`` is now stricter than its spawn tier.
+
+    Every new claim makes this check itself (``_reacquire_and_validate``). A holder
+    that keeps one claim, and its permit, for its whole life calls this at each turn
+    boundary instead, then re-acquires the key. Returns whether the session was ended.
+    """
+    allocation = self._allocation_boundary()
+    folded = self._fold_key(key)
+    session = allocation._sessions.get(folded)
+    if session is None or not allocation._sandbox_tightened(session.provider):
+        return False
+    await allocation._evict_stale_session(folded, session, held_by_caller=True)
+    return True
 
 
 def _get_session_agent(self: SessionManager, session_key: str) -> str:
@@ -388,7 +406,7 @@ async def get_or_create(
                 # failed boot start on any other: through the same path the boot
                 # uses, so it keeps its start stamping.
                 await self._ensure_background(start_priority=start_priority)
-        return await self._allocation_boundary().get_or_create(
+        provider, is_new, resumed = await self._allocation_boundary().get_or_create(
             key,
             agent=agent,
             channel_id=channel_id,
@@ -404,6 +422,8 @@ async def get_or_create(
             focus_resume=focus_resume,
             **extra_factory_kwargs,
         )
+    self.note_session_head(key, provider, is_new=is_new, resumed=resumed)
+    return provider, is_new, resumed
 
 
 @contextmanager
@@ -922,13 +942,16 @@ def _store_provider_mapping(self: SessionManager, key: str, provider: LLMProvide
     cwd = provider.cwd
     if not all(isinstance(value, str) and value for value in (sid, label, cwd)):
         return False
+    kas_memory = getattr(provider, "kas_memory_mode", "")
+    kas_memory = kas_memory if isinstance(kas_memory, str) else None
     if (
         self._session_map.get(key) == sid
         and self._session_map.get_provider(key) == label
         and self._session_map.get_cwd(key) == cwd
+        and (kas_memory is None or self._session_map.get_kas_memory(key) == kas_memory)
     ):
         return False
-    self._session_map.set(key, sid, provider=label, cwd=cwd)
+    self._session_map.set(key, sid, provider=label, cwd=cwd, kas_memory=kas_memory)
     return True
 
 

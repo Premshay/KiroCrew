@@ -654,6 +654,16 @@ TYPES: tuple[EntryType, ...] = (
                     "without it clears the item's wake_at."
                 ),
             ),
+            Field(
+                "discussion",
+                JSON_OBJECT,
+                note=(
+                    "Where a discussion the worker hosts stands, set by report: phase, "
+                    "round, minutes, direction, agreed, disputed, checking, recent and "
+                    "thread, checked for shape by the fold. A report without it clears "
+                    "the item's discussion."
+                ),
+            ),
             Field("summary", JSON_STRING, note="The worker's summary, set by report."),
             Field(
                 "artifacts",
@@ -672,6 +682,15 @@ TYPES: tuple[EntryType, ...] = (
             Field("event_ts", JSON_STRING, note="The store's stamp on that event."),
             Field("created_at", JSON_STRING, note="The item's committed creation stamp."),
             Field("last_report_at", JSON_STRING, note="The item's committed last-report stamp."),
+            Field(
+                "received_at",
+                JSON_STRING,
+                note=(
+                    "On a report the hub ingested from a remote peer: the hub's clock when "
+                    "it filed it (last_report_at is then the peer's stamp). A report "
+                    "without it clears the item's received_at."
+                ),
+            ),
             Field("closed_at", JSON_STRING, note="The item's committed close stamp."),
             Field("decided_at", JSON_STRING, note="The item's committed decide stamp."),
             Field(
@@ -743,6 +762,36 @@ TYPES: tuple[EntryType, ...] = (
                     "True on the worker's own copy of a report whose board copy landed. "
                     "The work and worktree folds skip it (the board copy is the record); "
                     "the workers fold reads it as the worker's own report."
+                ),
+            ),
+            Field(
+                "peer_event_id",
+                JSON_STRING,
+                note=(
+                    "On a report the hub ingested from a remote peer: the peer's own id "
+                    "for that report event, verbatim (also the entry's event_id). The work "
+                    "fold files each peer event id once per binding and derives where "
+                    "ingest stands from the ids it holds."
+                ),
+            ),
+            Field(
+                "peer_seen",
+                JSON_ARRAY,
+                item_type=JSON_STRING,
+                note=(
+                    "On an ingested peer report: peer ids before it the hub passes "
+                    "over for good (reports that can never file, or, on a binding "
+                    "filed before peer ids were kept, the reports filed then). The "
+                    "work fold holds them as filed."
+                ),
+            ),
+            Field(
+                "peer_skipped",
+                JSON_INT,
+                note=(
+                    "On an ingested peer report: places before it in the peer's reports "
+                    "the hub could not file. A peer log that rolled past where ingest "
+                    "stood counts one; a report that can never file counts one."
                 ),
             ),
             Field(

@@ -11,6 +11,7 @@ module never imports that facade.
 from __future__ import annotations
 
 import re
+import string
 from typing import Any
 
 from kiro_crew.checkpoint_contract import (
@@ -355,6 +356,18 @@ SEARCH_CHAT_HISTORY_SCHEMA = ToolSchema(
     ],
 )
 
+#: The characters a transcript tool row's ``meta.tool_call_id`` (``toolu_...``) uses.
+_TOOL_CALL_ID_CHARS = frozenset(string.ascii_letters + string.digits + "_.:-")
+
+
+def _validate_get_chat_session(args: dict[str, Any]) -> None:
+    tool_call_id = args.get("tool_call_id")
+    if tool_call_id is None:
+        return
+    if not tool_call_id or any(ch not in _TOOL_CALL_ID_CHARS for ch in tool_call_id):
+        raise ValidationError("tool_call_id", "must be letters, digits, '_', '.', ':' or '-'")
+
+
 GET_CHAT_SESSION_SCHEMA = ToolSchema(
     tool_name="get_chat_session",
     fields=[
@@ -362,7 +375,9 @@ GET_CHAT_SESSION_SCHEMA = ToolSchema(
         FieldSpec("max_messages", int, required=False, min_val=1, max_val=200, default=50),
         FieldSpec("all_workspaces", bool, required=False, default=False),
         FieldSpec("crew", str, required=False, max_len=MAX_SHORT_STRING, pattern=_CREW_RE),
+        FieldSpec("tool_call_id", str, required=False, max_len=MAX_SHORT_STRING),
     ],
+    custom_validator=_validate_get_chat_session,
 )
 
 LIST_SESSIONS_SCHEMA = ToolSchema(
@@ -437,6 +452,10 @@ SESSION_CREATE_SCHEMA = ToolSchema(
         # ``work_item`` (wave 4): with ``crew`` only, the caller's own item the crew
         # session is born bound to. The gateway refuses it without ``crew``.
         FieldSpec("work_item", str, required=False, max_len=16),
+        # ``requires`` (rfc-conductor-remote-dispatch.md §2b): with ``crew`` or a
+        # placed ``work_item`` only, the tags and logins a crew must advertise. The
+        # gateway checks its shape (``remote_placement.parse_requires``).
+        FieldSpec("requires", dict, required=False),
         # The new session's first turn, delivered in the same call so the caller
         # never has to send to a key it has not read back yet. Bounded exactly as
         # ``session_send.message`` is; the route repeats that bar before creating.
@@ -689,6 +708,11 @@ SESSION_STATUS_SCHEMA = ToolSchema(
     fields=[],
 )
 
+CREW_LIST_SCHEMA = ToolSchema(
+    tool_name="crew_list",
+    fields=[FieldSpec("logins", bool)],
+)
+
 SESSION_ADOPT_SCHEMA = ToolSchema(
     tool_name="session_adopt",
     fields=[
@@ -939,5 +963,13 @@ SESSION_QUEUE_SCHEMA = ToolSchema(
             max_len=QUEUE_ENTRY_ID_MAX_CHARS,
         ),
         FieldSpec("position", int, required=False, min_val=0, max_val=10_000),
+    ],
+)
+
+SESSION_RUN_QUEUED_SCHEMA = ToolSchema(
+    tool_name="session_run_queued",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+        FieldSpec("queue_id", str, required=True, max_len=QUEUE_ENTRY_ID_MAX_CHARS),
     ],
 )

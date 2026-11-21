@@ -25,6 +25,22 @@ from kiro_crew.task_planner import group_parallel_tasks
 
 logger = logging.getLogger(__name__)
 
+# One word per task status, shared by the progress file and the completion notice.
+TASK_STATUS_ICONS: dict[TaskStatus, str] = {
+    TaskStatus.PASSED: "Passed",
+    TaskStatus.FAILED: "Failed",
+    TaskStatus.IN_PROGRESS: "Running",
+    TaskStatus.REVIEWING: "Reviewing",
+    TaskStatus.PENDING: "Pending",
+    TaskStatus.SKIPPED: "Skipped",
+    TaskStatus.CANCELLED: "Cancelled",
+}
+
+# The lead of a passed line in TASK_PROGRESS.md. Files written before the status
+# words led with U+2705 instead, and a checkpoint on disk is read back on resume,
+# so both spellings count.
+_PASSED_LEAD = "(?:\u2705|Passed)"  # emoji-ok: old saved lead
+
 
 # ── Notifications ──
 
@@ -131,15 +147,7 @@ def save_progress(run: Project) -> None:
             "## Tasks\n",
         ]
         for task in run.tasks:
-            icon = {
-                TaskStatus.PASSED: "✅",
-                TaskStatus.FAILED: "❌",
-                TaskStatus.IN_PROGRESS: "🔄",
-                TaskStatus.REVIEWING: "🔍",
-                TaskStatus.PENDING: "⬜",
-                TaskStatus.SKIPPED: "⏭️",
-                TaskStatus.CANCELLED: "🚫",
-            }[task.status]
+            icon = TASK_STATUS_ICONS[task.status]
             line = f"- {icon} **Task {task.index}:** {task.title}"
             if task.attempts > 1:
                 line += f" (attempts: {task.attempts})"
@@ -202,10 +210,15 @@ def load_checkpoint(spec_path: Path) -> set[str] | None:
             if spec_match.group(1) != spec_path.name:
                 return None
             continue
-        match = re.match(r"^- ✅ \*\*Task \d+:\*\* (.+?)(?:\s*\(attempts:.*\))?$", line)
+        match = re.match(
+            rf"^- {_PASSED_LEAD} \*\*Task \d+:\*\* (.+?)(?:\s*\(attempts:.*\))?$", line
+        )
         if not match:
             # Backward compat: also match old "Step N:" format
-            match = re.match(r"^- ✅ \*\*Step \d+:\*\* (.+?)(?:\s*\(attempts:.*\))?$", line)
+            match = re.match(
+                rf"^- {_PASSED_LEAD} \*\*Step \d+:\*\* (.+?)(?:\s*\(attempts:.*\))?$",
+                line,
+            )
         if match:
             completed.add(match.group(1).lower().strip())
     return completed if completed else None
@@ -215,7 +228,7 @@ def build_resume_context(completed: list[Task]) -> str:
     """Build LLM context summarizing previously completed work."""
     lines = ["## Previously Completed (from checkpoint)"]
     for task in completed:
-        lines.append(f"- ✅ {task.title}")
+        lines.append(f"- Done: {task.title}")
     lines.append("")
     lines.append(
         "These tasks were completed in a previous run. "
@@ -326,22 +339,22 @@ def format_completion_summary(run: Project) -> str:
 
     lines = [
         f"**{passed}/{len(run.tasks)}** tasks passed" + (f" · {failed} failed" if failed else ""),
-        f"⏱ {time_str}",
+        f"Elapsed: {time_str}",
     ]
     # Execution passing is not verification: only an exit-0 test run counts.
     verdicts = Counter((t.verification or "not run").replace("_", " ") for t in run.tasks)
     verified = verdicts.pop(VerificationStatus.PASSED, 0)
     others = "".join(f" · {n} {v}" for v, n in sorted(verdicts.items()))
-    lines.append(f"🧪 {verified}/{len(run.tasks)} verified{others}")
+    lines.append(f"{verified}/{len(run.tasks)} verified{others}")
     if run.tokens_used:
-        lines.append(f"🪙 ~{run.tokens_used // 1000}K tokens")
+        lines.append(f"~{run.tokens_used // 1000}K tokens")
     if run.replan_count:
-        lines.append(f"🔄 {run.replan_count} replan(s)")
-    lines.append(f"📁 `{run.work_dir}`")
+        lines.append(f"{run.replan_count} replan(s)")
+    lines.append(f"Folder: `{run.work_dir}`")
     if run.branch_name:
-        lines.append(f"🌿 Branch: `{run.branch_name}`")
+        lines.append(f"Branch: `{run.branch_name}`")
     task_list = "\n".join(
-        f"  {'✅' if t.status == TaskStatus.PASSED else '❌'} {t.title}" for t in run.tasks
+        f"  {TASK_STATUS_ICONS.get(t.status, 'Failed')} {t.title}" for t in run.tasks
     )
     if task_list:
         lines.append(f"\n**Tasks:**\n{task_list}")

@@ -1195,6 +1195,13 @@ def _flock_acquirer_row(fields: list[str], want: tuple[int, int, int]) -> int | 
     ``"23: FLOCK ADVISORY WRITE 39542 103:01:146872 0 EOF"``. A blocked waiter is
     ``"23: -> FLOCK ..."`` and owns nothing; other lock types, short rows and
     unparsable fields are skipped the same way.
+
+    An owner of ``0`` (or below) names nobody. The kernel prints the acquirer as
+    seen from the reader's pid namespace, and it prints ``0`` when it cannot: the
+    acquirer has exited and its pid is released (seen on Linux 6.1 for a flock a
+    forked child inherited), or it lives in a namespace the reader cannot see.
+    pid 0 is never a process, so such a row is a lock with no nameable owner and
+    the caller gets its "holder could not be identified" answer.
     """
     if len(fields) < 6 or "->" in fields[:2] or fields[1] != "FLOCK":
         return None

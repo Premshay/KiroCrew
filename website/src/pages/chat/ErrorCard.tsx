@@ -1,16 +1,21 @@
 import { memo, useState, type ReactNode } from 'react'
+import { KiroSignInStrip, requestIdOf } from '../../components/KiroSignInDialog'
+import KiroCliSignInRow from './KiroCliSignInRow'
 import { useMutation } from '@tanstack/react-query'
-import { ExternalLink, KeyRound, Loader2, MessageSquarePlus, RotateCw, Settings, ShieldCheck, SlidersHorizontal, Wand2 } from 'lucide-react'
+import { ExternalLink, Loader2, MessageSquarePlus, RotateCw, Settings, ShieldCheck, SlidersHorizontal, Wand2 } from 'lucide-react'
 
 import { ApiError, apiErrorCode } from '../../api/apiError'
 import ErrorNotice from '../../components/ErrorNotice'
+import { reportForError } from '../../utils/errorReport'
 // The shared two-step restart control. Its module holds only the About panel's
 // update actions (shared components and the api client), not the Settings page.
 import { RestartGatewayButton } from '../settings/AboutPanelUpdateFlow'
 import { CopyCommandButton } from '../../components/settingRef/CopyCommandButton'
+import { fmtDateTime } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 import { chatErrorDisplayText } from '../../lib/chatErrorRecovery'
+import { LimitContinueRow } from './LimitContinueRow'
 import { isStopEvent } from '../../lib/stopEvent'
 import { isSystemNoticeKind } from '../../lib/systemNotice'
 import type { ChatMessage } from '../../types'
@@ -18,6 +23,7 @@ import { withOriginLink } from '../../components/withOriginLink'
 import { SessionTurnLimitButton } from '../../components/SessionTurnLimitMenu'
 import { AgentSpecChoiceCard, agentSpecAmbiguity } from './AgentSpecChoiceCard'
 import { injectOpensTurn } from './RecoveryCard'
+import { HostSandboxUnavailableCard, isHostSandboxUnavailable } from './HostSandboxUnavailableCard'
 import { resumeProseFor } from './gatewayNotice'
 import { WorkConfirmDeclined } from '../../utils/workInFlight'
 import { useRestartRefusal } from '../../hooks/useRestartRefusal'
@@ -74,6 +80,18 @@ const AUTH_REQUIRED_KIND = 'auth_required'
 export const isAuthRequired = (m: Pick<ChatMessage, 'kind' | 'meta'>): boolean =>
   m.kind === AUTH_REQUIRED_KIND || (m.meta as { kind?: string } | undefined)?.kind === AUTH_REQUIRED_KIND
 
+/** Row kind for the same signed-out turn on the Kiro CLI harness, which runs on
+ *  kiro-cli's own sign-in (`chat_utils_injected_rows.KIRO_CLI_SIGN_IN_KIND`): the row shows
+ *  kiro-cli's two sign-in commands instead of Crew's card. Same two carriers. */
+const KIRO_CLI_SIGN_IN_KIND = 'kiro_cli_sign_in'
+
+export const isKiroCliSignIn = (m: Pick<ChatMessage, 'kind' | 'meta'>): boolean =>
+  m.kind === KIRO_CLI_SIGN_IN_KIND || (m.meta as { kind?: string } | undefined)?.kind === KIRO_CLI_SIGN_IN_KIND
+
+/** That row from kiro-cli's relay, which runs on either sign-in (`meta.crew_sign_in`). */
+export const kiroCliRowOffersCrewSignIn = (m: Pick<ChatMessage, 'kind' | 'meta'>): boolean =>
+  isKiroCliSignIn(m) && (m.meta as { crew_sign_in?: unknown } | undefined)?.crew_sign_in === true
+
 /** Row kind the backend stamps on the terminal error a SPENT PLAN ALLOWANCE
  *  produces (`chat_utils.USAGE_LIMIT_KIND`): the provider refused the turn
  *  because the account's usage limit is reached. Decided from the raw frame on
@@ -83,6 +101,38 @@ const USAGE_LIMIT_KIND = 'usage_limit'
 
 export const isUsageLimit = (m: Pick<ChatMessage, 'kind' | 'meta'>): boolean =>
   m.kind === USAGE_LIMIT_KIND || (m.meta as { kind?: string } | undefined)?.kind === USAGE_LIMIT_KIND
+
+/** When a `usage_limit` row's limit opens again, as epoch milliseconds. The backend
+ *  stamps `meta.reset_at` (an ISO instant) only when it read the provider's reset
+ *  clause; absent or unparseable, there is nothing to show. The one reader of it. */
+export const limitResetAt = (meta: ChatMessage['meta']): number | undefined => {
+  if (!isUsageLimit({ meta })) return undefined
+  const raw = (meta as { reset_at?: unknown } | undefined)?.reset_at
+  const at = typeof raw === 'string' ? Date.parse(raw) : NaN
+  return Number.isFinite(at) ? at : undefined
+}
+
+/** That instant in the reader's locale and time zone. */
+export const limitResetTime = (meta: ChatMessage['meta']): string | undefined => {
+  const at = limitResetAt(meta)
+  return at === undefined ? undefined : fmtDateTime(at)
+}
+
+/** The row's own `reset_at` string, when `limitResetAt` reads it: the card sends it
+ *  back unchanged, since a `Date` keeps only milliseconds of it. */
+const limitResetIso = (meta: ChatMessage['meta']): string | undefined =>
+  limitResetAt(meta) === undefined ? undefined : String((meta as { reset_at?: unknown }).reset_at)
+
+/** The one read-only line a usage-limit card adds under the provider's sentence. */
+function LimitResetLine({ meta }: { meta: ChatMessage['meta'] }) {
+  const time = limitResetTime(meta)
+  if (!time) return null
+  return (
+    <div className="text-[12px] leading-5 text-muted mt-1" data-testid="error-card-limit-reset">
+      {i18nT('pages.chat.errorCard.limit_resets_at', { time })}
+    </div>
+  )
+}
 
 /** Row kind the backend stamps on the terminal error a SESSION START that never
  *  answered produces (`chat_utils.SESSION_START_FAILED_KIND`): `session/new`
@@ -280,12 +330,29 @@ export interface ErrorCardProps {
   /**
    * The fix affordance for an `auth_required` row: deep link to the Kiro
    * sign-in card in Settings, where the user signs in to Kiro Crew's own
-   * identity again. Offered INSTEAD of Continue for the same reason as the
-   * entitlement actions -- a retry hits the same signed-out wall -- and on
-   * EVERY such row, because a lapsed sign-in is settled state the user still
-   * has to act on. Omitted on a surface with no settings route (embed, popout).
+   * identity again. Offered INSTEAD of Continue (until `signInWorks`) for the
+   * same reason as the entitlement actions -- a retry hits the same signed-out
+   * wall -- and on EVERY such row, because a lapsed sign-in is settled state
+   * the user still has to act on. Omitted on a surface with no settings route (embed, popout).
    */
   onOpenSignIn?: () => void
+  /** A `kiro_cli_sign_in` row: one line and kiro-cli's two sign-in commands. */
+  kiroCliSignIn?: boolean
+  /** A `kiro_cli_sign_in` row from kiro-cli's relay: it also offers Kiro Crew's own sign-in. */
+  kiroCliCrewSignIn?: boolean
+  /** The row's untranslated text, where a translated notice dropped its request id. */
+  rawContent?: string
+  /**
+   * True on an `auth_required` row whose sign-in the host has read as working
+   * again: the row's line says so, and `onContinue`'s Resume gets a row of its
+   * own under the kept Sign in button, since a retry no longer meets that wall.
+   */
+  signInWorks?: boolean
+  /**
+   * The failed read of whether that sign-in works again: shown under the
+   * row's text on a surface with no app-level sign-in notice (embed, popout).
+   */
+  signInCheckError?: Error | null
   /**
    * True on the newest `session_start_failed` row when the same session start
    * has already failed `SESSION_START_REPEAT_REFUSAL_AT` times in a row with
@@ -320,6 +387,15 @@ export interface ErrorCardProps {
    * an ordinary chat has no form to offer and keeps today's card.
    */
   featureRequestFormUrl?: string
+  /**
+   * The chat this card's usage-limit row belongs to, on the chat's newest error
+   * row. With a reset time ahead on a row that can be resumed, the card adds
+   * "Continue automatically after <time>" beside Resume (see `LimitContinueRow`).
+   * While the gateway holds such a wait the card keeps its Cancel, even once the
+   * reset has passed or the chat cannot be resumed right now. Omitted anywhere
+   * else, so no other card changes.
+   */
+  limitContinueSlot?: string
   /**
    * Set beside `featureRequestFormUrl` when the row is a `kiro_cli_missing`
    * start failure rather than a spent allowance: the same form is offered, and
@@ -369,6 +445,9 @@ export interface ErrorCardProps {
   /** Where that press stands: `pending` while the repair + re-issue runs, `done`
    *  once the turn was re-issued against the repaired conversation. */
   repairImages?: RepairImagesState
+  /** Internal: render a `host_sandbox_unavailable` row as every other row, the
+   *  machine owner's view (`HostSandboxUnavailableCard`). */
+  hostSandboxOwnerView?: boolean
 }
 
 // No `shrink-0` and no `truncate`: every action sits in a flex row, and a
@@ -588,29 +667,49 @@ function RestartGatewayCard({ displayText, onRestartGateway }: {
  * its row swaps Resume for the two actions that actually end it: pick a model
  * the account is served, and change the default the next session would start on.
  */
-export const ErrorCard = memo(function ErrorCard({
-  content: wireContent,
-  resumeContent,
-  meta,
-  onContinue,
-  continuing,
-  onPickModel,
-  onOpenDefaultModel,
-  onOpenSignIn,
-  unentitledElsewhere,
-  featureRequestFormUrl,
-  kiroCliMissing,
-  sessionStartRepeat,
-  onRestartGateway,
-  onOpenCapabilities,
-  onOpenTurnLimit,
-  turnLimitSlot,
-  onFreshSession,
-  freshSession = 'idle',
-  onRepairImages,
-  repairImages = 'idle',
-}: ErrorCardProps) {
+export const ErrorCard = memo(function ErrorCard(props: ErrorCardProps) {
+  const {
+    content: wireContent,
+    resumeContent,
+    meta,
+    onContinue,
+    continuing,
+    onPickModel,
+    onOpenDefaultModel,
+    onOpenSignIn,
+    kiroCliSignIn,
+    kiroCliCrewSignIn,
+    rawContent,
+    signInWorks,
+    signInCheckError,
+    unentitledElsewhere,
+    featureRequestFormUrl,
+    limitContinueSlot,
+    kiroCliMissing,
+    sessionStartRepeat,
+    onRestartGateway,
+    onOpenCapabilities,
+    onOpenTurnLimit,
+    turnLimitSlot,
+    onFreshSession,
+    freshSession = 'idle',
+    onRepairImages,
+    repairImages = 'idle',
+    hostSandboxOwnerView,
+  } = props
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
+  if (isHostSandboxUnavailable(meta) && !hostSandboxOwnerView) {
+    // The host cannot build an OS sandbox: the owner keeps this card as it is,
+    // anyone else gets one line naming whom to ask.
+    return (
+      <HostSandboxUnavailableCard
+        meta={meta}
+        onContinue={onContinue}
+        continuing={continuing}
+        ownerView={<ErrorCard {...props} hostSandboxOwnerView />}
+      />
+    )
+  }
   // Swap the gateway's "please retry" wording ONLY on a row that renders the
   // Resume button. A row with no control keeps the wire text: telling the
   // reader to resume beside nothing is worse than the mismatch it would fix.
@@ -635,6 +734,7 @@ export const ErrorCard = memo(function ErrorCard({
       >
         <div className="text-danger text-[13px] leading-5 min-w-0" style={{ overflowWrap: 'anywhere' }}>
           {content}
+          <LimitResetLine meta={meta} />
         </div>
         <div className="text-[12px] leading-5 text-muted" data-testid="error-card-feature-request-hint">
           {i18nT(kiroCliMissing ? 'pages.chat.errorCard.feature_request_form_cli_missing_hint' : 'pages.chat.errorCard.feature_request_form_hint')}
@@ -705,32 +805,53 @@ export const ErrorCard = memo(function ErrorCard({
       </div>
     )
   }
-  if (onOpenSignIn) {
-    // A signed-out agent process: the one action that ends it is signing in
-    // again from Settings. The prose (the backend's own wording, which may
-    // still mention `kiro-cli login` for a kiro-cli-owned process) stays; the
-    // button is the in-product path for the Crew-owned one.
+  const resumeButton = onContinue && (
+    <button
+      type="button"
+      onClick={onContinue}
+      disabled={continuing}
+      className={`${ACTION_BTN} bg-accent text-accent-fg hover:bg-accent-hover`}
+      title={i18nT('pages.chat.errorCard.resume_hint')}
+      data-testid="error-card-continue"
+    >
+      {continuing
+        ? <Loader2 size={12} className="lucide-inline shrink-0 animate-spin" aria-hidden="true" />
+        : <RotateCw size={12} className="lucide-inline shrink-0" aria-hidden="true" />}
+      {i18nT('pages.chat.errorCard.resume')}
+    </button>
+  )
+  const signInCheckNotice = signInCheckError && (
+    <div className="mt-1">
+      <ErrorNotice
+        title={signInCheckError.message ? i18nT('components.kasLogin.sign_in_status_unavailable') : undefined}
+        message={signInCheckError.message || i18nT('components.kasLogin.sign_in_status_unavailable')}
+        report={reportForError(signInCheckError)}
+        messagePlacement="below"
+        variant="inline"
+        noHandoffReason="This row says the agent's Kiro sign-in failed and no read has shown it working since; on KAS the Ask-the-agent chat runs as that same sign-in and would fail the same way."
+        testId="error-card-sign-in-check-failed"
+      />
+    </div>
+  )
+  if (kiroCliSignIn) {
     return (
-      <div
-        className="bg-danger-subtle ring-1 ring-inset forced-colors:border ring-danger/20 rounded-md self-center w-full max-w-full min-w-0 px-3 py-2 flex flex-col gap-2 animate-scale-in"
-        data-testid="error-card"
-        data-auth-required="true"
-      >
-        <div className="text-danger text-[13px] leading-5 min-w-0" style={{ overflowWrap: 'anywhere' }}>
-          {withOriginLink(content)}
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            onClick={onOpenSignIn}
-            className={`${ACTION_BTN} bg-accent text-accent-fg hover:bg-accent-hover`}
-            title={i18nT('pages.chat.errorCard.sign_in_hint')}
-            data-testid="error-card-sign-in"
-          >
-            <KeyRound size={12} className="lucide-inline shrink-0" aria-hidden="true" />
-            {i18nT('pages.chat.errorCard.sign_in')}
-          </button>
-        </div>
+      <KiroCliSignInRow fallback={content} crewSignIn={kiroCliCrewSignIn} />
+    )
+  }
+  if (onOpenSignIn) {
+    // Kiro Crew's own sign-in stopped working: one line and the shared sign-in
+    // dialog, opened over the stored (refused) sign-in. The request id stays
+    // behind a copy control. Once the host reads the sign-in as working, the
+    // line says so and Resume sits on its own row under Sign in.
+    return (
+      <div className="self-center w-full max-w-full min-w-0" data-testid="error-card" data-auth-required="true">
+        <KiroSignInStrip
+          title={signInWorks ? content : i18nT('components.kiroSignInPrompt.keep_title')}
+          reauth
+          requestId={requestIdOf(rawContent ?? wireContent)}
+          testId="error-card-sign-in"
+          action={signInWorks ? resumeButton : undefined}
+        />
       </div>
     )
   }
@@ -965,21 +1086,6 @@ export const ErrorCard = memo(function ErrorCard({
       </div>
     )
   }
-  const resumeButton = onContinue && (
-    <button
-      type="button"
-      onClick={onContinue}
-      disabled={continuing}
-      className={`${ACTION_BTN} bg-accent text-accent-fg hover:bg-accent-hover`}
-      title={i18nT('pages.chat.errorCard.resume_hint')}
-      data-testid="error-card-continue"
-    >
-      {continuing
-        ? <Loader2 size={12} className="lucide-inline shrink-0 animate-spin" aria-hidden="true" />
-        : <RotateCw size={12} className="lucide-inline shrink-0" aria-hidden="true" />}
-      {i18nT('pages.chat.errorCard.resume')}
-    </button>
-  )
   if (onOpenTurnLimit || turnLimitSlot) {
     const secondaryBtn = `${ACTION_BTN} bg-transparent text-text ring-1 ring-inset ring-border hover:bg-bg-elevated`
     return (
@@ -1026,6 +1132,12 @@ export const ErrorCard = memo(function ErrorCard({
       />
     )
   }
+  const limitAt = limitContinueSlot ? limitResetAt(meta) : undefined
+  const limitIso = limitContinueSlot ? limitResetIso(meta) : undefined
+  // A wait the gateway still holds keeps its Cancel on a card that offers none.
+  const limitHeld = limitContinueSlot && limitAt !== undefined && limitIso !== undefined
+    ? <LimitContinueRow slot={limitContinueSlot} resetAt={limitIso} time={fmtDateTime(limitAt)} offer={false} />
+    : null
   if (!onContinue) {
     return (
       <div
@@ -1034,6 +1146,8 @@ export const ErrorCard = memo(function ErrorCard({
         style={{ overflowWrap: 'anywhere' }}
       >
         {withOriginLink(displayText)}
+        <LimitResetLine meta={meta} />
+        {limitHeld}
         {elsewhere && (
           <div className="text-[12px] leading-5 text-muted mt-1" data-testid="error-card-elsewhere-hint">
             {i18nT(elsewhereKey!)}
@@ -1051,6 +1165,24 @@ export const ErrorCard = memo(function ErrorCard({
             {restartHint()}
           </div>
         )}
+        {signInCheckNotice}
+      </div>
+    )
+  }
+  if (limitContinueSlot && limitAt !== undefined && limitIso !== undefined && limitAt > Date.now()) {
+    return (
+      <div
+        className="bg-danger-subtle ring-1 ring-inset forced-colors:border ring-danger/20 rounded-md self-center w-full max-w-full min-w-0 px-3 py-2 flex flex-col gap-2 animate-scale-in"
+        data-testid="error-card"
+        data-continuable="true"
+      >
+        <div className="text-danger text-[13px] leading-5 min-w-0" style={{ overflowWrap: 'anywhere' }}>
+          {withOriginLink(displayText)}
+          <LimitResetLine meta={meta} />
+        </div>
+        <LimitContinueRow slot={limitContinueSlot} resetAt={limitIso} time={fmtDateTime(limitAt)}>
+          {resumeButton}
+        </LimitContinueRow>
       </div>
     )
   }
@@ -1062,6 +1194,8 @@ export const ErrorCard = memo(function ErrorCard({
     >
       <div className="text-danger text-[13px] leading-5 flex-1 min-w-0" style={{ overflowWrap: 'anywhere' }}>
         {withOriginLink(displayText)}
+        <LimitResetLine meta={meta} />
+        {limitHeld}
       </div>
       {resumeButton}
     </div>

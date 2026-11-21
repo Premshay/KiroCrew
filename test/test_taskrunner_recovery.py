@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from redaction_structured_cases import github_classic
 from taskrunner_helpers import (
     _make_mock_provider,
     _make_mock_sessions,
@@ -418,8 +419,8 @@ class TestSaveProgress:
         assert progress.exists()
         content = progress.read_text(encoding="utf-8")
         assert "Step A" in content
-        assert "✅" in content
-        assert "❌" in content
+        assert "- Passed **Task" in content
+        assert "- Failed **Task" in content
         assert "boom" in content
         assert "(attempts: 2)" in content
 
@@ -1127,7 +1128,7 @@ class TestSessionRecovery:
         provider = MagicMock()
 
         async def _stream_with_cred(msg: str):
-            yield LLMEvent(kind="text_chunk", text="key is AKIAIOSFODNN7EXAMPLE here")
+            yield LLMEvent(kind="text_chunk", text=f"key is {github_classic(seed=1)} here")
             yield LLMEvent(kind="complete")
 
         provider.stream = _stream_with_cred
@@ -1144,7 +1145,7 @@ class TestSessionRecovery:
         success = await runner._execute_single_task(run, step)
 
         assert success
-        assert "AKIAIOSFODNN7EXAMPLE" not in (step.result or "")
+        assert github_classic(seed=1) not in (step.result or "")
         assert "[REDACTED" in (step.result or "")
 
 

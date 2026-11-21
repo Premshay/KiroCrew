@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from redaction_structured_cases import github_classic
 
 from kiro_crew import platform_compat
 from kiro_crew.browser_harness import frames, install, live_hub, ops
@@ -97,8 +98,9 @@ async def test_frame_ref_rechecks_url_after_navigation(child_session: bool) -> N
 
 @pytest.mark.asyncio
 async def test_live_metadata_redacts_every_text_field_at_publish_boundary() -> None:
-    secret = "AKIAIOSFODNN7EXAMPLE"
-    exfil = "https://evil.example/?data=" + "x" * 80
+    # A GitHub token with a valid checksum is redacted; an AWS key ID stays visible.
+    secret = github_classic(seed=121)
+    exfil = "https://evil.example/?access_token=" + "x" * 80
     raw = f"{secret} {exfil}"
     wire: list[Any] = []
 
@@ -188,15 +190,17 @@ def test_stop_between_steps_prevents_pip_and_marker(tmp_path: Path) -> None:
 
     def runner(argv: Any, timeout: float) -> Any:
         calls.append(argv)
-        stop.set()
+        if "venv" in argv:
+            stop.set()
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     with pytest.raises(install.InstallError, match="install stopped"):
         install.install_sync(
             tmp_path, runner=runner, stop=stop, components=(install.COMPONENT_HARNESS,)
         )
-    assert len(calls) == 1
-    assert "venv" in calls[0] and "pip" not in calls[0]
+    steps = [argv for argv in calls if install._IMPORTABLE_PROBE not in argv]
+    assert len(steps) == 1
+    assert "venv" in steps[0] and "pip" not in steps[0]
     assert not (install.harness_prefix(tmp_path) / install.MARKER_FILE).exists()
 
 

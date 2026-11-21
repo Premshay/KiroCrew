@@ -106,13 +106,38 @@ async def _audit(request: web.Request, operation: str, outcome: str, error: str 
         logger.debug("Could not audit KAS login operation %s", operation, exc_info=True)
 
 
+def _load_agent_config() -> Any:
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    return KiroCrewConfig.load().agent
+
+
+def _company_sign_in() -> dict[str, str]:
+    """What the company sign-in form starts filled in with (auth/company_sign_in.py)."""
+    from kiro_crew.auth.company_sign_in import company_sign_in_default
+
+    try:
+        agent = _load_agent_config()
+    except Exception:
+        # An unreadable config still lets the edition default fill the form.
+        logger.debug("could not read config for the company sign-in default", exc_info=True)
+        agent = None
+    return company_sign_in_default(agent)
+
+
 async def api_kas_login_status(request: web.Request) -> web.Response:
-    """GET /api/kas-login — auth state + the transport this install shape supports."""
+    """GET /api/kas-login — auth state + the transport this install shape supports.
+
+    ``company_sign_in`` carries the start URL and region the company SSO form
+    starts with (both ``""`` when nothing supplies one).
+    """
     service = _service(request)
     if service is None:
         return _unavailable()
     try:
-        return web.json_response(await service.status())
+        body = await service.status()
+        body["company_sign_in"] = await asyncio.to_thread(_company_sign_in)
+        return web.json_response(body)
     except TokenStoreError as err:
         # A refused (e.g. linked) token-store directory is a coded storage
         # failure, not an anonymous 500.
@@ -181,13 +206,22 @@ async def api_kas_login_begin_device(request: web.Request) -> web.Response:
             status=400,
         )
     except InvalidStartUrlError as err:
-        return web.json_response({"error": str(err), "code": "invalid_start_url"}, status=400)
+        # `reason` names the broken rule so the form can say it in the user's language.
+        return web.json_response(
+            {"error": str(err), "code": "invalid_start_url", "reason": err.reason}, status=400
+        )
     except StartUrlRejectedError as err:
         # AWS refused what the user typed (the URL or the region): a 400 the form
         # can fix, not an auth-service failure. A bare answer names neither field.
         await _audit(request, "kas_login_begin_device", "failed", error=str(err))
-        code = "invalid_start_url" if err.names_start_url else "start_url_or_region_rejected"
-        return web.json_response({"error": str(err), "code": code}, status=400)
+        if err.names_start_url:
+            return web.json_response(
+                {"error": str(err), "code": "invalid_start_url", "reason": "aws_rejected"},
+                status=400,
+            )
+        return web.json_response(
+            {"error": str(err), "code": "start_url_or_region_rejected"}, status=400
+        )
     except (DeviceAuthError, BuilderIdAuthError) as err:
         await _audit(request, "kas_login_begin_device", "failed", error=str(err))
         return web.json_response(
@@ -250,7 +284,21 @@ async def api_kas_login_poll(request: web.Request) -> web.Response:
     # change worth an audit line; a pending tick is just a read.
     if result.get("status") == "authorized":
         await _audit(request, "kas_login_authorized", "success")
+        _close_browser_relay_crews()
     return web.json_response(result)
+
+
+def _close_browser_relay_crews() -> None:
+    """End every relay Crew open in a browser tab: they ran as the account that just left.
+
+    Loaded only if an open was ever made, so a gateway that never relayed one in a
+    browser imports nothing here.
+    """
+    import sys
+
+    module = sys.modules.get("kiro_crew.relay_viewer.browser_origin")
+    if module is not None:
+        module.close_all()
 
 
 async def api_kas_login_logout(request: web.Request) -> web.Response:
@@ -278,6 +326,7 @@ async def api_kas_login_logout(request: web.Request) -> web.Response:
             status=500,
         )
     await _audit(request, "kas_login_logout", "success")
+    _close_browser_relay_crews()
     await _retire_runtimes_after_sign_out(request)
     return web.json_response({"ok": True})
 

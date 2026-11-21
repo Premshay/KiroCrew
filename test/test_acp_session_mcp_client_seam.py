@@ -34,11 +34,24 @@ from acp_session_mcp_helpers import (
 
 from kiro_crew.acp import client as client_mod
 from kiro_crew.acp import session_mcp
-from kiro_crew.acp.client import AcpClient
+from kiro_crew.acp.client import AcpClient, ClaudeAcpClient
+from kiro_crew.acp.raw_sdk_tasks import RAW_SDK_MESSAGE_FILTER
 from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_DEEPSEEK
 from kiro_crew.providers.mirrors import claude_code as claude_mirror
 from kiro_crew.providers.mirrors import registry as mirrors_registry
 from kiro_crew.providers.mirrors.claude_code import ClaudeCodeMirror
+
+#: What a claude session asks for beside its options (``acp.raw_sdk_tasks``).
+_RAW_SDK_FILTER = [
+    *RAW_SDK_MESSAGE_FILTER,
+    {"type": "user", "origin": "coordinator"},
+    {"type": "user", "origin": "observer"},
+    {"type": "user", "origin": "observer-activity"},
+    {"type": "user", "origin": "peer"},
+    {"type": "user", "origin": "task-notification"},
+    {"type": "assistant"},
+    {"type": "result"},
+]
 
 
 class TestClientSeam:
@@ -47,8 +60,10 @@ class TestClientSeam:
 
         Without a Crew-authored ``settings.local.json`` the array is withheld, so a test
         skipping the seed would hit the withhold path (see ``_resolve_session_mcp_servers``).
+        Built as the class that seeds that file, whatever backend *kw* names, so a test
+        can widen the capability set for a backend that is not claude.
         """
-        client = AcpClient(work_dir=tmp_path, **kw)
+        client = ClaudeAcpClient(work_dir=tmp_path, **kw)
         client._write_claude_local_settings()
         assert client._claude_settings_authored is True
         return client
@@ -472,6 +487,36 @@ class TestClientSeam:
         assert killed == [True]
 
     @pytest.mark.asyncio
+    async def test_a_gained_rule_stops_the_session_through_its_driver_hook(
+        self, tmp_path, agents_dir, monkeypatch
+    ):
+        """The re-read stops the session through ``_claude_stop_session`` only.
+
+        A driver serving several sessions on one process overrides that hook to
+        close this one session; a re-read that killed the process itself would
+        stop every session on it.
+        """
+        client = self._excluded_client(tmp_path, agents_dir, {"permissions": {}})
+        client._write_claude_local_settings()
+        client._claude_session_meta()
+        (tmp_path / ".claude" / "settings.json").write_text(
+            json.dumps({"permissions": {"ask": ["Bash(git push:*)"]}}), encoding="utf-8"
+        )
+        stopped: list[bool] = []
+
+        async def _stop() -> None:
+            stopped.append(True)
+
+        async def _no_kill(*_a, **_kw):
+            raise AssertionError("the re-read killed the process directly")
+
+        monkeypatch.setattr(client, "_claude_stop_session", _stop)
+        monkeypatch.setattr(client, "_kill_process", _no_kill)
+        with pytest.raises(client_mod.AcpError, match="gained deny or ask rules"):
+            await client._verify_claude_project_denies_unchanged()
+        assert stopped == [True]
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("version", ["0.84.0", "0.83.0", None])
     async def test_the_handshake_never_resolves_the_array_on_the_loop(
         self, tmp_path, agents_dir, monkeypatch, version
@@ -544,8 +589,11 @@ class TestClientSeam:
         assert client._claude_local_settings_excluded is False
         assert client._claude_inline_settings is None
         assert "foo" in _by_name(client._session_mcp_servers())
-        assert client._claude_session_meta()["claudeCode"]["options"] == {
-            "settingSources": ["project", "local"]
+        assert client._claude_session_meta() == {
+            "claudeCode": {
+                "options": {"settingSources": ["project", "local"]},
+                "emitRawSDKMessages": _RAW_SDK_FILTER,
+            }
         }
 
     def test_the_envelope_follows_the_array_it_shipped_with(self, tmp_path, agents_dir):
@@ -583,11 +631,8 @@ class TestClientSeam:
         from kiro_crew import model_registry
 
         substitute = "global.anthropic.claude-sonnet-4-6[1m]"
-        monkeypatch.setattr(
-            model_registry,
-            "_ADVERTISED_MODELS",
-            {"claude_code": ["global.anthropic.claude-opus-5[1m]", substitute]},
-        )
+        # The pin is not advertised, so the retry adopts the substitute.
+        monkeypatch.setattr(model_registry, "_ADVERTISED_MODELS", {"claude_code": [substitute]})
         _write_spec(agents_dir, servers={"foo": {"command": "/bin/foo"}}, tools=["@foo"])
         client = AcpClient(
             work_dir=tmp_path,
@@ -627,7 +672,12 @@ class TestClientSeam:
         await client._new_session_following_substitution()
 
         assert len(sent) == 2
-        assert sent[0]["_meta"]["claudeCode"]["options"] == {"settingSources": ["project", "local"]}
+        assert sent[0]["_meta"] == {
+            "claudeCode": {
+                "options": {"settingSources": ["project", "local"]},
+                "emitRawSDKMessages": _RAW_SDK_FILTER,
+            }
+        }
         retry = sent[1]
         assert "foo" in _by_name(retry["mcpServers"])
         options = retry["_meta"]["claudeCode"]["options"]
@@ -644,7 +694,12 @@ class TestClientSeam:
         client = self._seeded(tmp_path, agent="kirocrew", acp_backend=ACP_BACKEND_CLAUDE)
         params = await self._session_new_params(client, tmp_path, monkeypatch)
         assert "foo" in _by_name(params["mcpServers"])
-        assert params["_meta"]["claudeCode"]["options"] == {"settingSources": ["project", "local"]}
+        assert params["_meta"] == {
+            "claudeCode": {
+                "options": {"settingSources": ["project", "local"]},
+                "emitRawSDKMessages": _RAW_SDK_FILTER,
+            }
+        }
 
     _pin_harness = staticmethod(_pin_harness)
     _recorded_results = staticmethod(_recorded_results)
@@ -822,7 +877,9 @@ class TestClientSeam:
         client._write_claude_local_settings()
         assert client._claude_local_settings_excluded is False
         assert client._session_mcp_servers() == []
-        assert client._claude_session_meta()["claudeCode"]["options"] == {}
+        assert client._claude_session_meta() == {
+            "claudeCode": {"options": {}, "emitRawSDKMessages": _RAW_SDK_FILTER}
+        }
 
     @pytest.mark.parametrize("version", ["0.84.0", "0.85.2-preview.3", "1.0.0"])
     def test_an_installed_adapter_at_or_above_the_floor_keeps_the_tools(
@@ -885,7 +942,7 @@ class TestClientSeam:
             claude_mod, "_resolve_claude_acp_bin", lambda: (["/opt/bin/claude-agent-acp"], "")
         )
         monkeypatch.setattr(claude_mod, "_claude_adapter_installed_version", _version)
-        monkeypatch.setattr(AcpClient, "_write_claude_local_settings", _write)
+        monkeypatch.setattr(ClaudeAcpClient, "_write_claude_local_settings", _write)
         monkeypatch.setattr(AcpClient, "_resolve_session_mcp_servers", _resolve)
         try:
             asyncio.run(
@@ -905,6 +962,33 @@ class TestClientSeam:
 
         assert steps == [("read", ""), ("seed", "0.84.0"), ("warm", "")]
         assert client._session_mcp_cache == []
+        assert client._claude_adapter_argv == ("/opt/bin/claude-agent-acp",)
+
+    def test_a_wrapper_is_judged_on_the_version_its_last_handshake_reported(
+        self, tmp_path, monkeypatch
+    ):
+        """A wrapper script has no package.json beside it, so the version the same
+        argv reported at its latest handshake stands in; a manifest still wins."""
+        from kiro_crew.acp.harness import claude as claude_mod
+
+        monkeypatch.setattr(claude_mod, "_claude_adapter_handshake_versions", {})
+        wrapper = tmp_path / "bin" / "claude-agent-acp"
+        wrapper.parent.mkdir()
+        wrapper.write_text('#!/bin/sh\nexec node /elsewhere/dist/index.js "$@"\n', encoding="utf-8")
+        argv = [str(wrapper)]
+        assert client_mod._claude_adapter_known_version(argv) == ""
+
+        claude_mod._claude_adapter_handshake_versions[tuple(argv)] = "0.87.0"
+        assert client_mod._claude_adapter_known_version(argv) == "0.87.0"
+        assert client_mod._claude_adapter_known_version([str(tmp_path / "other")]) == ""
+
+        pkg = wrapper.parent / "node_modules" / "@agentclientprotocol" / "claude-agent-acp"
+        pkg.mkdir(parents=True)
+        (pkg / "package.json").write_text(
+            json.dumps({"name": client_mod.CLAUDE_ACP_NPM_PKG, "version": "0.88.0"}),
+            encoding="utf-8",
+        )
+        assert client_mod._claude_adapter_known_version(argv) == "0.88.0"
 
     def test_the_installed_version_is_read_from_the_adapters_own_manifest(self, tmp_path):
         pkg = tmp_path / "node_modules" / "@agentclientprotocol" / "claude-agent-acp"
@@ -1145,7 +1229,9 @@ class TestClientSeam:
         import inspect
 
         source = inspect.getsource(client_mod.AcpClient._initialize_session)
-        assert source.count("await self._pin_claude_starting_mode(") == 2
+        assert source.count("await self._pin_starting_mode(") == 2
+        hook = inspect.getsource(client_mod.ClaudeAcpClient._pin_starting_mode)
+        assert "await self._pin_claude_starting_mode(resp)" in hook
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("path", ["new", "load"])
@@ -1351,6 +1437,25 @@ class TestClientSeam:
             await client._initialize_session()
         assert killed == [True]
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("version", ["0.87.0", None])
+    async def test_the_handshake_records_the_version_its_adapter_argv_reported(
+        self, tmp_path, agents_dir, monkeypatch, version
+    ):
+        """The next pre-spawn check reads it for that argv, and a handshake that
+        reports no version replaces an earlier answer rather than keeping it."""
+        from kiro_crew.acp.harness import claude as claude_mod
+
+        argv = ("/opt/bin/claude-agent-acp",)
+        monkeypatch.setattr(claude_mod, "_claude_adapter_handshake_versions", {argv: "0.85.0"})
+        client = self._seeded(tmp_path, agent="kirocrew", acp_backend=ACP_BACKEND_CLAUDE)
+        client._claude_adapter_argv = argv
+        self._adapter_transport(client, monkeypatch, started_mode=None, version=version)
+
+        await client._initialize_session()
+
+        assert claude_mod._claude_adapter_handshake_versions == {argv: version or ""}
+
     @staticmethod
     def _claude_reads_natively(path, *, deny, allow):
         """Whether Claude Code runs a Read of *path* without asking the host.
@@ -1447,7 +1552,9 @@ class TestClientSeam:
         main = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
         await main._prepare_claude_side_read_denies()
         assert main._claude_side_read_denies == ()
-        assert main._claude_session_meta()["claudeCode"]["options"] == {}
+        assert main._claude_session_meta() == {
+            "claudeCode": {"options": {}, "emitRawSDKMessages": _RAW_SDK_FILTER}
+        }
 
     @pytest.mark.parametrize(
         ("target", "windows", "pattern"),
@@ -1470,10 +1577,12 @@ class TestClientSeam:
     )
     def test_side_chat_asks_the_installed_adapters_version(self, monkeypatch, version, expected):
         """Side Chat grants tools on claude only from an adapter at the floor."""
+        from kiro_crew.acp.harness import claude as claude_mod
         from kiro_crew.agent_sdk.drivers.acp import claude_adapter_honours_session_options
 
         monkeypatch.setattr(client_mod, "_claude_acp_argv_cache", (["/x/claude-agent-acp"], ""))
         monkeypatch.setattr(client_mod, "_claude_adapter_installed_version", lambda argv: version)
+        monkeypatch.setattr(claude_mod, "_claude_adapter_handshake_versions", {})
         assert claude_adapter_honours_session_options() is expected
 
     def test_side_chat_sees_no_adapter_as_unverified(self, monkeypatch):
@@ -1481,6 +1590,23 @@ class TestClientSeam:
 
         monkeypatch.setattr(client_mod, "_claude_acp_argv_cache", (None, "PATH"))
         assert claude_adapter_honours_session_options() is False
+
+    def test_side_chat_on_a_wrapper_reads_the_version_its_last_handshake_reported(
+        self, monkeypatch
+    ):
+        """No package.json beside a wrapper script: Side Chat grants tools once the
+        same argv has reported a version at the floor at a handshake."""
+        from kiro_crew.acp.harness import claude as claude_mod
+        from kiro_crew.agent_sdk.drivers.acp import claude_adapter_honours_session_options
+
+        argv = ["/x/claude-agent-acp"]
+        monkeypatch.setattr(client_mod, "_claude_acp_argv_cache", (argv, ""))
+        monkeypatch.setattr(client_mod, "_claude_adapter_installed_version", lambda argv: "")
+        monkeypatch.setattr(claude_mod, "_claude_adapter_handshake_versions", {})
+        assert claude_adapter_honours_session_options() is False
+
+        claude_mod._claude_adapter_handshake_versions[tuple(argv)] = "0.87.0"
+        assert claude_adapter_honours_session_options() is True
 
     @pytest.mark.parametrize(
         "raw",
@@ -1515,7 +1641,9 @@ class TestClientSeam:
         )
         client._write_claude_local_settings()
         assert client._session_mcp_servers() == []
-        assert client._claude_session_meta()["claudeCode"]["options"] == {}
+        assert client._claude_session_meta() == {
+            "claudeCode": {"options": {}, "emitRawSDKMessages": _RAW_SDK_FILTER}
+        }
 
     def test_a_symlinked_project_file_still_withholds_the_array(self, tmp_path, agents_dir):
         _write_spec(agents_dir, servers={"foo": {"command": "/bin/foo"}}, tools=["@foo"])
@@ -1527,7 +1655,9 @@ class TestClientSeam:
         client = AcpClient(work_dir=tmp_path, agent="kirocrew", acp_backend=ACP_BACKEND_CLAUDE)
         client._write_claude_local_settings()
         assert client._session_mcp_servers() == []
-        assert client._claude_session_meta()["claudeCode"]["options"] == {}
+        assert client._claude_session_meta() == {
+            "claudeCode": {"options": {}, "emitRawSDKMessages": _RAW_SDK_FILTER}
+        }
 
     def test_the_cached_array_is_not_aliased_to_callers(self, tmp_path, agents_dir):
         # The two call sites splat this list into their params; handing out the

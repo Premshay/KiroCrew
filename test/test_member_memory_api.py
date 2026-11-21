@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
-from member_memory_helpers import DOCUMENT_CREDENTIAL, document_store
+from member_memory_helpers import document_store
 from member_memory_helpers import env as _member_env
 from member_memory_helpers import request, seed_body
 
@@ -27,7 +27,12 @@ from kiro_crew.dashboard.handlers import (
 )
 from kiro_crew.mcp_tools import learn
 from kiro_crew.memory import MemoryStore
+from kiro_crew.testing.synthetic_credentials import github_classic, synth
 from kiro_crew.vector_memory import VectorMemoryStore, open_member_database
+
+# A synthetic GitHub token for the "sensitive document" fixtures. An AWS key ID or a
+# bare 40-character run is kept visible, so neither makes a document sensitive.
+DOCUMENT_CREDENTIAL = github_classic(seed=47)
 
 pytestmark = pytest.mark.xdist_group("member_memory_api")
 
@@ -281,7 +286,7 @@ async def test_memory_events_redact_content_without_mutating_the_audit_store(env
         tier = env.tiers[store]
 
     credential = DOCUMENT_CREDENTIAL
-    exfiltration_url = "https://evil.example.com/steal?data=" + "A" * 250
+    exfiltration_url = "https://evil.example.com/steal?access_token=" + synth(64, seed=48)
     assert tier.set_semantic("project.audit", credential, 1.0, "user_explicit") is None
     assert tier.set_semantic("project.audit", exfiltration_url, 1.0, "user_explicit") is None
     stored_events = tier.get_events()
@@ -1535,6 +1540,7 @@ async def test_the_dashboard_owner_still_sees_and_controls_every_run(env):
         "api_cron_history",
         "api_cron_history_detail",
         "api_cron_history_all",
+        "api_cron_get",
         "api_cron_script_source",
         "api_cron_secret_grant",
         "api_crons",

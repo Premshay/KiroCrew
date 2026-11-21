@@ -58,7 +58,7 @@ import kiro_crew.agent as _agent_module  # noqa: F401
 # Bindings below that only the ``context_assembly`` owners read stay bound here:
 # callers rebind them on this module, and the owners read them through it at call
 # time, so such a patch still reaches the code that moved.
-from kiro_crew import model_registry, resource_status  # noqa: F401
+from kiro_crew import model_registry, redaction_seams, resource_status  # noqa: F401
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.agent import _prompt_path, _shipped_prompt, is_managed_prompt  # noqa: F401
 from kiro_crew.agent_discovery import WHOLE_CATALOG_TEMPLATES, agent_skill_globs
@@ -1073,13 +1073,13 @@ def _project_steering_delivered(
     workspace that sets ``chat.disableInheritingDefaultResources`` gets only
     the declared resources, so the folder carries the trees minus the
     documents in the launch record); a harness Crew loads the spec's steering
-    for (``acp_driver.crew_loads_spec_steering``: the Claude Code seam and
-    Codex) receives the explicit ``[Steering resources]`` load in
+    for (``acp_driver.crew_loads_spec_steering``: the Claude Code seam,
+    Codex, OpenCode and Pi) receives the explicit ``[Steering resources]`` load in
     ``build_message``, but only for the Kiro Crew default agent: that load
     sends nothing for a custom *agent*, so there the folder still carries the
     trees (``None`` is the default agent); KAS reports ``native_steering`` on
-    its session provider. Every other harness -- OpenCode, Pi, Goose,
-    DeepSeek -- has NO path for those trees today, so a folder that declares one
+    its session provider. Every other harness -- Goose, DeepSeek and
+    the rest -- has NO path for those trees today, so a folder that declares one
     of them must deliver its documents itself rather than skip them as "already
     delivered" with nothing arriving in their place. A harness that is not
     named (``None``) is not assumed to be kiro-cli: it matches no path here, so
@@ -1293,9 +1293,34 @@ def build_session_replay(
         return None
 
     replay = _replay.replay_text(messages, model_window, budget_chars=budget_chars)
-    replay, _ = redact_exfiltration_urls(replay)
-    replay, _ = redact_credentials(replay)
+    # An output seam: the owner's redaction setting may stand the credential pass down here.
+    # The credential pass masks a credential inside a URL as well; no URL is replaced whole.
+    with redaction_seams.output_seam(redaction_seams.ACP_PROMPT):
+        replay, _ = redact_credentials(replay)
     return replay.translate(_MULTIBYTE_TABLE)
+
+
+def build_tool_pointers(conversation_log: "ConversationLog | None", session_key: str) -> str:
+    """The tool-result pointer list a context-cap trim's seed carries, redacted, or ``""``.
+
+    Read through the guarded derivation seam with each key's rotated archive, so an id
+    listed before a rotation stays fetchable, and a private or busy transcript lists
+    nothing; see ``context_assembly.replay.tool_pointer_text``.
+    """
+    from kiro_crew.history import TranscriptBusy, TranscriptWithheld
+
+    if conversation_log is None:
+        return ""
+    try:
+        rows, _keys = conversation_log.derive_messages_chained_full_with_keys(session_key)
+    except (TranscriptBusy, TranscriptWithheld):
+        return ""
+    text = _replay.tool_pointer_text(rows, session_key)
+    if not text:
+        return ""
+    text, _ = redact_exfiltration_urls(text)
+    text, _ = redact_credentials(text)
+    return text.translate(_MULTIBYTE_TABLE)
 
 
 def _skills_injection_plan(

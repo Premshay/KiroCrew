@@ -26,7 +26,7 @@ import re
 import time
 from typing import Any, Awaitable, Callable
 
-from kiro_crew import name_grant
+from kiro_crew import name_grant, redaction_seams
 from kiro_crew.acp.types import (
     EVENT_COMPACTION_STATUS,
     EVENT_COMPLETE,
@@ -58,6 +58,7 @@ from kiro_crew.constants import (
 )
 from kiro_crew.deny_notice import steer_refusal_notice
 from kiro_crew.executors import run_in_tool_gate_pool
+from kiro_crew.messaging.alternation_echo import could_be_echo, echo_prefix_len, is_echo
 from kiro_crew.messaging.directive_tracker import DirectiveTracker
 from kiro_crew.messaging.driver_quoted_markers import QuotedDirectiveFilter
 from kiro_crew.messaging.empty_turn_copy import (
@@ -97,6 +98,7 @@ from kiro_crew.security import StreamRedactor, redact_credentials, redact_exfilt
 from kiro_crew.sel import sel
 from kiro_crew.tool_call_title import derive_tool_call_title
 from kiro_crew.tool_gate_busy import TOOL_GATE_BUSY_REASON
+from kiro_crew.tracing import steps as trace_steps
 from kiro_crew.tracing import surfaces as trace_surfaces
 
 logger = logging.getLogger(__name__)
@@ -113,16 +115,15 @@ APPROVAL_INTERACTIVE = "interactive"
 #:
 #: A decider MAY also carry ``last_deny_cause``: set on every call, ``""`` for a
 #: human's own answer (or no answer worth explaining) and a ``DENY_CAUSE_*``
-#: name from ``kiro_crew.constants`` when the denial was the host's doing.
-#: Today that is :data:`DENY_CAUSE_APPROVAL_TIMEOUT`, recorded by every shipped
-#: decider when its prompt expires unanswered, or
-#: :data:`DENY_CAUSE_APPROVAL_UNDELIVERABLE`, recorded when the prompt never
-#: reached the channel (text-reply, Discord, Telegram and Teams deciders). The
-#: driver steers both, each with its own reason. The driver reads it after a
-#: denial and steers the cause into the running turn BEFORE it rejects, so the
-#: model is not left with kiro-cli's generic "User denied tool execution" for a
-#: call nobody answered. A plain callable without the attribute is a denial
-#: with no cause, exactly as before.
+#: name from ``kiro_crew.constants`` when the denial was the host's doing:
+#: :data:`DENY_CAUSE_APPROVAL_TIMEOUT`, recorded by every shipped decider when
+#: its prompt expires unanswered, or :data:`DENY_CAUSE_APPROVAL_UNDELIVERABLE`,
+#: recorded when the prompt never reached the channel (text-reply, Discord,
+#: Telegram and Teams deciders). After a denial the driver steers the cause into
+#: the running turn BEFORE it rejects, each with its own reason, so the model is
+#: not left with kiro-cli's generic "User denied tool execution" for a call
+#: nobody answered. A plain callable without the attribute is a denial with no
+#: cause.
 ApprovalDecider = Callable[[Any], Awaitable[bool]]
 
 #: Strong references to the teardown-time orphan rejects scheduled by
@@ -296,12 +297,14 @@ _STEER_TAIL_PREFIX_RE = re.compile(_STEERING_TAIL_PREFIX_RE.pattern, re.IGNORECA
 # still knows the destination is external, so reserve the prefixes and replace
 # the internal summary with a terse user-safe status. The dashboard does not use
 # TurnDriver and retains its authoritative transcript/audit record.
+# Current writers lead with no glyph; the U+2705 forms are what saved
+# transcripts and older gateways carry, so both stay reserved.
 _COMPACTION_NOTICE_PREFIXES = (
-    "✅ Conversation compacted:",
+    "\u2705 Conversation compacted:",  # emoji-ok: old saved lead
     "Conversation compacted:",
-    "✅ Compacted:",
+    "\u2705 Compacted:",  # emoji-ok: old saved lead
 )
-_COMPACTION_NOTICE_REPLACEMENT = "✅ Context compacted."
+_COMPACTION_NOTICE_REPLACEMENT = "Context compacted."
 _COMPACTION_PROBE_MAX = max(map(len, _COMPACTION_NOTICE_PREFIXES)) + 64
 
 
@@ -694,7 +697,10 @@ class TurnDriver:
 
     async def run(self, message: str) -> str:
         """Drive one turn; return the accumulated channel-safe assistant text."""
-        with trace_surfaces.root(trace_surfaces.TRIGGER_CHANNEL, channel=self._trace_channel()):
+        with (
+            trace_surfaces.root(trace_surfaces.TRIGGER_CHANNEL, channel=self._trace_channel()),
+            redaction_seams.output_seam(redaction_seams.CHANNELS),
+        ):
             return await self._drive(message)
 
     def _trace_channel(self) -> str:
@@ -785,6 +791,11 @@ class TurnDriver:
         # accumulated — then reported once at turn end. Counts only, by
         # contract: no text in the log line.
         text_after_terminal = 0
+        # The turn's first text, held while it could still be the backend's
+        # alternation placeholder (``alternation_echo``): the model repeats it at
+        # the start of a turn after one that ended on a tool result. It is
+        # dropped when it is that text and released when it stops matching.
+        echo_held = ""
         # The turn's session-directive bookkeeping (forgery gate, sub-agent
         # isolation, single-consume). Only built when a directive consumer is
         # injected, so a consumer-less turn does no extra work.
@@ -895,6 +906,17 @@ class TurnDriver:
                 self.partial_text = accumulated
                 await self.renderer.dispatch(OutputEvent(kind=TEXT_CHUNK, text=safe))
 
+        async def settle_echo_hold() -> None:
+            """End the placeholder hold: drop the whole placeholder, emit anything else.
+
+            Called where the held segment ends: a tool call, a steer boundary,
+            the turn's end.
+            """
+            nonlocal echo_held
+            held, echo_held = echo_held, ""
+            if not is_echo(held):
+                await emit_text(held)
+
         def steer_entered_turn() -> bool:
             try:
                 stamp = float(getattr(self.provider, "last_steer_monotonic", 0.0) or 0.0)
@@ -904,7 +926,7 @@ class TurnDriver:
 
         async def dispatch_frames(frames: list[tuple[str, str]]) -> None:
             nonlocal pending_steer_events, unmatched_marker_events
-            nonlocal steered_this_turn, text_after_terminal
+            nonlocal steered_this_turn, text_after_terminal, echo_held
             for frame_kind, payload in frames:
                 if frame_kind == "text":
                     if self.terminal_directive_applied and not steered_this_turn:
@@ -920,8 +942,18 @@ class TurnDriver:
                             # tool-result tail. Counted, never rendered.
                             text_after_terminal += 1
                             continue
+                    if not fed_raw:
+                        held = echo_held + payload
+                        if could_be_echo(held):
+                            echo_held = held
+                            continue
+                        echo_held = ""
+                        # The placeholder, then the model's own words after it.
+                        cut = echo_prefix_len(held)
+                        payload = held[cut:].lstrip() if cut else held
                     await emit_text(payload)
                     continue
+                await settle_echo_hold()
                 # An inline steer marker is a consumption echo: a steer is in
                 # this turn, so the text that follows it is kept.
                 steered_this_turn = True
@@ -1040,6 +1072,7 @@ class TurnDriver:
                 held_line = quoted_marker_filter.flush()
                 if held_line:
                     await dispatch_frames(steering_filter.feed(held_line))
+                await settle_echo_hold()
                 tool_gap = True
                 if segment_tail is not None and len(fed_raw) != tail_fed_at:
                     # Text came since the pending run without ending it (it
@@ -1225,7 +1258,18 @@ class TurnDriver:
                     )
                     await self.provider.reject_tool(event.request_id)
                     continue
-                if _gate == "auto_approve":
+                from kiro_crew.mate_held_rules import held_for
+                from kiro_crew.web_ask_rule import held_phrases
+
+                # A held Bot limit (``mate_held_rules``), or an organisation's
+                # ``ask`` on a KAS web call (``web_ask_rule``): only a person
+                # approves it; with no decider ``_approve`` refuses it.
+                _held = list(
+                    await asyncio.to_thread(
+                        held_for, event, session_key=self.audit_session_key, agent=self.audit_agent
+                    )
+                ) + held_phrases(event)
+                if _gate == "auto_approve" and not _held:
                     # The gate's hook granted this by NAME (the
                     # `auto_approve_tools` globs, or the read-only
                     # allowlist). Honour it only while each program name in
@@ -1296,7 +1340,9 @@ class TurnDriver:
                 #  - hook: auto_approve_subagent_spawn -> spawn_run
                 #  - per-session Trust / global YOLO (injected predicate)
                 _auto_reason = ""
-                if self.auto_approve_tool is not None and self.auto_approve_tool(event):
+                if _held:
+                    pass
+                elif self.auto_approve_tool is not None and self.auto_approve_tool(event):
                     _auto_reason = "hook_auto_approve"
                 elif self.auto_approve_session is not None and self.auto_approve_session():
                     _auto_reason = "session_trust"
@@ -1320,7 +1366,11 @@ class TurnDriver:
                 # Only render approve/deny buttons when there's a decider to
                 # await the click. Without one, _approve() denies by default,
                 # so posting buttons would leave the user with dead controls.
-                if self.approval_mode == APPROVAL_INTERACTIVE and self.decider is not None:
+                # The prompt is answerable from its dispatch: its wait starts here.
+                _asked = trace_steps.asked_now()
+                if (
+                    self.approval_mode == APPROVAL_INTERACTIVE or _held
+                ) and self.decider is not None:
                     # The prompt names the tool from the PERMISSION event's own
                     # title, and its purpose from the tool_call that shares the
                     # id. A renderer that instead remembers the last titled
@@ -1350,7 +1400,7 @@ class TurnDriver:
                             tool_name=_redact(_mcp_tool),
                         )
                     )
-                approved = await self._approve(event)
+                approved = await self._approve(event, asked=_asked, held=_held)
                 if approved:
                     approval_sent = await self.provider.approve_tool(event.request_id)
                     permission_outcome = (
@@ -1414,6 +1464,7 @@ class TurnDriver:
                 if pending:
                     await dispatch_frames(steering_filter.feed(pending))
                 await dispatch_frames(steering_filter.flush())
+                await settle_echo_hold()
                 await flush_redactor()
                 for _ in range(pending_steer_events):
                     await self.renderer.dispatch(OutputEvent(kind=STEER_CONSUMED))
@@ -1479,6 +1530,7 @@ class TurnDriver:
             if pending:
                 await dispatch_frames(steering_filter.feed(pending))
             await dispatch_frames(steering_filter.flush())
+            await settle_echo_hold()
             await flush_redactor()
             for _ in range(pending_steer_events):
                 await self.renderer.dispatch(OutputEvent(kind=STEER_CONSUMED))
@@ -1597,19 +1649,58 @@ class TurnDriver:
         except Exception:
             logger.debug("host-deny steer notice failed; rejecting anyway", exc_info=True)
 
-    async def _approve(self, event: Any) -> bool:
-        """Apply the approval ladder to a permission-request event."""
+    async def _approve(
+        self,
+        event: Any,
+        *,
+        asked: trace_steps.Asked | None = None,
+        held: list[str] | None = None,
+    ) -> bool:
+        """Apply the approval ladder to a permission-request event.
+
+        *asked* is when the prompt became answerable, for its trace span's wait.
+        *held* names the moved Bot's limits the call falls under: a person decides.
+        """
         from kiro_crew.approval_mode_policy import session_mode_permitted
 
-        if self.approval_mode == APPROVAL_AUTO:
+        if held:
+            if self.decider is None:
+                return False
+        elif self.approval_mode == APPROVAL_AUTO:
             return True
         # A session mode the ``permission_mode`` policy denies falls through to the
         # interactive ladder below rather than auto-approving.
-        if self.approval_mode == APPROVAL_TRUST and session_mode_permitted("trust"):
+        elif self.approval_mode == APPROVAL_TRUST and session_mode_permitted("trust"):
             return True
-        if self.approval_mode == APPROVAL_TRUST_READS and session_mode_permitted("trust_reads"):
+        elif self.approval_mode == APPROVAL_TRUST_READS and session_mode_permitted("trust_reads"):
             return bool(getattr(event, "tool_kind", "") == "read")
         # interactive: deny-by-default unless a decider approves.
         if self.decider is not None:
-            return bool(await self.decider(event))
+            from kiro_crew import mate_held_rules
+
+            # The one wait a person can answer here: its span (tracing/steps.py).
+            approval = trace_steps.approval_opened(
+                str(event.request_id) if getattr(event, "request_id", None) is not None else "",
+                tool_call_id=str(getattr(event, "tool_call_id", "") or ""),
+                since=asked,
+            )
+            approved = False
+            answered = False
+            try:
+                # Marked held, so a decider that would answer on its own (YOLO, an
+                # ``auto_approve_sources`` entry, slot trust) asks a person instead.
+                marker = mate_held_rules.held_call(held) if held else contextlib.nullcontext()
+                with marker:
+                    approved = bool(await self.decider(event))
+                answered = True
+            finally:
+                # A cancel or a raise out of the wait is no one's answer: the host's.
+                trace_steps.approval_closed(
+                    approval,
+                    approved=approved,
+                    by=trace_steps.decided_by(
+                        host=not answered, cause=getattr(self.decider, "last_deny_cause", "")
+                    ),
+                )
+            return approved
         return False

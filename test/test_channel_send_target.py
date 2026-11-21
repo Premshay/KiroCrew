@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from kiro_crew.dashboard.handlers import messaging as mod
+from kiro_crew.testing.synthetic_credentials import github_classic
 
 
 class _Caps:
@@ -176,16 +177,21 @@ class TestGates:
 
 
 class TestRedaction:
+    # A GitHub token with a valid checksum; ``SPLIT`` is the same token with renderer
+    # delimiters.
+    SECRET = github_classic(seed=64)
+    SPLIT = SECRET[:10] + "**" + SECRET[10:20] + "**" + SECRET[20:]
+
     @pytest.mark.asyncio
     async def test_credentials_are_redacted_before_the_wire(self) -> None:
         # The text can come from the model, and this leg bypasses the driver's
         # own stream redaction.
         transport = _Transport()
         await mod._send_to_channel_target(
-            _state(webex=transport), "webex", "user:a@b.com", "key AKIAIOSFODNN7EXAMPLE here"
+            _state(webex=transport), "webex", "user:a@b.com", f"key {self.SECRET} here"
         )
 
-        assert "AKIAIOSFODNN7EXAMPLE" not in transport.sent[0][1]
+        assert self.SECRET not in transport.sent[0][1]
 
     @pytest.mark.asyncio
     async def test_a_delimiter_split_credential_is_redacted_too(self) -> None:
@@ -197,10 +203,10 @@ class TestRedaction:
         """
         transport = _Transport()
         await mod._send_to_channel_target(
-            _state(webex=transport), "webex", "user:a@b.com", "AKIA**IOSF**ODNN7EXAMPLE"
+            _state(webex=transport), "webex", "user:a@b.com", self.SPLIT
         )
 
-        assert "AKIAIOSFODNN7EXAMPLE" not in transport.sent[0][1].replace("*", "")
+        assert self.SECRET not in transport.sent[0][1].replace("*", "")
 
     @pytest.mark.asyncio
     async def test_broadcast_mentions_are_defanged_where_the_platform_parses_them(self) -> None:
@@ -236,10 +242,10 @@ class TestRedaction:
         """Skipping the defang must not skip the display-form credential scan."""
         transport = _Transport(mention_grammars=False)
         await mod._send_to_channel_target(
-            _state(webex=transport), "webex", "user:a@b.com", "AKIA**IOSF**ODNN7EXAMPLE"
+            _state(webex=transport), "webex", "user:a@b.com", self.SPLIT
         )
 
-        assert "AKIAIOSFODNN7EXAMPLE" not in transport.sent[0][1].replace("*", "")
+        assert self.SECRET not in transport.sent[0][1].replace("*", "")
 
 
 class TestAuditing:

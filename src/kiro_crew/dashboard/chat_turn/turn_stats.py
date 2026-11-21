@@ -11,7 +11,12 @@ import math
 import time
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
-from kiro_crew.dashboard.cache_rewrite import note_turn_cache
+from kiro_crew.dashboard.cache_rewrite import (
+    CACHE_LIKELY,
+    CACHE_REWRITE,
+    judge_turn_cache,
+    note_turn_cache,
+)
 from kiro_crew.dashboard.chat_utils import slot_history_key
 from kiro_crew.dashboard.state import row_mid
 from kiro_crew.dashboard.system_notices import is_system_notice
@@ -49,6 +54,7 @@ if TYPE_CHECKING:
         note_coding_activity,
         persist_token_record_async,
         provider_last_turn_usage,
+        provider_prompt_cache_lifetime,
         read_context_tokens,
         read_effective_agent,
         read_turn_model,
@@ -60,6 +66,7 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_turn.model_fallback import _backfill_canonical_model
     from kiro_crew.dashboard.chat_turn.native_cards import (
         NATIVE_SUBAGENT_INTERRUPTED_ERROR,
+        _keep_background_open,
         _native_subagent_close_all,
     )
     from kiro_crew.dashboard.chat_turn.tool_rows import _MAX_TCID_SOURCES
@@ -237,6 +244,7 @@ def _attach_turn_stats(
     turn_start_mid: str | None = None,
     retries: int = 0,
     cache_rewrite: bool = False,
+    cache_likely: bool = False,
 ) -> bool:
     """Attach per-turn stats to the turn's last reply row.
 
@@ -273,9 +281,12 @@ def _attach_turn_stats(
 
     ``retries`` is how many times the user turn was re-sent after a pre-output
     transient error (``slot._turn_retries``), recorded only when positive.
-    ``cache_rewrite`` marks a turn that rebuilt the prompt cache (see ``dashboard/cache_rewrite.py``).
+    ``cache_rewrite`` marks a turn that rebuilt the prompt cache and ``cache_likely`` one
+    that probably did (see ``dashboard/cache_rewrite.py``).
     """
-    stats = turn_stats_meta(elapsed_ms, credits, cost_usd, model, cache_rewrite=cache_rewrite)
+    stats = turn_stats_meta(
+        elapsed_ms, credits, cost_usd, model, cache_rewrite=cache_rewrite, cache_likely=cache_likely
+    )
     if stats is None:
         return False
     if ttft_ms > 0:
@@ -492,10 +503,13 @@ def _emit_turn_metric(
     provider: str = "",
     harness: str = HARNESS_UNKNOWN,
     trigger: str = TRIGGER_OTHER,
+    owning_app: str = "",
 ) -> None:
     """Emit this turn's OTEL samples (best-effort).
 
     ``trigger`` is who started the turn (:func:`_dashboard_turn_trigger`).
+    ``owning_app`` is the turn's live client's ``owning_app``, for
+    ``kirocrew.app.run_time``.
 
     ``harness`` labels the duration and usage samples (see
     :func:`kiro_crew.metrics.turns.emit_turn_duration`); the caller resolves it
@@ -533,6 +547,7 @@ def _emit_turn_metric(
         provider=provider,
         harness=harness,
         trigger=trigger,
+        owning_app=owning_app,
     )
     emit_turn_usage(
         input_tokens=getattr(usage, "input_tokens", 0),
@@ -596,6 +611,14 @@ def _emit_recovery_outcome(mechanism: str, outcome: str, attempts: int) -> None:
         logger.debug("recovery outcome metric emit failed", exc_info=True)
 
 
+def _cache_estimate_on() -> bool:
+    """Whether ``dashboard.turn_cache_estimate`` is on, read from the live snapshot (no file read)."""
+    from kiro_crew.config import live
+
+    cfg = live.snapshot()
+    return cfg is not None and cfg.dashboard.turn_cache_estimate is True
+
+
 def turn_stats_meta(
     elapsed_ms: int,
     credits: float,
@@ -603,6 +626,7 @@ def turn_stats_meta(
     model: str = "",
     *,
     cache_rewrite: bool = False,
+    cache_likely: bool = False,
 ) -> dict[str, Any] | None:
     """The ``meta.turn_stats`` value the footer renders, or None for nothing to show.
 
@@ -613,7 +637,8 @@ def turn_stats_meta(
     ``Infinity``/``NaN`` that no browser parses. The provider-reported model id is
     scrubbed like every ACP-controlled string (``_redact_acp_string``) and dropped past ``_MAX_MODEL_ID_LEN``, because the row is retained.
     ``cache_rewrite`` adds ``"cache": "rewrite"``, so a turn that rebuilt the prompt
-    cache says why it cost more; every other payload keeps its shape.
+    cache says why it cost more. ``cache_likely`` adds ``"cache": "likely"`` instead, an
+    estimate a measured rewrite outranks. Every other payload keeps its shape.
     """
     if elapsed_ms <= 0:
         return None
@@ -627,7 +652,9 @@ def turn_stats_meta(
         if len(safe_model) <= _MAX_MODEL_ID_LEN:
             stats["model"] = safe_model
     if cache_rewrite:
-        stats["cache"] = "rewrite"
+        stats["cache"] = CACHE_REWRITE
+    elif cache_likely:
+        stats["cache"] = CACHE_LIKELY
     return stats
 
 
@@ -764,8 +791,8 @@ async def _on_complete(turn: _ChatTurn, event) -> Literal[_Flow.BREAK] | None:
                 )
     # Turn-end diagnostics. Read only from `event`, which nothing in
     # this arm mutates, so the position is free — kept below the
-    # consumption gate because that gate's adjacency to the arm's start
-    # is pinned by test_subagent_delivery_ttl_anchor.
+    # consumption gate, which must stay at the arm's start
+    # (test_subagent_delivery_ttl_anchor pins when consumption is reported).
     # `synthetic_completion` is readable ONLY here, and the
     # empty-response verdict that needs it runs in _turn_settle_answer.
     _saw_terminal_event = True
@@ -779,13 +806,17 @@ async def _on_complete(turn: _ChatTurn, event) -> Literal[_Flow.BREAK] | None:
     # unfinished at the cut may count toward timeout attribution
     # (terminal entries linger in the tracker for reconnect
     # replay and would corrupt the series).
-    _children_unfinished = any(not _i.get("done") for _i in _native_tracker.values())
+    _children_unfinished = any(
+        not _i.get("done") and not _i.get("background") for _i in _native_tracker.values()
+    )
     # Safety net: complete any native subagent cards still marked
     # running at turn end (in case a terminal status was missed),
     # so cards don't stay stuck "running". Only a raw end_turn counts
     # as a normal landing; a cancel, refusal or synthesized completion
     # cut its children off, so their cards close as interrupted.
     _landed_normally = event.stop_reason == STOP_REASON_END_TURN and not event.synthetic_completion
+    # A background card the harness still runs outlives any end Crew did not cut short.
+    _keep_background_open(turn, event.stop_reason or "")
     _native_subagent_close_all(
         state,
         slot,
@@ -952,12 +983,27 @@ async def _on_complete(turn: _ChatTurn, event) -> Literal[_Flow.BREAK] | None:
     # A synthesized completion (cancel, timeout) carries partial counts, and a
     # turn that compacted, by `/compact` or automatically mid-turn, writes its new
     # smaller prefix once, so both only move the remembered context size and are
-    # never flagged.
-    turn._turn_cache_rewrite = (
-        note_turn_cache(slot, client, _ctx_used, event.usage.cache_creation_tokens)
-        and not event.synthetic_completion
-        and not turn._compaction_completed
-    )
+    # never flagged. With ``dashboard.turn_cache_estimate`` on, a backend that
+    # reports no cache counts is judged by the idle gap against its cache lifetime
+    # instead, and that verdict is only "likely"; off, only the counts decide.
+    if _cache_estimate_on():
+        _cache_verdict = judge_turn_cache(
+            slot,
+            client,
+            _ctx_used,
+            event.usage.cache_creation_tokens,
+            cache_read=event.usage.cache_read_tokens,
+            started_at=turn._turn_t0,
+            ended_at=time.monotonic(),
+            lifetime_secs=provider_prompt_cache_lifetime(client),
+        )
+    elif note_turn_cache(slot, client, _ctx_used, event.usage.cache_creation_tokens):
+        _cache_verdict = CACHE_REWRITE
+    else:
+        _cache_verdict = ""
+    _cache_judged = not event.synthetic_completion and not turn._compaction_completed
+    turn._turn_cache_rewrite = _cache_judged and _cache_verdict == CACHE_REWRITE
+    turn._turn_cache_likely = _cache_judged and _cache_verdict == CACHE_LIKELY
     # One shared predicate across every persist gate: a
     # claude-seam turn ending via a synthetic EVENT_COMPLETE
     # (timeout, tool-stall, cancel-unacked) can carry cost or cache
@@ -1007,6 +1053,8 @@ async def _on_complete(turn: _ChatTurn, event) -> Literal[_Flow.BREAK] | None:
         # turn (a per-session acp_backend override included).
         harness=harness_of(client),
         trigger=_dashboard_turn_trigger(turn),
+        # Trusted: Crew sets it from the slot's app at allocation.
+        owning_app=getattr(client, "owning_app", ""),
     )
     if usage_has_billing(_u):
         # Claim the turn's single usage row BEFORE the persist await
@@ -1372,7 +1420,7 @@ async def _persist_abnormal_turn_usage(
             elapsed_ms=elapsed_ms,
             model_source=client,
             delivered=delivered,
-            # Abnormal-turn histogram sampling is out of this change's scope
+            # Abnormal-turn histogram sampling is out of scope here
             # (the usage ROW is the deliverable); opt the row's persist out of
             # the metric so it does not file a sample under slot.key, which for a
             # linked-channel turn would mis-attribute to session_source=dashboard.

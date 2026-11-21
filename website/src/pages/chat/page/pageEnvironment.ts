@@ -2,7 +2,6 @@ import { useRef, useMemo, useState, type MutableRefObject, type Dispatch, type S
 import { useNavigate, useNavigationType, useLocation, useSearchParams } from 'react-router-dom'
 import { useQueryClient, useQuery } from '@tanstack/react-query'
 import { useIsMobile } from '../../../hooks/useIsMobile'
-import { useIsTouchDevice } from '../../../hooks/useIsTouchDevice'
 import { useShellSlot } from '../../../hooks/useShellSlot'
 import { useMobileNavRail } from '../../../components/MobileNavRailContext'
 import { useVisualViewport } from '../../../hooks/useVisualViewport'
@@ -19,8 +18,8 @@ import { useMoveSlotToFolder } from '../../../hooks/useMoveSlotToFolder'
 import { setFileDraft } from '../../../utils/chatFileDrafts'
 import type { ChatMessage, ChatSlot } from '../../../types'
 import { crewModeView } from '../../../lib/crewMode'
-import { useCrewMode, useMateSessionsHidden } from '../../../hooks/usePreviewFlag'
-import { selectLiveMateThreads } from '../../../store/dashboardSlice'
+import { useCrewMode } from '../../../hooks/usePreviewFlag'
+import { selectMateThreadsHidingSessions } from '../../../store/dashboardSlice'
 import { useConnectionsUiEnabled } from '../../../hooks/useConnectionsUi'
 import { isChatPageSurface } from '../../../utils/channelOrigin'
 import { useGuidePredicate, useGuideSelection } from '../../../guide/guidePredicates'
@@ -30,17 +29,18 @@ import { fetchDashboardConfig } from '../../../api/dashboardConfigQuery'
  *  members INCLUDED. The page's active-slot rules read this list, and a crew member
  *  opened from its root's Crew panel is the active chat in the main pane, so it
  *  must stay listed here or the page would drop it and pick another session. */
-export function chatPageSlots<T extends ChatSlot>(slots: T[]): T[] {
-  return slots.filter(s => isChatPageSurface(s.surface ?? s.mode))
+export function chatPageSlots<T extends ChatSlot>(slots: T[], bound?: string | null): T[] {
+  return slots.filter(s => s.key === bound || isChatPageSurface(s.surface ?? s.mode))
 }
 
-/** The person's rows of that list: crew members, and with the mate sessions
- *  preview on a live mate thread's sessions, left out (`crewModeView`; the
+/** The person's rows of that list: crew members, and a live mate thread's
+ *  sessions its Bot does not show in this list, left out (`crewModeView`; the
  *  server keeps them in the slot frame under `?crew=all`, and their root's Crew
  *  panel shows them). What the collapsed-sidebar flyout lists and the unread count
- *  counts; the sidebar applies the same function at its own door. */
-export function personChatPageSlots<T extends ChatSlot>(slots: T[], mateThreads?: ReadonlySet<string>): T[] {
-  return crewModeView(slots, false, mateThreads)
+ *  counts; the sidebar applies the same function at its own door. *activeKey*
+ *  is the open session, which keeps its row (`slackRowHidden`). */
+export function personChatPageSlots<T extends ChatSlot>(slots: T[], mateThreads?: ReadonlySet<string>, activeKey?: string | null): T[] {
+  return crewModeView(slots, false, mateThreads, activeKey)
 }
 
 /** The unread keys among *visible* rows: a crew member's unread never counts on
@@ -92,9 +92,6 @@ export function useChatPageEnvironment({
   // effect reads it (mobile replaces rather than pushes a session switch), and
   // ChatPage defines that effect well before the layout hooks start.
   const isMobile = useIsMobile()
-  // Width alone cannot tell a phone from a narrow desktop pane, which still has
-  // Enter: only a narrow TOUCH device forces Ctrl+Enter over the saved choice.
-  const isTouch = useIsTouchDevice()
   /**
    * Phone: the App shell's top bar is the ONE bar, and this page's title row
    * lives in it. The shell renders `#mobile-topbar-slot` (centre cell) and
@@ -145,17 +142,24 @@ export function useChatPageEnvironment({
   // Unified chat view: show default and crew slots together, crew members included
   // (`chatPageSlots`), so a crew member opened in the main pane stays the active
   // slot. App-owned worker slots (s.app) are excluded by the sidebar itself.
-  const filteredSlots = useMemo(() => chatPageSlots(slots), [slots])
+  const activeSlot = useAppSelector(s => s.chat.activeSlot)
+  // An app's embedded chat (`ChatPanel`) is bound to its one slot, and a pop-out
+  // window to the chat its `?sid=` names. Either may be a chat an app keeps out of
+  // the session lists (`permissions.hiddenSessions`), so that slot stays listed
+  // here; the sidebar and Sessions page filter for themselves.
+  const bound = popout ? searchParams.get('sid') || searchParams.get('slot') : embedded ? activeSlot : null
+  const filteredSlots = useMemo(() => chatPageSlots(slots, bound), [slots, bound])
   // The person's rows: what the collapsed-sidebar flyout lists and the unread
   // count counts. The sidebar filters its own prop the same way.
-  // Keyed on the Crew Mode preview too, which decides whether crew members are
-  // left out: off, `crewModeView` hands the rows back unchanged.
+  // Keyed on whether this build offers conductor mode too, which decides whether
+  // crew members are left out. The mate threads come from the full store, since
+  // `chatPageSlots` leaves them out.
   const crewMode = useCrewMode()
-  // And on the mate sessions preview; the mate threads come from the full store,
-  // since `chatPageSlots` leaves them out.
-  const mateHidden = useMateSessionsHidden()
-  const mateThreads = useAppSelector(selectLiveMateThreads)
-  const personSlots = useMemo(() => (crewMode || mateHidden ? personChatPageSlots(filteredSlots, mateThreads) : filteredSlots), [filteredSlots, crewMode, mateHidden, mateThreads])
+  const mateThreads = useAppSelector(selectMateThreadsHidingSessions)
+  // The open session keeps its row even when the Slack list setting leaves its
+  // conversation out (`crewModeView`), so the flyout always lists what is open.
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- crewMode stands for the read crewModeView makes
+  const personSlots = useMemo(() => personChatPageSlots(filteredSlots, mateThreads, activeSlot), [filteredSlots, crewMode, mateThreads, activeSlot])
   const filteredSlotsRef = useRef(filteredSlots)
   filteredSlotsRef.current = filteredSlots
   // Live guide predicates the sessions sidebar toggle needs to be drawn (see
@@ -166,7 +170,7 @@ export function useChatPageEnvironment({
   const unreadSlots = useAppSelector(s => s.dashboard.unreadSlots)
   // Unified view: unread keys for all chat-like slots.
   const surfaceUnreadSlots = useMemo(() => surfaceUnreadKeys(unreadSlots, personSlots), [unreadSlots, personSlots])
-  const refreshTrigger = useAppSelector(s => s.dashboard.refreshTrigger)
+  const catalogRefreshTrigger = useAppSelector(s => s.dashboard.catalogRefreshTrigger)
   const connected = useConnected()
   // Create-in-flight, so the flyout's New button can go inert exactly like the
   // sidebar's does instead of accepting a second click.
@@ -182,7 +186,6 @@ export function useChatPageEnvironment({
   // above the composer, which is the only place all of them can see.
   const unresumableResume = useAppSelector(s => s.chat.unresumableResume)
   const undeletableHistory = useAppSelector(s => s.chat.undeletableHistory)
-  const activeSlot = useAppSelector(s => s.chat.activeSlot)
   // The session picker's selection fact for a guide's "choose the session"
   // step: whether one is open here, whether any is listed, and which one by
   // its key, so a choice made there stays bound to that session. The key
@@ -218,7 +221,7 @@ export function useChatPageEnvironment({
   // MCP Apps in the side panel (dashboard.mcp_app_panel, opt-in). When on, a new
   // render opens the panel to its own `app` tab instead of drawing inline in the
   // bubble — same auto-open path the web-preview marker uses.
-  const { data: appPanelCfg, isError: appPanelCfgError } = useQuery<{ mcp_app_panel?: boolean; auto_open_git_panel?: boolean; side_panel_always_open?: boolean; side_panel_pin_summary?: boolean }>({
+  const { data: appPanelCfg, isError: appPanelCfgError } = useQuery<{ mcp_app_panel?: boolean; auto_open_git_panel?: boolean; side_panel_always_open?: boolean; side_panel_pin_summary?: boolean; auto_open_conductor_board?: boolean }>({
     queryKey: ['dashboardConfig'], queryFn: fetchDashboardConfig, staleTime: 30_000,
   })
   const mcpAppPanel = appPanelCfg?.mcp_app_panel === true
@@ -247,11 +250,18 @@ export function useChatPageEnvironment({
   // user closed meanwhile. A failed refetch keeps the data it had, which still
   // counts.
   const sidePanelAlwaysOpenKnown = appPanelCfg !== undefined
+  // On unless set off (dashboard.auto_open_conductor_board): a conductor mode
+  // chat's first entry opens the side panel on its Board. `undefined` until the
+  // read settles, so that entry waits for it. A FAILED read settles on the
+  // default (on), the way `autoOpenGitPanelKnown` settles on its default (off).
+  const autoOpenConductorBoard = appPanelCfg !== undefined || appPanelCfgError
+    ? appPanelCfg?.auto_open_conductor_board !== false
+    : undefined
   return {
-    dispatch, moveSlotToFolder, navigate, navigationType, location, queryClient, provider, deleteTerminalSessionRef, searchParams, setSearchParams, isMobile, isTouch, topbarSlot, topbarTrailSlot,
-    mobileNavRail, titleInTopbar, langGen, vv, keyboardInset, slots, switchSlotGone, filteredSlots, filteredSlotsRef, personSlots, surfaceUnreadSlots, refreshTrigger, connected, creatingSlot, foregroundCreateId,
+    dispatch, moveSlotToFolder, navigate, navigationType, location, queryClient, provider, deleteTerminalSessionRef, searchParams, setSearchParams, isMobile, topbarSlot, topbarTrailSlot,
+    mobileNavRail, titleInTopbar, langGen, vv, keyboardInset, slots, switchSlotGone, filteredSlots, filteredSlotsRef, personSlots, surfaceUnreadSlots, catalogRefreshTrigger, connected, creatingSlot, foregroundCreateId,
     foregroundCreateIdRef, lastCreatedActivationRef, unresumableResume, undeletableHistory, activeSlot, boundStore, voiceRecoverySlot, setVoiceRecoverySlot, appToolCallIds, mcpAppPanel,
-    autoOpenGitPanel, autoOpenGitPanelKnown, sidePanelAlwaysOpen, sidePanelAlwaysOpenKnown, sidePanelPinSummary,
+    autoOpenGitPanel, autoOpenGitPanelKnown, sidePanelAlwaysOpen, sidePanelAlwaysOpenKnown, sidePanelPinSummary, autoOpenConductorBoard,
   }
 }
 
@@ -270,7 +280,7 @@ interface PageFlagsOptions {
 
 /**
  * The dashboard-config switches this page reads (split view, link previews, social
- * share, Auto (Jev) send, the Connections gallery), the composer's file arrivals (held
+ * share, Auto (decision model) send, the Connections gallery), the composer's file arrivals (held
  * while split view owns the composers), the pop-out state for the title bar, and the
  * plan task id the transcript carries.
  *
@@ -319,7 +329,7 @@ export function usePageFlags({
   // entry stays hidden until it says true — the endpoint is the authority, the
   // frontend never guesses (same posture as the mobile-connect rail row).
   const socialShareOn = dashCfg?.social_share_enabled === true
-  // Whether the split send button may offer `Auto (Jev)`: the fleet ceiling and
+  // Whether the split send button may offer `Auto (decision model)`: the fleet ceiling and
   // the owner's consent, both the gateway's answers (see useJevAutoSend).
   const jevAutoConsented = useJevAutoSend()
   // Connections cards own consent for the providers they render, so chat drops

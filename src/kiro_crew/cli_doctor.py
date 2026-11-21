@@ -89,6 +89,7 @@ from kiro_crew.acp.types import ACP_BACKEND_KAS
 from kiro_crew.agent import AGENT_FILENAME, agent_spec_path
 from kiro_crew.agent_discovery import (
     _read_agent_spec,
+    plain_markdown_document,
     project_agent_files,
     project_agent_name,
 )
@@ -100,6 +101,8 @@ from kiro_crew.agent_spec_format import (  # noqa: F401
     SKILL_VIEW_PROJECTION_CEILING,
     count_authored_agent_files,
     is_agent_spec_name,
+    is_markdown_spec,
+    iter_agent_spec_files_strict,
     shadowed_markdown_specs,
     skill_view_ceiling,
 )
@@ -180,6 +183,7 @@ from kiro_crew.cron import (  # noqa: F401
 )
 from kiro_crew.dashboard.crash_dump_store import (  # noqa: F401
     dump_age_seconds,
+    dump_fired_at,
     dump_first_stack_lines,
     dump_superseded,
     dumps_with_stacks,
@@ -578,7 +582,46 @@ def _kiro_cli_version_row(kiro: str, issues: list[str], *, required: bool) -> st
     return "  kiro-cli:    ⚠  exits with error (optional backend)"
 
 
-def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False) -> None:
+def _reconcile_memory() -> None:
+    """``doctor --reconcile-memory``: the full metadata pass a start skips.
+
+    An explicit repair, the one write ``doctor`` makes besides ``--bundle``'s zip.
+    """
+    from kiro_crew import memory_record_metadata, memory_stores, sqlite_wal
+    from kiro_crew._sqlite_compat import sqlite3
+
+    path = memory_stores.resolve_store_path(memory_stores.DEFAULT_MEMORY_STORE)
+    if not path.is_file():
+        print(f"  ⏭ no memory database at {path}")
+        return
+    try:
+        db = sqlite3.connect(str(path), timeout=30)
+        # The gateway may be writing through this -wal: this close must not delete it.
+        kept = sqlite_wal.keep_wal_on_close(db)
+        try:
+            with db:
+                # One transaction with the pass, as a store's own open does it: a
+                # database from before the metadata tables gets them first.
+                db.execute("BEGIN IMMEDIATE")
+                if not memory_record_metadata.schema_is_current(db):
+                    memory_record_metadata.ensure_schema(db)
+                changed = memory_record_metadata.reconcile(db, full=True)
+        finally:
+            if kept:
+                db.close()
+            else:
+                sqlite_wal.close_keeping_wal(db)
+    except sqlite3.Error as exc:
+        print(f"  ❌ memory reconcile failed: {exc}")
+        sys.exit(1)
+    print(f"  ✅ memory reconcile: every row checked, {changed} journaled")
+
+
+def _doctor(
+    platform_boot_error: "Exception | None" = None,
+    bundle: bool = False,
+    reconcile_memory: bool = False,
+) -> None:
     """Verify KiroCrew setup — check dependencies, config, credentials, connectivity.
 
     ``platform_boot_error`` carries a :class:`PlatformCompositionError` from
@@ -590,11 +633,16 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     The order of the sections below IS the report: each section prints as it runs
     and appends to one ``issues`` list, and the closing line and exit status are
     decided from that list alone. The families are imported here, once the
-    ``--bundle`` mode has had its turn, so the ``kiro_crew.cli`` import every command
-    pays never loads them.
+    ``--bundle`` mode has had its turn (it loads ``services``, with the ``render``
+    helpers it imports, for the gateway version its ``versions.txt`` records), so
+    the ``kiro_crew.cli`` import every command pays never loads them.
     """
     print("Kiro Crew Doctor 👻\n")
     issues: list[str] = []
+
+    if reconcile_memory:
+        _reconcile_memory()
+        return
 
     # ── Diagnostics bundle (--bundle) ──
     # Short-circuit: collect logs + crash reports into a redacted zip and print
@@ -605,13 +653,16 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # scans printed output.
     if bundle:
         print("Collecting diagnostics bundle (secrets are redacted)...\n")
+        from kiro_crew.doctor_checks import services  # the one family a bundle reads
+
+        alignment = services._bundle_version_alignment()
         # The collector touches the filesystem in several places that can fail for
         # ordinary reasons — an unwritable data home, a plain FILE sitting where
         # `diagnostics/` should be, a full disk. Letting OSError escape prints a
         # traceback at the one moment the user is already trying to report a
         # failure, so fail with a readable message and a nonzero status instead.
         try:
-            result = diagnostics.collect_bundle()
+            result = diagnostics.collect_bundle(version_alignment=alignment)
         except OSError as exc:
             print(f"  ❌ could not write the diagnostics bundle: {exc}")
             print("     Check that ~/.kiro/crew is writable and has free space.")
@@ -1043,6 +1094,9 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
 
     # ── Loop-stall crash dumps ──
     workload._doctor_crash_dumps(issues)
+
+    # ── Session tree checkpoint ──
+    workload._doctor_session_tree_checkpoint(issues)
 
     # ── Connectivity ──
     print("\nConnectivity")

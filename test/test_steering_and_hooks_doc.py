@@ -110,7 +110,7 @@ class TestHookEvents:
         assert "`PreToolUse` is the only event whose exit code can decide" in body
         # The carve-out belongs beside the contract: PreToolUse also fires as a
         # notification once kiro-cli has already approved the call, where no exit
-        # code stops it (``hooks.fire_tool_call_hooks``). A doc stating only the
+        # code stops it (``hook_dispatch.fire_tool_hooks``). A doc stating only the
         # gate half reads as a guarantee the tool can never run.
         assert "does not always get a vote" in body
 
@@ -149,7 +149,7 @@ class TestHookFields:
         """``matcher_mode`` is read for the message events only.
 
         ``ScriptHookStore.fire`` routes a tool event's matcher through
-        ``_tool_matches`` (a fixed glob vocabulary, no mode) and every other
+        ``_hook_tool_matches`` (a fixed glob vocabulary, no mode) and every other
         event's through ``_context_matches`` (mode-driven). The doc states that
         split, so the two tool events it names must be the two the dispatch
         branches on -- a third tool event would silently make the claim wrong.

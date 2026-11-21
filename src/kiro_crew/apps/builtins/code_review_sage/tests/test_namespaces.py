@@ -14,6 +14,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from sage_lib import learning as L  # noqa: N812
 from sage_lib import review_pool, store
 
@@ -53,13 +54,13 @@ def _source(owner="acme", repository="service"):
 
 
 class TestNamespaceManagement(unittest.TestCase):
+    @pytest.fixture(autouse=True)
+    def _tmp_root(self, tmp_path):
+        self.tmp = str(tmp_path)
+
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
         self.root = Path(self.tmp) / "apps" / "code-review-sage"
         store.ensure_layout(self.root)
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_default_namespace_always_present(self):
         self.assertEqual(L.list_namespaces(self.root), ["default"])
@@ -154,13 +155,13 @@ class TestNamespaceManagement(unittest.TestCase):
 
 
 class TestNamespacedStaging(unittest.TestCase):
+    @pytest.fixture(autouse=True)
+    def _tmp_root(self, tmp_path):
+        self.tmp = str(tmp_path)
+
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
         self.root = Path(self.tmp) / "apps" / "code-review-sage"
         store.ensure_layout(self.root)
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_stage_isolated_per_namespace(self):
         L.create_namespace("proj-a", self.root)
@@ -182,8 +183,11 @@ class TestNamespacedStaging(unittest.TestCase):
 
 
 class TestActiveNamespaceUnion(unittest.TestCase):
+    @pytest.fixture(autouse=True)
+    def _tmp_root(self, tmp_path):
+        self.tmp = str(tmp_path)
+
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
         self.root = Path(self.tmp) / "apps" / "code-review-sage"
         store.ensure_layout(self.root)
         # seed a pattern in default (common) and one in proj-a
@@ -192,9 +196,6 @@ class TestActiveNamespaceUnion(unittest.TestCase):
         L.create_namespace("proj-a", self.root)
         L.consolidate_apply("# n\n\n" + L.render_pattern(L._normalize_pattern(_pattern("ProjA-lesson"))),
                             self.root, namespace="proj-a")
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_default_only_active_by_default(self):
         _set_active(self.root, ["default"])

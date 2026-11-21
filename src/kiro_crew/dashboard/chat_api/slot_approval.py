@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
+from kiro_crew.dashboard.always_allow_tool import ACTION as _ALWAYS_ALLOW_TOOL
 from kiro_crew.dashboard.deny_override import DENY_OVERRIDE_ACTIONS, is_deny_override_card
 
 if TYPE_CHECKING:
@@ -32,7 +33,6 @@ if TYPE_CHECKING:
         deny_app_session_control,
         deny_non_dashboard_caller,
         effective_session_key,
-        exact_trust_pattern,
         grant_deadline,
         logger,
         native_resolution_target,
@@ -42,6 +42,7 @@ if TYPE_CHECKING:
         row_mid,
         safety_override,
         sel,
+        session_approval_refusal,
         session_grant,
         session_mode_permitted,
         slot_not_found,
@@ -130,13 +131,19 @@ async def deny_session_approval_caller(request: web.Request, operation: str) -> 
         )
     except Exception:  # pragma: no cover - audit is best-effort
         logger.debug("SEL audit failed for %s denial", operation, exc_info=True)
-    return web.json_response(
-        {
-            "error": "app cannot manage session approvals",
-            "code": "session_approval_not_granted",
-        },
-        status=403,
-    )
+    return await session_approval_refusal(request_app)
+
+
+def _shared_crew_teammate(request: web.Request) -> bool:
+    """Whether *request* is a Shared Crew teammate's session, not the machine owner's.
+
+    A teammate passes the owner gate here as everywhere
+    (``shared_crew.teammate_access``); this only keeps the decide-by-id form the
+    owner's browser alone uses, since a teammate's card always names its request.
+    """
+    from kiro_crew.shared_crew.teammate_access import is_shared_crew_teammate
+
+    return is_shared_crew_teammate(request)
 
 
 def bare_approval_decide_allowed(request: web.Request) -> bool:
@@ -740,6 +747,10 @@ async def apply_approval_mode(
         if not scoped:
             for aid in list(state._approval_futures):
                 fut = state._approval_futures[aid]
+                if (state._pending_approvals.get(aid) or {}).get("person_only"):
+                    # An organisation's ``ask`` on a web call (``web_ask_rule``):
+                    # a trust grant is not a person's answer to it.
+                    continue
                 if not fut.done():
                     state.resolve_approval(aid, True)
                     try:
@@ -757,6 +768,10 @@ async def apply_approval_mode(
                 for ch in mgr._channels.values():
                     for agent in ch.members.values():
                         fut = agent._approval_future
+                        if getattr(agent, "_pending_approval_person_only", False):
+                            # An organisation's ``ask`` on a web call
+                            # (``web_ask_rule``): not a trust grant's to answer.
+                            continue
                         if fut and not fut.done():
                             fut.set_result("approved")
                             try:
@@ -823,12 +838,19 @@ def _sweep_pending_approvals(
         # row's window on the event loop (``load_window_off_loop`` is what a
         # reader awaits first), once per such slot on every all-slots grant.
         return
+    from kiro_crew import web_ask_rule
+
     _elicitations = _pending_elicitation_ids(slot)
     for aid, fut in list(slot._approval_futures.items()):
-        if aid in _elicitations or _is_deny_override_card(slot, aid):
-            # A server's own question to the person, or a security-rule
-            # override: a trust tier is not an answer to either, and the card
-            # stays open.
+        if (
+            aid in _elicitations
+            or _is_deny_override_card(slot, aid)
+            or _get_pattern_from_pending(slot, aid, web_ask_rule.CARD_META_KEY)
+        ):
+            # A server's own question to the person, a security-rule override,
+            # or a web call the organisation asks a person about
+            # (``web_ask_rule``): a trust tier is not an answer to any of them,
+            # and the card stays open.
             continue
         if not fut.done():
             # Read while still pending: names the row the frame settles.
@@ -1094,11 +1116,22 @@ def _elicitation_not_an_approval() -> web.Response:
 # off the strict path.
 _STRICT_NATIVE_ACTIONS = frozenset(
     {"approved", "rejected", "rejected_once", "trust", "trust_reads", "trust_command", "trust_base"}
+    | {_ALWAYS_ALLOW_TOOL}
 )
 
 
+def _state_approval_pending(state: DashboardState, request_id: Any) -> bool:
+    """Whether *request_id* names a background approval that is still open."""
+    state_fut = state._approval_futures.get(request_id) if request_id else None
+    return state_fut is not None and not state_fut.done()
+
+
 async def api_chat_slot_approve(request: web.Request) -> web.Response:
-    """POST /api/chat/slots/{slot}/approve — resolve a pending tool approval."""
+    """POST /api/chat/slots/{slot}/approve — resolve a pending tool approval.
+
+    The owner (a Shared Crew teammate passes the owner gate,
+    ``shared_crew.teammate_access``), or an app with the session approval grant.
+    """
     state: DashboardState = request.app["state"]
     denied = await deny_session_approval_caller(request, "chat_slot_approve")
     if denied is not None:
@@ -1153,10 +1186,16 @@ async def api_chat_slot_approve(request: web.Request) -> web.Response:
     strict_native = "origin" in body
     # The one owner a strict native decide resolves on (``_strict_native_owner``).
     strict_owner: _ChatSlot | None = None
-    if not strict_native and not request_app and not bare_approval_decide_allowed(request):
+    if (
+        not strict_native
+        and not request_app
+        and (_shared_crew_teammate(request) or not bare_approval_decide_allowed(request))
+    ):
         # A decide by request id alone, from a caller that is not the dashboard
         # owner's browser session: refuse it rather than resolve whichever
-        # request now holds the id.
+        # request now holds the id. A teammate always names the card it was
+        # clicked on, so the strict check below confines them to a live card in
+        # this slot's session.
         return _approval_target_required()
     if strict_native:
         request_mid = body.get("request_mid")
@@ -1227,6 +1266,12 @@ async def api_chat_slot_approve(request: web.Request) -> web.Response:
     # and the resolved outcome MUST land on the OWNER slot — the one whose
     # session loop consumes the future and gates subsequent tools — or the trust
     # opt-in silently fails on the running session while the UI reports success.
+    if request_id and isinstance(request_id, (list, dict)):
+        # A non-empty one is unhashable and would raise in the lookups below; an
+        # empty one stays the implicit single-pending pick it has always been.
+        return web.json_response(
+            {"error": "invalid approval target", "code": "invalid_approval_target"}, status=400
+        )
     owner = slot
     if strict_owner is not None:
         # The strict check above already chose the owner by the card's mid:
@@ -1382,13 +1427,18 @@ async def api_chat_slot_approve(request: web.Request) -> web.Response:
                 return _deny_trust_pattern(name, request_id, original_action, "pattern_underivable")
             if pattern != expected:
                 return _deny_trust_pattern(name, request_id, original_action, "approval_superseded")
+            from kiro_crew.browser_host_trust import grant_pattern, is_host_key
+
+            if grant_ttl is not None and is_host_key(trust_key):  # a site grant has no lifetime
+                return _deny_trust_pattern(name, request_id, original_action, "ttl_unsupported")
             # ``_trusted_patterns`` is the existing fnmatch store.  Escape every
             # metacharacter so an exact grant for ``rm *.tmp`` cannot authorize
-            # ``rm secret.tmp``.
+            # ``rm secret.tmp``; a browser host ``act`` key alone also covers reads
+            # on its host (``browser_host_trust.grant_pattern``).
             record_trust_grant(
                 owner._trusted_patterns,
                 owner._trusted_pattern_deadlines,
-                (exact_trust_pattern(trust_key),),
+                (grant_pattern(trust_key),),
                 _grant_deadline(grant_ttl),
             )
         action = "approved"
@@ -1411,6 +1461,44 @@ async def api_chat_slot_approve(request: web.Request) -> web.Response:
                 base_trust_patterns(base),
                 _grant_deadline(grant_ttl),
             )
+        action = "approved"
+    # YOLO on a card whose request is pending nowhere (settled, expired, or never
+    # this id): the reply below is unchanged, but a stale card must not switch on
+    # global auto-approval.
+    elif (
+        action == "yolo"
+        and (not fut or fut.done())
+        and not _state_approval_pending(state, request_id)
+    ):
+        if not yolo_policy_permits():
+            # A policy that denies yolo still answers, and audits, the denial: the
+            # same two entries main writes (the override's own refusal, then this
+            # route's), without the activation attempt itself.
+            await asyncio.to_thread(safety_override()._log_policy_refusal, "dashboard", scope="")
+            return _deny_approval_mode(
+                caller=audit_caller(),
+                operation="tool_approval:yolo",
+                mode="yolo",
+                resource=request_id,
+            )
+        action = "approved"
+    # Always allow this tool: the verified ``@server/tool`` the pending card
+    # carries, written before this call is approved (``always_allow_tool``).
+    elif action == "always_allow_tool":
+        # Imported here: this body runs on the chat handlers facade's globals.
+        from kiro_crew.dashboard import always_allow_tool as _always_allow
+
+        refused = await _always_allow.grant_from_card(
+            request,
+            fut=fut,
+            card=lambda field: _get_pattern_from_pending(owner, request_id, field),
+            body=body,
+            from_app=bool(request_app),
+            delegated=bool(delegated),
+            strict_native=strict_native,
+        )
+        if refused is not None:
+            return refused
         action = "approved"
     # YOLO: auto-approve all tools globally (all slots)
     elif action == "yolo":

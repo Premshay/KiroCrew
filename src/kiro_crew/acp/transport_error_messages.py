@@ -15,8 +15,10 @@ from kiro_crew.acp.model_registry_errors import (
     is_model_registry_unavailable,
 )
 from kiro_crew.acp.oversized_request_errors import _is_request_size_exceeded
+from kiro_crew.acp.proxy_refusal import PROXY_REFUSAL_TEXT, _is_proxy_refusal
 from kiro_crew.acp.structured_error_data import (
     OVERSIZE_REPLY_DATA,
+    _error_kind_from_frame,
     provider_data_text,
     structured_data_prose,
 )
@@ -48,6 +50,7 @@ from kiro_crew.acp.transport_error_classification import (  # noqa: F401 - facad
     DEFAULT_MODEL,
     PROVIDER_ERROR_AUTH,
     PROVIDER_ERROR_CONNECTION,
+    PROVIDER_ERROR_HTTP_5XX,
     PROVIDER_ERROR_MODEL_UNAVAILABLE,
     PROVIDER_ERROR_THROTTLE,
     AcpContextWindowExceeded,
@@ -69,7 +72,9 @@ from kiro_crew.acp.transport_error_classification import (  # noqa: F401 - facad
     redact_credentials,
     redact_exfiltration_urls,
 )
+from kiro_crew.acp.user_rate_limit_errors import USER_RATE_LIMIT_TEXT, is_user_rate_limit
 from kiro_crew.acp_backends import ACP_BACKEND_KAS
+from kiro_crew.limit_reset import parse_limit_reset
 
 
 def _auto_remedy(available_models: Sequence[str] | None) -> str:
@@ -307,14 +312,13 @@ def _format_acp_error_worded(
                 f"wait a minute and retry."
                 f"{req_id_suffix}"
             )
+        elif is_user_rate_limit(haystack):  # per user, not per model: no switch advice
+            formatted = USER_RATE_LIMIT_TEXT + req_id_suffix
         elif _RE_THROTTLE_NAMED.search(haystack) or _RE_THROTTLE_GENERIC.search(haystack):
-            # Throttle / rate limit (the spent usage limit above was checked
-            # first). Worded by backend: only kiro-cli reaches the model through
-            # Bedrock, so only it names Bedrock (POSITIVE identity per AGENTS.md
-            # "Harness parity"; a "not claude" test would answer Bedrock for
-            # untested harnesses). The verb stays "throttling" so
-            # llm_helpers._TRANSIENT_MARKERS ("throttl") keeps classifying it
-            # transient: a throttle IS retryable, unlike the usage-limit branch.
+            # Throttle / rate limit (usage and user-rate limits checked above).
+            # Worded by backend: only kiro-cli reaches the model through Bedrock,
+            # so only it names Bedrock (POSITIVE identity, AGENTS.md "Harness
+            # parity"). "throttling" keeps the llm_helpers "throttl" marker.
             subject = "Bedrock" if backend == ACP_BACKEND_KIRO else "The model provider"
             formatted = (
                 f"{subject} is throttling requests. Try: (1) wait a few seconds "
@@ -377,6 +381,10 @@ def _format_acp_error_worded(
             )
         elif is_model_registry_unavailable(error.get("data")):
             formatted = MODEL_REGISTRY_UNAVAILABLE_TEXT + req_id_suffix
+        elif _is_proxy_refusal(haystack):
+            # A proxy between this computer and the backend refused the request.
+            # Signing in again cannot help, so this does not take the sign-in arm.
+            formatted = PROXY_REFUSAL_TEXT + req_id_suffix
         elif _RE_CONNECTION.search(haystack) or _RE_CONNECTOR_FAILURE.search(haystack):
             formatted = (
                 "Could not reach the model backend (connection refused, reset, "
@@ -554,27 +562,6 @@ def _rejected_model_from_error(error: object) -> str | None:
     return m.group(1) if m else None
 
 
-def _error_kind_from_frame(error: object) -> str:
-    """Return the structured ``errorKind`` a raw ACP frame's ``data`` carries.
-
-    claude-agent-acp names some provider answers with a machine-readable kind
-    alongside the prose (``{"code": -32603, "message": "Internal error",
-    "data": {"errorKind": "cloud_credential_error"}}`` -- the same field the
-    ``{'errorKind': 'unknown'}`` wrapper note at ``_RE_5XX_HINT`` describes).
-    Only a ``data`` that IS a mapping is read: the formatter pastes a
-    non-mapping ``data`` verbatim into the user-visible message, so matching
-    the kind out of that string would be the prose path structured readers
-    exist to avoid. Returns "" when the frame names no kind.
-    """
-    if not isinstance(error, dict):
-        return ""
-    data_field = error.get("data")
-    if isinstance(data_field, dict):
-        kind = data_field.get("errorKind")
-        return kind if isinstance(kind, str) else ""
-    return ""
-
-
 _CONTEXT_WINDOW_EXCEEDED_RE = re.compile(r"\bcontext_window_exceeded\b", re.IGNORECASE)
 
 
@@ -651,25 +638,25 @@ def _raise_acp_error(
     _frame_kind = classify_provider_error(raw_data).kind
     err.connection_failure = bool(err.transient) and _frame_kind == PROVIDER_ERROR_CONNECTION
     err.throttle = bool(err.transient) and _frame_kind == PROVIDER_ERROR_THROTTLE
+    err.server_error = bool(err.transient) and _frame_kind == PROVIDER_ERROR_HTTP_5XX
     verdict = classify_provider_error(raw_data)
     err.auth_error_code = verdict.matched if verdict.kind == PROVIDER_ERROR_AUTH else ""
-    # Tag deterministic STRUCTURAL rejections so self-driving callers can
-    # stop resending identical context. Keep the classifier data-scoped: a phrase
-    # echoed only in JSON-RPC ``message`` cannot stamp an unrelated error, except
-    # for the two anchored overflow sentences named below. The tag covers
+    # Tag deterministic STRUCTURAL rejections so self-driving callers stop resending
+    # identical context. Data-scoped: a phrase echoed only in JSON-RPC ``message``
+    # cannot stamp an unrelated error, except the anchored overflow sentences below. Covers
     # context overflow (kiro-cli's window, the claude adapter's input-too-long,
     # the model service's request size cap), malformed request, image validation
-    # failure, the many-image pixel-dimension cap, and kiro-cli's own refusal of a
-    # request it could not shrink to fit -- each reproduced exactly by re-sending
-    # the same context.
+    # failure, the many-image pixel-dimension cap, and kiro-cli's own refusal of a request
+    # it could not shrink to fit -- each reproduced exactly by re-sending the same context.
     raw_data_field = provider_data_text(error)  # the same field the verdict above read
     raw_message_field = str(error.get("message", "") or "") if isinstance(error, dict) else ""
     _data_kind = classify_provider_error(raw_data, data=raw_data_field).kind
     err.model_unavailable = bool(err.transient) and _data_kind == PROVIDER_ERROR_MODEL_UNAVAILABLE
-    # The claude adapter's overflow rides in ``message`` (anchored match, see
-    # _RE_ADAPTER_INPUT_TOO_LONG), and the model service's size cap may ride in
-    # either field (anchored, see _RE_REQUEST_SIZE_EXCEEDED); every other tag
-    # below stays data-scoped.
+    err.user_rate_limit = bool(err.throttle) and is_user_rate_limit(
+        f"{raw_data_field} {raw_message_field}"
+    )
+    # The claude adapter's overflow rides in ``message`` (anchored, _RE_ADAPTER_INPUT_TOO_LONG)
+    # and the size cap in either field (_RE_REQUEST_SIZE_EXCEEDED); other tags are data-scoped.
     _context_overflow = bool(
         isinstance(err, AcpContextWindowExceeded)
         or _RE_CONTEXT_WINDOW_OVERFLOW.search(raw_data_field)
@@ -718,10 +705,9 @@ def _raise_acp_error(
     # wall. Decided from the raw frame, never from the prose, and only when the
     # formatter would have reached its sign-in branch: a Bedrock-named credential
     # exception (`_RE_AUTH`, a different remedy) or a usage-limit answer that
-    # happens to carry a 401/403 is not a Kiro sign-in problem. Gated on the
-    # harness signing in through Crew's own identity (harness parity H6): for a
-    # harness with its own credential store the card would sign in the wrong
-    # thing, so its 401 carries only ``sign_in_needed`` and that harness's remedy.
+    # happens to carry a 401/403 is not a Kiro sign-in problem. The card is gated on
+    # a harness signing in through Crew (harness parity H6); the Kiro CLI harness
+    # gets kiro-cli's commands, any other only ``sign_in_needed`` and its own remedy.
     err.sign_in_needed = (
         not rejected
         and _is_session_expired(raw_data)
@@ -729,6 +715,7 @@ def _raise_acp_error(
         and not _RE_USAGE_LIMIT.search(raw_data)
     )
     err.auth_required = err.sign_in_needed and backend in ACP_BACKENDS_HOST_AUTH_CALLBACK
+    err.kiro_cli_sign_in = err.sign_in_needed and backend == ACP_BACKEND_KIRO
     # Tag a spent plan allowance the same way: from the raw frame, and only when
     # the formatter reached its usage-limit branch -- an entitlement rejection
     # that happens to carry limit wording keeps its own (served-model) remedy.
@@ -738,6 +725,7 @@ def _raise_acp_error(
         raw_data_field, available_models
     ):
         err.usage_limit = True
+        err.usage_limit_reset_at = parse_limit_reset(raw_data)
     # A stale-credential answer, read from the structured field (not the prose),
     # recycles the process instead of retrying it. Pinned non-transient: the
     # prose ends in "try again", and a retry would re-ask the one process that

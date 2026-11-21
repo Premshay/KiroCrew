@@ -18,14 +18,24 @@ verb rather than per tool. That covers a file read, a `cat`, and a scripted
 a route the policy anticipated. The protection is enforced by Kiro Crew, not by
 the operating system: another program running as you can still open the files.
 
+## Seeing which code read a secret
+
+Turn on `dashboard.audit_secret_reads` (off by default) to have the gateway write
+a security log row whenever it reads a vault secret, including the reads that
+resolve an MCP server's `secret://` references. The row names the secret,
+the module that read it and the function that asked, and never holds the value.
+A read handed to a worker thread as a bare method has no calling code on that
+thread, so its row names `unknown`. A name longer than 128 characters is
+clipped in the row and marked with the start of its digest.
+Repeat reads of one secret by the same code share one row per 10 minutes, which
+counts them, so the log does not grow with every turn. A process with no live
+config, such as the MCP gateway process, rereads the setting at most every 30
+seconds, so a change reaches it within that time. See
+[Configuration](configuration.md#dashboard).
+
 ## Adding a secret
 
-Use **Settings → Secrets** in the dashboard. The panel lists the names it holds,
-adds a new entry, and deletes one. It never shows a stored value back to you —
-listing returns names only, so a screenshot of the panel leaks nothing.
-
-With **Secrets vault redesign** turned on in **Settings → Developer → Feature
-Previews**, the tab changes shape. The left list holds every entry the vault
+Use **Settings → Secrets** in the dashboard. The left list holds every entry the vault
 knows, grouped into the credentials Kiro Crew uses by name and your
 own; picking one opens it on the right. **Add secret** asks what you are
 storing first: a **Secret** (one value, an API key or token), a **Login** (a
@@ -48,7 +58,7 @@ so you do not have to fetch the credential again.
 
 ## Signing in to a website from the vault
 
-With the same preview on, when the agent's browser asks you to sign in, the
+When the agent's browser asks you to sign in, the
 sign-in card lists your saved logins for that site, one button each, labelled
 by the account's username. The first three show; **More** shows the rest. Click
 one and Kiro Crew types its username and password into the page for you;
@@ -82,13 +92,15 @@ kirocrew secrets import           # report only
 kirocrew secrets import --apply   # store the secrets and rewrite .env
 ```
 
-Migration is deliberately narrow. Only the Jira credentials are moved today —
-the global `JIRA_API_TOKEN` and the per-host `JIRA_TOKEN_<HEX>` entries — because
-those are the only `.env` consumers in the migration set that resolve a
-`secret://` reference. Every other credential in `.env` (Slack, Discord,
-kiro-cli, and the rest) still reads the literal value, so rewriting its line
-would hand the reader the reference string instead of the token and break
-authentication. Those keys migrate as their readers become vault-aware.
+Migration is deliberately narrow. It moves only credentials whose every reader
+resolves a `secret://` reference: the Jira credentials (the global
+`JIRA_API_TOKEN` and the per-host `JIRA_TOKEN_<HEX>` entries) and the channel
+secrets (the Slack app and bot tokens, and the Telegram, Discord, Webex, Teams,
+WeCom, Weixin and Feishu secrets). Every other credential in `.env` (kiro-cli's
+own key, the Azure DevOps PAT, and the rest) is read by a child process from its
+inherited environment, so rewriting its line would hand the reader the
+reference string instead of the token and break authentication. Those keys
+migrate as their readers become vault-aware.
 
 Running the import again is safe: a key whose value is already a `secret://`
 reference is reported as such and skipped.

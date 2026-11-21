@@ -56,7 +56,7 @@ or merge it into another.
    is out of scope; the participants and their role cards; the shared inputs
    participants may read; `soft_rounds` (default 3), `hard_rounds` (default
    6), `check_every` (default 1); a budget (wall clock, default 2 hours; work
-   items, default half the goal's item cap); and `anchor_v=1`. Only the human
+   items, default 10); and `anchor_v=1`. Only the human
    changes the anchor; each change bumps `anchor_v`, and replies written
    against an older `anchor_v` are filed, not judged. A need the owner states
    later is an anchor change, not a ruling.
@@ -171,6 +171,12 @@ Round `r` is one proposal step and one critique step.
 | c | each critic | `round-<r>-<aspect>.md`: a short steelman of the proposal, then its objection table or `no_blocking:` |
 | d | you | wait for every critic, rule, run the checkpoint, relay to the proposers |
 
+**Steer every direct follow-up.** Send every relay, ruling, changed role card,
+nudge and finishing instruction with `session_send` and `steer: true`. For a
+broadcast relay use `session_broadcast` with `mode: steer`, and take its
+`targets` from the note's participants list. The initial `work_dispatch` seed
+stays plain (`steer: false`).
+
 **Every relay message** opens with the original question, restated in one or
 two sentences, then `anchor_v`, the rounds left, the ids the recipient must
 answer, and the paths to read. It carries your rulings and your own words
@@ -182,11 +188,16 @@ with `path:line`. Never cite an id from memory or from a report summary. When
 a participant's file and your relay disagree, the file wins; the recipient
 answers the file and names the mismatch.
 
-Check each delivery result. `started: false` means the message is queued:
-read `session_status`, and if the target is sleeping in `wait`, resend with
-`steer=true`, which also ends the wait. For a broadcast, take the
-targets from the note's participants list, read every row of the result, and
-resend the failed ones one by one. Log every resend in the round log.
+Check each delivery result in order: `steered: true` means it entered the
+running turn; otherwise `started: true` means a new turn started. Only
+`steered: false` AND `started: false` means queued. Never resend a successful
+steer merely because `started` is false. For a queued relay, read
+`session_status`; if the target is sleeping in `wait`, resend with
+`session_send` and `steer: true`, which also ends the wait. For a broadcast,
+read every row of the result using the same distinction and resend refused or
+queued targets individually with `session_send` and `steer: true`. Inspect a
+delivery whose outcome is unknown before resending: it may already have run.
+Log every resend in the round log.
 
 **Ruling** on an objection, one line each, with a reason and an evidence
 pointer:
@@ -210,7 +221,8 @@ e.g. `A-M3`) and is reassigned in the next step-b relay. Rule
 `fixed_verified` on a question only after a critic says, in its critique
 step, that the evidence holds; a failed answer is re-asked under the same id.
 
-A `needs-a-decision` stays open until the human rules. When critics conflict,
+A `needs-a-decision` stays open until it is ruled: ask the human only for an
+ask case (a)-(e); otherwise rule it yourself and record it. When critics conflict,
 rule on the evidence. A participant that does not file gets one nudge; after
 that it is marked absent for the round and its open objections stay open. Only
 the human can drop a participant. Before you nudge, check `session_status`: a
@@ -251,20 +263,20 @@ Then take the first rule that holds:
    its final file and lists them; each critic verifies them in its own final
    file. No extra round is opened. A wrap-up fix a critic verified counts as
    reviewed under Finishing.
-4. `hard_rounds` reached or budget spent → ask the human. No round starts
-   without their answer.
-5. Churn, drift over half, or cost over budget → ask the human, naming it.
-6. A `needs-a-decision` blocks the other answers → ask the human about it;
-   the rest continue.
+4. `hard_rounds` reached or budget spent → you decide: wrap up with open items recorded, or extend once and record why, unless going on spends past an amount the owner approved: that is (b).
+5. Churn, drift over half, or cost over budget → name it; you decide: wrap up with open items recorded, or extend once and record why, unless going on spends past an amount the owner approved: that is (b).
+6. A `needs-a-decision` blocks the other answers → ask the human only for an
+   ask case (a)-(e); otherwise rule it yourself and record it; the rest continue.
 7. No new blocking, old blocking still open, and no drop over the last two
-   checkpoints → more rounds will not help; ask the human for a ruling.
+   checkpoints → more rounds will not help; ask the human only for an ask case
+   (a)-(e); otherwise rule it yourself and record it.
 8. Otherwise continue: relay to the proposers and start round `r + 1`. From
    `soft_rounds` on, a round starts only after you write the reason to
    continue in the checkpoint line.
 
 ## The human's ruling
 
-When the debate is stuck, tell the user in your own words what the open
+When the debate is stuck on an ask case (a)-(e), tell the user in your own words what the open
 blocking objections are: id, claim, the proposer's answer, and what each
 option costs. Put it in the needs-you line on your dashboard. The user answers
 in a free-form message to you; there is no fixed set of values.
@@ -272,9 +284,10 @@ in a free-form message to you; there is no fixed set of values.
 Read the message and act on it:
 
 - Map it to the open ids it covers. If it is unclear which objection it rules
-  on, or what it wants, ask back once; never guess.
-- Send the participants the ruling as you understood it, plus the user's words
-  quoted verbatim for the note keeper to file.
+  on, or what it wants, pick the likeliest reading, state it, apply it.
+- Send the participants the ruling as you understood it using `session_send`
+  with `steer: true`, plus the user's words quoted verbatim for the note keeper
+  to file.
 - Then coordinate what it asks for: more rounds, a fix one critic verifies,
   dropping a proposal, accepting a risk, or finishing.
 
@@ -318,3 +331,24 @@ Count a participant's report only when its round file exists and its round and
 - Each round costs one relay per participant. Keep relays to paths and ids, let
   each critic list everything in one file per round, and stop early when the
   checkpoint allows.
+
+## When to offer a debate
+
+**Offer a debate for a costly, contested choice.** Offer one when the owner
+asks for it. When the owner says "discuss", "debate", "讨论" or "grill" and it
+is unclear whether they want a debate or one worker proposing a solution,
+pick the likelier reading, state it, and go on. Offer one unasked only when the task is a complex analysis: two or
+more plausible approaches, AND a wrong choice is costly. Costly means it
+crosses a security, data, approval or trust boundary, changes a contract
+others depend on, or follows a prior failed attempt or a design block from a
+reviewer. Size alone
+(about 150 lines, two or more modules) is not a reason, and neither is an RFC
+unless both conditions hold. A debate costs about 45 minutes and several work
+items. To offer it, put "debate first" in your Round 0 plan as one Assumption
+line: the question, the participants and their roles, the rounds, a time
+estimate and the work items it uses. Do not offer it for a small change with
+a clear fix, CI or rebase work, wording, an emergency, a design the owner
+already decided, or when fewer than half the goal's work items are left.
+"Skip the debate", "just do it" or any gate-skipping message drops it. A
+standing preference the owner stated ("always debate first", "stop suggesting
+debates") wins over these rules.

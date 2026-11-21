@@ -3,7 +3,7 @@
 :func:`validate_import_zip` reads the archive's inventory and its one manifest under the
 member, size and name limits; the staged cron store is vetted again and published
 (:func:`_sanitize_imported_crons`); and host-local state is stripped from the staged
-memory stores (:func:`_strip_host_local_store_state`).
+archive (:func:`_strip_host_local_store_state`).
 """
 
 from __future__ import annotations
@@ -17,17 +17,20 @@ from pathlib import Path, PurePosixPath
 from kiro_crew import pinned_fs, platform_compat
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.mcp_cron import _log_cron_denial, _vet_shell_command
-from kiro_crew.memory_stores import MEMORY_STORES_DIR_NAME, is_host_local_store_state
 from kiro_crew.portability_archive import (
     _MAX_IMPORT_MEMBERS,
-    _MAX_IMPORT_UNCOMPRESSED,
     _MAX_SETTINGS_DOCUMENT_BYTES,
     MEMORY_EXPORT_MANIFEST_VERSION,
     _is_link_entry,
     _unsafe_member_name,
+    import_size_problem,
     manifest_is_memory_only,
 )
-from kiro_crew.snapshot import EXPORT_MANIFEST_VERSION
+from kiro_crew.snapshot import (
+    EXPORT_MANIFEST_VERSION,
+    _is_host_local,
+    _may_hold_host_local,
+)
 from kiro_crew.zip_vet import ZipInventoryRejected, vet_zip_inventory
 
 
@@ -86,7 +89,8 @@ def validate_import_zip(zip_path: Path) -> tuple[bool, str, dict]:
                 if _unsafe_member_name(name):
                     return False, f"Rejected path traversal: {name}", {}
 
-            # Zip-bomb guard: bound entry count and total uncompressed size.
+            # Zip-bomb guard: bound entry count, each member's size, and the total
+            # against the ceiling, the compression ratio and the free disk space.
             infos = zf.infolist()
             if len(infos) > _MAX_IMPORT_MEMBERS:
                 return (
@@ -94,16 +98,9 @@ def validate_import_zip(zip_path: Path) -> tuple[bool, str, dict]:
                     f"Rejected: archive has too many entries ({len(infos)} > {_MAX_IMPORT_MEMBERS})",
                     {},
                 )
-            total_uncompressed = sum(i.file_size for i in infos)
-            if total_uncompressed > _MAX_IMPORT_UNCOMPRESSED:
-                return (
-                    False,
-                    (
-                        f"Rejected: uncompressed size {total_uncompressed} exceeds cap "
-                        f"{_MAX_IMPORT_UNCOMPRESSED} (possible zip bomb)"
-                    ),
-                    {},
-                )
+            size_problem = import_size_problem(infos, os.path.getsize(zip_path))
+            if size_problem is not None:
+                return False, size_problem, {}
 
             # Link members can redirect a later write outside the extraction root
             # even when every name passes the traversal check above.
@@ -452,14 +449,18 @@ def _disable_imported_script_hooks(hooks_path: Path) -> list[str]:
 
 
 def _strip_host_local_store_state(snap: Path) -> None:
-    """Remove from the extracted archive what no export ever writes under ``memory_stores/``.
+    """Remove from the extracted archive every path no bundle carries (`_is_host_local`).
 
-    The export's own filter (`_keep_store_for_export`) keeps these out on the way out; this
-    is the same predicate applied on the way in, so an import is not the one direction in
-    which a hand-built archive can plant them. Pruned at the first matching component, so a
-    whole ``.execution-logs/`` or ``<store>/backups/`` goes as one removal.
+    That is ``memory_stores/``'s host-local half, ``crew-teams/.lock`` and the legacy
+    activity files in ``members/<slug>/``. The export and staging filters keep these out
+    on the way out; this is the same predicate applied on the way in, ON DISK, so neither
+    an import nor a restore is a direction in which a hand-built archive can plant them,
+    whatever spelling of an entry name the filesystem resolved to one of them. Pruned at
+    the first matching component, so a whole ``.execution-logs/`` or ``<store>/backups/``
+    goes as one removal, and descended only where a match is possible
+    (`_may_hold_host_local`), so a large working tree is not walked.
 
-    An absent or non-directory ``memory_stores`` is a no-op, answered by the pin chain
+    A tree that is absent or not a real directory is a no-op, answered by the pin chain
     below rather than by a by-name ``is_dir()`` probe ahead of it -- that probe would be
     the screen-then-act shape this traversal exists to remove.
     """
@@ -508,7 +509,7 @@ def _strip_host_local_store_state(snap: Path) -> None:
     def _strip(pinned: platform_compat.PinnedDirectory, rel: tuple[str, ...]) -> None:
         for name in sorted(pinned.names()):
             here = (*rel, name)
-            matched = is_host_local_store_state((MEMORY_STORES_DIR_NAME, *here))
+            matched = _is_host_local(here)
             if pinned.is_link(name) or not pinned.is_dir(name):
                 if matched:
                     pinned.unlink(name)
@@ -516,6 +517,8 @@ def _strip_host_local_store_state(snap: Path) -> None:
             if matched:
                 # Removed whole, so its contents are never judged individually.
                 _remove_dir(pinned, name)
+                continue
+            if not _may_hold_host_local(here):
                 continue
             sub = pinned.child_if_real_dir(name)
             if sub is None:
@@ -533,8 +536,4 @@ def _strip_host_local_store_state(snap: Path) -> None:
             # and following it is the harm.
             return
         with snap_pin:
-            stores_pin = snap_pin.child_if_real_dir(MEMORY_STORES_DIR_NAME)
-            if stores_pin is None:
-                return
-            with stores_pin:
-                _strip(stores_pin, ())
+            _strip(snap_pin, ())

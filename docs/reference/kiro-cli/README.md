@@ -11,8 +11,10 @@ numbers in the code are feature floors, each a lowest probed release rather than
 a supported range, and a 3.x CLI satisfies all of them: `mcp_hot_reload.py`'s
 `MCP_HOT_RELOAD_MIN_KIRO_CLI_VERSION` (2.21.0, MCP hot reload) and
 `kiro_cli.py`'s `SPEC_PERMISSIONS_MIN_VERSION` (2.23.0, the agent-spec
-`permissions` block) and `MANDATORY_MCPS_DROP_MIN_VERSION` (2.27.0, deferring
-Crew's MCP servers under Tool Search).
+`permissions` block), `MANDATORY_MCPS_DROP_MIN_VERSION` (2.27.0, deferring
+Crew's MCP servers under Tool Search) and `KAS_AUTH_CLIENT_MIN_KIRO_CLI` (2.35.2,
+`--auth-method client` on a KAS relay spawn), and `acp/harness/kas.py`'s
+`KAS_AGENT_PROMPT_MIN_KIRO_CLI` (2.33.1, KAS applying a `customAgents` prompt).
 So these pages describe what upstream published on the fetch date recorded per
 row, not a supported-version contract.
 
@@ -58,12 +60,12 @@ content; each is marked in the page. A re-fetch must preserve them.
 | [chat/voice.md](chat/voice.md) | **Not a mirror**, and the one page here with no upstream source: Kiro Crew's own voice setup, speech-to-text in (local by default) and text-to-speech out (system by default, or Amazon Polly), across the dashboard and supported messaging channels. Its behavioral contracts live in [stt-streaming](../../system-specs/modules/stt-streaming.md) and [voice-streaming](../../system-specs/modules/voice-streaming.md); its settings reference is [configuration](../../../src/kiro_crew/docs/configuration.md). | n/a |
 | [steering.md](steering.md) | /docs/steering/ — plus local measurement of what kiro-cli does with `inclusion` | 2026-09-06 |
 | [skills.md](skills.md) | /docs/skills/ | 2026-09-06 |
-| [hooks.md](hooks.md) | /docs/hooks/ and its `types` and `actions` subpages — plus Kiro Crew's fail-closed `PreToolUse` exit contract, which has no upstream counterpart | 2026-09-06 |
+| [hooks.md](hooks.md) | /docs/hooks/ and its `types` and `actions` subpages — plus Kiro Crew's fail-closed `PreToolUse` exit contract and its notes on command length, output size and caching, which have no upstream counterpart | 2026-09-06 |
 | [autocomplete.md](autocomplete.md) | /docs/cli/autocomplete/ | 2026-09-06 |
 | [custom-agents/](custom-agents/) | /docs/custom-agents/ | 2026-09-06 |
 | [custom-agents/creating.md](custom-agents/creating.md) | /docs/custom-agents/creating/ | 2026-09-06 |
 | [custom-agents/configuration-reference.md](custom-agents/configuration-reference.md) | /docs/custom-agents/configuration-reference/ — the agent-spec schema `acp/kas_agents.py`'s `UNSUPPORTED_SPEC_KEYS` is measured against | 2026-09-06 |
-| [acp.md](acp.md) | /docs/cli/acp/ — plus a local row for `session/set_config_option` and the measured session-update names, which upstream's method table does not carry | 2026-09-06 |
+| [acp.md](acp.md) | /docs/cli/acp/ — plus local rows for `session/set_config_option`, `_kiro.dev/mcp/server_init_failure` and `_kiro.dev/agent/switched`, and the measured session-update names and everything below them, which upstream's method table does not carry | 2026-09-06 |
 | [mcp/](mcp/) | /docs/mcp/ | 2026-09-06 |
 | [mcp/configuration.md](mcp/configuration.md) | /docs/mcp/configuration/ | 2026-09-06 |
 | [mcp/examples.md](mcp/examples.md) | /docs/mcp/examples/ — [connecting a remote OAuth MCP server](../../guides/connecting-remote-oauth-mcp-server.md) is the first-party guide readers are sent to | 2026-09-06 |

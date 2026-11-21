@@ -537,14 +537,14 @@ def test_restored_aliases_rejoin_one_binding(tmp_path, monkeypatch):
         state,
         a,
         {"linked_session_key": KEY, "project": str(tmp_path / "p")},
-        codec.Restore(name="a"),
+        codec.Recent(name="a", history_key=KEY),
     )
     b = state.get_or_create_slot("b")
     codec.apply(
         state,
         b,
         {"linked_session_key": KEY, "project": str(tmp_path / "p")},
-        codec.Restore(name="b"),
+        codec.Recent(name="b", history_key=KEY),
     )
 
     assert a._binding is b._binding
@@ -563,7 +563,7 @@ def test_a_restored_tab_seeds_an_unseeded_live_alias(tmp_path, monkeypatch):
         state,
         restored,
         {"linked_session_key": KEY, "project": str(tmp_path / "disk")},
-        codec.Restore(name="r"),
+        codec.Recent(name="r", history_key=KEY),
     )
 
     assert restored._binding is fallback._binding
@@ -580,7 +580,7 @@ def test_a_restored_tab_gives_an_unseeded_live_alias_its_threshold(tmp_path, mon
         state,
         restored,
         {"linked_session_key": KEY, "autocompact_pct": 40.0},
-        codec.Restore(name="r"),
+        codec.Recent(name="r", history_key=KEY),
     )
 
     assert fallback.autocompact_pct == restored.autocompact_pct == 40.0
@@ -597,7 +597,7 @@ def test_a_restored_tab_keeps_a_live_aliases_threshold(tmp_path, monkeypatch):
         state,
         restored,
         {"linked_session_key": KEY, "autocompact_pct": 70.0},
-        codec.Restore(name="r"),
+        codec.Recent(name="r", history_key=KEY),
     )
 
     assert live.autocompact_pct == restored.autocompact_pct == 40.0
@@ -615,7 +615,7 @@ def test_a_restored_tab_keeps_a_live_aliases_clear(tmp_path, monkeypatch):
         state,
         restored,
         {"linked_session_key": KEY, "project": str(tmp_path / "old")},
-        codec.Restore(name="r"),
+        codec.Recent(name="r", history_key=KEY),
     )
 
     assert live.project == restored.project == ""
@@ -635,7 +635,7 @@ def test_seeding_a_running_alias_arms_its_reset(tmp_path, monkeypatch):
         state,
         restored,
         {"linked_session_key": KEY, "project": str(tmp_path / "disk")},
-        codec.Restore(name="r"),
+        codec.Recent(name="r", history_key=KEY),
     )
 
     assert fallback.project == str(tmp_path / "disk")
@@ -671,3 +671,77 @@ def test_surfacing_beside_a_running_unseeded_alias_arms_the_reset(tmp_path, monk
     assert slot is not None and fallback.project == str(tmp_path / "disk")
     assert fallback._pending_reset_history_key == CHANNEL_KEY
     assert slot._pending_reset_history_key == CHANNEL_KEY
+
+
+def test_a_persons_pick_holds_across_an_alias_save_and_its_worker_turn(tmp_path, monkeypatch):
+    """One alias picks the folder; the other saves and runs a Bot worker turn."""
+    import asyncio
+
+    from kiro_crew import crewmate_worktree as cw
+    from kiro_crew.dashboard import crewmate_worktree_scope as scope
+
+    state = _state(tmp_path, monkeypatch)
+    a = state.get_or_create_slot("a", linked_session_key=KEY)
+    b = state.get_or_create_slot("b", linked_session_key=KEY)
+    proj = str(tmp_path / "p")
+    a.project = proj
+    a._project_picked = True
+
+    _save_slot_to_history(state, b, force=True)
+    assert state.conversation_log._read_metadata(KEY).get("project_picked") is True
+
+    hit = cw.CrewmateWorktree(repo=proj, path="/ws/wt", branch="crew/atlas/p", cwd="/ws/wt")
+    monkeypatch.setattr(scope, "_worker_crewmate", lambda *_a: "Atlas")
+    monkeypatch.setattr(scope, "resolve_worker_project", lambda *_a: hit)
+    assert asyncio.run(scope.scope_worker_turn(state, b, None, None, "")) == ""
+    assert (a.project, b.project, b._project_picked) == (proj, proj, True)
+
+
+def test_a_project_write_that_moves_the_folder_drops_the_pick():
+    from kiro_crew.dashboard.state import _ChatSlot
+
+    slot = _ChatSlot("lone")
+    slot.project = "/p"
+    slot._project_picked = True
+    slot.project = "/p"
+    assert slot._project_picked is True
+    slot.project = "/q"
+    assert slot._project_picked is False
+
+
+def test_a_rolled_back_pick_restores_the_earlier_pick():
+    from kiro_crew.dashboard.state import _ChatSlot
+
+    slot = _ChatSlot("lone")
+    slot.project = "/p"
+    slot._project_picked = True
+    token = _CommitToken("/q")
+    slot.project = token
+    assert slot._project_picked is False
+    _rollback(slot, token, "/p")
+    assert (slot.project, slot._project_picked) == ("/p", True)
+
+
+def test_a_stored_pick_is_restored_beside_an_unseeded_alias(tmp_path, monkeypatch):
+    """A second tab not yet loaded does not cost the restored folder its pick."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from kiro_crew import crewmate_worktree as cw
+    from kiro_crew.dashboard import crewmate_worktree_scope as scope
+    from kiro_crew.dashboard.slot_persistence.metadata_codec import _read_project
+
+    state = _state(tmp_path, monkeypatch)
+    a = state.get_or_create_slot("a", linked_session_key=KEY)
+    b = state.get_or_create_slot("b", linked_session_key=KEY)
+    proj = str(tmp_path / "picked")
+    meta = {"project": proj, "project_picked": True}
+
+    _read_project(SimpleNamespace(state=state, slot=b, meta=meta))
+
+    assert (a.project, b.project, a._project_picked, b._project_picked) == (proj, proj, True, True)
+    hit = cw.CrewmateWorktree(repo=proj, path="/ws/wt", branch="crew/atlas/p", cwd="/ws/wt")
+    monkeypatch.setattr(scope, "_worker_crewmate", lambda *_a: "Atlas")
+    monkeypatch.setattr(scope, "resolve_worker_project", lambda *_a: hit)
+    assert asyncio.run(scope.scope_worker_turn(state, b, None, None, "")) == ""
+    assert b.project == proj

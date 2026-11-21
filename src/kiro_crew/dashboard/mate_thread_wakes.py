@@ -23,10 +23,15 @@ envelope ``[Worker report]``).
 
 
 The same flush delivers a moved crewmate's one upgrade notice first
-(:mod:`kiro_crew.mate_upgrade_notice`), and the notice a thread owes once its
+(:mod:`kiro_crew.mate_upgrade_notice`), the notice a thread owes once its
 crewmate is set to another agent than the thread runs
-(:func:`offer_rebind_notice`). Per-gateway state lives on the dashboard state
-object, never in module globals.
+(:func:`offer_rebind_notice`), then what the user did with the crewmate's
+cards and commands (:func:`queue_user_action`,
+:mod:`kiro_crew.dashboard.mate_user_actions`) as one ``[User action]`` turn,
+then the reports, then the refs installed apps sent while the thread was busy
+(:func:`app_wakes`, written by :mod:`kiro_crew.dashboard.app_bot_wake`) as one
+turn with crew-log actor ``app``, so app wakes never hold a report back.
+Per-gateway state lives on the dashboard state object, never in module globals.
 """
 
 from __future__ import annotations
@@ -403,6 +408,37 @@ def _tasks(state: Any) -> dict[str, asyncio.Task[Any]]:
     return tasks
 
 
+def app_wakes(state: Any) -> dict[str, dict[str, list[str]]]:
+    """App wakes waiting on each thread: thread key -> app name -> refs, in arrival order."""
+    wakes = getattr(state, "_mate_app_wakes", None)
+    if not isinstance(wakes, dict):
+        wakes = {}
+        state._mate_app_wakes = wakes
+    return wakes
+
+
+def _take_app_refs(state: Any, key: str, taken: dict[str, list[str]]) -> None:
+    """Remove *taken*'s refs from *key*'s held wakes, keeping any that arrived since."""
+    held = app_wakes(state).get(key)
+    if not held:
+        return
+    for app, refs in taken.items():
+        left = [r for r in held.get(app, []) if r not in refs]
+        if left:
+            held[app] = left
+        else:
+            held.pop(app, None)
+    if not held:
+        app_wakes(state).pop(key, None)
+
+
+def _put_back_app_refs(state: Any, key: str, refs_by_app: dict[str, list[str]]) -> None:
+    """Hold *refs_by_app* on *key* again, ahead of any ref that arrived since."""
+    held = app_wakes(state).setdefault(key, {})
+    for app, refs in refs_by_app.items():
+        held[app] = refs + [r for r in held.get(app, []) if r not in refs]
+
+
 def _notices(state: Any) -> set[str]:
     """Threads whose claimed upgrade notice is still to be delivered."""
     notices = getattr(state, "_mate_notices", None)
@@ -460,6 +496,51 @@ def offer_rebind_notice(state: Any, slot: Any, agent: str, recorded_agent: str) 
     schedule_flush(state, slot.key)
 
 
+def _user_actions(state: Any) -> dict[str, list[str]]:
+    """Each thread's queued ``[User action]`` lines (:mod:`mate_user_actions`), oldest first."""
+    queued = getattr(state, "_mate_user_actions", None)
+    if not isinstance(queued, dict):
+        queued = {}
+        state._mate_user_actions = queued
+    return queued
+
+
+def _user_action_drops(state: Any) -> dict[str, int]:
+    """How many of each thread's oldest ``[User action]`` lines the cap let go."""
+    drops = getattr(state, "_mate_user_action_drops", None)
+    if not isinstance(drops, dict):
+        drops = {}
+        state._mate_user_action_drops = drops
+    return drops
+
+
+def queue_user_action(state: Any, key: str, line: str, *, once: bool = False) -> bool:
+    """Queue *line* for crewmate thread *key* and schedule its delivery.
+
+    Delivered with every other line queued by then as one hidden turn once the
+    thread is idle (:func:`_flush`): a busy thread is never steered. At most
+    ``mate_user_actions.MAX_PENDING_LINES`` lines wait; the oldest is dropped, and
+    the count of dropped lines is said once in that turn.
+    With *once*, a line already waiting on that thread is not queued a second time.
+    """
+    from kiro_crew.dashboard.mate_user_actions import MAX_PENDING_LINES
+
+    slot = state.get_slot(key)
+    if slot is None or not is_crewmate_thread(slot) or not line:
+        return False
+    lines = _user_actions(state).setdefault(key, [])
+    if once and line in lines:
+        return True
+    lines.append(line)
+    over = len(lines) - MAX_PENDING_LINES
+    if over > 0:
+        del lines[:over]
+        drops = _user_action_drops(state)
+        drops[key] = drops.get(key, 0) + over
+    schedule_flush(state, key)
+    return True
+
+
 def _notice_checked(state: Any) -> set[str]:
     checked = getattr(state, "_mate_notice_checked", None)
     if not isinstance(checked, set):
@@ -478,7 +559,11 @@ async def offer_upgrade_notice(state: Any, slot: Any) -> bool:
     if not is_crewmate_thread(slot) or slot.key in _notice_checked(state):
         return False
     _notice_checked(state).add(slot.key)
-    from kiro_crew.mate_upgrade_notice import claim_kept_notice, claim_notice_prompt
+    from kiro_crew.mate_upgrade_notice import (
+        claim_kept_notice,
+        claim_notice_prompt,
+        claim_policy_notice,
+    )
 
     binding = await asyncio.to_thread(members_mod.read_dm_binding_for_slot, slot.key)
     slug = members_mod.slug_from_dm_slot_key(slot.key)
@@ -488,14 +573,38 @@ async def offer_upgrade_notice(state: Any, slot: Any) -> bool:
     if prompt:
         _notices(state).add(slot.key)
         _notice_prompts(state)[slot.key] = prompt
-    else:
-        # Not moved: a crewmate the migration left where it was says why, once.
+    # Owed when a start put back the restrictions an earlier upgrade dropped
+    # (``mate_policy_repair``); delivered after a moved notice still owed, which
+    # it corrects. Else a crewmate the migration left where it was says why, once.
+    kept, held = await asyncio.to_thread(claim_policy_notice, slug, slot.agent)
+    if held:
+        _notify_held(state, slot.agent)
+    if not kept and not prompt:
         kept = await asyncio.to_thread(claim_kept_notice, slug, slot.agent)
-        if not kept:
-            return False
+    if kept:
         _kept_notices(state)[slot.key] = kept
+    elif not prompt:
+        return False
     schedule_flush(state, slot.key)
     return True
+
+
+def _notify_held(state: Any, name: str) -> None:
+    """Put one bell note for Bot *name* whose limits now ask a person, and keep asking."""
+    from urllib.parse import quote
+
+    try:
+        state.notify(
+            "agent",
+            "A Bot now asks before some actions",
+            f"Some limits set for {name} could not be applied as written. It now asks "
+            "you before each action they cover, and it keeps asking. Approve or decline "
+            "each one when it asks.",
+            url=f"/members?member={quote(name, safe='')}",
+            i18n={"id": "bot_limits_held", "params": {"name": name}},
+        )
+    except Exception:  # noqa: BLE001 - the chat notice still carries it
+        logger.warning("held-limits bell note failed for %r", name, exc_info=True)
 
 
 async def offer_upgrade_notices(state: Any) -> None:
@@ -520,10 +629,15 @@ async def _flush(state: Any, key: str) -> None:
     while True:
         slot = state.get_slot(key)
         reports = _due_reports(state, key)
+        apps = app_wakes(state).get(key)
+        actions = _user_actions(state).get(key)
         owed = (
-            key in _notices(state) or key in _kept_notices(state) or key in _rebind_notices(state)
+            key in _notices(state)
+            or key in _kept_notices(state)
+            or key in _rebind_notices(state)
+            or bool(apps)
         )
-        if not (reports or owed) or slot is None or not is_crewmate_thread(slot):
+        if not (reports or owed or actions) or slot is None or not is_crewmate_thread(slot):
             # Nothing to say, or the thread is gone: what is pending stays, and
             # the thread's next turn end schedules this again.
             return
@@ -549,6 +663,52 @@ async def _flush(state: Any, key: str) -> None:
         if _idle(slot) and key in _rebind_notices(state):
             dispatch_hidden_turn(state, slot, _rebind_notices(state).pop(key), human_seen=False)
             logger.info("rebind notice started on %s", key)
+            continue
+        if _idle(slot) and actions:
+            # What the user did with the crewmate's cards or commands: its own
+            # turn, before any worker report, so a report never reads as news
+            # the user's answer already made stale.
+            from kiro_crew.dashboard.mate_user_actions import prompt as user_action_prompt
+
+            _user_actions(state).pop(key, None)
+            not_listed = _user_action_drops(state).pop(key, 0)
+            dispatch_hidden_turn(
+                state, slot, user_action_prompt(actions, not_listed), human_seen=False
+            )
+            logger.info("user action note started on %s (%d line(s))", key, len(actions))
+            continue
+        if _idle(slot) and apps and not reports:
+            # Waiting reports go first (below), so a steady run of app wakes
+            # cannot hold a worker's report back.
+            from kiro_crew.dashboard.app_bot_wake import still_granted, wake_prompt
+
+            # A ref held while the Bot was busy goes only to an app that still holds
+            # `wake` and this Bot now: the grant files are read off the loop.
+            # The read runs on a copy: a wake that arrives meanwhile is added to the
+            # live entry, stays there, and is checked on the next pass.
+            slug = members_mod.slug_from_dm_slot_key(key) or ""
+            snapshot = {app: list(refs) for app, refs in apps.items()}
+            granted = await asyncio.to_thread(still_granted, slug, snapshot)
+            if (
+                state.get_slot(key) is not slot
+                or not is_crewmate_thread(slot)
+                or getattr(slot, "is_closing", False)
+            ):
+                # The same fence as the report turn below: the thread was closed or
+                # replaced during the read, so nothing starts on it and the refs stay.
+                return
+            _take_app_refs(state, key, snapshot)
+            dropped = sorted(set(snapshot) - set(granted))
+            if dropped:
+                logger.info("app wake on %s dropped for %s: no longer granted", key, dropped)
+            if not granted:
+                continue
+            if not _idle(slot):
+                _put_back_app_refs(state, key, granted)
+                continue
+            apps = granted
+            dispatch_hidden_turn(state, slot, wake_prompt(apps), human_seen=False, actor="app")
+            logger.info("app wake started on %s (%s)", key, ", ".join(sorted(apps)))
             continue
         # The Dashboard line reads the page store: off the loop, before the idle check.
         slug = (members_mod.slug_from_dm_slot_key(key) or "") if reports else ""
@@ -579,10 +739,11 @@ async def _flush(state: Any, key: str) -> None:
             # The thread was closed or replaced during the read: no wake on it, and
             # what is pending stays for the thread's next turn end.
             return
-        # A rebind notice is offered from inside the thread's own turn, so its
-        # flush waits for that turn to end; the other notices wait for a later
-        # turn end to schedule them again.
-        if not reports and key not in _rebind_notices(state):
+        # A rebind notice is offered from inside the thread's own turn, and the
+        # turn-end tail schedules app wakes before that turn has released the
+        # slot, so both wait for the turn to end; the other notices wait for a
+        # later turn end to schedule them again.
+        if not reports and not apps and not actions and key not in _rebind_notices(state):
             return
         if reports and _idle(slot):
             _pending(state).pop(key, None)
@@ -688,13 +849,22 @@ def _is_jobs_own_cron_key(job: Any, session_key: str) -> bool:
     )
 
 
-async def note_cron_result(state: Any, job: Any, session_key: str, reply_text: str) -> bool:
+async def note_cron_result(
+    state: Any,
+    job: Any,
+    session_key: str,
+    reply_text: str,
+    *,
+    mcp_report: dict[str, Any] | None = None,
+) -> bool:
     """Report a crewmate's scheduled turn to its thread, as one of its workers. Never raises.
 
     The caller decides the result CHANGED; this decides whose it is, from
     attested state only: *session_key* is *job*'s own ``cron:`` key, its capture
     names ``job.member_id``, and the turn ran on that crewmate's worker. Then it
-    takes the worker path. Returns whether a report was recorded.
+    takes the worker path, with *mcp_report* (the cron session's own MCP report
+    payload, :func:`provider_mcp_payload`) standing in for the worker slot's.
+    Returns whether a report was recorded.
     """
     try:
         member = getattr(job, "member_id", "") or ""
@@ -730,11 +900,27 @@ async def note_cron_result(state: Any, job: Any, session_key: str, reply_text: s
         ):
             return False
         title = crewmate_prompts.fill("worker_report.cron_title", name=getattr(job, "name", ""))
-        _record_report(state, thread.key, session_key, title, reply_text or "")
+        _record_report(state, thread.key, session_key, title, reply_text or "", mcp_report)
         return True
     except Exception:
         logger.warning("cron report for %s failed", session_key, exc_info=True)
         return False
+
+
+def provider_mcp_payload(provider: Any) -> dict[str, Any] | None:
+    """*provider*'s own session MCP report payload, or None. Never raises.
+
+    Read through the declared ``LLMProvider.mcp_session_report`` contract; a
+    provider that keeps no report, one whose read fails, and a payload that is
+    not a dict all read as no report.
+    """
+    try:
+        report = provider.mcp_session_report() if provider is not None else None
+        payload = report.payload() if report is not None else None
+    except Exception:  # noqa: BLE001 - a missing report is never worth a lost wake
+        logger.debug("Failed to read the session MCP report", exc_info=True)
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def note_turn_end(
@@ -777,6 +963,8 @@ def note_turn_end(
         elif is_crewmate_thread(slot):
             if (
                 _due_reports(state, slot.key)
+                or app_wakes(state).get(slot.key)
+                or _user_actions(state).get(slot.key)
                 or slot.key in _notices(state)
                 or slot.key in _kept_notices(state)
                 or slot.key in _rebind_notices(state)

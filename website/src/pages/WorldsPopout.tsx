@@ -1,11 +1,13 @@
 import { safeSetItem } from '../utils/safeStorage'
 import { useState, useEffect } from 'react'
+import { ChevronDown, ChevronUp } from 'lucide-react'
 import { useAgentSync } from '../hooks/useAgentSync'
 import { usePopoutSync } from '../hooks/usePopoutSync'
 import { SCENES, SCENE_STORAGE_KEY, SCENE_LAYOUT_SCALE, type SceneKey } from './scenes/config'
 import { SCENE_COMPONENTS } from './scenes/components'
 import { useAppDispatch } from '../store'
 import { fetchSlots } from '../store/dashboardSlice'
+import { pollWhileVisible } from '../lib/pollWhileVisible'
 
 import { i18nT } from '../i18n/t'
 import { RadioChipGroup, radioChip } from '../components/RadioChipGroup'
@@ -29,8 +31,7 @@ export default function WorldsPopout() {
 
   useEffect(() => {
     dispatch(fetchSlots())
-    const iv = setInterval(() => dispatch(fetchSlots()), 5000)
-    return () => clearInterval(iv)
+    return pollWhileVisible(() => { dispatch(fetchSlots()) }, 5000)
   }, [dispatch])
 
   useEffect(() => { safeSetItem(SCENE_STORAGE_KEY, scene) }, [scene])
@@ -90,7 +91,7 @@ export default function WorldsPopout() {
               color: 'var(--text-muted, #999)', fontSize: 16, lineHeight: 1,
             }}
           >
-            {collapsed ? '▼' : '▲'}
+            {collapsed ? <ChevronDown size={16} /> : <ChevronUp size={16} />}
           </button>
 
           {SCENES.map(s => {

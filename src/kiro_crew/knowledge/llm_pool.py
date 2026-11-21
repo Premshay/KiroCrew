@@ -14,7 +14,7 @@ import os
 import shutil
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from kiro_crew import platform_compat
 from kiro_crew.agent_sdk import build_acp_provider, is_acp_timeout
@@ -33,6 +33,7 @@ from kiro_crew.agent_sdk.backends import (
 )
 from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
+from kiro_crew.agent_spec_injections import WRITE_BACK_CAUSE
 from kiro_crew.config import live
 from kiro_crew.config.loader import read_merged_config_files
 from kiro_crew.config.paths import config_dir
@@ -170,10 +171,16 @@ def _section(data: dict, key: str) -> dict:
 
 
 def _get_provider_type(config: Optional[dict] = None) -> str:
-    """Configured knowledge provider; defaults to ``"acp"``."""
-    data = _read_config() if config is None else config
-    provider = _section(data, "agent").get("provider", "acp")
-    return provider if isinstance(provider, str) and provider else "acp"
+    """``agent.provider`` as the loader validates it: outside the schema enum is ``"acp"``.
+
+    The pool reads raw ``config.json``; checking the same enum keeps a hand-edited
+    value that every other reader sees as ``"acp"`` from picking this pool's worker.
+    """
+    from kiro_crew.config.schema import JSON_SCHEMA
+
+    provider = _section(_read_config() if config is None else config, "agent").get("provider")
+    allowed = JSON_SCHEMA["properties"]["agent"]["properties"]["provider"].get("enum", [])
+    return provider if isinstance(provider, str) and provider in allowed else "acp"
 
 
 def _clean_binding(raw: dict) -> dict:
@@ -280,10 +287,12 @@ class KnowledgeHarnessUnavailable(RuntimeError):
     """An LTS knowledge pool would fall back to the Kiro CLI harness.
 
     LTS only (RFC D6): KAS is the floor and the Kiro CLI harness is being
-    retired, so an LTS build never falls back to it. The pool cannot run on
-    KAS (it needs a client KAS has no arm in), so it runs on Kiro CLI only when the
-    user picked Kiro CLI (``agent.acp_backend`` ``"kiro"``) and the remote
-    ``agent_backend`` policy allows it. Otherwise it refuses before any process.
+    retired, so an LTS build never falls back to it. The pool runs on KAS through
+    the gateway's background runtime (:class:`SessionWorker`), and on Kiro CLI
+    only when the user picked Kiro CLI (``agent.acp_backend`` ``"kiro"``) and the
+    remote ``agent_backend`` policy allows it. Otherwise (a backend neither path
+    can run, or no session manager to reach KAS through) it refuses before any
+    process.
     """
 
     code = "knowledge_harness_unavailable"
@@ -300,6 +309,61 @@ class KnowledgeHarnessUnavailable(RuntimeError):
         )
 
 
+class KnowledgeKiroCliSignedOut(KnowledgeHarnessUnavailable):
+    """The pool's Kiro CLI worker cannot start or answer because Kiro CLI is signed out.
+
+    The pool runs on Kiro CLI when it is picked, and in an ``oss`` build whenever
+    no other path can run the chosen agent, so a gateway signed in only to KAS
+    can still reach a signed-out Kiro CLI here.
+    Every chunk then failed on its own, each one spawning Kiro CLI twice, so a
+    long document outlived its caller's timeout and a short one was stored with
+    no extraction. A subclass of the harness refusal so it takes the same path:
+    the batch stops, the ingest job ends ``failed`` with this text and nothing is
+    stored. An agent document is ingested in full when it is added again after
+    sign-in; a watched-folder file reads ``failed`` with this text until Retry.
+    """
+
+    code = "knowledge_kiro_cli_signed_out"
+
+    def __init__(self) -> None:
+        from kiro_crew.agent_sdk.host_auth import HOST_TERMINAL_NOTE
+        from kiro_crew.kiro_cli_bundle import spawn_login_command
+
+        # Skip the parent's LTS text: this is not a build refusal.
+        RuntimeError.__init__(
+            self,
+            "Knowledge Library extraction needs Kiro CLI signed in when it runs on "
+            "Kiro CLI. Kiro CLI is not signed in here, so nothing "
+            f"was added. Run `{spawn_login_command()}` in a terminal on the gateway "
+            "host, then add the document again (a watched-folder file: press Retry "
+            "on the Knowledge page). Documents already in the library stay "
+            # Last, so a store that keeps 500 characters (a folder row's error)
+            # loses only this hint, never the command or the Retry step.
+            f"searchable. {HOST_TERMINAL_NOTE}",
+        )
+
+
+async def _kiro_cli_signed_out(exc: BaseException) -> bool:
+    """Whether a Kiro CLI worker failed because Kiro CLI is signed out.
+
+    kiro-cli's own words in the error are enough: the ACP layer's auth-failure
+    check, which also knows an expired or invalid token. Otherwise ask the gateway's
+    ``whoami`` check, which answers True only on an explicit "not logged in"
+    and False outside the gateway, so an unrelated failure keeps its old path.
+    """
+    # The SDK's delegation, not kiro_crew.acp: the agent-sdk-boundary gate
+    # refuses a new ACP import edge here.
+    from kiro_crew.agent_sdk.drivers.acp import is_auth_failure_output
+    from kiro_crew.kiro_prerequisite import kiro_signed_out_confirmed
+
+    if any(cls.__name__ == "AcpAuthRequired" for cls in type(exc).__mro__):
+        return True
+    if is_auth_failure_output(str(exc)):
+        return True
+
+    return await kiro_signed_out_confirmed()
+
+
 class LLMPoolClosed(RuntimeError):
     """A send on a shut-down pool, or one its shutdown cut short.
 
@@ -309,6 +373,136 @@ class LLMPoolClosed(RuntimeError):
 
     def __init__(self) -> None:
         super().__init__("the LLM pool is shut down")
+
+
+class KnowledgeSpecUnconfirmed(RuntimeError):
+    """The worker's spec could not be confirmed to mount nothing, even after its repair.
+
+    Not a failed item: every chunk would spawn a worker, repair the spec and be
+    refused again, so the ingest fails with this message instead, and the pool
+    refuses further starts for :data:`SPEC_REFUSAL_COOLDOWN_SECS`.
+    """
+
+    code = "knowledge_spec_unconfirmed"
+
+
+#: How long a pool refuses to start a worker after :class:`KnowledgeSpecUnconfirmed`.
+#: A spec that is still wrong after the repair is being rewritten by something
+#: else, so retrying sooner only spawns a process to be refused again.
+SPEC_REFUSAL_COOLDOWN_SECS = 600.0
+
+#: The top-level keys the zero-tool guard (``acp.client_mcp_array.spec_is_toolless``)
+#: judges, in the order a refusal names them.
+_ZERO_TOOL_KEYS = (
+    "tools",
+    "allowedTools",
+    "mcpServers",
+    "hooks",
+    "permissions",
+    "toolsSettings",
+    "includePowers",
+)
+
+
+def _mounting_keys(spec: object) -> list[str]:
+    """The top-level keys that make *spec* mount something; names only, never values.
+
+    For the refusal message only: the guard already refused the spec, and this
+    names what it saw. A key counts when it is set to anything but an empty list
+    or object (``False`` for ``includePowers``); ``tools`` and ``includeMcpJson``
+    also count when they are not the exact values a zero-tool spec carries.
+    """
+    if not isinstance(spec, dict):
+        return ["(not a JSON object)"]
+    found = []
+    for key in _ZERO_TOOL_KEYS:
+        if key not in spec:
+            if key == "tools":
+                found.append("tools (missing)")
+            continue
+        value = spec[key]
+        if key == "includePowers":
+            if value is not False:
+                found.append(key)
+        elif not (isinstance(value, (list, dict)) and not value):
+            found.append(key)
+    if spec.get("includeMcpJson") is not False:
+        found.append("includeMcpJson")
+    return found
+
+
+def _unconfirmed_spec_detail(client: Any) -> str:
+    """Which file kiro-cli loaded for the worker, and what it mounts; names and keys only.
+
+    Read after the refusal, for the message only, from the branch the confirmation
+    took. With a prepared projection kiro-cli loaded the published skill-view alias,
+    so the view and that alias file are named and the authored spec is not: it was
+    not loaded, and rewriting it cannot change the answer. Without one kiro-cli
+    loaded the spec the declared-name resolver returns (``session_agent_spec_path``,
+    pins applied), which is named, or its ambiguity or pin error; a project spec of
+    the same name is refused before the spawn (``acp.managed_agent_shadow``).
+    Never raises.
+    """
+    from kiro_crew import agent as agent_mod
+    from kiro_crew.agent_discovery import _read_agent_spec
+    from kiro_crew.agent_files import KNOWLEDGE_AGENT_FILENAME
+
+    parts: list[str] = []
+
+    def judge(spec: object, label: str) -> bool:
+        if spec is None:
+            parts.append(f"{label} is missing or unreadable")
+            return False
+        keys = _mounting_keys(spec)
+        if keys:
+            parts.append(f"{label} sets {', '.join(keys)}")
+            return False
+        return True
+
+    def read(path: Any) -> object:
+        return _read_agent_spec(path, operation="knowledge_spec_refusal", source="unknown")
+
+    try:
+        agents_dir = agent_mod.kiro_agents_dir_path()
+        installed = agents_dir / KNOWLEDGE_AGENT_FILENAME
+        projection = getattr(client, "_native_skill_projection", None)
+        if projection is not None:
+            view_ok = judge(
+                projection.specs.get(AGENT_NAME),
+                f"the skill view Kiro Crew prepared from {installed}",
+            )
+            alias = projection.aliases.get(AGENT_NAME)
+            if not alias:
+                parts.append("the projection published no skill-view alias for it")
+            else:
+                path = agents_dir / f"{alias}.json"
+                if not judge(read(path), f"the published skill-view alias {path}") and view_ok:
+                    parts.append(
+                        "the view Kiro Crew prepared mounts nothing, so that file was "
+                        "rewritten after Kiro Crew published it, most likely by a tool that "
+                        "rewrites the spec files in that directory when kiro-cli starts"
+                    )
+        else:
+            # The file the confirmation judged: the declared-name resolver, with
+            # ``agent.spec_pins`` applied, which may not be the installed file.
+            try:
+                resolved = agent_mod.session_agent_spec_path(AGENT_NAME)
+            except ValueError as exc:
+                parts.append(str(exc))
+            else:
+                if resolved is None:
+                    parts.append(f"no readable spec resolves to {AGENT_NAME!r}")
+                else:
+                    label = "the installed spec" if resolved == installed else "the spec"
+                    judge(read(resolved), f"{label} {resolved}")
+    except Exception:
+        logger.debug("AcpWorker: could not describe the unconfirmed spec", exc_info=True)
+    if not parts:
+        return (
+            "no file mounts anything when read again, so another tool rewrote it while "
+            "kiro-cli started"
+        )
+    return "; ".join(parts)
 
 
 def _kiro_fallback(reason: str) -> str:
@@ -340,7 +534,7 @@ def _kiro_pick_allowed() -> str:
     return ACP_BACKEND_KIRO
 
 
-def _get_acp_backend(config: Optional[dict] = None) -> str:
+def _get_acp_backend(config: Optional[dict] = None, *, sessions: Any = None) -> str:
     """Configured ``agent.acp_backend``, through the one selection gate (H3),
     then narrowed to a backend this pool's zero-tool workers can trust.
 
@@ -355,6 +549,9 @@ def _get_acp_backend(config: Optional[dict] = None) -> str:
     ``AcpRuntime`` sessions refuse every permission request but still run some
     calls without asking) and ``.acp_client_spawnable`` (not
     kas/codex, which need ``AcpRuntime`` and have no arm in ``AcpClient._spawn``).
+    A backend that passes the first and fails the second (KAS) is still returned
+    when *sessions*, the gateway's session manager, runs its shared background
+    runtime on it: the pool then runs each chunk there (:class:`SessionWorker`).
 
     The pool reads raw ``config.json``, which never passed the loader's
     normalizer, so the stored vocabulary is translated first (``"kiro"`` is Kiro
@@ -382,9 +579,34 @@ def _get_acp_backend(config: Optional[dict] = None) -> str:
         )
         return _kiro_fallback(f"{_label(resolved)} does not honor a zero-tool spec")
     if not capabilities_for(resolved).acp_client_spawnable:
+        # KAS needs ``AcpRuntime``, which the gateway's background runtime already
+        # runs; the pool uses that runtime (``SessionWorker``) when it is on this backend.
+        if _session_path_serves(resolved, sessions):
+            return resolved
         _log_capability_fallback(resolved, declared, "is not acp_client_spawnable")
         return _kiro_fallback(f"{_label(resolved)} cannot run the knowledge pool's client")
     return resolved
+
+
+def _session_path_serves(backend: str, sessions: Any) -> bool:
+    """Whether *sessions*' shared background runtime runs on *backend*.
+
+    The rule ``get_bg_session`` dispatches on (a backend in the runtime set gets a
+    fresh session per call on one shared process), plus the backend that runtime
+    spawns under, read the way it reads it. Only then can a :class:`SessionWorker`
+    run a chunk on *backend*. ``None`` or an unreadable manager answers False, so
+    the pool keeps its old path. Never raises.
+    """
+    if sessions is None:
+        return False
+    try:
+        return (
+            bool(sessions._bg_backend_supports_runtime())
+            and sessions._configured_bg_backend() == backend
+        )
+    except Exception:
+        logger.debug("Knowledge pool: background runtime unreadable", exc_info=True)
+        return False
 
 
 def _label(backend: str) -> str:
@@ -532,6 +754,67 @@ def _select_effort_level(requested: str, supported: list[str]) -> Optional[str]:
         if level in supported_levels and EFFORT_LEVELS.index(level) <= requested_index
     ]
     return eligible[-1] if eligible else None
+
+
+async def _apply_effort_to(target: Any, backend: str, requested: str, *, who: str) -> str | None:
+    """Apply *requested* effort on *target* (a client or a session) and return what was set.
+
+    The one effort writer of this pool's workers (``AcpWorker._apply_effort``, and
+    ``SessionWorker`` on each KAS session after its model is set). ``None`` means
+    nothing was sent and the provider default applies: the backend has no channel
+    for it, the option is not offered, no advertised level fits, or the write
+    failed. *who* names the worker in the log lines.
+    """
+    try:
+        via_config_option = capabilities_for(backend).effort_via_config_option
+        if not via_config_option and not capabilities_for(backend).effort_via_slash_command:
+            logger.warning(
+                "%s: effort=%s unsupported on backend=%s; using provider default",
+                who,
+                requested,
+                _label(backend),
+            )
+            return None
+        # Resolved per backend, like every other effort site: writing the
+        # wrong spelling draws "unknown config option", and the except
+        # below turns that into "using provider default" without saying
+        # why.
+        effort_option = effort_config_option_id(backend)
+        if via_config_option and not target.supports_config_option(effort_option):
+            logger.warning("%s: effort=%s unsupported; using provider default", who, requested)
+            return None
+        # The harness's own spelling first, then the advertised fold: the
+        # table answers a level this harness does not HAVE, and
+        # ``_select_effort_level`` answers one the current model will not
+        # take. Both are asked here so this site writes the same value as
+        # the three other effort writers.
+        requested = effort_config_option_value(backend, requested)
+        supported = target.get_valid_effort_levels()
+        if not isinstance(supported, list):
+            supported = []
+        effective = _select_effort_level(requested, supported)
+        if effective is None:
+            logger.warning(
+                "%s: no supported effort at or below %s; using provider default",
+                who,
+                requested,
+            )
+            return None
+        if via_config_option:
+            await target.set_config_option(effort_option, effective)
+        else:
+            await target.send_command("/effort", args={"level": effective})
+    except Exception:
+        logger.warning(
+            "%s: could not apply effort=%s; using provider default",
+            who,
+            requested,
+            exc_info=True,
+        )
+        return None
+    if effective != requested:
+        logger.warning("%s: effort=%s downgraded to supported effort=%s", who, requested, effective)
+    return effective
 
 
 def _repair_agent_spec(tolerate_registered_injection: bool = False) -> bool:
@@ -738,24 +1021,21 @@ class AcpWorker(Worker):
                     authored_before_spawn=authored_before_spawn,
                 )
             if not confirmed:
-                logger.warning(
-                    'AcpWorker: agent=%s backend=%s spec does not declare "tools": []; '
-                    "refusing to start the worker",
-                    AGENT_NAME,
-                    POLICY_ID_BY_BACKEND.get(acp_backend, acp_backend),
-                )
+                client, self._client = self._client, None
                 try:
-                    await self._client.shutdown()
+                    await client.shutdown()
                 except Exception:
                     logger.debug(
                         "AcpWorker: unconfirmed-spec client shutdown failed", exc_info=True
                     )
-                self._client = None
-                raise RuntimeError(
-                    f"knowledge agent {AGENT_NAME!r} could not be confirmed to declare a "
-                    "zero-tool spec (a project-level spec may shadow the installed one, "
-                    "or the installed one could not be read or restored); refusing to run "
-                    "the knowledge pool without a confirmed tool ban"
+                detail = await asyncio.to_thread(_unconfirmed_spec_detail, client)
+                raise KnowledgeSpecUnconfirmed(
+                    f"{KnowledgeSpecUnconfirmed.code}: knowledge agent {AGENT_NAME!r} could not "
+                    "be confirmed to declare a zero-tool spec after Kiro Crew's repair "
+                    f"({detail}); refusing to run the knowledge pool without a confirmed tool "
+                    f"ban. {WRITE_BACK_CAUSE}, or remove or rename the file named here if you "
+                    "added it yourself; the pool tries again after "
+                    f"{int(SPEC_REFUSAL_COOLDOWN_SECS)} seconds"
                 )
         await self._apply_effort()
         # Shield the live worker PID from the periodic orphan sweep for as long
@@ -801,7 +1081,7 @@ class AcpWorker(Worker):
             spec = getattr(getattr(self._client, "_handle", None), "consumed_agent_spec", None)
             if not isinstance(spec, dict) or spec.get("tools") != []:
                 await self.shutdown()
-                raise RuntimeError(
+                raise KnowledgeSpecUnconfirmed(
                     f"Knowledge worker backend {backend!r} did not confirm a zero-tool spec"
                 )
             logger.info(
@@ -839,7 +1119,7 @@ class AcpWorker(Worker):
                 confirmed = self._client.spec_zero_tools
             if not confirmed:
                 await self.shutdown()
-                raise RuntimeError(
+                raise KnowledgeSpecUnconfirmed(
                     f"Knowledge worker backend {backend!r} did not confirm a zero-tool spec"
                 )
 
@@ -904,7 +1184,12 @@ class AcpWorker(Worker):
             authored_before_spawn = await asyncio.to_thread(
                 client.authored_spec_declares_zero_tools
             )
-        await client.ensure_ready()
+        try:
+            await client.ensure_ready()
+        except Exception as exc:
+            if acp_backend == ACP_BACKEND_KIRO and await _kiro_cli_signed_out(exc):
+                raise KnowledgeKiroCliSignedOut() from exc
+            raise
         return client, authored_before_spawn
 
     async def _apply_effort(self) -> None:
@@ -929,64 +1214,13 @@ class AcpWorker(Worker):
         inherit an existing member's.
         """
         client = self._client
-        requested = self._effort
-        if client is None or requested is None:
+        if client is None or self._effort is None:
             return
-        try:
-            backend = getattr(client, "backend", "")
-            via_config_option = capabilities_for(backend).effort_via_config_option
-            if not via_config_option and not capabilities_for(backend).effort_via_slash_command:
-                logger.warning(
-                    "AcpWorker: effort=%s unsupported on backend=%s; using provider default",
-                    requested,
-                    _label(backend),
-                )
-                return
-            # Resolved per backend, like every other effort site: writing the
-            # wrong spelling draws "unknown config option", and the except
-            # below turns that into "using provider default" without saying
-            # why.
-            effort_option = effort_config_option_id(backend)
-            if via_config_option and not client.supports_config_option(effort_option):
-                logger.warning(
-                    "AcpWorker: effort=%s unsupported; using provider default",
-                    requested,
-                )
-                return
-            # The harness's own spelling first, then the advertised fold: the
-            # table answers a level this harness does not HAVE, and
-            # ``_select_effort_level`` answers one the current model will not
-            # take. Both are asked here so this site writes the same value as
-            # the three other effort writers.
-            requested = effort_config_option_value(backend, requested)
-            supported = client.get_valid_effort_levels()
-            if not isinstance(supported, list):
-                supported = []
-            effective = _select_effort_level(requested, supported)
-            if effective is None:
-                logger.warning(
-                    "AcpWorker: no supported effort at or below %s; " "using provider default",
-                    requested,
-                )
-                return
-            if via_config_option:
-                await client.set_config_option(effort_option, effective)
-            else:
-                await client.send_command("/effort", args={"level": effective})
-        except Exception:
-            logger.warning(
-                "AcpWorker: could not apply effort=%s; using provider default",
-                requested,
-                exc_info=True,
-            )
-            return
-        self._effective_effort = effective
-        if effective != requested:
-            logger.warning(
-                "AcpWorker: effort=%s downgraded to supported effort=%s",
-                requested,
-                effective,
-            )
+        effective = await _apply_effort_to(
+            client, getattr(client, "backend", ""), self._effort, who="AcpWorker"
+        )
+        if effective is not None:
+            self._effective_effort = effective
 
     async def send_message(self, prompt: str, timeout: float = DEFAULT_TIMEOUT) -> str:
         if self._provider is not None:
@@ -1011,11 +1245,23 @@ class AcpWorker(Worker):
                     timeout,
                 )
             return await self._client.send_message(prompt, timeout=timeout)
-        except BaseException:
+        except (Exception, asyncio.CancelledError) as exc:
             # A timed-out turn is still running in the child, so a reused client
             # answers "Prompt already in progress". Prompts are self-contained,
             # so drop the client on any failure and let acquire respawn it.
+            backend = getattr(self._client, "backend", None)
             await self.shutdown()
+            # A signed-out bundled kiro-cli-chat opens sessions and then fails
+            # every prompt as a connection error, so the start above cannot see
+            # it. Ask only for that error, as the chat path does. Twin check:
+            # AcpSessionProvider._connection_failure_is_signed_out in
+            # acp/session_provider.py; keep the two in step.
+            if (
+                backend == ACP_BACKEND_KIRO
+                and getattr(exc, "connection_failure", None) is True
+                and await _kiro_cli_signed_out(exc)
+            ):
+                raise KnowledgeKiroCliSignedOut() from exc
             raise
 
     async def shutdown(self) -> None:
@@ -1224,6 +1470,7 @@ class CCWorker(Worker):
                 if event is not None:
                     await self._event_queue.put(event)
         except Exception:
+            # A read error ends the reader the same way the end of the stream does.
             pass
         finally:
             await self._event_queue.put(None)
@@ -1357,6 +1604,11 @@ class LLMPool:
     Dead workers are replaced transparently on acquire.
     """
 
+    # When and why a worker last failed its zero-tool confirmation; while it is
+    # fresh, ``_create_worker`` refuses without spawning (SPEC_REFUSAL_COOLDOWN_SECS).
+    # Class-level so a pool built without ``__init__`` still has it.
+    _spec_refusal: Optional[tuple[float, KnowledgeSpecUnconfirmed]] = None
+
     def __init__(
         self,
         pool_size: int = DEFAULT_POOL_SIZE,
@@ -1366,8 +1618,13 @@ class LLMPool:
         fallback_effort: str = "",
         config_pool_size_key: Optional[str] = None,
         use_config_pool_size: Optional[bool] = None,
+        sessions: Optional[Callable[[], Any]] = None,
     ):
         self._pool_size = pool_size
+        # Returns the gateway's session manager (or None). Read per worker, so a
+        # pool built before the manager exists still finds it. Without it a backend
+        # the pool cannot spawn a client for falls back as before.
+        self._sessions = sessions
         self._effort = _normalize_effort(effort)
         # Workload-bound effort resolution: when ``effort_key`` is set, the
         # effort is re-resolved from the config read in ``start()`` (explicit
@@ -1494,11 +1751,13 @@ class LLMPool:
     def provider_type(self) -> str:
         return self._provider_type
 
-    async def start(self) -> None:
+    async def start(self, *, should_stop: Callable[[], BaseException | None] | None = None) -> None:
         """Spawn all workers based on configured provider."""
         async with self._start_lock:
             if self._started:
                 return
+            if should_stop is not None and (refusal := should_stop()) is not None:
+                raise refusal
             # Read config once, off the event loop, and reuse for every worker.
             config = await asyncio.to_thread(_read_config)
             self._provider_type = _get_provider_type(config)
@@ -1539,6 +1798,7 @@ class LLMPool:
                     try:
                         await w.shutdown()
                     except Exception:
+                        # One worker's failed shutdown must not stop the others' cleanup.
                         pass
                 self._workers.clear()
                 self._available = asyncio.Queue()
@@ -1554,6 +1814,16 @@ class LLMPool:
                 self._provider_type,
             )
 
+    def _session_manager(self) -> Any:
+        """The gateway's session manager, or None (no getter, or it raised)."""
+        if self._sessions is None:
+            return None
+        try:
+            return self._sessions()
+        except Exception:
+            logger.debug("LLMPool: session manager unreadable", exc_info=True)
+            return None
+
     async def _create_worker(self) -> Worker:
         """Create and start a new worker based on provider type.
 
@@ -1568,19 +1838,40 @@ class LLMPool:
         Off the loop because the read stats and may re-parse ``config.json``,
         the same reason ``start`` offloads its own read.
         """
+        refused = self._spec_refusal
+        if refused is not None:
+            if time.monotonic() - refused[0] < SPEC_REFUSAL_COOLDOWN_SECS:
+                raise KnowledgeSpecUnconfirmed(str(refused[1]))
+            self._spec_refusal = None
         sandbox_mode = await asyncio.to_thread(_get_sandbox_mode)
         if is_claude_code(self._provider_type):
             worker: Worker = CCWorker(sandbox_mode=sandbox_mode)
         else:
-            worker = AcpWorker(
-                sandbox_mode=sandbox_mode,
-                effort=self._effort,
-                acp_backend=await asyncio.to_thread(_get_acp_backend),
-            )
-        await worker.start()
+            sessions = self._session_manager()
+            acp_backend = await asyncio.to_thread(_get_acp_backend, sessions=sessions)
+            if capabilities_for(acp_backend).acp_client_spawnable:
+                worker = AcpWorker(
+                    sandbox_mode=sandbox_mode,
+                    effort=self._effort,
+                    acp_backend=acp_backend,
+                )
+            else:
+                # Only returned when the session manager's background runtime runs it.
+                from kiro_crew.knowledge.llm_pool_session import SessionWorker
+
+                worker = SessionWorker(sessions, backend=acp_backend, effort=self._effort)
+        try:
+            await worker.start()
+        except KnowledgeSpecUnconfirmed as exc:
+            # Logged once per refusal window; the starts it then refuses are silent.
+            logger.warning("LLMPool: %s", exc)
+            self._spec_refusal = (time.monotonic(), exc)
+            raise
         return worker
 
-    async def acquire(self) -> tuple[int, Worker]:
+    async def acquire(
+        self, *, should_stop: Callable[[], BaseException | None] | None = None
+    ) -> tuple[int, Worker]:
         """Acquire a worker from the pool. Blocks if all busy.
 
         Returns (worker_index, worker). Caller must release after use.
@@ -1591,7 +1882,9 @@ class LLMPool:
             if self._closed:
                 raise LLMPoolClosed()
             if not self._started:
-                await self.start()
+                if should_stop is not None and (refusal := should_stop()) is not None:
+                    raise refusal
+                await self.start(should_stop=should_stop)
             await self._semaphore.acquire()
             async with self._start_lock:
                 if not self._started:
@@ -1609,10 +1902,14 @@ class LLMPool:
                 worker = self._workers[idx]
 
             if not worker.is_alive():
+                if should_stop is not None and (refusal := should_stop()) is not None:
+                    self.release(idx)
+                    raise refusal
                 logger.warning("LLMPool: worker %d dead, replacing", idx)
                 try:
                     await worker.shutdown()
                 except Exception:
+                    # A replacement is created below whatever the dead worker's shutdown does.
                     pass
                 try:
                     new_worker = await self._create_worker()
@@ -1633,6 +1930,7 @@ class LLMPool:
                     try:
                         await new_worker.shutdown()
                     except Exception:
+                        # The fresh worker is discarded either way.
                         pass
                     continue
 
@@ -1727,12 +2025,24 @@ class LLMPool:
         self,
         prompt: str,
         timeout: float = DEFAULT_TIMEOUT,
+        *,
+        should_stop: Callable[[], BaseException | None] | None = None,
     ) -> str:
         """Convenience: acquire a worker, send prompt, release, return response."""
-        idx, worker = await self.acquire()
+        idx, worker = await self.acquire(should_stop=should_stop)
+        if should_stop is not None and (refusal := should_stop()) is not None:
+            self.release(idx)
+            raise refusal
         try:
             # After acquire: start() has run, so the bound floor is resolved.
             return await worker.send_message(prompt, timeout=max(timeout, self._timeout_floor))
+        except KnowledgeSpecUnconfirmed as exc:
+            # A worker can be refused mid-call (KAS judges each session); start the
+            # same cooldown a refused start does, so the next acquire spawns nothing.
+            if self._spec_refusal is None:
+                logger.warning("LLMPool: %s", exc)
+                self._spec_refusal = (time.monotonic(), exc)
+            raise
         except Exception as exc:
             if self._closed:
                 raise LLMPoolClosed() from exc
@@ -1795,33 +2105,34 @@ class LLMPool:
             return []
 
         results: list[str] = [""] * len(prompts)
-        terminal: list[BaseException] = []
-        floor_hit: list[BaseException] = []
+        refused: Exception | None = None
+        halted: Exception | None = None
+
+        def pending_failure() -> Exception | None:
+            return refused if refused is not None else halted
 
         async def _do_one(idx: int, prompt: str) -> None:
-            if terminal or floor_hit:
+            nonlocal refused, halted
+            if refused is not None:
+                raise refused
+            if halted is not None:
                 return
-            slot, worker = await self.acquire()
-            sent = False
             try:
-                # Re-checked after the wait: a prompt queued behind a full pool
-                # may have been waiting while an earlier one proved the backend
-                # terminal or exceeded the bound-lane floor, and spending its
-                # slot would buy nothing.
-                if terminal or floor_hit:
-                    return
-                sent = True
-                results[idx] = await worker.send_message(
-                    prompt, timeout=max(timeout, self._timeout_floor)
-                )
-            except (KnowledgeHarnessUnavailable, LLMPoolClosed):
+                results[idx] = await self.send(prompt, timeout=timeout, should_stop=pending_failure)
+            except (KnowledgeHarnessUnavailable, KnowledgeSpecUnconfirmed, LLMPoolClosed) as exc:
+                # A refusal aborts the ingest. Queued chunks stop before acquiring
+                # a new worker and turns already sent release theirs in send().
+                if refused is None:
+                    refused = exc
                 raise
             except Exception as e:
-                if self._closed:
-                    raise LLMPoolClosed() from e
+                if e is halted:
+                    return
+                # MERGE-REVIEW: The bound lane uses the timeout floor as a health
+                # signal. Skip queued chunks once that floor is exceeded.
                 if self._timeout_floor > 0 and is_acp_timeout(e):
-                    if not floor_hit:
-                        floor_hit.append(e)
+                    if halted is None:
+                        halted = e
                         logger.warning(
                             "LLMPool: prompt exceeded the %.0fs timeout floor; "
                             "the serving lane is unhealthy, abandoning the remaining "
@@ -1829,22 +2140,20 @@ class LLMPool:
                             self._timeout_floor,
                         )
                 elif getattr(e, "transient", None) is False:
-                    if terminal:
+                    if halted is not None:
                         logger.debug("LLMPool: batch item %d hit the same terminal error", idx)
                     else:
-                        terminal.append(e)
+                        halted = e
                         logger.warning("LLMPool: batch abandoned, backend is terminal: %s", e)
                 else:
                     logger.warning("LLMPool: batch item %d failed: %s", idx, e)
-                results[idx] = ""
-            finally:
-                try:
-                    if sent:
-                        await self._maybe_recycle(slot, worker)
-                finally:
-                    self.release(slot)
 
-        await asyncio.gather(*[_do_one(i, p) for i, p in enumerate(prompts)])
+        tasks = [asyncio.ensure_future(_do_one(i, p)) for i, p in enumerate(prompts)]
+        for task in tasks:
+            # The items outlive a raised gather; retrieve each one's exception so
+            # asyncio never logs it as unretrieved.
+            task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        await asyncio.gather(*tasks)
         return results
 
     async def shutdown(self) -> None:

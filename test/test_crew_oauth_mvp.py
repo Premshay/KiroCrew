@@ -126,7 +126,7 @@ def test_the_flag_is_off_unless_config_says_true(home, monkeypatch):
     assert crew_oauth.enabled() is False
     _write_config(home, _PREVIEW_ON)
     assert crew_oauth.enabled() is True
-    assert crew_oauth.manages("slack") is False
+    assert crew_oauth.manages("hubspot") is False
 
 
 @pytest.mark.parametrize(
@@ -293,6 +293,31 @@ def test_token_endpoint_errors_carry_no_value():
     with pytest.raises(CrewOAuthError) as err:
         crew_oauth.tokens_from_response({"error": "bad_verification_code"}, 0.0)
     assert err.value.code == "bad_verification_code"
+
+
+def test_vendor_error_text_is_sanitized_in_audit_and_code(caplog):
+    import logging
+    import re
+
+    with pytest.raises(CrewOAuthError) as err:
+        crew_oauth.tokens_from_response({"error": "bad\nforged line\x1b[31m"}, 0.0)
+    assert re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", err.value.code)
+    with caplog.at_level(logging.INFO):
+        crew_oauth._audit("op", "error", "github", "bad\nforged\x1b[31m")
+    lines = [r.getMessage() for r in caplog.records]
+    assert lines and all("\n" not in m and "\x1b" not in m for m in lines)
+
+
+def test_a_vendor_error_with_nothing_allowed_reads_as_exchange_failed():
+    with pytest.raises(CrewOAuthError) as err:
+        crew_oauth.tokens_from_response({"error": "\n\x1b !!"}, 0.0)
+    assert err.value.code == "exchange_failed"
+
+
+def test_the_refresh_refusal_text_never_carries_vendor_control_text():
+    resp = crew_oauth_proxy._refresh_refusal("bad\nforged\x1b[31m")
+    message = json.loads(resp.text)["error"]
+    assert "\n" not in message and "\x1b" not in message
 
 
 # --- sign-in listener -------------------------------------------------------
@@ -716,7 +741,7 @@ def test_a_stored_pair_is_found_whatever_the_flag_says(tmp_path, monkeypatch):
     assert crew_oauth.holds_grant("github") is False
     TokenStore(vault).replace("github", Tokens("a", "r", None, ""))
     assert crew_oauth.holds_grant("github") is True
-    assert crew_oauth.holds_grant("slack") is False
+    assert crew_oauth.holds_grant("hubspot") is False
 
 
 def test_the_warm_universe_leaves_a_crew_owned_provider_out(monkeypatch):

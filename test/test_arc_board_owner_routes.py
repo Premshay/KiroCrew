@@ -20,7 +20,7 @@ from dashboard_owner_helpers import as_owner
 MEMBER = "chat-arc-member"
 PEER = "chat-arc-peer"
 NEW = "chat-arc-new"
-SECRET = "sk-ant-api03-" + "A" * 40
+SECRET = "sk-ant-api03-" + "A" * 80
 
 
 @pytest.mark.asyncio

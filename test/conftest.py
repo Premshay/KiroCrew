@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import asyncio.proactor_events
 import errno
+import functools
 import json
 import os
 import pathlib
@@ -17,6 +18,7 @@ import time
 import urllib.error
 import urllib.parse
 from collections.abc import Iterator
+from types import ModuleType
 
 import pytest
 from hypothesis import HealthCheck, settings
@@ -96,7 +98,8 @@ def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None):
     the state after the test's ``monkeypatch`` has undone; autouse fixtures in one
     conftest are set up in alphabetical order and an earlier one already requests
     ``monkeypatch``, so a fixture here would be torn down first. For the same reason
-    it empties the boot-checked caches (``forget_home_bound_caches``) here.
+    it empties the boot-checked caches (``forget_home_bound_caches``) here, and
+    releases a finished ``tree_scan`` group's module memos (``release_tree_scan_memos``).
     """
     leaked: list[str] = []
     try:
@@ -108,6 +111,7 @@ def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None):
                 setattr(module, name, value)
                 leaked.append(f"{module.__name__}.{name}")
         forget_home_bound_caches()
+        release_tree_scan_memos(item, nextitem)
     if leaked:
         pytest.fail(f"test left {', '.join(leaked)} rebound (restored)", pytrace=False)
     return result
@@ -249,6 +253,18 @@ def bundled_python_with_user_site(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(platform_compat, "is_bundled_interpreter", lambda: True)
 
 
+# The per-test guards run behind these fixtures; ``seal_guards`` at the end of this
+# file sorts the guards bound here into them.
+from conftest_guards import (  # noqa: E402,F401 -- bound for pytest and importers
+    _b_guards,
+    _e_guards,
+    _h_guards,
+    _j_guards,
+    _o_guards,
+    per_test_guard,
+    seal_guards,
+)
+
 # Helpers and opt-in fixtures tests import or request by name.
 from conftest_opt_in import (  # noqa: E402,F401 -- bound for pytest and importers
     absent_sysconf,
@@ -275,38 +291,58 @@ from conftest_opt_in import (  # noqa: E402,F401 -- bound for pytest and importe
 # Per-test resets of process-global kiro_crew state, and the network fences.
 from conftest_resets import (  # noqa: E402,F401 -- bound for pytest and importers
     _approve_every_mcp_launch,
+    _cold_source_link_settings,
+    _cold_vault_read_audit,
     _crewmate_dynamic_capabilities_on,
     _disable_dev_fleet_background_tasks,
     _disarm_agent_slice_memory_high,
     _drop_live_config_snapshot,
     _ensure_event_loop,
     _fake_computer_use_backend,
+    _forget_app_declared_row_listings,
     _forget_app_turn_approver,
+    _forget_declared_mcp_not_ready_notes,
     _forget_enterprise_profile_pin,
+    _forget_gatewayd_telemetry_override,
     _forget_legacy_auth_sweep_clean_roots,
     _forget_mount_source_sweep_pacing,
+    _forget_observed_people,
+    _forget_offered_instance_types,
+    _forget_pending_trace_links,
+    _forget_registry_ssh_sign_in_refusals,
     _forget_sandbox_launch_mark,
+    _forget_tracing_switch,
     _fresh_aws_bin_dir_trust,
+    _fresh_config_load_debug_memories,
+    _fresh_dev_fleet_service_reads,
     _fresh_hardlink_spec_warnings,
     _fresh_reexec_environment,
     _fresh_released_sessions_warning,
     _history_cleanup_throttle_closed,
     _inline_taskq_pump,
     _isolate_advertised_model_cache,
+    _isolate_context_store_caches,
     _isolate_display_verdicts,
     _isolate_kiro_window_cache,
+    _isolate_member_identity_cache,
+    _ledger_create_ignores_live_memory,
     _no_boot_heap_freeze,
     _no_boot_sandbox_sweep,
     _no_carried_auto_update_effect,
+    _no_host_posture_published,
     _no_inherited_git_proxy_env,
     _no_live_catalog_network,
     _no_live_kernel_memory_pressure,
     _no_managed_venv_override,
     _no_release_feed_network,
     _no_restart_ready_timeout_override,
+    _published_redaction_verdict_on,
     _release_source_corpus_after_module,
     _release_stt_engine,
+    _reset_browser_host_approvals,
+    _reset_browser_media_watches,
     _reset_channel_turn_ceiling,
+    _reset_chromium_opt_in_record,
     _reset_cjk_segmenter,
     _reset_create_rate_limit_buckets,
     _reset_crewmate_worker_slots,
@@ -314,15 +350,22 @@ from conftest_resets import (  # noqa: E402,F401 -- bound for pytest and importe
     _reset_env_boot_record_and_ownership,
     _reset_live_execution_records,
     _reset_materialized_agents_snapshot,
+    _reset_resource_subscription_state,
     _reset_runtime_ownership_tables,
     _reset_safety_override_between_tests,
     _reset_session_switch_locks,
+    _reset_subagent_not_due_memo,
     _restore_autonudge_singleton,
     _restore_default_child_watcher,
     _session_memory_scope_sample_unshared,
     _shut_down_shared_pools_in_session,
     _small_default_host,
     forget_home_bound_caches,
+)
+
+# Per-test resets of process-global kiro_crew.acp state.
+from conftest_resets_acp import (  # noqa: E402,F401 -- bound for pytest and importers
+    _reset_kas_agent_config_error_reports,
 )
 
 # The in-memory Slack client and the Slack state resets.
@@ -372,6 +415,7 @@ REDOS_SCALING_FLOOR_SECONDS = 0.25
 _PEM_DASHES = "-" * 5
 _PEM_TAIL_HALF = f"ATE KEY{_PEM_DASHES}\nMIIBOgIBAAJBAKJ2\n"
 
+
 #: Credential shapes a message cap can SEVER. Each half is clean on its own, so
 #: scrubbing the two pieces separately sees nothing, while a reader shown them one
 #: after the other sees the key -- the platform renders the markup away.
@@ -385,21 +429,55 @@ _PEM_TAIL_HALF = f"ATE KEY{_PEM_DASHES}\nMIIBOgIBAAJBAKJ2\n"
 #: Shared because two suites pin the same table -- the primitive that decides where
 #: a cut may fall (``test_display_split_safety.py``) and the renderer that applies
 #: it (``test_wecom_renderer.py``) -- and a duplicated fixture table drifts.
-CREDENTIAL_STRADDLE_SHAPES = [
-    pytest.param("[AKIA](https://ex.test/a,b)", "IOSFODNN7EXAMPLE", id="link-target-comma"),
-    pytest.param(
-        "Authorization: Bearer",
-        " abcdefghijklmnopqrstuvwxyz0123456789",
-        id="header-whitespace",
-    ),
-    pytest.param("AKIAIOSF_", "_ODNN7EXAMPLE", id="underscore-emphasis"),
-    pytest.param("AKIAIOSF~", "~ODNN7EXAMPLE", id="tilde-emphasis"),
-    pytest.param("https://evil.test/?q=AKIAIOSFODNN7", "EXAMPLE.", id="url-punctuation"),
-    pytest.param("[l](https://ex.test/x/AKIAIOSF", "ODNN7EXAMPLE)", id="cut-inside-a-url"),
-    pytest.param(f"{_PEM_DASHES}BEGIN RSA PRIV", _PEM_TAIL_HALF, id="pem-anchor"),
-    pytest.param(f"{_PEM_DASHES}BEG**IN** RSA PRIV", _PEM_TAIL_HALF, id="pem-anchor-markup-split"),
-    pytest.param("AKIAIOSF", "ODNN7EXAMPLE", id="no-markup-at-all"),
-]
+#:
+#: The key-shaped rows split a synthetic Google API key the redactor removes by its
+#: published format (``AIza`` and 35 letters and digits, so no half carries markup of
+#: its own); a bare 40-character run and an AWS key ID stay visible and would prove
+#: nothing here.
+#:
+#: Read as ``from conftest import CREDENTIAL_STRADDLE_SHAPES``. Built on first read
+#: by the module ``__getattr__`` below, so collecting a file that never asks for it
+#: does not import the redaction stack ``synthetic_credentials`` reaches
+#: (test/test_conftest_import_budget.py holds that line).
+def _credential_straddle_shapes() -> list:
+    from kiro_crew.testing import synthetic_credentials as _synthetic_credentials
+
+    _STRADDLE_KEY = "AIza" + _synthetic_credentials.synth(35, seed=17)
+    return [
+        pytest.param(
+            f"[{_STRADDLE_KEY[:4]}](https://ex.test/a,b)", _STRADDLE_KEY[4:], id="link-target-comma"
+        ),
+        pytest.param(
+            "Authorization: Bearer",
+            " abcdefghijklmnopqrstuvwxyz0123456789",
+            id="header-whitespace",
+        ),
+        pytest.param(f"{_STRADDLE_KEY[:8]}_", f"_{_STRADDLE_KEY[8:]}", id="underscore-emphasis"),
+        pytest.param(f"{_STRADDLE_KEY[:8]}~", f"~{_STRADDLE_KEY[8:]}", id="tilde-emphasis"),
+        pytest.param(
+            f"https://evil.test/?q={_STRADDLE_KEY[:14]}",
+            f"{_STRADDLE_KEY[14:]}.",
+            id="url-punctuation",
+        ),
+        pytest.param(
+            f"[l](https://ex.test/x/{_STRADDLE_KEY[:8]}",
+            f"{_STRADDLE_KEY[8:]})",
+            id="cut-inside-a-url",
+        ),
+        pytest.param(f"{_PEM_DASHES}BEGIN RSA PRIV", _PEM_TAIL_HALF, id="pem-anchor"),
+        pytest.param(
+            f"{_PEM_DASHES}BEG**IN** RSA PRIV", _PEM_TAIL_HALF, id="pem-anchor-markup-split"
+        ),
+        pytest.param(_STRADDLE_KEY[:8], _STRADDLE_KEY[8:], id="no-markup-at-all"),
+    ]
+
+
+def __getattr__(name: str):
+    if name == "CREDENTIAL_STRADDLE_SHAPES":
+        shapes = _credential_straddle_shapes()
+        globals()[name] = shapes
+        return shapes
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def assert_rejected_without_backtracking(
@@ -519,7 +597,7 @@ def assert_rejected_without_backtracking(
 #: where it is.
 
 
-@pytest.fixture(autouse=True)
+@per_test_guard
 def _fresh_update_ownership(_floor_monkeypatch):
     """Give every test its own update-ownership registry, and fail one that leaks a step.
 
@@ -549,7 +627,7 @@ def _fresh_update_ownership(_floor_monkeypatch):
     assert not open_steps, f"the test left update steps open: {open_steps}"
 
 
-@pytest.fixture(autouse=True)
+@per_test_guard
 def _krb5_keyring_check_done(_floor_monkeypatch):
     """Mark the once-per-process KEYRING ccache check as already run, for every test.
 
@@ -565,7 +643,7 @@ def _krb5_keyring_check_done(_floor_monkeypatch):
     _floor_monkeypatch.setattr(env_krb5_keyring, "_KRB5_KEYRING_CHECKED", True)
 
 
-@pytest.fixture(autouse=True)
+@per_test_guard
 def _fresh_host_unservable_backends(_floor_monkeypatch):
     """Give every test its own copy of the host's KAS-floor verdicts.
 
@@ -581,9 +659,28 @@ def _fresh_host_unservable_backends(_floor_monkeypatch):
     _floor_monkeypatch.setattr(backends, "_host_unservable", dict(backends._host_unservable))
     _floor_monkeypatch.setattr(backends, "_kiro_cli_offers_kas", False)
     _floor_monkeypatch.setattr(backends, "_kiro_cli_kas_probed", False)
+    # The gateway floor asks again about an unknown Kiro CLI pick after minutes; a
+    # test that drives the floor opts into those asks with delays of its own.
+    from kiro_crew.agent_sdk import kas_floor_wait
+
+    _floor_monkeypatch.setattr(
+        kas_floor_wait, "KIRO_PICK_VERDICT_RETRY_SECS", ()  # flake-ok: no ask, no wait
+    )
 
 
-@pytest.fixture(autouse=True)
+@per_test_guard
+def _no_kiro_signin_hold(_floor_monkeypatch):
+    """Start every test with the warm pool's signed-out hold released.
+
+    A pool start that fails on ``AcpAuthRequired`` records the hold as process
+    state, so it would otherwise keep a later test's pool from filling.
+    """
+    from kiro_crew.acp import kiro_signin_hold
+
+    _floor_monkeypatch.setattr(kiro_signin_hold, "_HELD", {})
+
+
+@per_test_guard
 def _fresh_mcp_oauth_provenance(_floor_monkeypatch):
     """Give every test its own record of the MCP sign-in links children sent.
 
@@ -598,7 +695,22 @@ def _fresh_mcp_oauth_provenance(_floor_monkeypatch):
     _floor_monkeypatch.setattr(mcp_oauth_provenance, "_emitted", OrderedDict())
 
 
-@pytest.fixture(autouse=True)
+@per_test_guard
+def _no_kiro_telemetry_destination(_floor_monkeypatch):
+    """Keep the built-in Kiro telemetry destination out of every test.
+
+    The public provider returns it next to the configured entries, and it posts to
+    a real endpoint. Off here, so a test that builds a live recorder never reaches
+    the network and every existing destination count stays what it was. The tests
+    of the destination turn it back on with their own ``monkeypatch``.
+    """
+    from kiro_crew.metrics import kiro_export
+
+    _floor_monkeypatch.setattr(kiro_export, "_suppressed_for_tests", True)
+    _floor_monkeypatch.setattr(kiro_export, "_last_build_kept", False)
+
+
+@per_test_guard
 def _relay_unless_a_test_opens_the_kas_route(_floor_monkeypatch):
     """Start every test with KAS's automatic bundle switch closed and no install state.
 
@@ -611,9 +723,14 @@ def _relay_unless_a_test_opens_the_kas_route(_floor_monkeypatch):
     state are process slots, rebound per test so one test's spawn is not the next
     one's.
     """
-    from kiro_crew.acp import kas_engine_install, kas_route
+    from kiro_crew.acp import kas_build_default, kas_engine_install, kas_route
 
     _floor_monkeypatch.setattr(kas_route, "automatic_switch_allowed", lambda pin="": False)
+    _floor_monkeypatch.setattr(kas_build_default, "_FIRST_SWITCH_FAILED_AT", 0.0)
+    _floor_monkeypatch.setattr(kas_build_default, "_ENGINE_RAN", False)
+    _floor_monkeypatch.setattr(kas_route, "_PREVIEW_BUNDLE_FAILED", "")
+    _floor_monkeypatch.setattr(kas_route, "_PREVIEW_BUNDLE_FAILED_AT", 0.0)
+    _floor_monkeypatch.setattr(kas_route, "_PREVIEW_SKIP_LOGGED", "")
     _floor_monkeypatch.setattr(kas_route, "_LAST_SPAWN_ROUTE", None)
     _floor_monkeypatch.setattr(
         kas_engine_install,
@@ -622,7 +739,7 @@ def _relay_unless_a_test_opens_the_kas_route(_floor_monkeypatch):
     )
 
 
-@pytest.fixture(autouse=True)
+@per_test_guard
 def _kas_projection_relays_no_runner_auth_env(_floor_monkeypatch):
     """Project KAS agents without the runner's own ssh-agent socket or Kerberos cache.
 
@@ -638,7 +755,7 @@ def _kas_projection_relays_no_runner_auth_env(_floor_monkeypatch):
     _floor_monkeypatch.setattr(kas_env_launch, "inherited_auth_env", lambda _forward: {})
 
 
-@pytest.fixture(autouse=True)
+@per_test_guard
 def _registry_governance_reachability_unknown(_floor_monkeypatch):
     """Answer "governance may reach this sign-in" unless a test says otherwise.
 
@@ -655,7 +772,7 @@ def _registry_governance_reachability_unknown(_floor_monkeypatch):
     _floor_monkeypatch.setattr(kiro_cli, "_governance_warm_running", False)
 
 
-@pytest.fixture(autouse=True)
+@per_test_guard
 def _tool_deferral_state_starts_empty(_floor_monkeypatch):
     """Start every test with no tools-list refusal on record and no PATH probe answer.
 
@@ -676,7 +793,7 @@ def _tool_deferral_state_starts_empty(_floor_monkeypatch):
     _floor_monkeypatch.setattr(kiro_cli_path_probe, "warm", lambda: None)
 
 
-@pytest.fixture(autouse=True)
+@per_test_guard
 def _config_content_check_off_unless_a_test_turns_it_on(_floor_monkeypatch):
     """Turn the config content check off for tests that do not ask for it.
 
@@ -815,7 +932,7 @@ def _windows_restrict_to_owner_stub(request, _floor_monkeypatch):
     yield
 
 
-@pytest.fixture(autouse=True)
+@per_test_guard
 def _no_inherited_admission_service(_floor_monkeypatch):
     """Start every test without a Shared Crew admission service another test built.
 
@@ -832,7 +949,7 @@ def _no_inherited_admission_service(_floor_monkeypatch):
     yield
 
 
-@pytest.fixture(autouse=True)
+@per_test_guard
 def _isolate_aim_skills_dir(_floor_monkeypatch):
     """Prevent SkillsLoader from discovering edition-contributed skill roots.
 
@@ -879,6 +996,46 @@ def in_tree_scan_group(item: pytest.Item) -> bool:
         return False
     name = marker.kwargs.get("name", marker.args[0] if marker.args else "")
     return isinstance(name, str) and name.startswith("tree_scan")
+
+
+def _xdist_group_name(item: pytest.Item | None) -> object:
+    marker = item.get_closest_marker("xdist_group") if item is not None else None
+    if marker is None:
+        return None
+    return marker.kwargs.get("name", marker.args[0] if marker.args else "")
+
+
+#: Test modules whose items ran in the ``tree_scan`` group this worker is inside now.
+_TREE_SCAN_GROUP_MODULES: dict[str, ModuleType] = {}
+
+
+def release_tree_scan_memos(item: pytest.Item, nextitem: pytest.Item | None) -> None:
+    """Empty the module-level ``lru_cache``s of a ``tree_scan`` group once it is done.
+
+    A tree scan memoises its corpus (file texts, parsed patch sites) in its own test
+    module so the group's tests read the tree once. pytest keeps every module object for
+    the session, so without this the memo lived for the rest of the worker:
+    ``test_facade_mirror_guards.py`` alone kept 360 MiB of test-tree text and events.
+    ``--dist loadgroup`` runs a group's items back to back on one worker, including the
+    ``test_facade_shared_checks.py`` params that reuse another module's memo, so the memo
+    is released when the next item is in a different group, never in the middle.
+    Only caches defined in the group's own modules are cleared.
+    """
+    if not in_tree_scan_group(item):
+        return
+    module = getattr(item, "module", None)
+    if module is not None:
+        _TREE_SCAN_GROUP_MODULES[module.__name__] = module
+    if nextitem is not None and _xdist_group_name(nextitem) == _xdist_group_name(item):
+        return
+    for name, owner in _TREE_SCAN_GROUP_MODULES.items():
+        for value in list(vars(owner).values()):
+            if (
+                isinstance(value, functools._lru_cache_wrapper)
+                and getattr(value, "__module__", None) == name
+            ):
+                value.cache_clear()
+    _TREE_SCAN_GROUP_MODULES.clear()
 
 
 def timeout_mark_value(marker: pytest.Mark) -> object:
@@ -1056,7 +1213,7 @@ def pytest_internalerror(excrepr, excinfo) -> None:
     )
 
 
-@pytest.fixture(autouse=True)
+@per_test_guard
 def _reset_reasoning_effort_globals():
     """Snapshot + restore the process-global reasoning-effort allowlist around
     each test. The allowlist is union-only/monotonic by design (persistence
@@ -1075,7 +1232,7 @@ def _reset_reasoning_effort_globals():
         _cp._reasoning_effort_ordered = saved_ordered
 
 
-@pytest.fixture(autouse=True)
+@per_test_guard
 def _reset_overlay_refresher():
     """Clear the MCP broker's overlay-refresh hook after each test.
 
@@ -1088,7 +1245,7 @@ def _reset_overlay_refresher():
     overlay_refresh.set_overlay_refresher(None)
 
 
-@pytest.fixture(autouse=True)
+@per_test_guard
 def _undetected_host_timezone():
     """Give every test a host zone that was never detected (``kiro_crew.host_timezone``).
 
@@ -1106,7 +1263,7 @@ def _undetected_host_timezone():
     host_timezone.reset_host_timezone()
 
 
-@pytest.fixture(autouse=True)
+@per_test_guard
 def _reset_crew_workers_cache():
     """Give every test an EMPTY Crew worker list cache (``handlers.crew_workers``).
 
@@ -1122,7 +1279,7 @@ def _reset_crew_workers_cache():
     yield
 
 
-@pytest.fixture(autouse=True)
+@per_test_guard
 def _reset_creator_titles():
     """Give every test an EMPTY last-known-title registry (``dashboard.creator_titles``).
 
@@ -1147,7 +1304,7 @@ def _reset_creator_titles():
         _reset()
 
 
-@pytest.fixture(autouse=True)
+@per_test_guard
 def _reset_main_spec_episode_globals():
     """Clear the unreadable-main-spec episode's process globals around each test.
 
@@ -1179,7 +1336,7 @@ def _reset_main_spec_episode_globals():
 #: below still request ``_isolation_dirs`` and resolve it up the hierarchy.
 
 
-@pytest.fixture(autouse=True)
+@per_test_guard
 def _isolate_message_entry_cache():
     """Give every test an EMPTY ``chat_persistence`` persisted-entry cache.
 
@@ -1528,7 +1685,7 @@ def gateway_posts(request, _floor_monkeypatch):
     yield posted
 
 
-@pytest.fixture(autouse=True)
+@per_test_guard
 def _no_leaked_interleave_hook():
     """Fail a test that INHERITED a set ``chat_handlers._test_interleave``.
 
@@ -1574,7 +1731,7 @@ _INHERITED_AGENT_MARKERS = (
 )
 
 
-@pytest.fixture(autouse=True)
+@per_test_guard
 def _cloud_guard_ignores_the_runners_agent_markers(_floor_monkeypatch):
     """Hide the runner's own agent markers and confinement from the cloud guard.
 
@@ -1618,7 +1775,7 @@ def release_engine_installs(_floor_monkeypatch):
     yield calls
 
 
-@pytest.fixture(autouse=True)
+@per_test_guard
 def _drain_dashboard_verify_slot() -> None:
     """A verify thread that outlived its route's reply window still owns its browser
     profile; the test that started it waits for it so the profile is removed within
@@ -1662,3 +1819,17 @@ def held_flag(monkeypatch):
     monkeypatch.setattr(agent_mod, "_main_spec_skip_generation", None)
     monkeypatch.setattr(agent_mod, "_main_spec_held_pass_at", None)
     return agent_mod
+
+
+@pytest.fixture
+def no_ambient_kiro_api_key(monkeypatch):
+    """Run the credit-pill refresh as an install with no ``KIRO_API_KEY``.
+
+    With the key set the refresh publishes the ``api_key`` marker and reads no balance
+    (sessions bill the key, not kiro-cli's login), so a test of the reading itself must
+    not inherit an operator's key from the shell that launched pytest.
+    """
+    monkeypatch.delenv("KIRO_API_KEY", raising=False)
+
+
+seal_guards(globals())

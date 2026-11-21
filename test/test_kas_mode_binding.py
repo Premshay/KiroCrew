@@ -17,6 +17,7 @@ import copy
 import json
 import sys
 
+import member_essential_context_helpers
 import pytest
 
 from kiro_crew.acp import session_handle as sh
@@ -42,8 +43,16 @@ def _fast_no_report_ceiling(monkeypatch):
     session pays the full production ceiling. drain_init() resolves the module
     constant at call time precisely so this patch takes effect. Nothing in this
     module asserts on the ceiling itself.
+
+    A zero ceiling, the value production passes for an MCP-free runtime: any
+    positive one still holds the drain for its full ``duration``, because the
+    drain waits until ``max(duration, ceiling)`` for a first report.
     """
-    monkeypatch.setattr(sh, "_MCP_DRAIN_NO_REPORT_CEILING", 0.05)
+    monkeypatch.setattr(sh, "_MCP_DRAIN_NO_REPORT_CEILING", 0.0)
+
+
+#: A test-owned home and a member whose essentials the builder renders.
+env = member_essential_context_helpers.env
 
 
 #: Records what the client injected so a test can read it back, and gates
@@ -338,6 +347,40 @@ class TestModeBinding:
         finally:
             await runtime.kill()
         assert handle.native_context_documents.get("template://kirocrew#prompt") == recorded
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("prompt", "headed"),
+        [("stub", True), ("You are Kiro.", False)],
+        ids=["managed-stub", "person-written-prompt"],
+    )
+    async def test_a_dashboard_session_records_its_head_only_on_the_managed_stub(
+        self, mode_stub, crew_agent, tmp_path, monkeypatch, prompt, headed
+    ):
+        """The default agent's managed stub is replaced on the wire by the session head
+        and the session records its blocks; a prompt a person wrote is sent as it is."""
+        from kiro_crew import session_head
+        from kiro_crew.acp.harness import kas as kas_harness
+        from kiro_crew.agent_parts.spec_build import _NATIVE_PROMPT_STUB
+
+        spec = json.loads((crew_agent / "kirocrew.json").read_text(encoding="utf-8"))
+        spec["prompt"] = _NATIVE_PROMPT_STUB if prompt == "stub" else prompt
+        (crew_agent / "kirocrew.json").write_text(json.dumps(spec), encoding="utf-8")
+        monkeypatch.setattr(kas_harness, "_bundle_route_selected", lambda: False)
+        monkeypatch.setattr(kas_harness, "installed_kiro_cli_version", lambda: (2, 33, 1))
+        runtime = AcpRuntime(
+            work_dir=tmp_path / "wsh", agent="kirocrew", sandbox_mode="off", acp_backend="kas"
+        )
+        try:
+            await runtime.spawn()
+            handle = await runtime.create_session(
+                cwd=tmp_path / "wsh", agent="kirocrew", session_key="dashboard:headed"
+            )
+        finally:
+            await runtime.kill()
+        wire = handle.native_context_documents.get("template://kirocrew#prompt")
+        assert session_head.applied(handle.native_context_documents) is headed
+        assert (session_head.parse(wire) != ()) is headed
 
     @pytest.mark.asyncio
     async def test_runtime_default_agent_is_activated_without_explicit_request(
@@ -758,6 +801,42 @@ class TestSavedMemberSpecOnKas:
         assert seen["start_mode"][METHOD_SESSION_NEW] == START_AGENT_ID
         assert START_AGENT_ID not in seen["modes"]
         assert seen["set_mode"] == _SAVED_TEMPLATE
+
+    @pytest.mark.asyncio
+    async def test_global_always_steering_reaches_a_member_once(
+        self, env, close_skills_loaders, mode_stub, crew_agent, tmp_path
+    ):
+        """KAS loads the global steering tree itself, so the snapshot blanks its body."""
+        steering = tmp_path / "host-home" / ".kiro" / "steering"
+        steering.mkdir(parents=True)
+        (steering / "shared.md").write_text(
+            "---\ninclusion: always\n---\nGLOBAL_ALWAYS_BODY", encoding="utf-8"
+        )
+        runtime = AcpRuntime(
+            work_dir=tmp_path / "ws",
+            agent="kirocrew",
+            sandbox_mode="off",
+            acp_backend=ACP_BACKEND_KAS,
+            member_context=True,
+        )
+        try:
+            await runtime.spawn()
+            handle = await runtime.create_session(cwd=tmp_path / "ws", agent="kirocrew")
+        finally:
+            await runtime.kill()
+        source = str(steering / "shared.md")
+        assert "GLOBAL_ALWAYS_BODY" in handle.native_context_documents.get(source, "")
+        native_envelope: list[str] = []
+        full = env.builder._build_v2_essentials(
+            env.store,
+            member=env.member,
+            project=str(env.project),
+            native_documents=handle.native_context_documents,
+            native_envelope_out=native_envelope,
+        )
+        assert "GLOBAL_ALWAYS_BODY" in full
+        assert f"[Essential source: {source}]" in native_envelope[0]
+        assert "GLOBAL_ALWAYS_BODY" not in native_envelope[0]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the stub launcher is a POSIX shell script")

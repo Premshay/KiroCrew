@@ -47,10 +47,11 @@ from kiro_crew.dashboard.peer_redaction import redact_peer_text
 from kiro_crew.instances.ssh_tunnel_manager import ProxyRequestError
 from kiro_crew.mcp_session_crew import CREW_TOOLS, with_crew_schema
 from kiro_crew.remote_dispatch import REMOTE_DISPATCH_DISABLED
+from kiro_crew.testing.synthetic_credentials import github_classic
 
-#: A GitHub-style personal access credential, built at runtime so no scanner
-#: reads this file as holding one.
-PLANTED = "ghp_" + "Ab3x9" * 7 + "Z"
+#: A GitHub personal access token with a valid checksum, built at runtime so no
+#: scanner reads this file as holding one.
+PLANTED = github_classic(seed=51)
 
 INSTANCE = "inst-lab"
 
@@ -120,8 +121,8 @@ class _Registry:
         return list(self._rows)
 
 
-def _ultra(slot):
-    """Make *slot* an Ultra Mode chat: a root on the configured conductor template."""
+def _conductor_mode(slot):
+    """Make *slot* a conductor mode chat: a root on the configured conductor template."""
     slot.agent = crew_mode.crew_mode_agent()
     slot.agent_kind = "template"
     return slot
@@ -137,7 +138,7 @@ def env(tmp_path, monkeypatch):
         [SimpleNamespace(id=INSTANCE, name="lab"), SimpleNamespace(id="inst-b", name="other")]
     )
     caller = _busy(_slot(state, "chat-1"))
-    _ultra(caller)
+    _conductor_mode(caller)
     monkeypatch.setattr(crew, "remote_dispatch_enabled", lambda: True)
     # The verb tests stand in an admitting owner check so the rest of the path
     # can be driven; the real one is pinned by the ``*_owner_*`` tests below.
@@ -202,7 +203,9 @@ def test_switch_off_advertises_exactly_todays_schemas(monkeypatch):
     monkeypatch.setattr("kiro_crew.remote_dispatch.remote_dispatch_enabled", lambda: False)
     # The session_harness preview filters `backend`; held on so only `crew` varies here.
     monkeypatch.setattr("kiro_crew.session_harness_preview.session_harness_enabled", lambda: True)
-    assert mcp_dashboard._list_tools() == mcp_dashboard.TABLE.list()
+    # `crew_list` is the one row the switch hides outright.
+    base = [t for t in mcp_dashboard.TABLE.list() if t["name"] != "crew_list"]
+    assert mcp_dashboard._list_tools() == base
     for tool in mcp_dashboard._list_tools():
         assert "crew" not in tool["inputSchema"].get("properties", {})
 
@@ -228,6 +231,7 @@ def test_switch_on_adds_crew_to_the_five_tools_only(monkeypatch):
     "verb, fields",
     [
         ("create", {"crew": "lab"}),
+        ("create", {"crew": "lab", "agent": "kirocrew-worker", "agent_kind": "template"}),
         ("send", {"crew": "lab", "target": "chat-77", "message": "hi"}),
         ("read", {"crew": "lab", "target": "chat-77"}),
         ("stop", {"crew": "lab", "target": "chat-77"}),
@@ -309,6 +313,100 @@ def test_send_read_stop_close_each_land_on_their_route(env):
     assert env.peer.calls[0]["body"] == {"message": "go", "slot": target, "turn_origin": "agent"}
 
 
+def _page(first: int, total: int, roles: list[str]) -> dict:
+    """A peer slot-detail page: rows ``[first, first + len(roles))`` of *total*."""
+    return {
+        "title": "w",
+        "next_before": first,
+        "total": total,
+        "messages": [{"role": r, "content": f"m{first + i}"} for i, r in enumerate(roles)],
+    }
+
+
+def _read_since(env, page: dict, **fields) -> tuple[int, dict]:
+    target = _create(env)
+    env.peer.calls.clear()
+    env.peer.reply("GET", f"api/chat/slots/{target}", 200, page)
+    return _call(env, "read", crew="lab", target=target, **fields)
+
+
+def test_read_since_returns_only_later_rows_and_a_cursor(env):
+    page = _page(2, 7, ["user", "assistant", "user", "assistant", "user"])
+    status, body = _read_since(env, page, limit=5, since=4)
+    assert status == 200, body
+    assert [m["index"] for m in body["messages"]] == [4, 5, 6]
+    assert [m["content"] for m in body["messages"]] == ["m4", "m5", "m6"]
+    assert (body["next_since"], body["total"]) == (7, 7)
+    # since=N is the peer's older-page read for [N, N+limit), one GET.
+    (only,) = env.peer.calls
+    assert only["params"] == {"limit": "5", "before": "9"}
+
+
+def test_read_since_stops_before_an_in_flight_row(env):
+    page = _page(3, 6, ["user", "assistant", "streaming"])
+    status, body = _read_since(env, page, limit=5, since=4)
+    assert status == 200, body
+    assert [m["index"] for m in body["messages"]] == [4]
+    assert body["next_since"] == 5 and body["streaming"] is True
+
+
+def test_read_since_at_the_end_is_empty_with_the_same_cursor(env):
+    status, body = _read_since(env, _page(3, 6, ["user", "assistant", "user"]), since=6)
+    assert status == 200, body
+    assert body["messages"] == [] and body["next_since"] == 6
+
+
+def test_read_since_past_the_end_is_refused(env):
+    status, body = _read_since(env, _page(3, 6, ["user", "assistant", "user"]), since=9)
+    assert (status, body["code"]) == (409, "cursor_unavailable")
+
+
+def test_read_since_a_page_cut_short_by_bytes_is_refused(env):
+    # The crew dropped [4, 6) from its page for size: serving 6.. would skip them.
+    status, body = _read_since(env, _page(6, 9, ["user", "assistant", "user"]), since=4)
+    assert (status, body["code"]) == (409, "crew_page_cut")
+
+
+def test_read_since_needs_positions_in_the_crew_reply(env):
+    status, body = _read_since(env, {"title": "w", "messages": []}, since=1)
+    assert (status, body["code"]) == (502, "crew_reply_malformed")
+
+
+@pytest.mark.parametrize("since, code", [("-1", "invalid_since"), ("x", "invalid_pagination")])
+def test_a_bad_since_is_refused_before_any_peer_call(env, since, code):
+    target = _create(env)
+    env.peer.calls.clear()
+    status, body = _call(env, "read", crew="lab", target=target, since=since)
+    assert (status, body["code"]) == (400, code)
+    assert env.peer.calls == []
+
+
+def test_a_tail_read_carries_indexes_and_a_cursor(env):
+    status, body = _read_since(env, _page(4, 6, ["user", "assistant"]), limit=2)
+    assert status == 200, body
+    assert [m["index"] for m in body["messages"]] == [4, 5]
+    assert body["next_since"] == 6
+    assert env.peer.calls[0]["params"] == {"limit": "2"}
+
+
+def test_a_tail_read_of_a_running_session_issues_no_cursor(env):
+    # [user, streaming, tool]: limit=1 sees only the tool. The later segment cut
+    # deletes the chunk run and appends the reply at 2, so a cursor of 3 would
+    # skip it for good.
+    page = {**_page(2, 3, ["tool"]), "running": True}
+    status, body = _read_since(env, page, limit=1)
+    assert status == 200, body
+    assert [m["index"] for m in body["messages"]] == [2]
+    assert "next_since" not in body and body["total"] == 3
+
+
+def test_a_since_read_of_a_running_session_still_resumes(env):
+    page = {**_page(4, 6, ["user", "assistant"]), "running": True}
+    status, body = _read_since(env, page, limit=5, since=4)
+    assert status == 200, body
+    assert body["next_since"] == 6
+
+
 def test_close_forgets_the_slot(env):
     target = _create(env)
     assert _call(env, "close", crew="lab", target=target)[0] == 200
@@ -340,6 +438,29 @@ def test_a_create_with_work_item_is_born_bound_on_the_callers_ledger(env, monkey
     assert seen["instance"] == INSTANCE and "memory_mode" in seen["create"]
 
 
+def test_a_bound_create_reply_carries_the_binds_patrol_outcome(env, monkeypatch):
+    """M4: the patrol fields the hub bind answered reach the create reply."""
+    from kiro_crew.dashboard.handlers import remote_ingest
+
+    async def _bound(state, mgr, board, instance_id, item_id, create):
+        payload = {
+            "key": "chat-77",
+            "patrol": "refused",
+            "patrol_reason": "user-stopped",
+            "patrol_note": "arm one",
+        }
+        return "chat-77", payload, SimpleNamespace(item_id=item_id, title="item one")
+
+    monkeypatch.setattr(remote_ingest, "create_bound", _bound)
+    status, body = _call(env, "create", crew="lab", work_item="it_0000abcd")
+    assert status == 200, body
+    assert (body["patrol"], body["patrol_reason"], body["patrol_note"]) == (
+        "refused",
+        "user-stopped",
+        "arm one",
+    )
+
+
 def test_after_a_restart_the_item_pair_still_fences_the_slot(env, monkeypatch):
     """The in-memory record is gone after a hub restart; an open item bound to the
     slot on that crew still admits the verbs, and nothing else does."""
@@ -365,6 +486,60 @@ def test_after_a_restart_the_item_pair_still_fences_the_slot(env, monkeypatch):
 def test_a_crew_create_refuses_local_only_fields(env):
     status, body = _call(env, "create", crew="lab", folder_id="f1")
     assert (status, body["code"]) == (400, "crew_field_unsupported")
+    assert env.peer.calls == []
+
+
+def test_a_template_kind_reaches_the_peer_create(env):
+    """D6: the peer resolves a same-named crew member first unless the create says
+    ``template``, so the kind rides the create; without it nothing changes."""
+    _create(env, agent="kirocrew-worker", agent_kind="template")
+    first = env.peer.calls[0]
+    assert first["body"]["agent"] == "kirocrew-worker"
+    assert first["body"]["agent_kind"] == "template"
+    env.peer.calls.clear()
+    _create(env, agent="kirocrew-worker")
+    assert "agent_kind" not in env.peer.calls[0]["body"]
+    env.peer.calls.clear()
+    _create(env, agent="kirocrew-worker", agent_kind="")
+    assert "agent_kind" not in env.peer.calls[0]["body"]
+
+
+def test_a_bound_create_carries_the_template_kind(env, monkeypatch):
+    from kiro_crew.dashboard.handlers import remote_ingest
+
+    seen: dict = {}
+
+    async def _bound(state, mgr, board, instance_id, item_id, create):
+        seen.update(create)
+        return "chat-77", {"key": "chat-77"}, SimpleNamespace(item_id=item_id, title="t")
+
+    monkeypatch.setattr(remote_ingest, "create_bound", _bound)
+    status, body = _call(
+        env,
+        "create",
+        crew="lab",
+        work_item="it_0000abcd",
+        agent="kirocrew-worker",
+        agent_kind="template",
+    )
+    assert status == 200, body
+    assert seen["agent_kind"] == "template" and seen["agent"] == "kirocrew-worker"
+
+
+@pytest.mark.parametrize(
+    "fields, code",
+    [
+        ({"agent": "kirocrew-worker", "agent_kind": "member"}, "invalid_agent_kind"),
+        ({"agent": "kirocrew-worker", "agent_kind": "Template"}, "invalid_agent_kind"),
+        ({"agent": "kirocrew-worker", "agent_kind": True}, "invalid_agent_kind"),
+        ({"agent": "kirocrew-worker", "agent_kind": ["template"]}, "invalid_agent_kind"),
+        ({"agent_kind": "template"}, "agent_kind_requires_agent"),
+        ({"agent": "  ", "agent_kind": "template"}, "agent_kind_requires_agent"),
+    ],
+)
+def test_a_bad_agent_kind_is_refused_before_any_peer_call(env, fields, code):
+    status, body = _call(env, "create", crew="lab", **fields)
+    assert (status, body["code"]) == (400, code)
     assert env.peer.calls == []
 
 
@@ -492,7 +667,7 @@ def test_a_peer_slot_this_caller_did_not_dispatch_is_refused(env, verb):
 
 def test_another_callers_dispatch_is_refused(env):
     target = _create(env)
-    other = _ultra(_busy(_slot(env.state, "chat-9")))
+    other = _conductor_mode(_busy(_slot(env.state, "chat-9")))
     env.peer.calls.clear()
     status, body = _call(env, "stop", key=_key(other), crew="lab", target=target)
     assert (status, body["code"]) == (403, "crew_target_not_dispatched")
@@ -630,7 +805,7 @@ def test_an_unbound_owner_tab_is_admitted(env):
     assert _create(env) == "chat-77"
 
 
-def test_an_ultra_mode_chat_is_admitted(env):
+def test_a_conductor_mode_chat_is_admitted(env):
     assert crew_mode.slot_is_crew_mode_root(env.caller)
     assert _create(env) == "chat-77"
 
@@ -646,12 +821,12 @@ def test_an_ultra_mode_chat_is_admitted(env):
         ("close", {"crew": "lab", "target": "chat-77"}),
     ],
 )
-def test_a_plain_owner_chat_is_refused_ultra_mode_only(env, verb, fields):
+def test_a_plain_owner_chat_is_refused_conductor_mode_only(env, verb, fields):
     env.caller.agent, env.caller.agent_kind = "kirocrew", "template"
     assert not crew_mode.slot_is_crew_mode_root(env.caller)
     status, body = _call(env, verb, **fields)
-    assert (status, body["code"]) == (403, crew.ULTRA_MODE_ONLY)
-    assert "Ultra Mode" in body["error"]
+    assert (status, body["code"]) == (403, crew.CONDUCTOR_MODE_ONLY)
+    assert "conductor mode" in body["error"]
     assert env.peer.calls == []
 
 

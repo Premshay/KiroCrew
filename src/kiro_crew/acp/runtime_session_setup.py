@@ -12,12 +12,14 @@ of the method on the class or on an instance reaches every caller.
 
 Instance fields written: ``_session_start_timeout``, ``_start_collect_timeout``.
 
-Instance fields read: ``_acp_backend``, ``_agent``, ``_agent_capabilities``, ``_bound_workspace_fd``,
-``_child_env_names``, ``_expect_mcp_reports``, ``_governance_scope``, ``_kiro_native_spec_lookup``,
-``_launch_agent``, ``_launch_copy_spec``, ``_mcp_gateway_overlay``, ``_mcp_gateway_socket``,
-``_member_context``, ``_native_launch_resources``, ``_native_launch_sources``, ``_native_launch_view_alias``,
-``_native_skill_projection``, ``_session_queues``, ``_ssh_auth_sock_forwarded``, ``_start_launch_name``,
-``_tool_search_wire``, ``_wire_mode_id``, ``_work_dir``.
+Instance fields read: ``_acp_backend``, ``_agent``, ``_agent_capabilities``,
+``_bound_workspace_fd``, ``_child_env_names``, ``_expect_mcp_reports``,
+``_governance_scope``, ``_kiro_native_spec_lookup``, ``_launch_agent``,
+``_launch_copy_spec``, ``_mcp_gateway_overlay``, ``_mcp_gateway_socket``,
+``_member_context``, ``_native_launch_resources``, ``_native_launch_sources``,
+``_native_launch_view_alias``, ``_native_skill_projection``, ``_session_queues``,
+``_ssh_auth_sock_forwarded``, ``_start_launch_name``, ``_tool_search_wire``,
+``_wire_mode_id``, ``_work_dir``.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import os
 import weakref
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -43,6 +46,7 @@ from kiro_crew.acp.runtime_start import _SESSION_NEW_TIMEOUT, _resolve_start_col
 from kiro_crew.acp.session_handle import AcpRuntimeError, AcpSessionHandle
 from kiro_crew.acp.session_mcp import (
     agent_spec_snapshot,
+    refuse_contested_agent_spec,
     session_mcp_disabled_tools,
     session_mcp_server_is_disabled,
 )
@@ -52,6 +56,7 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_SESSION_MCP_ARRAY,
     overlay_project_scope,
 )
+from kiro_crew.agent_files import LITE_AGENT_FILENAME
 from kiro_crew.agent_sdk.backends import ACP_BACKENDS_CREW_OAUTH_BRIDGE
 from kiro_crew.agent_sdk.mcp_json_reach import mcp_json_server_names
 from kiro_crew.agent_sdk.tool_search import spec_grants_tool_search
@@ -63,7 +68,7 @@ from kiro_crew.mcp_gateway.session_servers import (
     injection_server_names,
     pooled_session_servers,
 )
-from kiro_crew.providers.mirrors.registry import mirror_for
+from kiro_crew.providers.mirrors.registry import has_mirror, mirror_for
 from kiro_crew.sandbox import BoundWorkspaceMismatch, resolve_bound_session_workspace
 from kiro_crew.session_token_sig import publish_session_token
 
@@ -186,16 +191,20 @@ def _pooled_session_servers_and_ref_spec(
 def _kas_worker_stub_names(
     backend: str, agent: str | None, session_key: str, pooled: list[dict[str, Any]]
 ) -> frozenset[str] | None:
-    """The stub names a KAS crewmate worker's projection subtracts, or ``None``.
+    """The stub names a KAS projection subtracts and withdraws against, or ``None``.
 
     The names of the entries :func:`_pooled_session_servers_and_ref_spec` just
     returned for this session, so KAS withholds from its projection exactly the
     servers ``session/new`` injects: one lookup answers both, and a crewmate edit
-    or an overlay refresh landing in between cannot make them differ. ``None``
-    for every other host, agent, or a session with no key: the projection then
-    asks the overlay by agent name, as before.
+    or an overlay refresh landing in between cannot make them differ. Handed in
+    for a crewmate worker session, and for the background helper, whose
+    projection withdraws every stub its spec does not mount. ``None`` for every
+    other host, agent, or a worker session with no key: the projection then asks
+    the overlay by agent name, as before.
     """
-    if backend == ACP_BACKEND_KAS and agent == MATE_WORKER_AGENT and session_key:
+    if backend == ACP_BACKEND_KAS and (
+        (agent == MATE_WORKER_AGENT and session_key) or agent == Path(LITE_AGENT_FILENAME).stem
+    ):
         return frozenset(
             str(entry["name"]) for entry in pooled if isinstance(entry, dict) and entry.get("name")
         )
@@ -260,7 +269,14 @@ class _MirroredSessionMcp(NamedTuple):
 async def _session_work_dir(self: AcpRuntime, cwd: str | Path | None = None) -> str | Path:
     """Resolve an ACP cwd without re-authorizing a mutable macOS pathname."""
     if self._bound_workspace_fd is None:
-        return cwd if cwd else self._work_dir
+        resolved = cwd if cwd else self._work_dir
+        from kiro_crew.session_work_dir import _is_disposable_dir_name
+
+        # Only a one-run name can be re-created, so only such a start pays the
+        # thread hop; every other start reaches the admission gate as before.
+        if resolved and _is_disposable_dir_name(Path(resolved).name):
+            await asyncio.to_thread(_ensure_unbound_session_workspace, resolved)
+        return resolved
     requested = cwd if cwd else self._work_dir
     # The shared rule lives in sandbox.resolve_bound_session_workspace; only the
     # error mapping is this front end's. What the peer receives is the BOUND
@@ -290,6 +306,49 @@ async def _session_work_dir(self: AcpRuntime, cwd: str | Path | None = None) -> 
         raise AcpWorkspaceBindingError(
             "Cannot verify the requested macOS session workspace"
         ) from exc
+
+
+def _ensure_unbound_session_workspace(path: str | Path | None) -> None:
+    """Re-create a missing Crew-derived one-run cwd before the peer spawns in it.
+
+    A one-run directory (``cron_<job>_<run>``, ``subagent_<id>``, ...) is made
+    by ``mark_run_dir`` once, in provider ``start()``, and removed by the
+    provider's shutdown reclaim. A runtime that is started or resumed again for
+    the same session after that reclaim (a failed resume that starts fresh, a
+    killed runtime that respawns) would otherwise hand the peer a deleted cwd.
+    Node's ``spawn`` reports a missing cwd as ``spawn <command> ENOENT``, so
+    EVERY managed MCP server then fails naming a binary that exists.
+
+    Only a directory this data home derives is re-created: its name has the
+    one-run shape and its parent is :func:`workspace_root`, and ``mark_run_dir``
+    writes the same provenance the start path writes, so the shutdown reclaim
+    and the sweep treat it exactly as before. A one-run name anywhere else is
+    never created here; it is logged so the failure that follows is
+    attributable. Every error is swallowed: this is a guard in
+    front of the existing start path, never a new way for it to fail.
+    """
+    if not path:
+        return
+    candidate = Path(path)
+    try:
+        if candidate.is_dir():
+            return
+        from kiro_crew.config.loader_locations import workspace_root
+        from kiro_crew.session_work_dir import _is_disposable_dir_name, mark_run_dir
+
+        root = Path(os.path.realpath(workspace_root(create=False)))
+        parent = Path(os.path.realpath(candidate.parent))
+        if parent == root and _is_disposable_dir_name(candidate.name):
+            mark_run_dir(candidate)
+            if candidate.is_dir():
+                logger.warning("re-created missing run work dir %s before session start", candidate)
+                return
+        logger.warning(
+            "session cwd %s does not exist; the peer's MCP spawns will fail with ENOENT",
+            candidate,
+        )
+    except Exception:
+        logger.debug("session cwd check failed for %s", candidate, exc_info=True)
 
 
 def _refuse_if_loader_unreachable(self: AcpRuntime, active_agent: str, kas_agents: Any) -> None:
@@ -351,6 +410,16 @@ async def _refuse_over_ceiling_start(self: AcpRuntime, active_agent: str | None)
         )
     except agent_mod.SharedTemplateOverCeiling as exc:
         raise AcpRuntimeError(str(exc)) from exc
+    # A mirrored host (codex) projects the spec through the session MCP read, so
+    # two differing specs declaring the agent are refused here, as the adapter
+    # hosts refuse them at spawn (R-SPEC-13). kiro-cli and KAS read the spec
+    # natively and refuse in their own resolution: a synchronous registry read,
+    # so their path gains no await (H13).
+    if has_mirror(getattr(self, "_acp_backend", "")):
+        try:
+            await asyncio.to_thread(refuse_contested_agent_spec, active_agent)
+        except agent_mod.AmbiguousAgentSpecError as exc:
+            raise AcpRuntimeError(str(exc)) from exc
 
 
 def _start_launch_name(self: AcpRuntime, agent: str | None) -> str | None:
@@ -598,6 +667,7 @@ async def _mirrored_session_mcp(
     work_dir: str | Path,
     session_key: str,
     channel_id: str,
+    permission_surface_owned: bool = False,
 ) -> _MirroredSessionMcp | None:
     """This session's ``mcpServers``, built by the host's agent-config MIRROR.
 
@@ -635,10 +705,12 @@ async def _mirrored_session_mcp(
     an allowlist and inherits nothing, so Crew's own control plane comes up with no
     session to act on unless the element carries the identity.
 
-    ``permission_surface_owned`` is False because this runtime authors no native
-    permission file. That is the fail-CLOSED direction: a mirror in claude's class
-    -- one whose tools could be pre-approved in a file Crew does not own, where
-    Crew's gate never fires -- withholds its array here rather than delivering it.
+    ``permission_surface_owned`` is False unless the host's own per-session state
+    says Crew governs this session's native permission file
+    (``HarnessAdapter.permission_surface_owned``: the claude harness seeds it per
+    session). False is the fail-CLOSED direction: a mirror in claude's class -- one
+    whose tools could be pre-approved in a file Crew does not own, where Crew's gate
+    never fires -- withholds its array here rather than delivering it.
 
     Blocking work (an agent-spec parse, an overlay read) runs off the loop, the
     same as the pooled resolution it replaces.
@@ -700,7 +772,7 @@ async def _mirrored_session_mcp(
             active_agent,
             stub_server_names=stubbed,
             stub_elements=stubs,
-            permission_surface_owned=False,
+            permission_surface_owned=permission_surface_owned,
             work_dir=work_dir,
             session_key=session_key,
             channel_id=channel_id,
@@ -721,8 +793,8 @@ async def _mirrored_session_mcp(
     servers = list(servers) if isinstance(servers, list) else []
     crew_bridged: list[str] = []
     if self.acp_backend in ACP_BACKENDS_CREW_OAUTH_BRIDGE:
-        # The AcpClient twin is in ``client_mcp_array``. Before the pickups below,
-        # so a bridge element gets its agent-socket pickup too.
+        # The AcpClient twin is in ``client_mcp_array``. Before the pickups the
+        # session paths issue, so a bridge element gets its agent-socket pickup too.
         servers, crew_bridged = await asyncio.to_thread(
             kas_env_launch.bridge_array,
             servers,
@@ -730,24 +802,6 @@ async def _mirrored_session_mcp(
             session_key=session_key or "",
             agent_id=active_agent or "",
         )
-    runtime_ref = weakref.ref(self)
-
-    def _own_root_pid() -> int | None:
-        live_runtime = runtime_ref()
-        if live_runtime is None:
-            return None
-        return live_runtime._pid  # pid-owner-ok: the runtime reads its own root
-
-    # An enforced harness's kirocrew-core cannot read the gateway secret through its
-    # credential mask, so its element gets an agent-socket pickup bound to this
-    # session's stub token and this runtime's process tree (acp/ipc_pickup.py).
-    servers = with_ipc_pickups(
-        servers,
-        backend=self.acp_backend,
-        session_token=stub_token,
-        runtime_pid=_own_root_pid,
-        owner=self,
-    )
     return _MirroredSessionMcp(
         servers=servers,
         denied_tools=projection.denied_tools,
@@ -757,6 +811,33 @@ async def _mirrored_session_mcp(
         agent_spec=projection.agent_spec,
         crew_bridged=crew_bridged,
         zero_tools=projection.zero_tools,
+    )
+
+
+def _with_runtime_ipc_pickups(
+    runtime: AcpRuntime, servers: list[dict[str, Any]], stub_token: str
+) -> list[dict[str, Any]]:
+    """*servers* with this runtime's agent-socket pickups (``acp/ipc_pickup.py``).
+
+    An enforced harness's Kiro Crew server cannot read the gateway secret through its
+    credential mask, so its element gets a pickup bound to this session's stub token
+    and this runtime's process tree. Create and resume call it once, on the mirrored
+    array after their member entries are appended, as the client path does.
+    """
+    runtime_ref = weakref.ref(runtime)
+
+    def _own_root_pid() -> int | None:
+        live_runtime = runtime_ref()
+        if live_runtime is None:
+            return None
+        return live_runtime._pid  # pid-owner-ok: the runtime reads its own root
+
+    return with_ipc_pickups(
+        servers,
+        backend=runtime.acp_backend,
+        session_token=stub_token,
+        runtime_pid=_own_root_pid,
+        owner=runtime,
     )
 
 

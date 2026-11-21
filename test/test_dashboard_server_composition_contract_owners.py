@@ -547,7 +547,10 @@ async def test_a_prior_crash_dump_is_reported_once_with_its_stacks(
     monkeypatch.setattr(server, "claim_dump_notification", lambda path: claims.append(path) or True)
     monkeypatch.setattr(server, "dump_replay_lines", lambda path: (["frame a", "frame b"], True))
     monkeypatch.setattr(server, "data_home", lambda: tmp_path)
-    monkeypatch.setattr(server, "attribute_dump", lambda path, home: ("attributed", path, home))
+    monkeypatch.setattr(
+        server, "attribute_dump", lambda path, home: types.SimpleNamespace(host_pause_secs=None)
+    )
+    monkeypatch.setattr(server, "dump_fired_at", lambda path: "2026-11-07T18:28:28Z")
     monkeypatch.setattr(server, "describe", lambda attribution: ["It was running cron nightly"])
     state = MagicMock()
     with caplog.at_level(logging.WARNING, logger=_FACADE):
@@ -560,7 +563,7 @@ async def test_a_prior_crash_dump_is_reported_once_with_its_stacks(
     ]
     state.notify.assert_called_once_with(
         "heartbeat",
-        "⚠️ Gateway restarted after an event-loop stall",
+        "Warning: Gateway restarted after an event-loop stall",
         "The previous gateway stopped responding and exited 2.0h ago, then restarted. "
         "Work in flight at that moment was interrupted and not saved. "
         f"It was running cron nightly. Thread stacks: {dump}",
@@ -830,8 +833,10 @@ async def test_the_workflow_service_hooks_redact_announce_and_authorize(
     prompt = slot.enqueue_or_run_prompt.call_args.args[0]
     assert prompt.startswith("[Workflow `nightly` finished: done] Its result was just posted")
     # The gateway's words: an inject row, run as a synthetic payload.
+    # A queued turn names the run it reports, so its trace joins that run's.
     assert slot.enqueue_or_run_prompt.call_args.kwargs == {
-        "gateway_prompt_kind": "workflow_followup"
+        "gateway_prompt_kind": "workflow_followup",
+        "extra_meta": {"workflow_run_id": "run-1"},
     }
     assert slot.enqueue_or_run_prompt.call_args.args[1].keywords == {"_synthetic_payload": True}
     state.push_slots_update.assert_called_once_with()
@@ -899,7 +904,7 @@ async def test_a_raising_cleanup_step_does_not_skip_the_crew_log_drain(
     """aiohttp stops at the first cleanup hook that raises, so each step contains its own.
 
     The steps here are registered in the order the dashboard entrypoint uses: the Kiro
-    services, the remote puller, then the instance tunnels and the crew-log drain. Every
+    services, then the instance tunnels and the crew-log drain. Every
     one before the drain raises, the way a network close or a gone process does at
     shutdown; the drain must still write out the session logs' buffered appends.
     """
@@ -915,19 +920,11 @@ async def test_a_raising_cleanup_step_does_not_skip_the_crew_log_drain(
         async def shutdown(self) -> None:
             raise ProcessLookupError("ssh child already gone")
 
-        async def stop(self) -> None:
-            raise OSError("socket closed under the puller")
-
-    puller = types.ModuleType("kiro_crew.dashboard.handlers.remote_puller")
-    puller.stop = _Raises().stop  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, puller.__name__, puller)
-
     app = web.Application()
     app["kiro_prerequisite_service"] = _Raises()
     app["kas_login_service"] = _Raises()
     state = types.SimpleNamespace(instances_manager=_Raises())
     server._register_kiro_service_shutdown(app)
-    app.on_cleanup.append(server._stop_remote_puller)
     server._register_instances_hooks(app, state, 0)
     app.on_cleanup.freeze()
 
@@ -935,7 +932,7 @@ async def test_a_raising_cleanup_step_does_not_skip_the_crew_log_drain(
         await app.on_cleanup.send(app)
 
     assert drained == [True]
-    for what in ("Kiro prerequisite", "KAS login", "Remote report puller", "Instance tunnel"):
+    for what in ("Kiro prerequisite", "KAS login", "Instance tunnel"):
         assert what in caplog.text
 
 

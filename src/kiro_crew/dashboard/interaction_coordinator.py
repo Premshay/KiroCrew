@@ -145,12 +145,14 @@ class ApprovalCoordinator:
         run_task_id: str = "",
         task_index: int | None = None,
         on_host_decision: Callable[[str], object] | None = None,
+        person_only: bool = False,
     ) -> bool:
         """Wait for a person's answer; an expired or cancelled wait answers ``False``.
 
         A caller that records who decided passes *on_host_decision*: it is told
         ``DENY_CAUSE_APPROVAL_TIMEOUT`` before an expiry's ``False``, and a
-        cancellation is raised to it, because nobody refused.
+        cancellation is raised to it, because nobody refused. *person_only* marks
+        a request a trust grant's sweep must leave open (``web_ask_rule``).
         """
         loop = asyncio.get_running_loop()
         future: asyncio.Future[bool] = loop.create_future()
@@ -170,6 +172,8 @@ class ApprovalCoordinator:
             "slot": slot,
             "ts": time.time(),
         }
+        if person_only:
+            record["person_only"] = True
         if run_task_id and isinstance(task_index, int) and not isinstance(task_index, bool):
             # A task gate names its run and task as fields, so a project page
             # finds its own run's gate in the global listing without reading
@@ -182,6 +186,12 @@ class ApprovalCoordinator:
         open_and_broadcast(
             state, decision_id, DecisionKind.APPROVAL, slot or "state", system_initiator(source)
         )
+        # A code-channel conductor's worker: its channel's work board shows this
+        # wait too, and clears it when answered (one dict lookup otherwise).
+        from kiro_crew.slack.code_channels.board import note_session_turn
+
+        note_session_turn(slot)
+        future.add_done_callback(lambda _done: note_session_turn(slot))
         # The record names its owning slot, and the slot projection reads the
         # live records through ``pending_coordinator_approvals``: this push is
         # what moves the parent slot into the Needs Approval lane. Without it
@@ -194,6 +204,11 @@ class ApprovalCoordinator:
         try:
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
+            # A tool permission request waiting on this prompt hears that nobody
+            # answered, rather than reading the ``False`` as a person's no.
+            from kiro_crew.llm_helpers import note_approval_expired
+
+            note_approval_expired()
             if on_host_decision is not None:
                 on_host_decision(DENY_CAUSE_APPROVAL_TIMEOUT)
             return False
@@ -797,7 +812,8 @@ class QuestionCoordinator:
     # MCP subprocess can ping the session keepalive between slices. A single
     # request held for the whole ask is exactly what the legacy
     # ``request``'s ``_QUESTION_TIMEOUT_MAX`` exists to cap: the ACP tool-stall
-    # watchdog kills a tool call that stays silent for 600s.
+    # watchdog kills a tool call that stays silent for ``_TOOL_STALL_TIMEOUT``
+    # (720s).
 
     @staticmethod
     def _reserve_agent_ask_slot(state: Any) -> bool:

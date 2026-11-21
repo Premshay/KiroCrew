@@ -175,6 +175,12 @@ CONFIRM_STALE_TEXT = (
     "⛔ That confirmation has expired or was already used. Pick the mode again in the "
     "first message."
 )
+#: A repeat click on a used confirmation whose change has landed: the person
+#: most likely pressed twice, so say where the channel is, not "expired".
+CONFIRM_ALREADY_TEXT = "ℹ This channel is already on *{label}*."
+#: What a used confirmation becomes, so its button cannot be pressed again.
+CONFIRM_DONE_TEXT = "✅ Switched this channel to *{label}*."
+CONFIRM_SPENT_TEXT = "This confirmation was used."
 #: Confirmation buttons already pressed (each is good for one click). In memory:
 #: a restart drops it, and the session pin and the age bound still hold then.
 _used_confirms: set[str] = set()
@@ -280,9 +286,9 @@ def audit_refused_pick(payload: dict[str, Any], reason: str) -> None:
 
 
 def _command(orch: Any = None) -> str:
-    """The app's slash command, as the person types it: the one the router
-    matched (``orch.slack_command``) when an orchestrator is in hand, else
-    ``slack.command``."""
+    """The app's slash command, as shown to the person: ``orch.slack_command``
+    (the live ``slack.command``, refreshed on a config change) when an
+    orchestrator is in hand, else ``slack.command`` read from config."""
     routed = str(getattr(orch, "slack_command", "") or "").strip().lstrip("/")
     if not routed:
         try:
@@ -948,12 +954,7 @@ async def _apply_to_workers(
         ok, error, landed = await _lower_one(state, worker, mode, user, live_for, gates, slot)
         if ok:
             _follows_channel(state, worker)
-        _audit(
-            "allowed" if ok else ("denied" if error == STALE_REASON else "error"),
-            f"{resources} result={'worker_set' if ok else 'worker_refused'}"
-            + (f" landed={landed}" if landed != mode else ""),
-            error,
-        )
+        _audit_lowering(resources, ok, error, landed, mode)
         if ok:
             origin_live = None  # a change committed under the fence
         elif origin_live is not None and error == STALE_REASON and not origin_live():
@@ -975,7 +976,7 @@ async def _lower_one(
 ) -> tuple[bool, str, str]:
     """Lower *worker* to *mode* under the fence ``live_for(mode)``.
 
-    ``(ok, error, landed)``, *landed* the mode written. A lowering to Reads
+    ``(ok, error, landed)``, *landed* the mode it last tried to write. A lowering to Reads
     refused because a gate closed, because the channel itself went below
     Reads meanwhile, or because a slot sharing *worker*'s session sits below
     Reads (:func:`_raises_a_sharer`), falls back to Normal, which needs no gate and is never
@@ -1053,15 +1054,28 @@ async def _lower_deeper(
         ok, error, landed = await _lower_one(state, worker, mode, user, live_for, gates, slot)
         if ok:
             _follows_channel(state, worker)
-        _audit(
-            "allowed" if ok else ("denied" if error == STALE_REASON else "error"),
-            f"{resources} result={'worker_set' if ok else 'worker_refused'}"
-            + (f" landed={landed}" if landed != mode else ""),
-            error,
-        )
+        _audit_lowering(resources, ok, error, landed, mode)
         if not ok and _still_above(state, worker, mode):
             failed.append(_failed_title(worker, slot))
     return failed
+
+
+def _audit_lowering(resources: str, ok: bool, error: str, landed: str, mode: str) -> None:
+    """Audit one worker's lowering: allowed when it took, denied when it was refused
+    as stale (:data:`STALE_REASON`), an error otherwise.
+
+    *landed*, the mode :func:`_lower_one` last tried to write, is named only when it
+    differs from *mode*.
+    """
+    if ok:
+        outcome = "allowed"
+    elif error == STALE_REASON:
+        outcome = "denied"
+    else:
+        outcome = "error"
+    result = "worker_set" if ok else "worker_refused"
+    note = f" landed={landed}" if landed != mode else ""
+    _audit(outcome, f"{resources} result={result}{note}", error)
 
 
 def _still_above(state: Any, worker: Any, mode: str) -> bool:
@@ -1329,7 +1343,7 @@ async def _apply_pick(
     via: str,
     still_live: Callable[[], bool] | None = None,
     expected_slot: Any = None,
-) -> None:
+) -> ModeResult:
     """Change the mode for an authorized pick; say anything short of a clean set."""
     try:
         outcome = await set_channel_mode(
@@ -1350,6 +1364,7 @@ async def _apply_pick(
         await _ephemeral(channel, user, outcome.text)
     if outcome.result != "set":
         await _refresh(binding)
+    return outcome
 
 
 def confirm_blocks(
@@ -1410,7 +1425,7 @@ async def handle_confirm(orch: Any, payload: dict[str, Any]) -> bool:
     if value in _used_confirms:
         # One click per confirmation: a later click on the same message changes nothing.
         _audit("denied", resources, "approval mode confirmation already used")
-        await _ephemeral(channel, user, CONFIRM_STALE_TEXT)
+        await _ephemeral(channel, user, _repeat_click_text(binding, mode))
         return True
     refusal = await authorize(orch, binding, user, team, resources)
     if refusal is not None:
@@ -1419,13 +1434,70 @@ async def handle_confirm(orch: Any, payload: dict[str, Any]) -> bool:
     # Checked again and spent with no await in between: two clicks that both
     # passed the check above cannot both apply, and a mode request made since
     # the confirmation was asked (a revoke included) voids it.
-    if value in _used_confirms or str(_latest_intent(channel)) != intent_seen:
-        _audit("denied", resources, "approval mode confirmation already used or superseded")
+    if value in _used_confirms:
+        _audit("denied", resources, "approval mode confirmation already used")
+        await _ephemeral(channel, user, _repeat_click_text(binding, mode))
+        return True
+    if str(_latest_intent(channel)) != intent_seen:
+        _audit("denied", resources, "approval mode confirmation superseded")
         await _ephemeral(channel, user, CONFIRM_STALE_TEXT)
         return True
     _spend_confirm(value)
-    await _apply_pick(orch, binding, mode, user, team, channel, via="select")
+    outcome = await _apply_pick(orch, binding, mode, user, team, channel, via="select")
+    done = outcome.result in ("set", "unchanged")
+    line = CONFIRM_DONE_TEXT.format(label=label(mode)) if done else CONFIRM_SPENT_TEXT
+    await _settle_confirm(payload, channel, line)
     return True
+
+
+def _repeat_click_text(binding: Binding, mode: str) -> str:
+    """The reply to a second click on a used confirmation.
+
+    Only wording: the click changes nothing either way. Read from the live
+    mode alone, never from what the first click is doing, so a channel lowered
+    on any surface meanwhile always gets the stale reply.
+    """
+    slot = channel_session(surface.dashboard_state(), binding)
+    if slot is not None and current_mode(slot) == mode and not _yolo_active():
+        return CONFIRM_ALREADY_TEXT.format(label=label(mode))
+    return CONFIRM_STALE_TEXT
+
+
+async def _settle_confirm(payload: dict[str, Any], channel: str, line: str) -> None:
+    """Replace the used private confirmation with *line*, dropping its button.
+
+    An ephemeral message can only be rewritten through the click's
+    ``response_url``, so this is a write outside the Slack client: it is a
+    fixed line to the clicker's own message, sent only to Slack's hooks host
+    and only while the ``channels`` policy admits Slack and this channel
+    (the checks the client's ``chat.*`` writes make). Never raises.
+    """
+    response_url = str(payload.get("response_url") or "")
+    if not response_url.startswith("https://hooks.slack.com/"):
+        return
+    from kiro_crew.slack.channel_policy import SlackChannelRefused, require_channel
+
+    try:
+        if not await surface.outbound_permitted():
+            return
+        require_channel(channel)
+        await _post_response_url(
+            response_url,
+            {"replace_original": True, "text": line, "blocks": settled_blocks(line)},
+        )
+    except SlackChannelRefused:
+        return
+    except Exception:
+        logger.debug("code channel confirmation not settled", exc_info=True)
+
+
+async def _post_response_url(url: str, body: dict[str, Any]) -> None:
+    import aiohttp
+
+    from kiro_crew.http_proxy import resolve_proxy
+
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as sess:
+        await sess.post(url, proxy=resolve_proxy(url), json=body)
 
 
 async def handle_command(

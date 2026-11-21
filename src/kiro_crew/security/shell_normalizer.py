@@ -95,6 +95,7 @@ from .shell_normalizer_walk import (  # noqa: F401  (also re-exported for import
     _is_shell_variable_reference,
     _iter_shell_chars,
     _matching_close_paren,
+    _only_single_quoted_openers,
     _opens_comment,
     _prev_word,
     _push_option_matches,
@@ -1119,7 +1120,17 @@ def _mint_verb_in_substitution(tokens: "list[str]", idx: int) -> bool:
     PROGRAM?".  This one answers "does it compute the VERB?", for the spelling that
     hides that half instead (``T=$(printf <verb>); <name> $T``).
     """
-    joined = " ".join(tokens[idx:])
+    return _mint_verb_in_text(" ".join(tokens[idx:]))
+
+
+@once_per_call()
+def _mint_verb_in_text(joined: str) -> bool:
+    """:func:`_mint_verb_in_substitution`'s answer for one suffix text, kept per gate call.
+
+    Pure in its text, so a repeat read is the same answer. Frames of a command whose
+    substitutions never close are suffixes of one another and share their assignment
+    suffixes; without the memo each frame reads each suffix again (cubic in length).
+    """
     for body in _substitution_bodies(joined):
         if any(_is_mint_verb(word) for word in body.split()):
             return True
@@ -1583,22 +1594,26 @@ def _nested_shell_payloads(
 # ``${a[@]}`` / ``${a[*]}`` / ``$a[@]`` -- the whole array as separate words.
 
 
-def _shell_payload_walk(text_lower: str) -> "list[tuple[str, list[str]]]":
+def _shell_payload_walk(
+    text_lower: str, *, literal_single_quotes: bool = True
+) -> "list[tuple[str, list[str]]]":
     """:func:`_shell_payload_walk_uncached`, once per text inside one ``sharing_views``
     call; each caller gets fresh lists, so one that edits its argv cannot reach the next."""
     from .shell_commands import _CALL_VIEWS  # circular import: the reader imports this module
 
     memo = _CALL_VIEWS.get()
     if memo is None:
-        return _shell_payload_walk_uncached(text_lower)
-    key = ("payload_walk", text_lower)  # the redirect views' keys are plain str
+        return _shell_payload_walk_uncached(text_lower, literal_single_quotes)
+    key = ("payload_walk", text_lower, literal_single_quotes)  # redirect views' keys are str
     frames = memo.get(key)
     if frames is None:
-        frames = memo[key] = _shell_payload_walk_uncached(text_lower)
+        frames = memo[key] = _shell_payload_walk_uncached(text_lower, literal_single_quotes)
     return [(source, list(tokens)) for source, tokens in frames]
 
 
-def _shell_payload_walk_uncached(text_lower: str) -> "list[tuple[str, list[str]]]":
+def _shell_payload_walk_uncached(
+    text_lower: str, literal_single_quotes: bool = True
+) -> "list[tuple[str, list[str]]]":
     """``(source, argv)`` for *text_lower* and every nested shell payload in it.
 
     ``bash -c "kirocrew token"`` tokenizes to ``['bash', '-c', 'kirocrew token']``
@@ -1655,7 +1670,12 @@ def _shell_payload_walk_uncached(text_lower: str) -> "list[tuple[str, list[str]]
         from .shell_commands import redirect_hidden_payloads  # the reader imports this module
 
         nested = list(nested) + redirect_hidden_payloads(source)
-        for payload in nested + _substitution_bodies(_fold_line_continuations(source)):
+        # Single-quoted text is literal only in the caller's own command line: a
+        # nested or decoded payload is read quote-blind.
+        literal = literal_single_quotes and source == text_lower  # payloads are shorter
+        for payload in nested + _substitution_bodies(
+            _fold_line_continuations(source), raw_source=literal
+        ):
             # Descend through EVERY literal payload, to any depth.  Termination is
             # structural, not a cap: a payload is carried inside one token of its
             # parent, so it is strictly shorter than the parent's source text.

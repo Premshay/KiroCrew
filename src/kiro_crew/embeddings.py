@@ -111,6 +111,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         gguf_declared_pooling,
     )
     from kiro_crew.embeddings_llama import (  # noqa: F401
+        _STOPPED,
         EmbeddingBackend,
         LlamaCppEmbedder,
         _caller_may_wait_for_load,
@@ -121,6 +122,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _InferJob,
         _install_bounded_decode,
         _install_metadata_kv_clear,
+        _person_waiting,
+        _Preemptible,
+        _retry_class,
         _runtime_has_blas,
         _trim_native_heap,
     )
@@ -233,6 +237,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _LARGE_HOST_MIN_CORES,
         _LLM_LOAD_RETRY_SECS,
         _MAX_BULK_PACE_SLEEP,
+        _MAX_BULK_PREEMPTS,
         _MAX_EMBED_BATCH_TEXTS,
         _MAX_EMBED_CHARS,
         _MAX_PENDING_EMBEDS,
@@ -249,6 +254,8 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _PROGRESS_EVERY_BYTES,
         _REJECTED_MODEL_SENTINEL,
         _SKIP_DOWNLOAD_ENV,
+        _SMALL_HOST_IDLE_EVICT_SECS,
+        _SMALL_HOST_MAX_MIB,
         DOWNLOAD_ATTEMPTS_INTERACTIVE,
         PRIORITY_BULK,
         PRIORITY_INTERACTIVE,
@@ -256,6 +263,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         EmbeddingWork,
         _embed_threads,
         _read_memory_config,
+        _small_host_cache,
         _work_for_priority,
         bulk_duty_cycle,
         bulk_embed_threads,
@@ -265,6 +273,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         embedding_weight_repack,
         embedding_work,
         enter_work_phase,
+        small_memory_host,
         work_phase,
     )
     from kiro_crew.embeddings_shared import (  # noqa: F401
@@ -307,6 +316,8 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         register_embedding_backend,
         reset_shared_embedder,
         store_embedding_space_is_stale,
+        warm_embedder_for_person,
+        warm_embedder_for_person_soon,
     )
 
 if TYPE_CHECKING:  # names it serves from outside the family, from their homes
@@ -346,6 +357,10 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew.embeddings_child import (  # noqa: F401
         ChildLlama,
         is_vendored_llama_class,
+    )
+    from kiro_crew.embeddings_preempt import (  # noqa: F401
+        PreemptFlag,
+        install_preempt_flag,
     )
     from kiro_crew.metrics.provider import (  # noqa: F401
         get_recorder,

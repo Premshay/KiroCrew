@@ -157,12 +157,16 @@ _INHERITED_HOME_OVERRIDE_ENV_VARS = (
     # different one from the data directory above: on that harness the config home
     # is where the secret lives.
     "XDG_CONFIG_HOME",
+    # goose's Windows config home, the same secret store, follows this one.
+    "APPDATA",
     # DeepSeek Harness relocates its WHOLE home, credential store included, from one
     # variable. Same reasoning as the entry above, and the source test pins this tuple
     # against the harness declarations so a new override cannot be forgotten here.
     "DSH_HOME",
     # GitHub Copilot CLI relocates its whole home, plaintext token file included.
     "COPILOT_HOME",
+    # Google Antigravity relocates its ACP settings and OAuth state together.
+    "GEMINI_HOME",
 )
 
 

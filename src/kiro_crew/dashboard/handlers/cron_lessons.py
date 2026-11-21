@@ -52,6 +52,7 @@ from kiro_crew.project_scope import (
     scope_is_admissible,
     scope_selector_is_inadmissible,
 )
+from kiro_crew.security import refuses
 from kiro_crew.validation import (
     ALLOWED_LESSON_SCOPES,
     LEARN_ADD_SCHEMA,
@@ -348,10 +349,13 @@ async def api_lessons_create(request: web.Request) -> web.Response:
     # category/length would be unbounded. Only schema-known keys are validated so
     # unrelated body fields don't trip unknown-field rejection.
     known = {f.name for f in LEARN_ADD_SCHEMA.fields}
+    fields = {k: v for k, v in body.items() if k in known}
+    # An edit keeps its row's stored category, so the listed one only labels the
+    # change notice and audit record; one outside the enum is clamped, not refused.
+    if body.get("replaces") is not None and "category" in fields:
+        fields["category"] = normalize_lesson_category(fields["category"], strict=True)
     try:
-        cleaned = validate_tool_args(
-            {k: v for k, v in body.items() if k in known}, LEARN_ADD_SCHEMA
-        )
+        cleaned = validate_tool_args(fields, LEARN_ADD_SCHEMA)
     except ValidationError as exc:
         return web.json_response({"error": str(exc)}, status=400)
     rule = cleaned["rule"]
@@ -431,6 +435,26 @@ async def api_lessons_create(request: web.Request) -> web.Response:
     _lesson_silo, refusal = await resolve_lesson_memory_store(request, state, "lessons.create")
     if refusal is not None:
         return refusal
+    from kiro_crew.memory_provider.chokepoints import session_route
+
+    memory_route = await asyncio.to_thread(session_route, _lesson_silo, sk or None)
+    if memory_route.replaces:
+        if replaces is not None:
+            return _lesson_replace_refusal("replace_vector_unsupported")
+        from kiro_crew.memory_provider import lesson_routes
+
+        return await lesson_routes.create(
+            state,
+            memory_route,
+            store=_lesson_silo or "",
+            session_key=sk,
+            rule=rule,
+            category=category,
+            negative=negative,
+            repo_scope=repo_scope,
+            applies=applies,
+            written_by=written_by,
+        )
     memory_refusal = await _prepare_member_lesson_store(_lesson_silo)
     if memory_refusal is not None:
         return memory_refusal
@@ -467,12 +491,17 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         # the lesson it compares with: does this rule repeat one shadow would demote?
         # Only a person re-teaches: an agent's own write counts only when the chat's
         # latest input row is the person's (the origin gate's fail-closed rule).
+        from kiro_crew import injection_receipts
+        from kiro_crew import memory_shadow_trace as _trace
         from kiro_crew import memory_tier_policy as _tier_policy
         from kiro_crew.memory_origin_gate import TURN_HUMAN, triggering_turn
 
         tier_mode = _tier_policy.configured_mode()
-        if (
-            tier_mode == _tier_policy.MODE_SHADOW
+        # The shadow report's re-teach signal for every stage: the stored lessons
+        # this rule comes within the re-teach bar of, read before the write too.
+        teach = rule_emb is not None and _trace.observing()
+        by_person = (
+            (tier_mode == _tier_policy.MODE_SHADOW or teach)
             and rule_emb is not None
             and (
                 request.get("internal_auth") is not True
@@ -481,8 +510,21 @@ async def api_lessons_create(request: web.Request) -> web.Response:
                 )
                 == TURN_HUMAN
             )
-        ):
-            await asyncio.to_thread(_tier_policy.record_reteach, vs, rule_emb, tier_mode)
+        )
+        if by_person and tier_mode == _tier_policy.MODE_SHADOW:
+            await asyncio.to_thread(
+                _tier_policy.record_reteach, vs, rule_emb, tier_mode, session_key=sk
+            )
+        if by_person and teach:
+            neighbours = await asyncio.to_thread(_trace.reteach_neighbours, vs, rule_emb)
+            injection_receipts.schedule_write(
+                injection_receipts.build_outcome_line(
+                    injection_receipts.LEARN_ADD,
+                    session_key=sk,
+                    store=_lesson_silo or "",
+                    ids=neighbours,
+                )
+            )
         # Persist the lesson immediately so the request returns fast. The
         # contradiction sweep below makes a per-candidate LLM call (~27s each);
         # running it inline would exceed the MCP client's 30s timeout while the
@@ -503,15 +545,10 @@ async def api_lessons_create(request: web.Request) -> web.Response:
             # The embed above was attempted; a None from it must not trigger a
             # second, unbounded embed of the same text inside the write.
             rule_emb_resolved=True,
-            # Stored lessons that still lack a vector are the standing repair
-            # sweep's to fill. Embedding them here is PRIORITY_BULK work with no
-            # deadline, queued behind every other bulk job, so it can hold this
-            # request past the MCP client's read timeout (``mcp_core._post``) while
-            # the write still lands later. Until the sweep fills such a row, both
-            # semantic checks (dedup here, the contradiction scan below) pass it
-            # over; the exact-rule, substring and keyword-overlap rules still apply
-            # to it.
-            defer_backfills=True,
+            # The write embeds no stored lesson: one that still lacks a vector is the
+            # standing repair sweep's to fill. Until it does, both semantic checks
+            # (dedup here, the contradiction scan below) pass it over; the exact-rule,
+            # substring and keyword-overlap rules still apply to it.
             written_by=written_by,
         )
         # Sweep ONLY when the lesson actually landed. The write declines for a value
@@ -526,7 +563,7 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         reason = result.reason
         stored = result.stored
         if origin is not None and origin.gate.loggable:
-            await asyncio.to_thread(record_origin_gate, vs, origin.gate)
+            await asyncio.to_thread(record_origin_gate, vs, origin.gate, session_key=sk)
         # Redacted through the SAME chain this handler already applies to a lesson's
         # rule and category below (`_redact_memory_field`, which walks a list). A
         # superseded rule is stored user text leaving the process, so a credential or
@@ -685,7 +722,7 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         # predicate, the blocked-content screen and the row cap -- and all answer
         # with the bare ``refused`` string, so the cause has to be re-derived here.
         # Re-running the predicates is exact rather than a guess: they are the same
-        # pure-text calls the store made, and ``_lesson_withheld`` above re-derives
+        # pure-text calls the store made, and the listing's ``_safe_lesson`` re-derives
         # the first the same way for its own surface. Reporting every refusal as
         # ``volatile_session_fact`` told a user at the row cap to reword a rule
         # whose wording was never the problem. The blocked-content reason is the
@@ -953,6 +990,23 @@ async def api_lessons_delete(request: web.Request) -> web.Response:
     _lesson_silo, refusal = await resolve_lesson_memory_store(request, state, "lessons.delete")
     if refusal is not None:
         return refusal
+    from kiro_crew.memory_provider.chokepoints import session_route
+
+    memory_route = await asyncio.to_thread(session_route, _lesson_silo, sk or None)
+    if memory_route.replaces:
+        from kiro_crew.memory_provider import lesson_routes
+
+        return await lesson_routes.delete(
+            state,
+            memory_route,
+            store=_lesson_silo or "",
+            session_key=sk,
+            rule=rule_sub,
+            repo_scope=repo_scope,
+            scoped=_rs is not _no_scope_key,
+            exact=exact,
+            keep_one=keep_one,
+        )
     memory_refusal = await _prepare_member_lesson_store(_lesson_silo)
     if memory_refusal is not None:
         return memory_refusal
@@ -1083,6 +1137,22 @@ async def api_lessons_update(request: web.Request) -> web.Response:
     _lesson_silo, refusal = await resolve_lesson_memory_store(request, state, "lessons.update")
     if refusal is not None:
         return refusal
+    from kiro_crew.memory_provider.chokepoints import session_route
+
+    memory_route = await asyncio.to_thread(session_route, _lesson_silo, sk or None)
+    if memory_route.replaces:
+        from kiro_crew.memory_provider import lesson_routes
+
+        return await lesson_routes.update(
+            state,
+            memory_route,
+            store=_lesson_silo or "",
+            session_key=sk,
+            rule=cleaned["rule"],
+            repo_scope=cleaned.get("repo_scope"),
+            current=cleaned["current"],
+            applies=cleaned["applies"],
+        )
     memory_refusal = await _prepare_member_lesson_store(_lesson_silo)
     if memory_refusal is not None:
         return memory_refusal
@@ -1190,7 +1260,7 @@ def _lesson_scope_selector(stored: object) -> str | None:
     # no real row.
     if any(ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F for ch in selector):
         return None
-    if _redact_memory_field(selector) != selector:
+    if refuses(selector, _redact_memory_field):
         return None
     return selector
 
@@ -1334,6 +1404,20 @@ async def api_lessons(request: web.Request) -> web.Response:
     _lesson_silo, refusal = await resolve_lesson_memory_store(request, state, "lessons.list")
     if refusal is not None:
         return refusal
+    list_key = request.headers.get("X-Session-Key", "")
+    from kiro_crew.memory_provider.chokepoints import session_route
+
+    memory_route = await asyncio.to_thread(session_route, _lesson_silo, list_key or None)
+    if memory_route.replaces:
+        from kiro_crew.memory_provider import lesson_routes
+
+        return await lesson_routes.list_page(
+            memory_route,
+            store=_lesson_silo or "",
+            session_key=list_key,
+            limit=limit,
+            offset=offset,
+        )
     memory_refusal = await _prepare_member_lesson_store(_lesson_silo)
     if memory_refusal is not None:
         return memory_refusal

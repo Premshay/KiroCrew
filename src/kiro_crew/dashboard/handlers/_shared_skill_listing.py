@@ -12,12 +12,18 @@ from __future__ import annotations
 import fnmatch
 import logging
 import os
+import unicodedata
 from pathlib import Path
 from typing import Any, NamedTuple
 
 from kiro_crew.agent_discovery import expand_skill_uri, parsed_agent_specs
 from kiro_crew.config.paths import kiro_agents_dir
-from kiro_crew.dashboard.handlers._shared_skill_roots import _edition_skill_roots
+from kiro_crew.dashboard.handlers._shared_skill_catalog import package_skill_catalog
+from kiro_crew.dashboard.handlers._shared_skill_roots import (
+    _edition_skill_roots,
+    resolved_skill_file,
+    split_package_key,
+)
 from kiro_crew.frontmatter import SKILL_LOADER, parse_frontmatter
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.skill_trust import is_project_trusted as _is_project_trusted
@@ -217,6 +223,47 @@ class _AgentMatch(NamedTuple):
     exact: frozenset[str]
     wildcard: tuple[str, ...]
     aliases: list[tuple[Path, list[str]]]
+    #: Equal for agents whose globs are equal, so a row is matched once per
+    #: distinct glob set: agents made from one template share one.
+    signature: int = -1
+    #: The folded names of the entries under every ``aliases`` prefix, read once
+    #: per index: a row whose folder name is in none of them has no alias to
+    #: test. ``None`` when a prefix could not be listed, so nothing is skipped.
+    alias_leaves: frozenset[str] | None = None
+
+
+def _fold_leaf(name: str) -> str:
+    """A folder name folded loosely, so the alias pre-check never misses a match.
+
+    Case and Unicode form are folded because a case-insensitive or normalizing
+    filesystem resolves either spelling; a loose fold only lets more rows through
+    to the exact check in ``_alias_hit``.
+    """
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def _alias_leaves(
+    aliases: list[tuple[Path, list[str]]], listed: dict[str, frozenset[str] | None]
+) -> frozenset[str] | None:
+    """The folded entry names under each alias prefix; ``None`` if one cannot be read."""
+    names: set[str] = set()
+    for base, _globs in aliases:
+        key = str(base)
+        if key not in listed:
+            try:
+                listed[key] = frozenset(_fold_leaf(n) for n in os.listdir(base))
+            except OSError:
+                # A missing prefix has no alias under it, as ``lexists`` would find.
+                listed[key] = frozenset() if not os.path.lexists(base) else None
+            except ValueError:
+                # A prefix no path can name (an embedded NUL in a spec's resource):
+                # skip nothing, so ``_alias_hit`` answers as it did without this check.
+                listed[key] = None
+        leaves = listed[key]
+        if leaves is None:
+            return None
+        names |= leaves
+    return frozenset(names)
 
 
 class _AgentMatchIndex(NamedTuple):
@@ -252,16 +299,23 @@ def _build_agent_match_index(expanded_agents: list[tuple[str, list[str]]]) -> _A
     root = str(skills_dir())
     real_root = validate_file_path(root)
     roots = (os.path.abspath(root), *((real_root,) if real_root else ()))
-    agents = tuple(
-        _AgentMatch(
-            name,
-            frozenset(os.path.normcase(g) for g in globs if not _has_wildcard(g)),
-            tuple(g for g in globs if _has_wildcard(g)),
-            _alias_candidates(globs, dict.fromkeys(globs), {g: g for g in globs}, roots),
+    signatures: dict[tuple[str, ...], int] = {}
+    listed: dict[str, frozenset[str] | None] = {}
+    agents = []
+    for name, globs in expanded_agents:
+        aliases = _alias_candidates(globs, dict.fromkeys(globs), {g: g for g in globs}, roots)
+        agents.append(
+            _AgentMatch(
+                name,
+                frozenset(os.path.normcase(g) for g in globs if not _has_wildcard(g)),
+                tuple(g for g in globs if _has_wildcard(g)),
+                aliases,
+                # Every field here is a function of the glob list alone.
+                signatures.setdefault(tuple(globs), len(signatures)),
+                _alias_leaves(aliases, listed),
+            )
         )
-        for name, globs in expanded_agents
-    )
-    return _AgentMatchIndex(agents, roots)
+    return _AgentMatchIndex(tuple(agents), roots)
 
 
 def _index_selects(path: str, agent: _AgentMatch) -> bool:
@@ -292,10 +346,14 @@ def _agents_loading_skill_indexed(skill_md: Path, index: _AgentMatchIndex) -> li
     resolved = False
     inside: bool | None = None
     out: list[str] = []
-    for agent in index.agents:
+    # The answer depends only on the agent's globs, so agents sharing them
+    # (Bots and workers made from one template) are matched once per row.
+    answers: dict[int, bool] = {}
+
+    def selects(agent: _AgentMatch) -> bool:
+        nonlocal real, resolved, inside
         if _index_selects(target, agent):
-            out.append(agent.name)
-            continue
+            return True
         if not resolved:
             resolved = True
             try:
@@ -304,14 +362,28 @@ def _agents_loading_skill_indexed(skill_md: Path, index: _AgentMatchIndex) -> li
                 candidate = target
             real = candidate if candidate != target else None
         if real is not None and _index_selects(real, agent):
-            out.append(agent.name)
-            continue
+            return True
         if not agent.aliases:
-            continue
+            return False
+        if (
+            agent.alias_leaves is not None
+            and _fold_leaf(skill_md.parent.name) not in agent.alias_leaves
+        ):
+            # ``_alias_hit`` tests ``<prefix>/<this folder name>/SKILL.md``, and no
+            # prefix holds an entry of that name.
+            return False
         if inside is None:
             # A row outside the skills root (a project row) is never resolved.
             inside = _within_any(os.path.abspath(skill_md), index.roots)
-        if inside and _alias_hit(skill_md, agent.aliases):
+        return bool(inside and _alias_hit(skill_md, agent.aliases))
+
+    for agent in index.agents:
+        hit = answers.get(agent.signature) if agent.signature >= 0 else None
+        if hit is None:
+            hit = selects(agent)
+            if agent.signature >= 0:
+                answers[agent.signature] = hit
+        if hit:
             out.append(agent.name)
     return out
 
@@ -512,7 +584,45 @@ def collect_skills_blocking(
         workspace_rows.extend(project_rows)
     result.extend(workspace_rows)
     annotate_skills_with_agents(result, project_dir=project_dir)
+    _qualify_colliding_package_rows(result, project_dir)
     return _one_row_per_skill_file(result)
+
+
+def _qualify_colliding_package_rows(rows: list[dict[str, Any]], project_dir: Path | None) -> None:
+    """Give each package row whose skill name another file shares its own key.
+
+    Two package roots bundling the same relative path list two rows the
+    resolver cannot tell apart, whether both are keyed ``package/<rel>`` or one
+    by its leaf name. Rows are grouped by that leaf, so either form is caught.
+    It runs before rows are merged by inode, so hardlinked copies keep each
+    other's key as an alias. Each such row is rekeyed, in place, to the key the
+    agent catalog offers for its file. A row whose file the catalog does not
+    list keeps its key.
+    """
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        key = row.get("key") or ""
+        if row.get("source") == "package" and key.startswith("package/"):
+            rel = split_package_key(key[len("package/") :])[1]
+            groups.setdefault(rel.rsplit("/", 1)[-1], []).append(row)
+    colliding = [
+        group
+        for group in groups.values()
+        if len({resolved_skill_file(row.get("path")) for row in group} - {None}) > 1
+    ]
+    if not colliding:
+        return
+    key_for_file: dict[Path, str] = {}
+    for key, catalog_file in package_skill_catalog(project_dir).items():
+        resolved = resolved_skill_file(catalog_file)
+        if resolved is not None:
+            key_for_file.setdefault(resolved, key)
+    for group in colliding:
+        for row in group:
+            skill_md = resolved_skill_file(row.get("path"))
+            qualified = key_for_file.get(skill_md) if skill_md is not None else None
+            if qualified is not None:
+                row["key"] = qualified
 
 
 def _skill_file_identity(row: dict[str, Any]) -> tuple[int, int] | None:

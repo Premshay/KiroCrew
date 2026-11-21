@@ -3,8 +3,8 @@ title: Dashboard chrome shell — one continuous surface with a fixed desktop ra
 status: accepted
 author: krewworker
 created: 2026-10-02
-last-audited: 2026-10-02
-audited-at: fa37aa54f
+last-audited: 2026-11-20
+audited-at: 0c5d8bd5f3
 doc-pr:
 implementation-prs: [16052]
 tracking-issues: []
@@ -18,10 +18,12 @@ superseded-by: []
 > Acceptance). Nothing is on main yet; the document lands first because the
 > fixed-collapsed desktop rail removes a user-facing capability and the First
 > Principles review lane reads that decision off the base branch. The
-> implementation is [#16052](https://github.com/kirodotdev/KiroCrew/pull/16052).
+> implementation was [#16052](https://github.com/kirodotdev/KiroCrew/pull/16052),
+> closed unmerged on 2026-11-01.
 
-- Status: accepted — nothing implemented on main yet. The implementation is
-  [#16052](https://github.com/kirodotdev/KiroCrew/pull/16052).
+- Status: accepted — nothing implemented on main yet. The implementation was
+  [#16052](https://github.com/kirodotdev/KiroCrew/pull/16052), closed unmerged
+  on 2026-11-01.
 - Author: krewworker
 - Related: `website/docs/page-layout.md` (the shell/panel layout this reshapes),
   `website/docs/theming-contract.md` (the stable class hooks it adds),

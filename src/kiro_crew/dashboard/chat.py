@@ -73,6 +73,7 @@ from kiro_crew.dashboard.chat_handlers import (  # noqa: F401
     api_chat_slot_detail,
     api_chat_slot_discard,
     api_chat_slot_end_wait,
+    api_chat_slot_fast_mode,
     api_chat_slot_followup,
     api_chat_slot_interrupt,
     api_chat_slot_model,
@@ -114,6 +115,7 @@ from kiro_crew.dashboard.chat_merge_back import (  # noqa: F401
 )
 from kiro_crew.dashboard.chat_mirror import (  # noqa: F401
     api_channel_targets,
+    api_channel_topics,
     api_chat_slot_mirror_link,
     api_chat_slot_mirror_pause,
     api_chat_slot_mirror_unlink,

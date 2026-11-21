@@ -7,7 +7,7 @@ Each function here whose first parameter is ``self`` is an ``AcpSessionHandle`` 
 class binds it by name, so it reads and writes the session's own state on the instance,
 and a patch of the method on the class or on an instance reaches every caller.
 
-Instance fields written: ``_config_options``, ``_input_wait_emitted``,
+Instance fields written: ``_input_wait_emitted``,
 ``_native_child_tool_call_ids``, ``_prompt_or_tool_seen``, ``_stale_eligible``,
 ``_status_rejected``, ``_tool_dispatched``, ``_tool_output_seen``, ``last_infra_error``.
 
@@ -255,8 +255,12 @@ def _tool_call_cache_overflow_for_wire(self: AcpSessionHandle) -> set[str] | Non
     return None
 
 
-def _handle_update(self: AcpSessionHandle, msg: JsonRpcMessage) -> list[AcpEvent]:
-    """Process a session/update notification and return events."""
+def _handle_update_frame(self: AcpSessionHandle, msg: JsonRpcMessage) -> list[AcpEvent]:
+    """Process a session/update notification and return events.
+
+    Read through ``session_handle_harness_surfaces._handle_update``, which adds the
+    harness surfaces of this session's own frames.
+    """
     params = msg.params or {}
     update = params.get("update") or {}
     if not isinstance(update, dict):
@@ -396,8 +400,7 @@ def _handle_update(self: AcpSessionHandle, msg: JsonRpcMessage) -> list[AcpEvent
     if session_update == "config_option_update":
         config_options = update.get("configOptions")
         if isinstance(config_options, list):
-            self._config_options = config_options
-            self._sync_effort_levels()
+            self.absorb_config_options(config_options)
         return []
 
     # KAS folds signals that kiro-cli sends as separate top-level
@@ -467,6 +470,7 @@ def _handle_update(self: AcpSessionHandle, msg: JsonRpcMessage) -> list[AcpEvent
                     identity_unreadable_cache=self._identity_unreadable_cache_for_wire(),
                     cache_scope=self._session_id,
                     cache_overflow=self._tool_call_cache_overflow_for_wire(),
+                    harness_backend=getattr(self._runtime, "acp_backend", "") or "",
                 )
                 self._note_child_calls(update, "kas-child")
                 self._release_settled_tool_call(update, self._session_id)

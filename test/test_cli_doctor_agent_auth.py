@@ -306,8 +306,8 @@ class TestDoctorKasBundle:
         assert "architecture (riscv64)" in issues[0]
 
     def test_nothing_installed_is_an_issue_naming_the_install(self, monkeypatch, capsys):
-        """Not installed yet is a warning: the first chat downloads the engine, and
-        the row names the command that does it now."""
+        """A missing engine is an error (the engine guarantee): the gateway installs
+        it when it starts, so missing means that failed; the row names the command."""
         from kiro_crew.agent_sdk import kas_bundle
 
         monkeypatch.setattr(kas_bundle, "installed_bundle", lambda: None)
@@ -315,10 +315,10 @@ class TestDoctorKasBundle:
         cli_doctor._doctor_kas(issues)
         out = capsys.readouterr().out
         assert "route:       bundle" in out
-        assert "bundle:      ⚠  not installed yet" in out
-        assert "downloads it at the first chat" in out
+        assert "bundle:      ❌ not installed under" in out
+        assert "installs it when it starts" in out
         assert "kirocrew kas install" in out
-        assert issues == ["agent.kas_bundle is on but no KAS engine bundle is installed"]
+        assert issues == ["the KAS engine this release needs is not installed"]
         assert "relay:" not in out
 
     def test_nothing_installed_reports_the_block_withheld_without_a_second_issue(
@@ -351,18 +351,36 @@ class TestDoctorKasBundle:
         monkeypatch.setattr(backend_install, "_engine_installable_here", lambda: installable)
 
     @pytest.mark.parametrize("on_disk", [[], ["0.66.33"]])
-    def test_a_pin_the_gateway_downloads_on_the_automatic_route_is_not_an_issue(
+    def test_a_pin_the_gateway_can_download_on_the_automatic_route_is_still_an_issue(
         self, monkeypatch, capsys, on_disk
     ):
-        """A fresh install with no kiro-cli starts here, and the first chat downloads
-        the engine: the row still warns, but the summary is not red."""
+        """The gateway installs the engine when it starts, so a missing pin means that
+        install failed: the summary is red, and the row names the retry."""
         self._automatic_route_without_the_pin(monkeypatch, on_disk, installable=True)
         issues: list[str] = []
         cli_doctor._doctor_kas(issues)
         out = capsys.readouterr().out
-        assert "bundle:      ⚠  " in out
-        assert "downloads it at the first chat" in out
-        assert issues == []
+        assert "bundle:      ❌ " in out
+        assert "installs it when it starts" in out
+        assert len(issues) == 1
+
+    def test_the_sharing_preview_route_without_its_engine_does_not_claim_the_switch(
+        self, monkeypatch, capsys
+    ):
+        """The preview picks the bundle with agent.kas_bundle off: doctor reports the
+        missing engine without claiming the setting is on."""
+        from kiro_crew.acp import kas_route
+        from kiro_crew.agent_sdk import kas_bundle
+
+        self._automatic_route_without_the_pin(monkeypatch, [], installable=True)
+        preview = kas_route.KasRoute(bundle=True, reason=kas_route.REASON_SHARING_PREVIEW)
+        monkeypatch.setattr(kas_bundle, "kas_route", lambda: preview)
+        issues: list[str] = []
+        cli_doctor._doctor_kas(issues)
+        out = capsys.readouterr().out
+        assert "installs it when it starts" in out
+        assert "agent.kas_bundle is on" not in out
+        assert not any("agent.kas_bundle is on" in issue for issue in issues)
 
     @pytest.mark.parametrize("on_disk", [[], ["0.66.33"]])
     def test_a_pin_this_host_cannot_download_stays_an_issue(self, monkeypatch, capsys, on_disk):
@@ -373,7 +391,7 @@ class TestDoctorKasBundle:
         cli_doctor._doctor_kas(issues)
         out = capsys.readouterr().out
         assert "The gateway will not install it on this host" in out
-        assert "downloads it at the first chat" not in out
+        assert "installs it when it starts" not in out
         assert len(issues) == 1
         assert "the gateway will not install it on this host" in issues[0]
 
@@ -382,7 +400,7 @@ class TestDoctorKasBundle:
     ):
         """A release whose pin moved finds the old engine, not nothing: say both versions.
 
-        A warning like nothing-installed, because the first chat installs the pin."""
+        An error like nothing-installed, because the gateway's start installs the pin."""
         from kiro_crew.agent_sdk import kas_bundle
 
         monkeypatch.setattr(kas_bundle, "installed_bundle", lambda: None)
@@ -391,13 +409,12 @@ class TestDoctorKasBundle:
         issues: list[str] = []
         cli_doctor._doctor_kas(issues)
         out = capsys.readouterr().out
-        assert "bundle:      ⚠  KAS 0.66.33 installed, but this release needs KAS 0.66.40" in out
-        assert "downloads it at the first chat" in out
+        assert "bundle:      ❌ KAS 0.66.33 installed, but this release needs KAS 0.66.40" in out
+        assert "installs it when it starts" in out
         assert "not installed yet under" not in out
         assert "kirocrew kas install" in out
         assert issues == [
-            "agent.kas_bundle is on but the KAS engine this release needs (0.66.40) "
-            "is not installed; on disk: 0.66.33"
+            "the KAS engine this release needs (0.66.40) is not installed; on disk: 0.66.33"
         ]
 
     def test_an_incomplete_pinned_directory_names_the_force_install(self, monkeypatch, capsys):
@@ -1178,19 +1195,37 @@ class TestTheKasBlockReportsToolVocabularyDrift:
         assert f"{major}.{minor - 1}.{patch}" in out
         assert not any("tool" in i and "vocabul" in i for i in issues)
 
-    def test_a_newer_engine_warns_and_names_both_versions_and_the_fixture(
+    def test_a_newer_engine_is_informational_with_no_maintainer_steps(
+        self, monkeypatch, capsys
+    ) -> None:
+        """A current kiro-cli newer than the last measurement is the normal case,
+        so the row is ➖ in plain words and names no source-tree fixture."""
+        from kiro_crew.platform.tool_names import KAS_TOOL_IDS_VERIFIED_ON_KIRO_CLI
+
+        major, minor, patch = KAS_TOOL_IDS_VERIFIED_ON_KIRO_CLI[-1]
+        for version in ((major, minor + 1, patch), (major + 1, 3, 0)):
+            out, issues = self._run(monkeypatch, capsys, version)
+            assert "tool names:  ➖" in out
+            assert "⚠️" not in out.split("tool names:")[1].splitlines()[0]
+            assert ".".join(str(p) for p in version) in out
+            assert f"{major}.{minor}.{patch}" in out
+            assert "Nothing to do" in out
+            assert "kas_builtin_tool_ids.json" not in out
+            assert "verified_kiro_cli_versions" not in out
+            assert "Re-measure" not in out
+            assert not any("tool" in i and "vocabul" in i for i in issues)
+
+    def test_an_unlisted_engine_between_releases_is_informational(
         self, monkeypatch, capsys
     ) -> None:
         from kiro_crew.platform.tool_names import KAS_TOOL_IDS_VERIFIED_ON_KIRO_CLI
 
-        major, minor, patch = KAS_TOOL_IDS_VERIFIED_ON_KIRO_CLI[-1]
-        out, issues = self._run(monkeypatch, capsys, (major, minor + 1, patch))
-        assert "tool names:  ⚠️" in out
-        assert f"{major}.{minor + 1}.{patch}" in out
-        assert f"{major}.{minor}.{patch}" in out
-        assert "kas_builtin_tool_ids.json" in out
-        assert "verified_kiro_cli_versions" in out
-        # Advisory: not known to have drifted, only not known not to have.
+        oldest, newest = KAS_TOOL_IDS_VERIFIED_ON_KIRO_CLI[0], KAS_TOOL_IDS_VERIFIED_ON_KIRO_CLI[-1]
+        between = (oldest[0], oldest[1], oldest[2] + 7)
+        assert oldest < between < newest and between not in KAS_TOOL_IDS_VERIFIED_ON_KIRO_CLI
+        out, issues = self._run(monkeypatch, capsys, between)
+        assert "tool names:  ➖" in out
+        assert "test/fixtures" not in out
         assert not any("tool" in i and "vocabul" in i for i in issues)
 
     def test_an_unknown_version_is_its_own_row(self, monkeypatch, capsys) -> None:

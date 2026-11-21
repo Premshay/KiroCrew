@@ -14,8 +14,12 @@ tests hold unchanged before and after the definitions move to their owner module
 from __future__ import annotations
 
 import pytest
+from redaction_structured_cases import github_classic
 
 from kiro_crew.acp import client as acp_client
+
+#: A credential the plan redacts: a GitHub classic token with a valid checksum.
+_SECRET = github_classic(seed=51)
 
 _RID = "0f1e2d3c-aaaa-bbbb-cccc-000000000001"
 _TEN_MODELS = ["m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "m9", "m10"]
@@ -302,7 +306,7 @@ _ERROR_ROWS = [
     ),
     pytest.param("boom", None, "Prompt error: boom", _tags(), id="non-dict-error"),
     pytest.param(
-        _frame("leak AKIAIOSFODNN7EXAMPLE https://evil.example.com/x?d=secret"),
+        _frame(f"leak {_SECRET} https://evil.example.com/x?d=secret"),
         None,
         "leak [REDACTED: credential] https://evil.example.com/x?d=secret",
         _tags(),
@@ -340,8 +344,8 @@ def test_raise_acp_error_type_and_tags(error, available, expected_text, expected
         pytest.param(
             "kas",
             True,
-            "Not signed in to Kiro. Sign in from Settings → Agent Harness → Kiro "
-            "Agent → Kiro sign-in, then send your message again.",
+            "Not signed in to Kiro. Sign in from Settings → Kiro account, then send your "
+            "message again.",
             id="host-auth-backend-tags-sign-in",
         ),
         pytest.param(
@@ -362,6 +366,20 @@ def test_session_expired_sign_in_tag_follows_the_backend(backend, auth_required,
         f"{sign_in_text} Switching models will not help — this "
         "is a sign-in issue, not a backend error."
     )
+
+
+def test_kas_sign_in_required_frame_is_tagged_for_the_sign_in_card():
+    """KAS 3.4's first prompt with no sign-in: its own errorType, no expiry wording."""
+    frame = {
+        "code": -32000,
+        "message": "Sign in to Kiro to send a prompt.",
+        "data": {"errorType": "SignInRequiredError", "retryErrorType": "CLIENT_ERROR"},
+    }
+    with pytest.raises(acp_client.AcpError) as caught:
+        acp_client._raise_acp_error(frame, None, backend="kas")
+    assert caught.value.auth_required is True
+    assert caught.value.transient is False
+    assert str(caught.value).startswith("Not signed in to Kiro. Sign in from Settings")
 
 
 # What an access refusal looks like from each side: the bare Bedrock-shaped

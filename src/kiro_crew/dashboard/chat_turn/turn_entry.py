@@ -30,6 +30,9 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_turn.file_changes import _flush_file_changes_off_loop
     from kiro_crew.dashboard.chat_turn.native_cards import (
         NATIVE_SUBAGENT_INTERRUPTED_ERROR,
+        _carried_background_native,
+        _expect_background_draw,
+        _keep_background_open_at_release,
         _native_flush_cut_short,
         _native_subagent_close_all,
         _retain_terminal_native,
@@ -178,6 +181,9 @@ async def _turn_open(turn: _ChatTurn) -> _Flow | None:
     # and strand the error card / session reset it owes. Initialised here, where the body's single
     # entry cannot miss them, and overwritten with their real values in _turn_dispatch_gates,
     # _turn_build_prompt and _on_cancelled; the seam then always reads a bound name.
+    # ``_turn_t0`` is the exception: its value here IS the real one. It is the
+    # turn's wall-clock start, which the footer's elapsed and the usage row's
+    # duration count from, so a cold start's session claim is inside it.
     _turn_t0 = time.monotonic()
     turn._turn_t0 = _turn_t0
     _stop_reason = ""
@@ -342,7 +348,11 @@ async def _turn_open(turn: _ChatTurn) -> _Flow | None:
         )
     )
     # Local to this invocation, including failures before provider dispatch.
-    _recovery_turn_id = uuid.uuid4().hex
+    from kiro_crew.tracing import inbound as trace_inbound
+
+    # A caller's traceparent (tracing/inbound.py) names the id its response header
+    # already carries; every other turn mints its own.
+    _recovery_turn_id = trace_inbound.claim_turn_id() or uuid.uuid4().hex
     turn._recovery_turn_id = _recovery_turn_id
     turn_exit.actor = _crew_log_actor
     turn_exit.turn_id = _recovery_turn_id
@@ -723,6 +733,11 @@ async def _turn_open(turn: _ChatTurn) -> _Flow | None:
     # call time.
     _seen_tool_identity: dict[str, tuple[str, str]] = {}
     turn._seen_tool_identity = _seen_tool_identity
+    # Identified call key -> digests of the (title, kind) the SEL last recorded
+    # for it, so a tool_call_update that changes neither writes no `refined` row.
+    # Keyed like `_failed_write_calls`, so the first-source map bounds the count,
+    # and the digests bound each entry's size.
+    turn._sel_tool_labels = {}
     # tool_call_id -> the receipt selector of a ``session_send`` call
     # (``session_send_receipts.call_selector`` over its raw arguments), so its
     # completed result can pick up what the gateway delivered.
@@ -789,7 +804,10 @@ async def _turn_open(turn: _ChatTurn) -> _Flow | None:
     # session_id -> {started, done, agent, task} for native kiro-cli subagents,
     # reconciled from `_kiro.dev/subagent/list_update` (one card per sub-agent).
     # The slot holds the same live dict so reconnect snapshots can restore cards.
-    _native_tracker: dict[str, dict] = {}
+    # It starts with the background cards an earlier turn left open.
+    _native_tracker: dict[str, dict] = _carried_background_native(
+        getattr(slot, "_native_subagent_tracker", None) or {}
+    )
     turn._native_tracker = _native_tracker
     slot._native_subagent_tracker = _native_tracker
     turn._timeline_subagent_roster = None
@@ -1013,6 +1031,11 @@ async def _turn_open(turn: _ChatTurn) -> _Flow | None:
     # the member section instead of running the member with no bounds.
     _member_session_start_pending = False
     turn._member_session_start_pending = _member_session_start_pending
+    # A slim resume (a new provider session over a restored history) owes the
+    # lessons and steering its compacted history may have lost. Armed at the
+    # session claim and narrowed at prompt assembly; the settle re-arms the
+    # reinjection when the owed blocks were not delivered.
+    turn._slim_resume_pending = False
     # Recoverable tool refusals (host-gate policy deny / read-only bash gate)
     # recorded during this turn as (redacted_title, reason). Each deny also gets
     # its reason steered in-band (see _refusal_notices); this ledger is what the
@@ -1044,16 +1067,24 @@ async def _turn_release_handles(turn: _ChatTurn) -> None:
     # force-marks every card done, and terminal entries linger in the
     # tracker for replay, so reading the tracker afterwards would blame
     # long-completed children for a later ceiling timeout.
-    _children_unfinished_final = any(not _i.get("done") for _i in _native_tracker.values())
+    # A background card is not a child the turn waits on.
+    _children_unfinished_final = any(
+        not _i.get("done") and not _i.get("background") for _i in _native_tracker.values()
+    )
     # A turn cut short gets no roster that flushes a Claude child's held text,
     # so it goes onto the card here, before the card closes.
     try:
         _native_flush_cut_short(turn)
     except Exception:
         logger.debug("native child text flush at release failed", exc_info=True)
-    # Every normal landing already closed its cards in _on_complete, so a
-    # card still open here belongs to a turn that was stopped, timed out or
-    # crashed before its terminal event.
+    # Every normal landing already closed its cards in _on_complete, so a card
+    # still open here belongs to a turn that was stopped, timed out or crashed
+    # before its terminal event, or is a background card the harness still runs,
+    # which stays open past any end Crew did not cut short, a landing's or not.
+    try:
+        _keep_background_open_at_release(turn)
+    except Exception:
+        logger.debug("keeping background cards open at release failed", exc_info=True)
     try:
         _native_subagent_close_all(
             state,
@@ -1099,6 +1130,7 @@ async def _turn_release_handles(turn: _ChatTurn) -> None:
     try:
         setattr(turn.client, "child_fidelity_aware", False)
     except Exception:
+        # Release must finish even when the client refuses the write.
         pass
     # The elicitation opt-in is the same promise (to render the card) and
     # ends with the turn for the same reason -- on the client the turn
@@ -1106,7 +1138,11 @@ async def _turn_release_handles(turn: _ChatTurn) -> None:
     try:
         setattr(turn.client, "accepts_elicitation", False)
     except Exception:
+        # Release must finish even when the client refuses the write.
         pass
+    # The mark that has this turn's stream draw Claude Code's background work ends with
+    # it too, so a stream that never reached its dispatch leaves the mark to no other.
+    _expect_background_draw(turn.client, False)
 
 
 async def _turn_flush_file_changes(turn: _ChatTurn) -> asyncio.CancelledError | None:

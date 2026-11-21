@@ -32,6 +32,7 @@ import {
   type Other,
   type Resp,
   PanelWindowCtx,
+  allConversations,
   panelWindow,
   otelWindow,
   spendWindow,
@@ -59,6 +60,13 @@ const TURN_NON_FAULT_OUTCOMES = new Set([
   // fault_rate by the API (see the comment in HealthBar).
   'unclassified',
 ])
+
+/**
+ * Startup outcomes that are NOT faults. A start that Stop, a closed chat or a
+ * reset cancelled never failed, so it stays out of the count, as a cancelled
+ * turn does.
+ */
+const STARTUP_NON_FAULT_OUTCOMES = new Set(['ready', 'cancelled'])
 
 // Seconds to one decimal from 1s up, whole milliseconds below; a missing or
 // non-finite reading is a dash rather than "NaNms".
@@ -849,8 +857,11 @@ export default function TelemetryPanel() {
   // no-data notice below would otherwise state a fact the request never
   // established. askAgent on: a read-only telemetry panel with nothing editable.
   if (isError && !data) {
+    // The window picker stays: the failing request may be the stored window
+    // itself, and with no control to pick another one every reload repeats it.
     return (
       <div className="py-12 px-4">
+        {windowControl}
         <ErrorNotice message={error?.message} askAgent testId="telemetry-startup-error" />
       </div>
     )
@@ -906,7 +917,7 @@ export default function TelemetryPanel() {
               <SpendTab c={offCost} />
             </PanelWindowCtx.Provider>
           )}
-          {data.context && <ContextTab c={data.context} convos={offCost?.conversations} navigable={offCost?.navigable_category} />}
+          {data.context && <ContextTab c={data.context} convos={allConversations(offCost)} navigable={offCost?.navigable_category} />}
           <div className="border border-border bg-card rounded-xl p-3 text-[11px] leading-relaxed">
             <span className="text-text font-medium">{i18nT('pages.telemetryPanel.telemetry_is_off')}</span>{' '}
             <span className="text-muted">{offBody}</span>
@@ -948,7 +959,7 @@ export default function TelemetryPanel() {
   // count has no such ceiling — the first real failure moves 0 to 1.
   const startupTotal = s ? Object.values(s.outcome).reduce((a, b) => a + b, 0) : 0
   const startupFaults = s
-    ? Object.entries(s.outcome).reduce((n, [k, v]) => (k === 'ready' ? n : n + v), 0)
+    ? Object.entries(s.outcome).reduce((n, [k, v]) => (STARTUP_NON_FAULT_OUTCOMES.has(k) ? n : n + v), 0)
     : 0
 
   const hasStartup = !!(s && s.overall.count > 0)
@@ -1022,7 +1033,7 @@ export default function TelemetryPanel() {
             <SpendTab c={data.cost} />
           </PanelWindowCtx.Provider>
         )}
-        {active === 'context' && ctx && <ContextTab c={ctx} convos={data?.cost?.conversations} navigable={data?.cost?.navigable_category} />}
+        {active === 'context' && ctx && <ContextTab c={ctx} convos={allConversations(data?.cost)} navigable={data?.cost?.navigable_category} />}
         <PanelWindowCtx.Provider value={otelWin ?? win}>
           {active === 'latency' && <LatencyTab other={other} />}
           {active === 'startup' && s && <StartupTab s={s} faults={startupFaults} total={startupTotal} />}

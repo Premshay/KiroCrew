@@ -6,13 +6,14 @@ import { Popover, PopoverTrigger, PopoverContent } from './ui/popover'
 import { Btn } from './ui'
 import ErrorNotice from './ErrorNotice'
 import { cronJobsQuery } from '../api/cronJobsQuery'
-import { runBelongsToSlot } from '../apps/workflows/runModel'
+import { runBelongsToSlot } from '../components/workflows/runModel'
 import { loadGoalDraft, saveGoalDraft, type GoalDraft } from '../utils/goalDrafts'
 import { DRAFT_SAVE_DEBOUNCE_MS } from '../utils/draftConstants'
 
 import { i18nT } from '../i18n/t'
 import { fmtTimeNumeric } from '../i18n/format'
 import { type AutoNudgeLoop, cycleText as loopCycleText, nextCycleText, judgeReading, judgeVerdictTime, loopFinished, isPullRequestWatchKind, AUTONUDGE_LOOPS_QUERY_KEY } from './autoNudgeLoop'
+import { apiTransport } from '../api/apiTransport'
 export type { AutoNudgeLoop } from './autoNudgeLoop'
 
 interface Props {
@@ -428,7 +429,7 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
    *  stale copy of a record a write just changed. */
   const loopWrite = useMutation({
     mutationFn: async ({ url, method, body }: { url: string, method: 'PATCH' | 'POST', body?: unknown }): Promise<AutoNudgeLoop> => {
-      const resp = await fetch(url, body === undefined
+      const resp = await apiTransport.request(url, body === undefined
         ? { method }
         : { method, headers: JSON_HEADERS, body: JSON.stringify(body) })
       const data = await resp.json().catch(() => ({}))
@@ -455,7 +456,7 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
     if (!loop) return
     setSaving(true)
     try {
-      const resp = await fetch(`/api/autonudge/${loop.id}?intent=clear`, { method: 'DELETE' })
+      const resp = await apiTransport.request(`/api/autonudge/${loop.id}?intent=clear`, { method: 'DELETE' })
       if (!resp.ok) {
         // A successful DELETE may return 204 No Content, so the body is read only here.
         const data = await resp.json().catch(() => ({}))

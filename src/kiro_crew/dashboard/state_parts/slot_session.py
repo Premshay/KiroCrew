@@ -15,12 +15,13 @@ Writes: ``_app``, ``_auto_tagged``, ``_binding``, ``_channel_runtime_origin``, `
 ``_effort_pick_gen``, ``_fork_lock``, ``_fork_title_spent``,
 ``_hidden_scratch_notice_shown``, ``_human_seen``, ``_last_stop_reason``, ``_lineage_minted``,
 ``_mcp_banner_shown``, ``_mcp_report``,
-``_mcp_report_session_id``, ``_memory_assignment_from_history``, ``_model_pick_gen``,
+``_mcp_report_session_id``, ``_mcp_sign_in_notice_shown``, ``_memory_assignment_from_history``, ``_model_pick_gen``,
 ``_model_pick_lock``, ``_model_runtime_pick_gen``, ``_model_withheld``,
 ``_model_withheld_for``, ``_origin``, ``_pending_discard_conversation_key``,
-``_deferred_model_switch_key``, ``_pending_discard_from_wake``, ``_pending_memory_mode``, ``_pending_model_pick``,
-``_pending_reset_history_key``, ``_prefetch_ttl_task``, ``_reasoning_effort``,
-``_reports_to_creator``, ``_revived_by``, ``_saved_created_by``,
+``_deferred_model_switch_key``, ``_pending_discard_from_wake``, ``_pending_discard_drops_plan``,
+``_pending_memory_mode``, ``_pending_model_pick``,
+``_pending_reset_history_key``, ``_prefetch_ttl_task``, ``_project_hook_files_notice_shown``, ``_reasoning_effort``,
+``_reports_to_creator``, ``_revived_by``, ``_saved_created_by``, ``_session_notice_marks``,
 ``_session_requested_model``,
 ``_slack_channel``, ``_slack_linked``, ``_slack_thread_ts``, ``_summary_in_flight``,
 ``_summary_turn_mark``, ``_tab_id``, ``_telemetry_notice_shown``, ``_title_epoch``, ``_title_in_flight``,
@@ -140,7 +141,7 @@ def init_session_fields(self: _ChatSlot) -> None:
     # next create or pick, and from the first row on the row carries it.
     self._welcome_preview = ("", "", "", "")
     # Whether the owner asked Jev to pick this turn's model tier
-    # (`decisions.points.model_route`), set by the picker's "Auto (Jev)" entry
+    # (`decisions.points.model_route`), set by the picker's "Auto (decision model)" entry
     # and cleared by any concrete pick. A FLAG beside `model`, never a
     # sentinel inside it: `model` is a provider model id -- it reaches
     # `session/set_model`, the session allocation and the composer chip -- and
@@ -310,6 +311,11 @@ def init_session_fields(self: _ChatSlot) -> None:
     #: until stamped or read back, then write-once. Persisted by the
     #: metadata codec's ``attribution`` row.
     self._attribution = None
+    #: Shared Crew participants (``shared_crew.participants``): the people who
+    #: have written here, for the session and Bot rows' initials. Persisted by the
+    #: metadata codec's ``participants`` row.
+    self._participants = []
+    self._participants_dropped = {"ids": [], "more": 0}
     #: The ``created_by`` the session's saved metadata line names, read on every
     #: hydration (restore, recent, resume). DISPLAY ONLY: the Crew Mode stamp reads
     #: it to keep a reopened worker under its root (``crew_mode.stamp_rows``), and a
@@ -339,6 +345,9 @@ def init_session_fields(self: _ChatSlot) -> None:
     #: crewmate's worker report may wake its creator
     #: (``dashboard.mate_thread_wakes``); never persisted or restored.
     self._reports_to_creator = False
+    #: A code-channel conductor's work at a glance (``work_aggregate``), written by
+    #: the channel's work board on each refresh; ``None`` when it has no workers.
+    self._work_aggregate = None
     #: Slot key of the session-control caller that REVIVED this slot from
     #: history, or "". Cap attribution only: ``creator_slot_count`` counts it
     #: beside ``_created_by`` for the per-caller slot cap, since a revive keeps
@@ -359,7 +368,10 @@ def init_session_fields(self: _ChatSlot) -> None:
     # memory only and bounded; see dashboard.mcp_banner_dedupe.
     self._mcp_banner_shown = {}
     self._hidden_scratch_notice_shown = False
+    self._mcp_sign_in_notice_shown = False
     self._telemetry_notice_shown = ""
+    self._project_hook_files_notice_shown = ""
+    self._session_notice_marks = []
     # Set by api_chat_slot_project; consumed in _run_chat instead of
     # inline because the endpoint can be reached from inside the kiro-cli
     # process group via the set_project MCP tool.
@@ -374,6 +386,8 @@ def init_session_fields(self: _ChatSlot) -> None:
     # True when a patrol wake queued that discard: it then also waits, at
     # the boundary, while a question card or tool approval is pending.
     self._pending_discard_from_wake = False
+    # True when a /clear's discard waits on a queued completion: its landing drops the plan.
+    self._pending_discard_drops_plan = False
     # Set by session_set_model on an idle slot; consumed at the start of the
     # next turn (session_control.apply_pending_model_pick), which re-checks
     # the caller's authorization and commits the model in one synchronous
@@ -396,7 +410,7 @@ def init_session_fields(self: _ChatSlot) -> None:
     # rather than re-arm the same load.
     self._eager_spawn_reported_resume = False
     # Consecutive failed background starts, and the monotonic time before
-    # which the next one waits (chat_runner._note_eager_spawn_failure).
+    # which the next one waits (chat_turn.eager_spawn._note_eager_spawn_failure).
     self._eager_spawn_failures = 0
     self._eager_spawn_retry_at = 0.0
     # Unclaimed-prefetch teardown timer (resume prefetch). At most one per

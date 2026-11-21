@@ -20,7 +20,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterator
 
-from kiro_crew.apps import agent_readonly_dirs, credential_masks, protected_app_state
+from kiro_crew.apps import (
+    agent_readonly_dirs,
+    credential_masks,
+    protected_app_state,
+)
 from kiro_crew.apps.admission import app_admission_denied
 from kiro_crew.apps.execution import repository_bound_grant_denied
 from kiro_crew.apps.manager_records import (
@@ -30,7 +34,7 @@ from kiro_crew.apps.manager_records import (
     InstalledApp,
     _approved_grants_after_manifest_change,
     _approved_grants_snapshot,
-    _declared_grant_entries,
+    _consented_grant_entries,
     _effective_approved_grants,
     _held_back_entries,
     _now_iso,
@@ -154,6 +158,10 @@ def install_app(
     as the source of marketplace code; a local-folder grant would admit that.
     The install-time trust check then compares against the listing coordinate.
     """
+    # Imported here, not at module level: the MCP listing imports this module and
+    # its import budget has no room (test_mcp_listing_import_budget).
+    from kiro_crew.apps import protected_app_ui
+
     market_coordinate = ""
     if market_source:
         # Imported here so the manager facade's star import gains no new names.
@@ -241,6 +249,8 @@ def install_app(
     hold_app_record_lock(name)
     existing = _read_installed(name)
     if existing:
+        from kiro_crew.apps.market_source import MARKET_OVERWRITE_HINT, is_market_source
+
         sel().log_api_access(
             caller="app_install",
             operation="install",
@@ -252,8 +262,36 @@ def install_app(
             ok=False,
             name=name,
             error=f"app {name!r} is already installed (v{existing.version}). "
-            f"Update it in place instead (from the app's page, or "
-            f"`kirocrew app update {name}`), or uninstall first.",
+            + (
+                MARKET_OVERWRITE_HINT
+                if is_market_source(existing.source)
+                else f"Update it in place instead (from the app's page, or "
+                f"`kirocrew app update {name}`), or uninstall first."
+            ),
+        )
+
+    # Ticked Bots that an earlier install under this name left behind go before
+    # this one exists; if they cannot be removed, nothing is installed.
+    # Deferred: an MCP server lists its tools without loading the Bot grant store.
+    from kiro_crew.apps.bot_grant_store import remove_granted_bots
+
+    try:
+        remove_granted_bots(name)
+    except (OSError, ValueError) as exc:
+        return AppResult(
+            ok=False, name=name, error=f"could not clear earlier Bot access for {name!r}: {exc}"
+        )
+    # Memory consent an earlier install under this name left behind goes too, before
+    # this one exists; if it cannot be removed, nothing is installed.
+    from kiro_crew.memory_provider.consent import revoke_app
+
+    try:
+        revoke_app(name)
+    except (OSError, ValueError) as exc:
+        return AppResult(
+            ok=False,
+            name=name,
+            error=f"could not clear earlier memory consent for {name!r}: {exc}",
         )
 
     source_repository = _effective_source_repository(source_repository)
@@ -365,6 +403,11 @@ def install_app(
                 logger.info("Reinstalling %s into the folder its uninstall kept", name)
             shutil.rmtree(dest)
         _copy_app_tree(source, dest)
+        # The scripts the dashboard will run: copied from the source this install
+        # copies, never from the sandbox-writable tree (``protected_app_ui``).
+        protected_app_ui.discard(
+            protected_app_ui.record(name, source / "ui", source, allow_hardlinks=True)
+        )
         # The gateway's own root entries -- ``.app_secret`` and, when a preserved
         # directory is put back below, ``data`` -- are never the source's: a
         # source entry so named reaches the app directory verbatim only when the
@@ -395,10 +438,17 @@ def install_app(
         refusal = gateway_data_dir_obstruction(dest)
         if refusal:
             raise InstalledTreeRefused(refusal)
+        # Created as soon as the tree is published, before any record write that can
+        # fail, so a tree never stays on disk without its data directory: the sandbox
+        # refuses every spawn while an app declaring a credential-mask directory has
+        # none (``sandbox_staging._materialize_declared_mask_dirs``). A failure here
+        # removes the tree below.
+        app_data_dir(name)
     except InstalledTreeRefused as exc:
         # Nothing preserved is inside `dest`: a restored `data/` IS a directory,
         # so the refusal only fires where none was put back.
         shutil.rmtree(dest, ignore_errors=True)
+        protected_app_ui.forget(name)
         sel().log_api_access(
             caller="app_install",
             operation="install",
@@ -411,6 +461,7 @@ def install_app(
         # Clean up partial install first
         if dest.exists():
             shutil.rmtree(dest, ignore_errors=True)
+        protected_app_ui.forget(name)
         # Restore preserved data to the clean dest
         try:
             if _owned_data_dir(tmp_data):
@@ -456,7 +507,7 @@ def install_app(
     # Written before the record, so no record ever sits beside a missing set.
     #
     # One unit: a failed write part-way through (disk full, permissions) must not
-    # leave a record with no secret or no data dir, read as installed. Only what
+    # leave a record with no secret, read as installed. Only what
     # this block wrote is undone; the copied tree, with any preserved ``data/``,
     # stays for the next install of this name to take over.
     #
@@ -465,11 +516,8 @@ def install_app(
     # outlive its record, and that set is restored byte for byte.
     prior_grants_text = _approved_grants_snapshot(name)
     try:
-        _write_approved_grants(name, _declared_grant_entries(grant_source(manifest)))
+        _write_approved_grants(name, _consented_grant_entries(grant_source(manifest)))
         _write_installed(name, meta)
-
-        # Create data directory
-        app_data_dir(name)
 
         # Generate and write app secret for token-based auth (App Kit §5.1)
         # circular import: token_auth -> dashboard -> bridges -> manager
@@ -482,6 +530,10 @@ def install_app(
             _restore_approved_grants(name, prior_grants_text)
         except OSError as undo_exc:
             logger.error("Failed to undo the install record of app %s: %s", name, undo_exc)
+        # The record's write asked for a refresh that may have read it; ask again.
+        from kiro_crew.apps.hidden_sessions import request_hiding_refresh
+
+        request_hiding_refresh()
         sel().log_api_access(
             caller="app_install",
             operation="install",
@@ -548,6 +600,10 @@ def update_app(
     new manifest neither holds back a grant nor adds ``sessionApproval``, so an
     adopted app keeps its ``enabled`` flag and every approved grant.
     """
+    # Imported here, not at module level: the MCP listing imports this module and
+    # its import budget has no room (test_mcp_listing_import_budget).
+    from kiro_crew.apps import protected_app_ui
+
     source = Path(source).expanduser().resolve()
     if not source.is_dir():
         return AppResult(ok=False, error=f"source is not a directory: {source}")
@@ -595,6 +651,28 @@ def update_app(
     existing = _read_installed(name, manifest=old_manifest)
     if not existing:
         return AppResult(ok=False, name=name, error=f"app {name!r} is not installed")
+
+    # A marketplace record's ``market:<ref>@<n>`` source and zip sha256 are its
+    # provenance and its trust coordinate; the record write below would replace
+    # them with the folder path. shortcut: refused outright until a marketplace
+    # update path (resolve, verify, re-confirm) exists; upgrade then.
+    from kiro_crew.apps.market_source import MARKET_OVERWRITE_HINT, is_market_source
+
+    if is_market_source(existing.source):
+        error = f"{name!r} cannot be updated from a folder. {MARKET_OVERWRITE_HINT}"
+        sel().log_api_access(
+            caller="app_update",
+            operation="provenance",
+            outcome="rejected",
+            resources=f"name={name!r}",
+            error=error,
+        )
+        return AppResult(
+            ok=False,
+            name=name,
+            error=error,
+            error_code="app_update_market_source",
+        )
 
     source_repository = _effective_source_repository(source_repository)
     trust_denied = repository_bound_grant_denied(name, repository=source_repository)
@@ -794,6 +872,8 @@ def update_app(
     except OSError as exc:
         return AppResult(ok=False, name=name, error=f"failed to update app files: {exc}")
     with _tree_swap(name), update_marker:
+        previous_ui: Path | None = None
+        ui_recorded = False
         try:
             if existing.enabled and not meta.enabled:
                 # Turned off for consent. Decided here, from the record read
@@ -835,6 +915,10 @@ def update_app(
             refusal = gateway_data_dir_obstruction(dest)
             if refusal:
                 raise InstalledTreeRefused(refusal)
+            # The scripts the dashboard will run: copied from the source this update
+            # installs, never from the sandbox-writable tree (``protected_app_ui``).
+            previous_ui = protected_app_ui.record(name, source / "ui", source, allow_hardlinks=True)
+            ui_recorded = True
             _write_approved_grants(name, approved_grants)
             _write_installed(name, meta)
         except (OSError, shutil.Error, ValueError, InstalledTreeRefused) as exc:
@@ -863,6 +947,14 @@ def update_app(
             except (OSError, shutil.Error, ValueError) as rollback_exc:
                 rollback_error = f"; rollback failed: {rollback_exc}"
                 logger.error("Failed to restore app %s after update error", name, exc_info=True)
+            if ui_recorded:
+                # Its own step, after the tree: a failure here never stops the tree
+                # and the record going back.
+                try:
+                    protected_app_ui.restore(name, previous_ui)
+                except (OSError, ValueError) as ui_exc:
+                    rollback_error += f"; UI script copy not restored: {ui_exc}"
+                    logger.error("Failed to restore app %s's UI script copy", name, exc_info=True)
             return AppResult(
                 ok=False,
                 name=name,
@@ -873,6 +965,7 @@ def update_app(
             _remove_any_shape(retired)
         except OSError:
             logger.warning("Could not remove retired app tree for %s", name, exc_info=True)
+        protected_app_ui.discard(previous_ui)
 
     # Ensure data directory exists
     app_data_dir(name)
@@ -880,6 +973,12 @@ def update_app(
     # publishes every record's config keys before the dashboard serves.
     if _adoption is None:
         refresh_app_config_keys()
+        # Before the route announces app_reload, so the reloaded dashboard is
+        # served the updated manifest's frame origins.
+        # Deferred: frame_sources stays off an MCP server's pre-list import budget.
+        from kiro_crew.apps.frame_sources import refresh_frame_sources  # noqa: PLC0415
+
+        refresh_frame_sources()
 
     logger.info(
         "Updated app %s: v%s -> v%s from %s",

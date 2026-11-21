@@ -790,6 +790,21 @@ class TestReachabilityCheck:
         assert "did not resolve" in r["note"]
         assert "Unable to locate credentials" in r["detail"]
         assert r["credential_helper_missing"] == ""
+        assert r.get("env_credentials") is False
+
+    @pytest.mark.parametrize("profile, expected", [("", True), ("work", False)])
+    def test_env_credentials_are_flagged_only_without_a_profile(
+        self, monkeypatch, profile, expected
+    ):
+        # The sandbox scrubs the secret key, so the CLI sees only the key id.
+        err = "aws: [ERROR]: Partial credentials found in env, missing: AWS_SECRET_ACCESS_KEY"
+        monkeypatch.setattr(aws, "run_aws", lambda *a, **k: (255, "", err))
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "example-secret")
+        monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
+        r = iam.reachability_check(profile)
+        assert r.get("env_credentials") is expected
+        assert r["note"] == aws.env_credentials_hint()
+        assert r["detail"] == err
 
     def test_a_credential_helper_missing_from_path_is_named(self, monkeypatch):
         # The AWS CLI's own words when the profile's credential_process command is
@@ -946,7 +961,7 @@ class TestAgentDenyListForCloudVerbs:
             assert self._denied(cmd), f"is_denied does not deny {cmd!r}"
 
     def test_global_args_do_not_bypass_deny(self):
-        # Regression: the deny patterns must tolerate AWS global options in BOTH
+        # The deny patterns must tolerate AWS global options in BOTH
         # positions — before the service (`aws --region r ec2 terminate-...`) AND
         # between the service and the operation (`aws ec2 --region r
         # terminate-...`), otherwise an agent trivially bypasses the denylist.

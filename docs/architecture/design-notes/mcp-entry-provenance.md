@@ -97,7 +97,7 @@ fix.
 **Re-establishing management on a legacy entry: Disconnect, then Connect.** The
 delete path removes the name from the shared file outright
 (`handlers/mcp.py`, `api_mcp_remove` / `api_mcp_server_detail`, both
-`data["mcpServers"].pop(name)` then `_write_mcp_json`). That file is the kiro-global
+`data.get("mcpServers", {}).pop(name, None)` then `_write_mcp_json`). That file is the kiro-global
 `~/.kiro/settings/mcp.json`: nothing in Crew removes an entry from the Claude Code
 sidecar `~/.mcp.json` (its registration only adds), so a legacy sidecar entry
 rejoins management only after the user deletes it from that file by hand. The name
@@ -145,8 +145,7 @@ that a field the user set and Kiro Crew never models survives a rebuild. One fie
 in that output is not the user's — the resolved absolute `command`. Reading a
 computed value back as if it were authored is what makes it permanent:
 `_resolve_command` accepts an absolute existing executable without a PATH search,
-so no later change to how commands resolve can rebind one that was stored once
-(#4955).
+so no later change to how commands resolve can rebind one that was stored once.
 
     "x-kirocrew-derived": { "from": "npx", "emitted": "/abs/npx" }
 
@@ -175,7 +174,7 @@ merge picks a winner by which command resolves, then adopts that winner's
 `args`/`env` as a unit. Any pre-resolution guess is wrong in one of two directions:
 scanning per field mixes sources, and taking the first owning scope picks a source
 the merge would not have chosen. That is a merge-precedence question, not a
-provenance one, and it belongs with the ownership work in #6171.
+provenance one, and it is out of scope here.
 
 The ownership test is deliberately conservative and compares by ALIAS, not raw key:
 a scope keys entries by its own raw name while the config's slash-containing keys

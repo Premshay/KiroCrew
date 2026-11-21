@@ -210,6 +210,15 @@ async def handle_registry_refresh(request: web.Request) -> web.Response:
       fetch on the exact same code path as a cold start, so refresh cannot
       behave differently from the load it is trying to repair.
     """
+    # A dashboard subject must be the owner, as on every sibling registry
+    # write. An app token reaches this path only through an explicit
+    # ``permissions.api`` grant that token auth already checked, so it keeps it.
+    if not request.get("app"):
+        from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+        denied = await require_owner_dashboard_request(request, "app_store.refresh")
+        if denied is not None:
+            return denied
     # Off the event loop like every other disk touch on these routes; three
     # unlinks gathered because none depends on another.
     await asyncio.gather(
@@ -218,6 +227,23 @@ async def handle_registry_refresh(request: web.Request) -> web.Response:
         asyncio.to_thread(forget_editorial_cache),
     )
     return web.json_response({"ok": True})
+
+
+def _held_mcp_servers(info: dict[str, Any] | None) -> bool:
+    """Whether an open chat may hold the MCP servers of the app *info* describes: it is
+    enabled and declares ``mcpServers``."""
+    return bool(info and info.get("enabled") and (info.get("manifest") or {}).get("mcpServers"))
+
+
+async def _reach_open_chats(request: web.Request, name: str) -> None:
+    """End as an MCP page write does, so a chat already open gets *name*'s MCP change;
+    a failure is logged, since the install has committed."""
+    from kiro_crew.dashboard.handlers.template_server_request import _reach_sessions
+
+    try:
+        await _reach_sessions(request)
+    except Exception:  # noqa: BLE001 - the install has committed
+        logger.warning("Open chats did not get %s's MCP change", name, exc_info=True)
 
 
 async def handle_registry_install(request: web.Request) -> web.Response:
@@ -238,7 +264,7 @@ async def handle_registry_install(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except (LookupError, RecursionError, ValueError):
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     not_object = body_not_object_error(body)
     if not_object is not None:
         return not_object
@@ -256,7 +282,8 @@ async def handle_registry_install(request: web.Request) -> web.Response:
         # Read before the install writes the app: an app already installed makes
         # this install an update, which takes the app down to replace its files and
         # whose rewritten crons must reach the scheduler.
-        was_installed = await asyncio.to_thread(lambda: get_app(name) is not None)
+        prior = await asyncio.to_thread(get_app, name)
+        was_installed = prior is not None
         if was_installed:
             result = await _reinstall_from_registry(name, name)
         else:
@@ -318,6 +345,10 @@ async def handle_registry_install(request: web.Request) -> web.Response:
                 # adopted app takes a catalog update.
                 result.update(await _rerun_on_enable_after_update(request, result["name"]))
     result["registration"] = reg.to_dict()
+    # An update ends as handle_update_app does, so a chat already open gets the app's
+    # MCP change (app-kit-platform §1).
+    if was_installed and (reg.mcp_servers or _held_mcp_servers(prior)):
+        await _reach_open_chats(request, name)
     sel().log_api_access(
         caller="dashboard", operation="app_registry_install", outcome="completed", resources=name
     )
@@ -351,7 +382,7 @@ async def handle_registry_install_stream(request: web.Request) -> web.StreamResp
     try:
         body = await request.json()
     except (LookupError, RecursionError, ValueError):
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     not_object = body_not_object_error(body)
     if not_object is not None:
         return not_object
@@ -434,10 +465,14 @@ async def handle_registry_install_stream(request: web.Request) -> web.StreamResp
     # Run install + drain concurrently. The complete lifecycle transaction —
     # install, resource registration, backend start — runs under one per-app
     # lock (install_from_registry is lock-free internally).
+    reach_open_chats = False
+
     async def _locked_install() -> dict[str, Any]:
+        nonlocal reach_open_chats
         async with app_lifecycle_lock(name):
             # Read before the install, as in handle_registry_install.
-            was_installed = await asyncio.to_thread(lambda: get_app(name) is not None)
+            prior = await asyncio.to_thread(get_app, name)
+            was_installed = prior is not None
             if was_installed:
                 r = await _reinstall_from_registry(name, name, log_lines=streaming_log)
             else:
@@ -464,6 +499,9 @@ async def handle_registry_install_stream(request: web.Request) -> web.StreamResp
                     if was_installed:
                         # An update, as in handle_registry_install: onEnable runs again.
                         r.update(await _rerun_on_enable_after_update(request, r["name"]))
+                reach_open_chats = was_installed and bool(
+                    reg.mcp_servers or _held_mcp_servers(prior)
+                )
             return r
 
     install_task = asyncio.create_task(_locked_install())
@@ -513,7 +551,10 @@ async def handle_registry_install_stream(request: web.Request) -> web.StreamResp
         return resp
 
     # Resource registration + backend start already ran inside the locked
-    # transaction above; result carries "registration".
+    # transaction above; result carries "registration". An update ends as in
+    # handle_registry_install.
+    if reach_open_chats:
+        await _reach_open_chats(request, name)
     sel().log_api_access(
         caller="dashboard",
         operation="app_registry_install_stream",
@@ -626,20 +667,22 @@ async def handle_registries(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
 
-    def _deny(msg: str, resources: str = "") -> web.Response:
+    def _deny(msg: str, resources: str = "", *, code: str | None = None) -> web.Response:
         sel().log_api_access(
             caller="dashboard",
             operation="registries.update",
             outcome="denied",
             resources=resources or msg,
         )
-        return web.json_response({"error": msg}, status=400)
+        if code is None:
+            return web.json_response({"error": msg}, status=400)
+        return web.json_response({"error": msg, "code": code}, status=400)
 
     # PUT — replace the entire registries list
     try:
         body = await request.json()
     except Exception:
-        return _deny("invalid JSON", "invalid JSON body")
+        return _deny("invalid JSON", "invalid JSON body", code="invalid_json")
     not_object = body_not_object_error(body)
     if not_object is not None:
         sel().log_api_access(
@@ -767,7 +810,7 @@ async def handle_registries(request: web.Request) -> web.Response:
     #     ``apps.routes`` (479 -> 596), and loads the whole ``dashboard.chat_utils``
     #     tree on paths that today never touch it.
     #
-    # Same reasoning, in routes.py, as ``handle_app_uninstall``'s lazy
+    # Same reasoning, in routes_uninstall.py, as ``_run_uninstall``'s lazy
     # ``_get_config_lock`` import; ``run_config_write`` itself defers that import
     # for an outright cycle.
     from kiro_crew.dashboard.chat_utils import run_config_write
@@ -915,7 +958,13 @@ async def handle_registries_refresh(request: web.Request) -> web.Response:
     cache-bust + re-fetch is offloaded inside ``refresh_registries`` (async).
     """
     from kiro_crew.apps.registry import refresh_registries
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 
+    # Busts every configured registry's cache and re-fetches it: the owner's
+    # call, as on the PUT that configures them.
+    denied = await require_owner_dashboard_request(request, "registries.refresh")
+    if denied is not None:
+        return denied
     caller = request.get("user", "dashboard")
     repo: str | None = None
     body_bytes = await request.read()
@@ -923,13 +972,16 @@ async def handle_registries_refresh(request: web.Request) -> web.Response:
         try:
             body = json.loads(body_bytes)
         except Exception:
-            return web.json_response({"error": "invalid JSON"}, status=400)
+            return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
         # A non-empty body MUST decode to an object. A valid-but-non-object
         # payload (e.g. ``[]`` or ``"foo"``) would otherwise leave ``repo=None``
         # and refresh EVERY configured registry — an unintended fan-out of git
         # clones / cache writes from a malformed request. Reject it as a 400.
         if not isinstance(body, dict):
-            return web.json_response({"error": "request body must be a JSON object"}, status=400)
+            return web.json_response(
+                {"error": "request body must be a JSON object", "code": "body_not_object"},
+                status=400,
+            )
         raw = body.get("repo")
         if raw is not None:
             repo = str(raw).strip() or None

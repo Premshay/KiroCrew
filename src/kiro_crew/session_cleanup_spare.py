@@ -19,6 +19,8 @@ import asyncio
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.metrics.chat_runtime_share import record_reclaimed, record_rss_sample
+
 if TYPE_CHECKING:
     from kiro_crew.session_cleanup import SessionCleanup
 
@@ -50,8 +52,35 @@ def rss_limit_for(cleanup: SessionCleanup, pid: int, rss: int | None = None) -> 
         # and returning chats found a new one, and this one dies with its last
         # holder as the next ticks recycle the rest. Under a hold nothing is
         # recycled, and the process stays closed to new chats while it lives.
-        RUNTIME_OWNERSHIP.close_to_joins(pid)
+        if RUNTIME_OWNERSHIP.close_to_joins(pid):
+            record_reclaimed("rss")
     return limit
+
+
+def note_tick_sizes(sessions: list[tuple[str, int, Any]], rss_by_pid: dict[int, int]) -> None:
+    """Hand one RSS tick's tree sizes to the conductor's worker growth wake.
+
+    rfc-resource-control.md §4.3. Here rather than in ``session_cleanup`` (at its
+    line cap); the work is ``resource_pressure.note_watchdog_sizes``. Never raises.
+    """
+    from kiro_crew.notifications.resource_pressure import note_watchdog_sizes
+
+    note_watchdog_sizes(sessions, rss_by_pid)
+
+
+def note_rss_measured(pid: int, rss: int) -> None:
+    """Count one tick's tree-RSS reading of *pid* when it is a SHARED chat process.
+
+    Called where a tick measures a pid for the first time (the reading is cached
+    per tick and every co-tenant reuses it), so a process is counted once per tick
+    however many chats are on it. An unshared runtime (one lease) is not counted:
+    its memory is already in the session RSS records.
+    """
+    from kiro_crew.runtime_ownership import RUNTIME_OWNERSHIP
+
+    leases = RUNTIME_OWNERSHIP.leases_on_pid(pid)
+    if leases > 1:
+        record_rss_sample(tenants=leases, rss_mb=rss)
 
 
 async def build_rss_measure(

@@ -40,7 +40,10 @@ from kiro_crew.dashboard.cron_inject import (
     move_cron_job_tab,
 )
 from kiro_crew.dashboard.cron_timeout_field import timeout_secs_from_body
-from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+from kiro_crew.dashboard.handlers._shared import (
+    _owner_denial_response,
+    require_owner_dashboard_request,
+)
 from kiro_crew.dashboard.handlers.cron_shared import (
     _CRON_BUSY_BODY,
     _CRON_BUSY_STATUS,
@@ -52,6 +55,7 @@ from kiro_crew.dashboard.handlers.cron_shared import (
     _sel,
 )
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.dashboard.token_auth_callers import effective_request_app
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.validation import (
     _MODEL_NAME_RE,
@@ -290,6 +294,53 @@ async def api_cron_tools(request: web.Request) -> web.Response:
     card_refusal = card_turn_cron_tool_refusal(request, actual, name)
     if card_refusal is not None:
         return card_refusal
+    # The same rule as ``POST /api/crons``, for an agent that runs in an app's
+    # session, scheduled run or background run and names a Bot in ``cron_add``,
+    # or moves a job onto one with ``cron_update`` (whose only such argument is
+    # ``agent``). Such a job carries no ``app:`` tag, so this is the only point
+    # that judges it. Answered as the tool answers any refused create.
+    app_caller = _app_caller(request)
+    if app_caller and name in {"cron_add", "cron_update"}:
+        try:
+            # Judge the same normalized values that the tool will store.
+            arguments = mcp_cron._validate_args(name, arguments)
+        except ValidationError:
+            # Let dispatch return its usual validation error without judging identity.
+            app_caller = ""
+    if app_caller and (name == "cron_add" or (name == "cron_update" and "agent" in arguments)):
+        from kiro_crew.cron_service.identity import app_schedule_names_bot
+
+        named = [
+            arguments.get("agent"),
+            arguments.get("member_id") if name == "cron_add" else None,
+        ]
+        # An update is judged on the job it changes. A store this route cannot
+        # reach, or an id it does not hold, is judged as a create from the maker:
+        # the tool's own ownership check refuses a job that is not the maker's.
+        crons = getattr(state, "crons", None)
+        job_id = arguments.get("job_id")
+        existing = (
+            crons.get_job(job_id)
+            if name == "cron_update" and crons is not None and isinstance(job_id, str)
+            else None
+        )
+        if all(isinstance(value, str) or value is None for value in named) and (
+            await asyncio.to_thread(
+                app_schedule_names_bot,
+                named[0] or "",
+                named[1] or "",
+                maker_session=actual,
+                job=existing,
+            )
+        ):
+            _audit_app_cron(
+                app_caller, "cron.tools", "denied", "an app's schedule cannot run as a Bot"
+            )
+            return web.json_response(
+                {
+                    "result": "Error: an app's schedule cannot run as a Bot; name an agent of the app's own"
+                }
+            )
 
     presented_token = request.headers.get("X-Session-Token", "")
     # Read while the verified caller's tab is open; cron_add records the answer.
@@ -572,6 +623,13 @@ def _with_schedule_warnings(
 #: set as ``mcp_cron._AUTO_RESETTING_FIELDS`` (a test keeps the two equal).
 _APP_AUTO_RESETTING_FIELDS = frozenset(
     {"message", "agent_id", "model", "cron_expr", "every_secs", "channel", "thread_ts"}
+    | {"channel_type", "target_id"}
+)
+
+#: What ``PATCH /api/crons/{id}`` says when a body names ``enabled``, which it ignores.
+_ENABLED_IGNORED_WARNING = (
+    "'enabled' is not changed by this route; pause or resume the job with "
+    "POST /api/crons/{id}/enable"
 )
 
 
@@ -595,6 +653,50 @@ def _refuse_app_auto_approval(
         },
         status=403,
     )
+
+
+async def _channel_target_kwargs(
+    request: web.Request, state: DashboardState, body: dict[str, Any]
+) -> tuple[dict[str, str], web.Response | None]:
+    """The job's ``channel_type``/``target_id`` from *body*, vetted like ``send_message``'s.
+
+    ``({}, None)`` when the body names neither. A set pair passes the same four
+    gates as an explicit-target send (``_vet_channel_target``), so a destination
+    the job could never reach is refused when it is saved rather than at its
+    first run; the send re-checks them under the job's own ``cron:<id>`` key.
+    """
+    if "channel_type" not in body and "target_id" not in body:
+        return {}, None
+    pair: dict[str, str] = {}
+    for field in ("channel_type", "target_id"):
+        raw = body.get(field) or ""
+        if not isinstance(raw, str) or len(raw) > MAX_SHORT_STRING:
+            return {}, web.json_response(
+                {"error": f"invalid {field}", "code": "invalid_channel_target"}, status=400
+            )
+        pair[field] = raw.strip()
+    if bool(pair["channel_type"]) != bool(pair["target_id"]):
+        return {}, web.json_response(
+            {
+                "error": "channel_type and target_id are set together",
+                "code": "invalid_channel_target",
+            },
+            status=400,
+        )
+    if pair["channel_type"]:
+        # Function-local: the handlers package imports ``messaging`` after this
+        # module, so a module-scope import would close a cycle.
+        from kiro_crew.dashboard.handlers.messaging import _vet_channel_target
+
+        refusal = await _vet_channel_target(
+            state,
+            pair["channel_type"],
+            pair["target_id"],
+            request_app=effective_request_app(state, request),
+        )
+        if refusal is not None:
+            return {}, refusal
+    return pair, None
 
 
 async def api_crons_create(request: web.Request) -> web.Response:
@@ -673,6 +775,9 @@ async def api_crons_create(request: web.Request) -> web.Response:
         return at_err
     if channel and not CHANNEL_ID_RE.match(channel):
         return web.json_response({"error": "invalid channel ID format"}, status=400)
+    channel_target, channel_target_err = await _channel_target_kwargs(request, state, body)
+    if channel_target_err is not None:
+        return channel_target_err
     if approval_mode and approval_mode not in {"", "auto"}:
         return web.json_response({"error": "invalid approval_mode"}, status=400)
     if (refused := _refuse_app_auto_approval(request, approval_mode, "crons.create")) is not None:
@@ -796,8 +901,21 @@ async def api_crons_create(request: web.Request) -> web.Response:
     # reply path cannot bind. An explicit ``member_id`` is left as the caller set it.
     # The split reads the member roster from the configuration on disk, so it runs
     # on a worker thread and never holds the event loop.
-    from kiro_crew.cron_service.identity import split_cron_agent_member
+    from kiro_crew.cron_service.identity import app_schedule_names_bot, split_cron_agent_member
 
+    # An app does not reach a Bot's own memory or chat by naming the Bot, the rule
+    # the App Kit SDK's create holds (``apps.cron_sdk``). Refused before the split
+    # records a member selection, with the answer an app gets on these routes for
+    # a job that is not its own.
+    app_caller = _app_caller(request)
+    names_bot = False
+    if app_caller:
+        names_bot = await asyncio.to_thread(app_schedule_names_bot, agent_id or "", member_id or "")
+    if names_bot:
+        _audit_app_cron(
+            app_caller, "crons.create", "denied", "an app's schedule cannot run as a Bot"
+        )
+        return _owner_denial_response(request)
     agent_id, member_id = await asyncio.to_thread(
         split_cron_agent_member, agent_id or "", member_id or ""
     )
@@ -815,6 +933,7 @@ async def api_crons_create(request: web.Request) -> web.Response:
             return refused
     add_kwargs: dict[str, Any] = {
         "channel": channel,
+        **channel_target,
         "agent_id": (agent_id or ""),
         "member_id": member_id or "",
         "model": model_val,
@@ -825,6 +944,8 @@ async def api_crons_create(request: web.Request) -> web.Response:
         "minimal_context": bool(minimal_context),
         "persistent_session": bool(persistent_session),
         "new_chat_per_run": new_chat_per_run,
+        # The store refuses anything but "resume" or "fresh" with a 400.
+        "on_tab_close": body.get("on_tab_close", "resume"),
         "folder_id": folder_id,
         "chat_folder_id": chat_folder_id,
         # Dashboard-only template provenance (see CronJob.source_preset). The
@@ -866,6 +987,14 @@ async def api_crons_create(request: web.Request) -> web.Response:
                 {"error": "'every' must be an integer", "code": "invalid_every"}, status=400
             )
         schedule_kwargs = {"every_secs": every}
+        if cron_expr:
+            # Both arrived; `every` is the one this route has always used, so the
+            # job keeps it, but cron_add would have used the expression instead,
+            # and a caller must not learn that only from the job it gets back.
+            flag_warnings.append(
+                f"'cron' ({cron_expr!r}) was ignored because 'every' was also given; "
+                "this job runs on the 'every' interval"
+            )
     elif cron_expr:
         schedule_kwargs = {"cron_expr": cron_expr}
     elif at_ts is not None:
@@ -907,6 +1036,12 @@ async def api_crons_create(request: web.Request) -> web.Response:
     # The fingerprint of the job as this write made it: a card step records it,
     # so its Undo's baseline is what the card made, not a later edit.
     created: dict[str, Any] = {"ok": True, "id": job.id, "revision": cron_job_revision(job)}
+    job_schedule = getattr(job, "schedule", None)
+    if every and job_schedule is not None:
+        from kiro_crew.cron_service.schedule import raised_interval_warning
+
+        if raised := raised_interval_warning(every, job_schedule):
+            flag_warnings.append(raised)
     return web.json_response(_with_schedule_warnings(created, job, flag_warnings))
 
 
@@ -938,7 +1073,7 @@ async def api_cron_delete(request: web.Request) -> web.Response:
                 job_id,
                 expected_revision=expected_revision,
                 revision_of=cron_job_revision,
-                actor="dashboard",
+                actor=_removal_actor(request),
                 source="api_cron_delete",
             )
             if outcome == "changed":
@@ -952,7 +1087,7 @@ async def api_cron_delete(request: web.Request) -> web.Response:
             ok = outcome == "removed"
         else:
             ok = await state.crons.remove_job_async(
-                job_id, actor="dashboard", source="api_cron_delete"
+                job_id, actor=_removal_actor(request), source="api_cron_delete"
             )
     except CronStoreBusy:
         return web.json_response(_CRON_BUSY_BODY, status=_CRON_BUSY_STATUS)
@@ -961,6 +1096,21 @@ async def api_cron_delete(request: web.Request) -> web.Response:
     if ok:
         state.push_refresh("crons")
     return web.json_response({"ok": ok})
+
+
+def _removal_actor(request: web.Request) -> str:
+    """Who asked for a removal: ``app:<name>`` for a verified app token, else the dashboard.
+
+    The cron service records a person's delete of an app job so the app's next
+    registration does not bring it back; an app's removal of its own job is not
+    such a choice, so it must reach the service under the app's own name.
+    """
+    app_claim = request.get("app")
+    if isinstance(app_claim, str) and app_claim:
+        from kiro_crew.apps.cron_sdk import owner_tag
+
+        return owner_tag(app_claim)
+    return "dashboard"
 
 
 # Guardrail: cap batch size so a runaway/hostile payload can't pin the event
@@ -1011,7 +1161,7 @@ async def api_cron_batch_delete(request: web.Request) -> web.Response:
         # would raise AFTER the on-disk delete and leave the scheduler timer
         # cancelled.
         deleted, failed = await state.crons.remove_jobs(
-            unique_ids, actor="dashboard", source="api_cron_batch_delete"
+            unique_ids, actor=_removal_actor(request), source="api_cron_batch_delete"
         )
     except Exception:
         # The batch itself raised (unexpected) — report everything as failed.
@@ -1078,6 +1228,7 @@ async def api_cron_update(request: web.Request) -> web.Response:
         "minimal_context",
         "persistent_session",
         "new_chat_per_run",
+        "on_tab_close",
         "folder_id",
         "chat_folder_id",
     ):
@@ -1195,6 +1346,25 @@ async def api_cron_update(request: web.Request) -> web.Response:
         kwargs["agent_id"] = (body["agent"] or "").strip()
     elif "agent_id" in body:
         kwargs["agent_id"] = (body["agent_id"] or "").strip()
+    # An app does not move its job onto a Bot by renaming its agent or member,
+    # the rule ``POST /api/crons`` holds on create, refused in the same words.
+    # Judged on the job's own capture, the record the update would store; an id
+    # the store does not hold was refused above (``_refuse_foreign_app_job``).
+    app_caller = _app_caller(request)
+    if app_caller and ("agent_id" in kwargs or "member_id" in kwargs):
+        from kiro_crew.cron_service.identity import app_schedule_names_bot
+
+        current = await state.crons.get_job_async(job_id)
+        if current is None or await asyncio.to_thread(
+            app_schedule_names_bot,
+            kwargs.get("agent_id", current.agent_id) or "",
+            kwargs.get("member_id", current.member_id) or "",
+            job=current,
+        ):
+            _audit_app_cron(
+                app_caller, "crons.update", "denied", "an app's schedule cannot run as a Bot"
+            )
+            return _owner_denial_response(request)
     if "model" in body:
         model_raw = body["model"]
         if model_raw is not None and not isinstance(model_raw, str):
@@ -1220,11 +1390,23 @@ async def api_cron_update(request: web.Request) -> web.Response:
         kwargs["channel"] = ch
         if ch and (len(ch) > CHANNEL_MAX_LEN or not CHANNEL_ID_RE.match(ch)):
             return web.json_response({"error": "invalid channel ID format"}, status=400)
+    channel_target, channel_target_err = await _channel_target_kwargs(request, state, body)
+    if channel_target_err is not None:
+        return channel_target_err
+    kwargs.update(channel_target)
     # Schedule: accept cron_expr or every (seconds)
+    # The store reads an empty value as "leave unchanged" (other writers rely on
+    # that), so an empty one here answers ok for an edit that never happened: say so.
     if "cron" in body:
         kwargs["cron_expr"] = body["cron"]
+        if not body["cron"] and not body.get("every"):
+            update_flag_warnings.append("'cron' is empty, so the schedule was left unchanged")
     if "every" in body:
         kwargs["every_secs"] = body["every"]
+        if not body["every"] and not body.get("cron"):
+            update_flag_warnings.append(
+                "'every' is empty or zero, so the schedule was left unchanged"
+            )
     if "timezone" in body:
         tz_val = (body["timezone"] or "").strip()
         if tz_val and not is_valid_timezone(tz_val):
@@ -1266,8 +1448,15 @@ async def api_cron_update(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": str(exc), "code": "invalid_alert_after_failures"}, status=400
             )
+    # Pausing is POST /api/crons/{id}/enable; this route never reads the flag, so a
+    # body naming it is told so rather than answered as if the job was paused.
+    if "enabled" in body:
+        update_flag_warnings.append(_ENABLED_IGNORED_WARNING)
     if not kwargs:
-        return web.json_response({"error": "no fields to update"}, status=400)
+        error = "no fields to update"
+        if "enabled" in body:
+            error = f"{error}; {_ENABLED_IGNORED_WARNING}"
+        return web.json_response({"error": error}, status=400)
     # The owner's ``auto`` covered the job as it was. An app that changes what the
     # job does turns it off in the same write, as the MCP ``cron_update`` tool does.
     if request.get("app") and _APP_AUTO_RESETTING_FIELDS.intersection(kwargs):

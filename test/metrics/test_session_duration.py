@@ -514,9 +514,7 @@ class TestEnd:
         assert "run_in_executor(" in body, "the hop must be a bare future, not a Task"
         assert "asyncio.shield(" in body, "a cancellation must not reach the queued item"
         assert "to_thread(" not in body, "shield would wrap a coroutine in a cancellable Task"
-        assert (
-            "_unlink_all(paths)" not in body
-        ), "the unlink must never run on the event loop, which is what #7537 is about"
+        assert "_unlink_all(paths)" not in body, "the unlink must never run on the event loop"
 
     def test_no_end_path_hands_its_caller_a_new_abort_point(self):
         """All three absorb; the helper owns not-dropping the unlink.
@@ -1240,6 +1238,11 @@ class TestEveryRegistryRemovalRecordsAnEnd:
             "the send-race registry's OrderedDict[str, _Session] of per-session "
             "send revisions, bounded by an idle-only LRU -- not the session registry, "
             "and it writes no crumb, so evicting a revision cannot leave one behind"
+        ),
+        "browser_harness.live_hub": (
+            "the live browser card hub's dict[str, LiveSession] of per-chat card "
+            "state, dropped when the chat's tab closes -- not the session registry, "
+            "and it writes no crumb, so dropping a card cannot leave one behind"
         ),
     }
 

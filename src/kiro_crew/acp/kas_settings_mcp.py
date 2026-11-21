@@ -36,6 +36,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew import mcp_cleanup
 from kiro_crew.acp.kas_tool_limits import kas_globs, unmatched_disabled_globs
 from kiro_crew.mcp_cleanup import (  # noqa: F401 - include_mcp_json is re-exported
     KIROCREW_BIN_MCP_SERVERS,
@@ -80,12 +81,68 @@ def _unreadable_line(exc: NativeSettingsUnreadable) -> str:
     )
 
 
+#: How a notice names the ``mcp.json`` under ``KIRO_HOME``.
+KIRO_HOME_SOURCE = "the Kiro home's MCP settings"
+
+
+def _kiro_home_servers(notices: list[str]) -> dict[str, Any]:
+    """The servers of ``$KIRO_HOME/settings/mcp.json``, when that is not Crew's global file.
+
+    KAS reads its global ``mcp.json`` under ``KIRO_HOME``
+    (:func:`kiro_crew.config.paths.kiro_home`); Crew's own global path
+    (``agent._KIRO_MCP_JSON``) does not follow that variable. Where the two
+    differ, KAS starts servers that only its own file names, so they are named
+    here for :func:`excluded_whole`. Read only to name servers and their
+    ``disabledTools``: it adds exclusions, and a server that Crew's global file
+    names too keeps that file's ``disabledTools`` (:func:`_shared_entry`). Empty
+    when ``KIRO_HOME`` is unset or names
+    Crew's own file. A file that cannot be read adds one line to *notices* and
+    names nothing, so the session still starts.
+    """
+    if not os.environ.get("KIRO_HOME"):
+        return {}
+    from kiro_crew import agent as agent_mod
+    from kiro_crew.acp.session_mcp import (
+        NativeSettingsUnreadable,
+        _read_mcp_settings,
+        _unreadable_reason,
+    )
+    from kiro_crew.config.paths import kiro_home
+
+    path = kiro_home() / "settings" / "mcp.json"
+    # ``kiro_home`` resolves links; compare like with like so one file is read once.
+    try:
+        if path == agent_mod._KIRO_MCP_JSON.resolve():
+            return {}
+    except (OSError, RuntimeError):
+        # An unresolvable Crew file must not hide the distinct Kiro home settings.
+        pass
+    try:
+        settings = _read_mcp_settings(path)
+    except (OSError, ValueError) as exc:
+        notices.append(
+            _unreadable_line(
+                NativeSettingsUnreadable(KIRO_HOME_SOURCE, path, _unreadable_reason(exc))
+            )
+        )
+        logger.warning("KAS: the Kiro home's MCP settings are unreadable; its servers are unnamed")
+        return {}
+    declared = settings.get("mcpServers") if isinstance(settings, dict) else None
+    return dict(declared) if isinstance(declared, dict) else {}
+
+
 def _file_servers(work_dir: str | Path | None, notices: list[str]) -> dict[str, Any]:
     """The mcp.json servers KAS reads, the workspace entry winning a shared name.
 
+    Crew's global file, then the one under ``KIRO_HOME`` when that is another
+    file (:func:`_kiro_home_servers`), then the workspace's.
     Each file that cannot be read adds one line to *notices*, naming it and why.
     """
-    from kiro_crew.acp.session_mcp import NativeSettingsUnreadable, native_settings_sources
+    from kiro_crew.acp.session_mcp import (
+        NATIVE_SOURCE_GLOBAL,
+        NativeSettingsUnreadable,
+        native_settings_sources,
+    )
 
     try:
         sources = native_settings_sources(work_dir)
@@ -99,12 +156,41 @@ def _file_servers(work_dir: str | Path | None, notices: list[str]) -> dict[str, 
         except NativeSettingsUnreadable as global_exc:
             if global_exc.path != exc.path:
                 notices.append(_unreadable_line(global_exc))
-            # KAS cannot use a global file Crew cannot read either; no servers to name.
-            return {}
-    servers: dict[str, Any] = {}
+            # Crew's global file names nothing; the one KAS reads still does.
+            return _kiro_home_servers(notices)
+    servers = _kiro_home_servers(notices)
     for source in sources:  # global first, so the project file overrides
-        servers.update(source.servers)
+        if source.label == NATIVE_SOURCE_GLOBAL:
+            shared = {
+                n: _shared_entry(e, servers[n]) for n, e in source.servers.items() if n in servers
+            }
+            servers = {**source.servers, **servers, **shared}
+        else:
+            servers.update(source.servers)
     return servers
+
+
+def _shared_entry(crew: Any, home: Any) -> Any:
+    """The entry for a server that Crew's global file and the ``KIRO_HOME`` file both name.
+
+    KAS starts the server from its own file while the gateway still pools the one
+    in Crew's, where the dashboard writes its tool switches. So the entry is the
+    ``KIRO_HOME`` one carrying the ``disabledTools`` of both: each file's own, a
+    muted entry adding none (:func:`_glob_disabled_tools`), and neither removing
+    the other's. Whether the server is muted follows the ``KIRO_HOME`` entry,
+    the one KAS reads.
+    """
+    if isinstance(home, dict) and mcp_entry_is_muted(home):
+        return home
+    tools: list[str] = []
+    for entry in (crew, home):
+        listed = entry.get("disabledTools") if isinstance(entry, dict) else None
+        if isinstance(listed, list) and not mcp_entry_is_muted(entry):
+            tools += [tool for tool in listed if isinstance(tool, str)]
+    if not tools:
+        return home
+    base = home if isinstance(home, dict) else {}
+    return {**base, "disabledTools": list(dict.fromkeys(tools))}
 
 
 def _init_timeout_ms(work_dir: str | Path | None) -> int | None:
@@ -182,12 +268,24 @@ def _glob_disabled_tools(entry: Any) -> list[str]:
     ]
 
 
-def declared_servers(spec: Mapping[str, Any]) -> list[str]:
-    """Names *spec* declares that ``mcp_server_muted_in_any_store`` leaves on."""
+def declared_servers(
+    spec: Mapping[str, Any], *, scope_muted: frozenset[str] | None = None
+) -> list[str]:
+    """Names *spec* declares that ``mcp_server_muted_in_any_store`` leaves on.
+
+    *scope_muted* is the caller's one MCP scope reading for the projection.
+    """
     servers = spec.get("mcpServers")
     if not isinstance(servers, dict):
         return []
-    return [n for n, e in servers.items() if not mcp_server_muted_in_any_store(n, e)]
+    # Read through the module, so the one scope reader stays the patch seam.
+    if scope_muted is None:
+        scope_muted = mcp_cleanup.mcp_scope_muted_aliases()
+    return [
+        n
+        for n, e in servers.items()
+        if not mcp_server_muted_in_any_store(n, e, scope_muted=scope_muted)
+    ]
 
 
 def stamp_settings_mcp(

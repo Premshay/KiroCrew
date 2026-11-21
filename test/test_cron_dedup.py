@@ -179,7 +179,7 @@ class TestCronDedup:
         _run_callback(gw, job, stream_result="error: token expired")
         assert gw.dashboard_state.notify.called
         title = gw.dashboard_state.notify.call_args.args[1]
-        assert "🔇" in title
+        assert title.startswith("Cron: ") and "(dup #" in title
         assert "dup #1" in title
         # It carries the stored result unchanged, so it names that result.
         assert job.last_result_ts > 0
@@ -250,7 +250,7 @@ class TestCronDedup:
         _run_callback(gw, job, stream_result="error: token expired")
         gw.slack.post_blocks.assert_called_once()
         posted_text = gw.slack.post_blocks.call_args
-        assert "⚠️" in str(posted_text)
+        assert "Warning: " in str(posted_text)
         # Its bell note carries the rewritten text, so it names no stored result.
         assert "result_ts" not in gw.dashboard_state.notify.call_args.kwargs["meta"]
         # Dedup state should reset after successful reminder delivery
@@ -650,7 +650,7 @@ class TestCronFailureRespectsSilent:
         assert job.consecutive_failures == 2
 
     def test_non_silent_first_failure_still_rings_dashboard(self) -> None:
-        # Regression: the silent guard must not suppress the bell for normal crons.
+        # The silent guard must not suppress the bell for normal crons.
         gw = _make_gateway()
         gw.slack.post_message = AsyncMock()
         job = _make_job(silent=False)
@@ -658,7 +658,7 @@ class TestCronFailureRespectsSilent:
         gw.slack.post_message.assert_awaited_once()
         alert_calls = [
             c for c in gw.dashboard_state.notify.call_args_list
-            if "❌ Job failed" in str(c)
+            if "Error: Job failed" in str(c)
         ]
         assert alert_calls, "Non-silent cron failure must still ring the dashboard bell"
 

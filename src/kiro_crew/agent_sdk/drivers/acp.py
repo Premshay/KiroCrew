@@ -58,6 +58,7 @@ __all__ = [
     "crew_loads_spec_steering",
     "lends_inherited_skills",
     "projected_session_mcp_servers",
+    "spec_with_default_crew_servers",
     "agent_spec_mcp_refs",
     "claude_adapter_cached_negative",
     "claude_adapter_honours_session_options",
@@ -373,10 +374,9 @@ def crew_loads_spec_steering(provider_type: str | None) -> bool:
     """Whether Crew puts the agent spec's ``file://`` steering into this session's prompt.
 
     *provider_type* is the session's provider label, as context assembly receives
-    it. True for a harness in ``ACP_BACKENDS_CREW_LOADS_SPEC_STEERING`` (claude and
-    codex), which is handed no spec and so reads none of its ``resources``, and for
-    a label in ``PROVIDER_LABELS_CREW_LOADS_SPEC_STEERING`` (antigravity, which is
-    no ACP backend).
+    it. True for the ACP harnesses in ``ACP_BACKENDS_CREW_LOADS_SPEC_STEERING``
+    and standalone providers in ``PROVIDER_LABELS_CREW_LOADS_SPEC_STEERING``.
+    These providers receive no spec and cannot load its ``resources``.
     """
     from kiro_crew.agent_sdk.backends import ACP_BACKENDS_CREW_LOADS_SPEC_STEERING
     from kiro_crew.agent_sdk.backends_routing import PROVIDER_LABELS_CREW_LOADS_SPEC_STEERING
@@ -407,7 +407,8 @@ def lends_inherited_skills(provider_type: str | None) -> bool:
 def reads_project_agents_md(provider_type: str | None) -> bool:
     """Whether the harness behind *provider_type* reads the project's ``AGENTS.md`` itself.
 
-    True for a harness in ``ACP_BACKENDS_NATIVE_PROJECT_AGENTS_MD`` (codex), which
+    True for a harness in ``ACP_BACKENDS_NATIVE_PROJECT_AGENTS_MD`` (codex, opencode,
+    pi), which
     reads the file from the session's working directory. Crew's steering load
     leaves that file out there.
     """
@@ -776,6 +777,11 @@ def _with_default_crew_servers(agent: str, spec: dict[str, Any]) -> dict[str, An
     except Exception:
         logger.debug("default Crew servers for %r could not be resolved", agent, exc_info=True)
         return spec
+
+
+def spec_with_default_crew_servers(agent: str, spec: dict[str, Any]) -> dict[str, Any]:
+    """*spec* with Crew's default servers added, for a read-only check; see :func:`_with_default_crew_servers`."""
+    return _with_default_crew_servers(agent, spec)
 
 
 def kiro_cli_resolves() -> bool:
@@ -1153,8 +1159,10 @@ def claude_adapter_honours_session_options() -> bool:
 
     ``CLAUDE_ACP_SETTING_SOURCES_MIN_VERSION`` is where the adapter is verified to
     spread ``_meta.claudeCode.options`` into the session, which the read-only
-    shape of a Side Chat or thread-reply session depends on. A missing adapter, or
-    one whose version cannot be read, answers False. The spawn's own cached
+    shape of a Side Chat or thread-reply session depends on. The version is the
+    adapter's package.json, or for a wrapper script what it reported at its latest
+    handshake (``_claude_adapter_known_version``). A missing adapter, or one whose
+    version is not known, answers False. The spawn's own cached
     resolution is read first, as :func:`claude_adapter_cached_negative` does.
     Blocking (resolves the adapter and reads its package.json); call it off the loop.
     """
@@ -1166,7 +1174,7 @@ def claude_adapter_honours_session_options() -> bool:
     argv = resolution[0] if isinstance(resolution, tuple) else None
     if not argv:
         return False
-    version = _client._claude_adapter_installed_version(argv)
+    version = _client._claude_adapter_known_version(argv)
     if _client._claude_adapter_honours_setting_sources(version):
         return True
     logger.warning(
@@ -1272,6 +1280,35 @@ def self_served_resolves(backend: str) -> bool:
 
     binary, _searched_path = _resolve_self_served_bin(backend)
     return bool(binary)
+
+
+def antigravity_components_resolve() -> tuple[bool, bool]:
+    """``(server, helper)`` for Google Antigravity's two-file distribution.
+
+    The install probe must distinguish a complete archive from either half, so
+    unlike a self-served binary this is not one conjunction. The fresh resolve
+    does not replace the spawn cache: a probe after an install reports
+    ``restart_required`` instead of changing what the running gateway will spawn.
+    """
+    from kiro_crew.acp.harness.antigravity import probe_antigravity_runtime
+
+    resolution = probe_antigravity_runtime()
+    return bool(resolution.server), bool(resolution.helper)
+
+
+def antigravity_cached_negative() -> bool:
+    """Whether the running process cached an incomplete Antigravity pair."""
+    from kiro_crew.acp.harness.antigravity import antigravity_cached_resolution
+
+    cached = antigravity_cached_resolution()
+    return cached is not None and (not cached.server or not cached.helper)
+
+
+def antigravity_install_hint() -> str:
+    """The registry/version guidance shared with the spawn failure."""
+    from kiro_crew.acp.harness.antigravity import ANTIGRAVITY_INSTALL_HINT
+
+    return ANTIGRAVITY_INSTALL_HINT
 
 
 def self_served_cached_negative(backend: str) -> bool:
@@ -1399,6 +1436,7 @@ def pi_cached_negative() -> bool:
         try:
             found, _searched = cached  # type: ignore[misc]
         except Exception:
+            # A cache value that is not a (found, searched) pair is skipped.
             continue
         if not found:
             return True
@@ -1472,6 +1510,13 @@ def forget_cached_resolution(backend: str) -> None:
         if hasattr(_client, name):
             setattr(_client, name, unresolved)
 
+    from kiro_crew.agent_sdk.backends import ACP_BACKEND_ANTIGRAVITY
+
+    if backend == ACP_BACKEND_ANTIGRAVITY:
+        from kiro_crew.acp.harness.antigravity import forget_antigravity_resolution
+
+        forget_antigravity_resolution()
+
     # The self-served harnesses share one dict keyed by backend, so forgetting one
     # is a key deletion and the others keep their answers.
     caches = getattr(_client, "_self_served_bin_caches", None)
@@ -1530,6 +1575,7 @@ async def run_kiro_native_commands(
 
     from kiro_crew.acp.client import AcpAuthRequired, AcpError, AcpTimeoutError
     from kiro_crew.sandbox import configured_sandbox_mode
+    from kiro_crew.startup_deadline import startup_deadline
 
     sandbox_mode = await asyncio.to_thread(configured_sandbox_mode)
     client = _native_command_client_factory()(
@@ -1547,7 +1593,9 @@ async def run_kiro_native_commands(
         return results
 
     try:
-        return "ok", await asyncio.wait_for(_run(), timeout=timeout_seconds)
+        # Not wait_for: a start this deadline cuts is a startup timeout.
+        async with startup_deadline(timeout_seconds):
+            return "ok", await _run()
     except AcpAuthRequired:
         return "kiro_auth_required", []
     except (asyncio.TimeoutError, AcpTimeoutError):

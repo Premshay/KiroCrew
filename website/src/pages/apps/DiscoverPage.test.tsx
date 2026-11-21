@@ -25,8 +25,8 @@
  * the other writers of that shared banner without mocking the banner itself.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { act, screen, fireEvent, waitFor } from '@testing-library/react'
-import { renderWithProviders } from '../../test/helpers'
+import { act, screen, fireEvent, waitFor, within } from '@testing-library/react'
+import { createConnectedTestStore, renderWithProviders } from '../../test/helpers'
 
 const { refreshAppStore, refreshRegistries } = vi.hoisted(() => ({
   refreshAppStore: vi.fn(),
@@ -83,15 +83,19 @@ vi.mock('./useAppsData', async importOriginal => {
  * write faithfully while the banner state itself stays real.
  */
 let pageSetError: ((message: string) => void) | null = null
+/** The page's Update All next-step setter, captured the same way. */
+let pageSetNotice: ((message: string) => void) | null = null
 
 vi.mock('./useAppUpdates', () => ({
-  useAppUpdates: ({ setError }: { setError: (m: string) => void }) => {
+  useAppUpdates: ({ setError, setNotice }: { setError: (m: string) => void; setNotice?: (m: string) => void }) => {
     pageSetError = setError
+    pageSetNotice = setNotice ?? null
     return {
       updatingAll: false,
       updatePending: {},
       runUpdate: vi.fn(),
       updateAll: vi.fn(),
+      trustHandoff: [],
     }
   },
 }))
@@ -148,7 +152,7 @@ describe('DiscoverPage manual refresh outcome reporting', () => {
     refreshRegistries.mockResolvedValue(
       registriesResult({ ok: false, failed: ['broken-registry'] }),
     )
-    renderWithProviders(<DiscoverPage />)
+    renderWithProviders(<DiscoverPage />, { store: createConnectedTestStore() })
     await clickRefresh()
     expect(await screen.findByText(FAILED_BANNER)).toBeInTheDocument()
   })
@@ -162,7 +166,7 @@ describe('DiscoverPage manual refresh outcome reporting', () => {
         { name: 'down-registry', ok: false },
       ],
     }))
-    renderWithProviders(<DiscoverPage />)
+    renderWithProviders(<DiscoverPage />, { store: createConnectedTestStore() })
     await clickRefresh()
     expect(await screen.findByText(
       'components.registryManager.refresh_sign_in_refused '
@@ -173,7 +177,7 @@ describe('DiscoverPage manual refresh outcome reporting', () => {
 
   it('surfaces a rejected refresh POST via its error message, and still refetches', async () => {
     refreshRegistries.mockRejectedValue(new Error('registry backend unreachable'))
-    const { queryClient } = renderWithProviders(<DiscoverPage />)
+    const { queryClient } = renderWithProviders(<DiscoverPage />, { store: createConnectedTestStore() })
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
     await clickRefresh()
     expect(
@@ -187,7 +191,7 @@ describe('DiscoverPage manual refresh outcome reporting', () => {
 
   it('keeps both sources firing: a rejected store refresh still reports, and the registries call still ran', async () => {
     refreshAppStore.mockRejectedValue(new Error('store refresh failed'))
-    renderWithProviders(<DiscoverPage />)
+    renderWithProviders(<DiscoverPage />, { store: createConnectedTestStore() })
     await clickRefresh()
     expect(await screen.findByText('store refresh failed')).toBeInTheDocument()
     expect(refreshRegistries).toHaveBeenCalledTimes(1)
@@ -197,7 +201,7 @@ describe('DiscoverPage manual refresh outcome reporting', () => {
     refreshRegistries.mockResolvedValue(
       registriesResult({ ok: false, failed: ['broken-registry'] }),
     )
-    const { queryClient } = renderWithProviders(<DiscoverPage />)
+    const { queryClient } = renderWithProviders(<DiscoverPage />, { store: createConnectedTestStore() })
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
     await clickRefresh()
     expect(await screen.findByText(FAILED_BANNER)).toBeInTheDocument()
@@ -211,7 +215,7 @@ describe('DiscoverPage manual refresh outcome reporting', () => {
     refreshRegistries.mockResolvedValueOnce(
       registriesResult({ ok: false, failed: ['broken-registry'] }),
     )
-    renderWithProviders(<DiscoverPage />)
+    renderWithProviders(<DiscoverPage />, { store: createConnectedTestStore() })
     await clickRefresh()
     expect(await screen.findByText(FAILED_BANNER)).toBeInTheDocument()
 
@@ -226,7 +230,7 @@ describe('DiscoverPage manual refresh outcome reporting', () => {
   it('says so when the refreshed listing is the offline fallback', async () => {
     // Offline the store POST still resolves ok and the listing still answers
     // 200, so only the listing's own flag can explain why the store shrank.
-    const { queryClient } = renderWithProviders(<DiscoverPage />)
+    const { queryClient } = renderWithProviders(<DiscoverPage />, { store: createConnectedTestStore() })
     queryClient.setQueryData(['registry'], { apps: [], catalogUnavailable: true })
     await clickRefresh()
     expect(await screen.findByText('pages.appsPage.store_catalog_unreachable')).toBeInTheDocument()
@@ -239,7 +243,7 @@ describe('DiscoverPage manual refresh outcome reporting', () => {
   })
 
   it('leaves a banner another writer set alone on a successful refresh', async () => {
-    renderWithProviders(<DiscoverPage />)
+    renderWithProviders(<DiscoverPage />, { store: createConnectedTestStore() })
     await screen.findByRole('button', { name: REFRESH_LABEL })
 
     // Stand in for the update hook reporting a failed Update All — the same
@@ -250,6 +254,33 @@ describe('DiscoverPage manual refresh outcome reporting', () => {
 
     await clickRefresh()
     expect(screen.getByText(foreign)).toBeInTheDocument()
+  })
+})
+
+describe('DiscoverPage Update All notices', () => {
+  it('renders consent lines in a warn-toned status notice, apart from the error alert', async () => {
+    renderWithProviders(<DiscoverPage />, { store: createConnectedTestStore() })
+    await screen.findByRole('button', { name: REFRESH_LABEL })
+
+    const failure = 'pages.appsPage.failed_to_update {"names":"Docs"}'
+    const nextStep = 'pages.appsPage.updated_needs_session_approval_consent {"name":"Notes"}'
+    act(() => {
+      pageSetError!(failure)
+      pageSetNotice!(nextStep)
+    })
+
+    const notice = await screen.findByTestId('update-all-notice')
+    expect(notice).toHaveAttribute('role', 'status')
+    expect(notice).toHaveAttribute('data-tone', 'warn')
+    expect(notice).toHaveTextContent(nextStep)
+    expect(notice).not.toHaveTextContent(failure)
+    const alert = screen.getByText(failure).closest('[role="alert"]')
+    expect(alert).not.toBeNull()
+    expect(alert).not.toHaveTextContent(nextStep)
+
+    fireEvent.click(within(notice).getByRole('button'))
+    expect(screen.queryByTestId('update-all-notice')).toBeNull()
+    expect(screen.getByText(failure)).toBeInTheDocument()
   })
 })
 

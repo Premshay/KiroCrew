@@ -7,6 +7,7 @@ import { crewLogProjectionsKey } from '../../hooks/useWebSocket'
 import { isOwnerOnlyRefusal } from '../sessionEnvironmentHooks'
 import AppIcon from '../AppIcon'
 import ContextBar, { contextTip, contextColor, composeContextReadout, contextPctClamped, fmtTokens } from '../ContextBar'
+import ErrorBoundary from '../ErrorBoundary'
 import ErrorNotice from '../ErrorNotice'
 import { Btn, Slider } from '../ui'
 import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover'
@@ -15,6 +16,7 @@ import { acpBackendName } from '../../api/acpBackend'
 // Only a session on another harness than the install's draws it, so its brand
 // assets stay out of the chat bundle.
 const HarnessLogo = lazy(() => import('../HarnessLogo').then(m => ({ default: m.HarnessLogo })))
+const harnessMarkPlaceholder = <span className="inline-block w-[13px] h-[13px]" aria-hidden="true" />
 import { fmtPercent } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
 import type { ComposerControl } from '../composerControl'
@@ -408,7 +410,11 @@ export function ContextUsageControl({ contextPct, contextUnknown = false, contex
                   <div className="mt-2 pt-2 border-t border-border">
                     <div className="flex items-center justify-between mb-1">
                       <span className="text-[11px] text-muted">{i18nT('components.chatInput.auto_compact_at')}</span>
-                      <span className="text-[12px] font-mono font-bold text-accent">{fmtPercent(Math.round(autoCompact.pct ?? autoCompact.agent_pct ?? autoCompact.global_pct) / 100)}</span>
+                      {/* A harness that compacts on its own ignores the global, so
+                          the global number is not shown as the threshold in force. */}
+                      <span className="text-[12px] font-mono font-bold text-accent">{harnessManagedNote
+                        ? i18nT('components.chatInput.harness_managed_value', { backend: harnessManagedNote.toUpperCase() })
+                        : fmtPercent(Math.round(autoCompact.pct ?? autoCompact.agent_pct ?? autoCompact.global_pct) / 100)}</span>
                     </div>
                     <Slider
                       value={autoCompact.pct ?? autoCompact.agent_pct ?? autoCompact.global_pct}
@@ -429,16 +435,15 @@ export function ContextUsageControl({ contextPct, contextUnknown = false, contex
                           ? <span><Trans i18nKey="components.chatInput.reset_to_agent_default" values={{ pct: Math.round(autoCompact.agent_pct) }} components={{ agent: agentName }} /></span>
                           : i18nT('components.chatInput.reset_to_global', { pct: Math.round(autoCompact.global_pct) })}
                       </Btn>
+                    ) : harnessManagedNote ? (
+                      <div className="mt-1 text-[10px] text-muted" data-testid="autocompact-harness-managed-note">
+                        {i18nT('components.chatInput.harness_managed_note', { backend: harnessManagedNote.toUpperCase() })}
+                      </div>
                     ) : (
                       <div className="mt-1 text-[10px] text-muted" title={agentDefaultSource}>
                         {autoCompact.agent_pct != null
                           ? <Trans i18nKey="components.chatInput.following_agent_default" values={{ pct: Math.round(autoCompact.agent_pct) }} components={{ agent: agentName }} />
                           : i18nT('components.chatInput.following_global', { pct: Math.round(autoCompact.global_pct) })}
-                      </div>
-                    )}
-                    {harnessManagedNote && (
-                      <div className="mt-1 text-[10px] text-muted" data-testid="autocompact-harness-managed-note">
-                        {i18nT('components.chatInput.harness_managed_note', { backend: harnessManagedNote.toUpperCase() })}
                       </div>
                     )}
                   </div>
@@ -591,9 +596,14 @@ export function ModelChip({ modelName, modelIsJevRouted, modelIsInheritedDefault
         span's title lets a hover on the mark alone say it too. */}
     {markHarness !== undefined && (
       <span className="inline-flex shrink-0" title={harnessLabel} data-testid="composer-model-chip-harness">
-        <Suspense fallback={<span className="inline-block w-[13px] h-[13px]" aria-hidden="true" />}>
-          <HarnessLogo id={markHarness} size={13} />
-        </Suspense>
+        {/* A failed chunk keeps the blank mark instead of blanking the chat page:
+            no notice, as the mark is decorative, sits inside this button, and
+            the chip's label already names the harness. */}
+        <ErrorBoundary scope="composer-harness-mark" fallback={harnessMarkPlaceholder}>
+          <Suspense fallback={harnessMarkPlaceholder}>
+            <HarnessLogo id={markHarness} size={13} />
+          </Suspense>
+        </ErrorBoundary>
       </span>
     )}
     <span className={`truncate ${shelfCompact ? 'max-w-[96px]' : 'max-w-[180px]'}`}>

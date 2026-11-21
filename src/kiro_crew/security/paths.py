@@ -100,6 +100,7 @@ def _path_in_home_dirs(
     *,
     strict: bool = False,
     pre_resolved: bool = False,
+    candidates: set[str] | None = None,
 ) -> bool:
     """Return True if *path_str* resolves under any of *home_dirs* (``$HOME``-relative).
 
@@ -132,16 +133,37 @@ def _path_in_home_dirs(
     ``pre_resolved`` is :func:`_candidate_forms`'s flag of the same name, and
     such a caller is by contract on its own worker thread, so the anchors are
     resolved inline as well (``_home_dir_targets(inline=True)``): the whole
-    check then performs no ``mc-pathres`` submission.
+    check then performs no ``mc-pathres`` submission. *candidates* is
+    :func:`_candidate_forms`'s answer for these arguments, from a caller that matches
+    one path against several lists (:func:`_matches_gate_rows`).
     """
     if not path_str:
         return False
 
     try:
-        candidates = _candidate_forms(path_str, base_dir, pre_resolved=pre_resolved)
+        if candidates is None:
+            candidates = _candidate_forms(path_str, base_dir, pre_resolved=pre_resolved)
         # The anchors are bounded the same way (see _rebuild_targets_bounded):
         # a stall with no prior canonical resolution to serve refuses too.
         sensitive_targets = _home_dir_targets(home_dirs, inline=pre_resolved)
+        from kiro_crew.config.paths import scratch_root_override_path_hint
+
+        scratch_override = scratch_root_override_path_hint()
+        if scratch_override is not None:
+            from kiro_crew.agent_scratch_trees import TREE_INDEX_FILENAME
+
+            scratch_targets = (
+                {os.path.realpath(os.path.expanduser(scratch_override))}
+                if pre_resolved
+                else _candidate_forms(str(scratch_override))
+            )
+            scratch_parents = {target.casefold() for target in scratch_targets}
+            for cand in candidates:
+                cand_cf = cand.casefold()
+                if (
+                    os.path.basename(cand_cf) == TREE_INDEX_FILENAME or cand_cf.endswith(".tmp")
+                ) and os.path.dirname(cand_cf) in scratch_parents:
+                    return True
     except PathResolutionStalled:
         # Canonical form unavailable (wedged mount under the path): refuse.  A
         # lexical-only match here would pass a workspace symlink into a
@@ -174,6 +196,8 @@ def _is_keystone_publish_artifact(
     *,
     strict: bool = False,
     pre_resolved: bool = False,
+    parents: list[str] | None = None,
+    candidates: set[str] | None = None,
 ) -> bool:
     """Return True if *path_str* is the atomic-write temp or lock beside a keystone leaf.
 
@@ -194,12 +218,21 @@ def _is_keystone_publish_artifact(
       of the leaf's own directory, and a prefix test would sweep every descendant of the
       crew home whose name happens to end in ``.tmp`` -- far wider than this needs, in a
       directory that must stay readable.
+
+    *parents* replaces :data:`_KEYSTONE_ARTIFACT_PARENTS` with that list plus the
+    installed apps' declared masks' directories, and *candidates* is the path's
+    :func:`_candidate_forms` (both from :func:`_matches_gate_rows`).
     """
     if not path_str:
         return False
     try:
-        artifact_parents = _home_dir_targets(_KEYSTONE_ARTIFACT_PARENTS, inline=pre_resolved)
-        candidates = _candidate_forms(path_str, base_dir, pre_resolved=pre_resolved)
+        artifact_parents = (
+            _home_dir_targets(_KEYSTONE_ARTIFACT_PARENTS, inline=pre_resolved)
+            if parents is None
+            else _home_dir_targets(parents, inline=pre_resolved)
+        )
+        if candidates is None:
+            candidates = _candidate_forms(path_str, base_dir, pre_resolved=pre_resolved)
     except PathResolutionStalled:
         if strict:
             raise
@@ -214,6 +247,77 @@ def _is_keystone_publish_artifact(
         if os.path.dirname(cand_cf) in artifact_parents:
             return True
     return False
+
+
+def _matches_gate_rows(
+    path_str: str,
+    home_dirs: list[str],
+    base_dir: str | None = None,
+    *,
+    strict: bool = False,
+    pre_resolved: bool = False,
+) -> bool:
+    """Return True if *path_str* is under *home_dirs* or is a crew-home leaf's publish artifact.
+
+    *home_dirs* is a gate's static list (:data:`_SENSITIVE_HOME_DIRS`, or that plus
+    :data:`_WRITE_PROTECTED_HOME_PATHS`), matched by :func:`_path_in_home_dirs`, and the
+    artifacts are :func:`_is_keystone_publish_artifact`'s. The installed apps' declared
+    credential masks (an adopted former built-in's included; the shipped built-ins' are
+    static rows) get what a core crew-home secret leaf gets: their rows
+    (``paths_targets._app_credential_mask_rows``) are matched as a list of their own when
+    there are any, and their directories join the artifact parents. The path is
+    resolved once for every list, and the static list is matched before the listing is
+    taken, so a stall refuses there before any wait on it. A listing that misses its
+    deadline refuses as a stalled resolution does (raised to a *strict* caller) unless
+    the static lists match.
+    """
+    if not path_str:
+        return False
+    try:
+        candidates = _candidate_forms(path_str, base_dir, pre_resolved=pre_resolved)
+    except PathResolutionStalled:
+        if strict:
+            raise
+        return True  # fail closed: see _path_in_home_dirs
+
+    def under(rows: list[str]) -> bool:
+        return _path_in_home_dirs(
+            path_str,
+            rows,
+            base_dir,
+            strict=strict,
+            pre_resolved=pre_resolved,
+            candidates=candidates,
+        )
+
+    if under(home_dirs):
+        return True
+    stalled: PathResolutionStalled | None = None
+    try:
+        rows, parents = _app_credential_mask_rows(inline=pre_resolved)
+    except PathResolutionStalled as exc:
+        rows, parents, stalled = (), (), exc
+    if rows and under(list(rows)):
+        return True
+    # A canonical spelling is matched as itself, so a name with no artifact suffix is no
+    # artifact, and skipping it spares the inline caller an anchor resolution.
+    if (
+        not pre_resolved
+        or _fold_windows_alias(path_str).casefold().endswith(_KEYSTONE_ARTIFACT_SUFFIXES)
+    ) and _is_keystone_publish_artifact(
+        path_str,
+        base_dir,
+        strict=strict,
+        pre_resolved=pre_resolved,
+        parents=_KEYSTONE_ARTIFACT_PARENTS + list(parents),
+        candidates=candidates,
+    ):
+        return True
+    if stalled is None:
+        return False
+    if strict:
+        raise stalled
+    return True  # fail closed: see _path_in_home_dirs
 
 
 # Credential dot-dirs denied as a path COMPONENT anywhere in an app-picked local
@@ -242,6 +346,9 @@ def is_sensitive_path(path_str: str, base_dir: str | None = None) -> bool:
     the leaf holds the leaf's full payload, so READ is blocked alongside write -- a
     write-only fence there would still disclose ``.env`` or ``token_signing.key`` to a
     reader that wins the race.
+
+    And the installed apps' declared credential masks (:func:`_matches_gate_rows`),
+    read from a listing, since an install can add one while the gateway runs.
 
     The decision is :func:`sensitive_path_refusal`'s -- this is its boolean
     spelling, so the two cannot diverge. A stall is refused there (a string) and is
@@ -285,10 +392,7 @@ def is_sensitive_resolved_path(resolved: str) -> bool:
     calling thread inside ``realpath``, exactly as that thread's own walk of the
     same mount would. Nothing is admitted while it blocks.
     """
-    return _path_in_home_dirs(resolved, _SENSITIVE_HOME_DIRS, pre_resolved=True) or (
-        _fold_windows_alias(resolved).casefold().endswith(_KEYSTONE_ARTIFACT_SUFFIXES)
-        and _is_keystone_publish_artifact(resolved, pre_resolved=True)
-    )
+    return _matches_gate_rows(resolved, _SENSITIVE_HOME_DIRS, pre_resolved=True)
 
 
 def is_sensitive_canonical_path(resolved: str) -> bool:
@@ -374,9 +478,7 @@ def sensitive_path_refusal(path_str: str, base_dir: str | None = None) -> str | 
     shortly" costs one wait.
     """
     try:
-        matched = _path_in_home_dirs(
-            path_str, _SENSITIVE_HOME_DIRS, base_dir, strict=True
-        ) or _is_keystone_publish_artifact(path_str, base_dir, strict=True)
+        matched = _matches_gate_rows(path_str, _SENSITIVE_HOME_DIRS, base_dir, strict=True)
     except PathResolutionStalled as exc:
         return _stall_refusal(exc, path_str)
     return f"Blocked: access to sensitive path: {path_str}" if matched else None
@@ -386,12 +488,14 @@ def sensitive_write_path_refusal(path_str: str, base_dir: str | None = None) -> 
     """:func:`is_sensitive_write_path` as reason-or-``None``: same decision, a stall
     still refuses, worded as the stall :func:`sensitive_path_refusal` words it."""
     try:
-        matched = _path_in_home_dirs(
+        matched = _matches_gate_rows(
             path_str, _SENSITIVE_HOME_DIRS + _WRITE_PROTECTED_HOME_PATHS, base_dir, strict=True
-        ) or _is_keystone_publish_artifact(path_str, base_dir, strict=True)
+        )
         matched = matched or _path_in_home_dirs(
             path_str, _app_readonly_dir_rows(), base_dir, strict=True
         )
+        if not matched and (rule_rows := _permission_rule_rows()):
+            matched = _path_in_home_dirs(path_str, rule_rows, base_dir, strict=True)
         matched = matched or _native_store_write(path_str, base_dir)
         matched = matched or _install_root_write(path_str, base_dir)
     except PathResolutionStalled as exc:
@@ -440,7 +544,8 @@ def path_contains_sensitive(
 
     List-based, no filesystem walk: the known sensitive roots
     (:data:`_SENSITIVE_HOME_DIRS`, including the crew data-home secret leaves
-    and any ``KIROCREW_HOME`` re-anchoring) are prefix-compared against the
+    and any ``KIROCREW_HOME`` re-anchoring, plus the installed apps' declared
+    credential masks) are prefix-compared against the
     directory's candidate forms, so the check is O(sensitive entries) even when
     *dir_str* is a huge tree. Shares :func:`_candidate_forms` and
     :func:`_home_dir_targets` with :func:`_path_in_home_dirs` so the
@@ -459,6 +564,8 @@ def path_contains_sensitive(
         return False
     try:
         sensitive_targets = _home_dir_targets(_SENSITIVE_HOME_DIRS, inline=pre_resolved)
+        if app_rows := list(_app_credential_mask_rows(inline=pre_resolved).rows):
+            sensitive_targets = sensitive_targets | _home_dir_targets(app_rows, inline=pre_resolved)
         candidates = _candidate_forms(dir_str, base_dir, pre_resolved=pre_resolved)
     except PathResolutionStalled:
         return True  # fail closed: see _path_in_home_dirs
@@ -505,6 +612,11 @@ def sensitive_home_dirs() -> tuple[str, ...]:
     ``_SENSITIVE_HOME_DIRS`` name — the same rationale as
     :func:`get_credential_patterns`. Returned as a tuple so a caller cannot
     mutate the live blocklist.
+
+    The static rows only: the installed apps' declared credential masks
+    (:func:`_matches_gate_rows`) are listed per check and are not here, so a
+    consumer that derives a fence of its own from this view (the ENFORCED harness's
+    credential mask, the posture page) keeps the scope it had.
     """
     return tuple(_SENSITIVE_HOME_DIRS)
 
@@ -515,7 +627,33 @@ def write_protected_home_paths() -> tuple[str, ...]:
     Companion to :func:`sensitive_home_dirs` — these stay readable but must not
     be written by an agent tool, the app-declared rows after the core ones.
     """
-    return (*_WRITE_PROTECTED_HOME_PATHS, *_app_readonly_dir_rows())
+    return (*_WRITE_PROTECTED_HOME_PATHS, *_permission_rule_rows(), *_app_readonly_dir_rows())
+
+
+def _permission_rule_rows() -> list[str]:
+    """kiro-cli's permission rule leaves while their write fence is on.
+
+    Off by default, so the agent may edit them as before; read live at each check, like
+    ``mcp.honour_auto_approve`` is. A degraded read that cannot establish the owner's
+    choice keeps the fence on.
+    """
+    try:
+        from kiro_crew.config import live
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        cfg = live.snapshot() or KiroCrewConfig.load()
+        if cfg._base_unreadable or cfg._overlay_unreadable or "mcp" in cfg.degraded_sections:
+            logger.warning(
+                "could not establish mcp.protect_kiro_permission_rules from degraded config; "
+                "fencing"
+            )
+            on = True
+        else:
+            on = cfg.mcp.protect_kiro_permission_rules
+    except Exception:  # noqa: BLE001 (an unreadable config must not drop an opted-in fence)
+        logger.warning("could not read mcp.protect_kiro_permission_rules; fencing", exc_info=True)
+        on = True
+    return list(_KIRO_PERMISSION_RULE_LEAVES) if on is True else []
 
 
 def crew_home_prefixes() -> tuple[str, ...]:
@@ -707,6 +845,7 @@ from .paths_lists import (  # noqa: E402
     _CREW_HOME_PREFIXES,
     _KEYSTONE_ARTIFACT_PARENTS,
     _KEYSTONE_ARTIFACT_SUFFIXES,
+    _KIRO_PERMISSION_RULE_LEAVES,
     _SENSITIVE_HOME_DIRS,
     _WRITE_PROTECTED_HOME_PATHS,
     _leaf_segments,
@@ -721,6 +860,7 @@ from .paths_resolver import (  # noqa: E402
 )
 from .paths_targets import (  # noqa: E402
     _OVERRIDE_ANCHORED_LEAVES,
+    _app_credential_mask_rows,
     _app_readonly_dir_rows,
     _candidate_forms,
     _home_dir_targets,
@@ -803,8 +943,10 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     )
     from kiro_crew.security.paths_targets import (  # noqa: F401
         _ADAPTER_ROOT_ENVS,
-        _APP_READONLY_ROWS_BUDGET_SECS,
-        _APP_READONLY_ROWS_TTL_SECS,
+        _APP_CREDENTIAL_MASK_ROWS,
+        _APP_READONLY_ROWS,
+        _APP_ROWS_BUDGET_SECS,
+        _APP_ROWS_TTL_SECS,
         _HOME_TARGETS_TTL_COST_RATIO,
         _HOME_TARGETS_TTL_MAX_SECS,
         _HOME_TARGETS_TTL_SECS,
@@ -818,12 +960,12 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _TTL_MAX_SECS_MAX,
         _TTL_MAX_SECS_MIN,
         _anchor_targets,
-        _app_readonly_rows_cache,
-        _app_readonly_rows_clock,
-        _app_readonly_rows_lock,
-        _app_readonly_rows_pending,
+        _app_rows_clock,
+        _AppMaskRows,
+        _AppRowsListing,
         _BuiltTargets,
         _cached_home_dir_targets,
+        _declarations_generation,
         _env_float,
         _expanded_env_root,
         _home_dir_targets_uncached,
@@ -833,7 +975,11 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _home_targets_tier,
         _home_targets_ttl,
         _lexical_root,
+        _list_app_credential_mask_rows,
         _list_app_readonly_dir_rows,
+        _list_for_home,
+        _Listed,
+        _listed_rows,
         _on_event_loop,
         _rebuild_targets_bounded,
         _report_expiry_pin,

@@ -105,7 +105,11 @@ def _folder_tools() -> tuple[Tool, ...]:
                 "natural alphabetical, created = newest first); the header line names "
                 "the active mode. In custom mode the sequence you read here is the "
                 "one the person sees, which is what makes it safe to pick a "
-                "``before``/``after`` anchor for chat_folder_move. In name or created "
+                "``before``/``after`` anchor for chat_folder_move. One exception this "
+                "listing cannot see: the person may turn on a browser-only sidebar view "
+                "that draws folders holding unread chats above that order; an anchor "
+                "still sets the stored position, and the view moves only while a "
+                "folder has unread chats. In name or created "
                 "mode the listing says so and warns that an anchor sets the stored "
                 "position without changing the displayed order. Returns per "
                 "folder: id, human path, project directory, default "
@@ -759,6 +763,7 @@ from kiro_crew.mcp_dashboard_session_runs import (  # noqa: E402, F401
     _WORK_RECORD_ROUTE,
     GENERATE_TITLE_TIMEOUT_SECS,
     SESSION_STATUS_READ_TIMEOUT_SECS,
+    _activity_suffix,
     _closed_at_display,
     _create_refusal_remedy,
     _create_session,
@@ -789,6 +794,7 @@ from kiro_crew.mcp_dashboard_session_runs import (  # noqa: E402, F401
     _run_session_rename,
     _run_session_retry,
     _run_session_revive,
+    _run_session_run_queued,
     _run_session_send,
     _run_session_set_color,
     _run_session_set_model,
@@ -857,16 +863,19 @@ def _list_tools() -> list[dict[str, Any]]:
 
     Reaching this process at all means an agent spec referenced this server, so
     the assignment already happened; there is nothing left to gate here. The one
-    conditional parts are the ``crew`` argument on the five session tools, which is
-    advertised only while ``work_ledger.remote_dispatch`` is on, and ``backend`` on
+    conditional parts are the ``crew`` argument on the five session tools and the
+    ``crew_list`` tool, advertised only while ``work_ledger.remote_dispatch`` is
+    on, and ``backend`` on
     ``session_create`` / ``work_dispatch``, only while the ``session_harness``
     feature preview is on.
     """
+    from kiro_crew.mcp_crew_list import with_crew_list
     from kiro_crew.mcp_session_crew import with_crew_schema
     from kiro_crew.remote_dispatch import remote_dispatch_enabled
     from kiro_crew.session_harness_preview import session_harness_enabled, with_backend_schema
 
-    tools = with_crew_schema(TABLE.list(), remote_dispatch_enabled())
+    crew = remote_dispatch_enabled()
+    tools = with_crew_list(with_crew_schema(TABLE.list(), crew), crew)
     return with_backend_schema(tools, session_harness_enabled())
 
 
@@ -927,6 +936,13 @@ ADVERTISE_CALLER_IDENTITY = True
 
 def run_mcp_server() -> None:
     """Run the MCP stdio server — reads JSON-RPC from stdin, writes to stdout."""
+    # An enforced harness hands this server a one-time pickup in place of the secret
+    # it withholds (``agent_ipc_client``); redeem it before the first request, as
+    # ``kirocrew-core`` does, since listing the tools already reads the tool policy.
+    from kiro_crew.agent_ipc_client import redeem_at_startup
+    from kiro_crew.port_resolution import resolve_client_port_src
+
+    redeem_at_startup(lambda: resolve_client_port_src(None)[0])
     run_mcp_stdio_loop(
         SERVER_NAME,
         SERVER_VERSION,
@@ -970,6 +986,7 @@ if TYPE_CHECKING:  # the project names this module imported that only its owners
         _folder_owner_app,
         _subtree_holds_foreign_folder,
     )
+    from kiro_crew.mcp_crew_list import crew_list_tool  # noqa: F401
     from kiro_crew.mcp_tools.dashboard_client import DashboardClient, DashboardError  # noqa: F401
     from kiro_crew.platform import redact_via_context as redact  # noqa: F401
     from kiro_crew.sel import sel  # noqa: F401

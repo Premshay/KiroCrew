@@ -5,8 +5,8 @@ enterprise signing service (CDSigner), Apple notarization and stapling, and
 rotation of the notary credential.
 
 The pipeline lives in `.github/workflows/sign-and-notarize.yml`, a reusable
-workflow called by `nightly.yml` (channel `nightly`) and `release.yml` (channels
-`insider` and `stable`). The scripts it drives are in `packaging/signing/`.
+workflow called by `nightly.yml` (channel `nightly`), `release.yml` (channels
+`insider` and `stable`) and `release-lts.yml` (channel `lts`). The scripts it drives are in `packaging/signing/`.
 Release mechanics as a whole live in [release.md](release.md); desktop packaging
 in [desktop-app.md](desktop-app.md).
 
@@ -104,8 +104,7 @@ latest-DMG permalink (`desktop/<channel>/latest/KiroCrew.dmg`) are a public
 contract, so deriving filenames from the bundle name would silently rename keys
 and break the permalink. The DMG's **volume** name does follow the bundle.
 
-The single-arch legs (`mac_variant: arm64 | x64`, on nightly and on both release
-channels) run the same three jobs once more per DMG and append the arch to every
+The single-arch legs (`mac_variant: arm64 | x64`, on nightly and on every release channel) run the same three jobs once more per DMG and append the arch to every
 name the legs would otherwise share: the signing-bucket keys (`SIGN_KEY_SUFFIX`, read by
 `sign.sh`), `notarized/…/KiroCrew-<arch>.zip`, the gated artifact
 `KiroCrew-notarized-<channel>-<version>-<arch>`, the public
@@ -184,7 +183,7 @@ out of both files.
 
 ## Supply-chain ordering inside the jobs
 
-Two orderings in the workflow are deliberate and must be preserved:
+These rules in the workflow are deliberate and must be preserved:
 
 - **`awscurl` is installed BEFORE AWS credentials are configured**, in both the
   `sign` and `notarize` jobs, so a compromised or version-drifted release of that
@@ -199,6 +198,13 @@ Two orderings in the workflow are deliberate and must be preserved:
   attestation would bind a digest that never ships. The shipping DMG is attested in
   the `notarize` job **after** stapling, since stapling embeds the ticket into the
   file and therefore changes the released bytes.
+- **Every attestation gets one paused retry.** `actions/attest-build-provenance`
+  mints over the network (Sigstore Fulcio and Rekor) and has no retry of its own.
+  Each attest step in this and the `publish-*` workflows runs with
+  `continue-on-error: true`; on failure a pause step sleeps, then the identical
+  step runs once more without `continue-on-error`, so two failures fail the job.
+  Same action pin, same subjects, same permissions.
+  `test/test_workflow_attest_retry.py` pins the shape for every attest step.
 
 ## OIDC subject alignment and the `prod` environment
 
@@ -224,9 +230,15 @@ account. Custody rules:
   `password` and `team_id`. It is never a GitHub secret and never a workflow env
   literal: a dedicated secret store gives custody, an audit trail, and a rotation
   lifecycle that a repository secret does not.
-- **Local copy: the macOS Keychain**, via
-  `xcrun notarytool store-credentials "KiroCrewNotary" ...`. Every local command
-  then uses `--keychain-profile "KiroCrewNotary"`.
+- **Local copy: the macOS Keychain**, stored once under a keychain profile name
+  you pick, and passed to every later local command:
+
+  ```sh
+  xcrun notarytool store-credentials "KiroCrewNotary" ...
+  # every later local command then passes:
+  #   --keychain-profile "KiroCrewNotary"
+  ```
+
 - **Never paste the password** into chat, tickets, docs, or a shell command line
   that lands in a shared log. Type it only into the Apple portal, into
   `store-credentials` in your own terminal, or into the Secrets Manager console
@@ -266,8 +278,13 @@ whenever convenient, and not urgent while the password path works.
 
 ## Troubleshooting
 
-**Notarization returns `Invalid`.** Pull the itemized log with
-`xcrun notarytool log <submission-id> --keychain-profile KiroCrewNotary`. Every
+**Notarization returns `Invalid`.** Pull the itemized log with:
+
+```sh
+xcrun notarytool log <submission-id> --keychain-profile KiroCrewNotary
+```
+
+Every
 listed binary must be Developer ID signed with hardened runtime and a secure
 timestamp. If binaries are listed, manifest coverage regressed: check
 `generate-manifest.py`'s scope rules and its layout tripwire.

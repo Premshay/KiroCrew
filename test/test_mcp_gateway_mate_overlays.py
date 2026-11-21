@@ -9,6 +9,7 @@ rewrites each crewmate file under the identity ``crewmate:<id>`` into
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -82,6 +83,11 @@ def _mate_overlay(home, name="pixel") -> dict:
 def _agent_flag(entry: dict) -> str:
     flags = expand_stub_flags(entry["args"])
     return flags[flags.index("--agent") + 1]
+
+
+def _stub_names(spec: dict | None) -> set[str]:
+    """The servers a worker lookup would inject; ``None`` injects nothing."""
+    return set((spec or {}).get("mcpServers") or {})
 
 
 class TestTheRewritePass:
@@ -303,19 +309,74 @@ class TestTheWorkerLookup:
         assert [e["name"] for e in injected] == [SERVER]
         assert all("autoApprove" not in json.dumps(e) for e in injected)
 
-    def test_without_a_kas_session_key_the_lookup_is_the_by_name_one(self, home, monkeypatch):
-        """Every host but KAS passes no key, and keeps the lookup it had on main."""
+    def test_without_a_kas_session_key_no_worker_stub_is_injected_by_name(self, home, monkeypatch):
+        """The stock worker overlay is written under the worker's name; a lookup by
+        that name would hand its base stubs to a session without its merged limits,
+        so every host but KAS (which passes the session key) gets none."""
+        base = {"command": sys.executable, "args": ["-V"]}
+        _write(
+            home.mates / f"{WORKER}.json",
+            {"name": WORKER, "tools": ["*"], "mcpServers": {SERVER: base}},
+        )
         _rewrite(home)
+        assert SERVER in json.loads((home.overlay / f"{WORKER}.json").read_text())["mcpServers"]
         _worker_session(monkeypatch, home, merged_servers={SERVER: {"command": "x"}})
-        # No leftover copy under the shared name: nothing, as on main.
         assert session_servers.pooled_session_servers(home.overlay, WORKER) == []
-        # A leftover ``~/.kiro/agents/kirocrew-mate-worker.json`` overlay still
-        # answers the by-name lookup, as on main.
-        _write(home.overlay / f"{WORKER}.json", _mate_overlay(home) | {"name": WORKER})
-        assert [
-            e["name"] for e in session_servers.pooled_session_servers(home.overlay, WORKER)
-        ] == [SERVER]
-        assert session_servers.injection_server_names(home.overlay, WORKER) == frozenset({SERVER})
+        assert session_servers.injection_server_names(home.overlay, WORKER) == frozenset()
+
+    def test_the_worker_gets_the_base_servers_stubs_from_the_worker_overlay(
+        self, home, monkeypatch
+    ):
+        """Every crewmate's worker shares the base servers, with the governed limits."""
+        base = {"command": sys.executable, "args": ["-V"], "autoApprove": ["*"]}
+        _write(
+            home.mates / f"{WORKER}.json",
+            {"name": WORKER, "tools": ["*"], "mcpServers": {SERVER: base}},
+        )
+        _rewrite(home)
+        entry = json.loads((home.overlay / f"{WORKER}.json").read_text())["mcpServers"][SERVER]
+        assert entry[_WRAPPER_MARKER] is True
+        assert _agent_flag(entry) == WORKER
+        _worker_session(
+            monkeypatch,
+            home,
+            merged_servers={SERVER: {"command": "x", "disabledTools": ["write"]}},
+            base_servers={SERVER: base},
+        )
+        spec = mate_overlays.worker_overlay_spec(home.overlay, "chat-1")
+        assert _stub_names(spec) == {SERVER}
+        assert "autoApprove" not in spec["mcpServers"][SERVER]
+        assert spec["mcpServers"][SERVER]["disabledTools"] == ["write"]
+        # The crewmate's own file has nothing to do with it.
+        monkeypatch.setattr(mate_worker, "mate_file_for_member", lambda member_id: "")
+        assert _stub_names(mate_overlays.worker_overlay_spec(home.overlay, "chat-1")) == {SERVER}
+        # A base server the merged spec mutes or drops is not injected.
+        _worker_session(
+            monkeypatch,
+            home,
+            merged_servers={SERVER: {"command": "x", "disabled": True}},
+            base_servers={SERVER: base},
+        )
+        assert _stub_names(mate_overlays.worker_overlay_spec(home.overlay, "chat-1")) == set()
+        _worker_session(monkeypatch, home, merged_servers={}, base_servers={SERVER: base})
+        assert _stub_names(mate_overlays.worker_overlay_spec(home.overlay, "chat-1")) == set()
+
+    def test_a_worker_overlay_with_another_identity_gives_no_base_stub(self, home, monkeypatch):
+        base = {"command": sys.executable, "args": ["-V"]}
+        _write(
+            home.mates / f"{WORKER}.json",
+            {"name": WORKER, "tools": ["*"], "mcpServers": {SERVER: base}},
+        )
+        _rewrite(home)
+        path = home.overlay / f"{WORKER}.json"
+        _write(path, json.loads(path.read_text()) | {"name": "kirocrew"})
+        _worker_session(
+            monkeypatch,
+            home,
+            merged_servers={SERVER: {"command": "x"}},
+            base_servers={SERVER: base},
+        )
+        assert _stub_names(mate_overlays.worker_overlay_spec(home.overlay, "chat-1")) == set()
 
     def test_a_server_the_merged_spec_drops_or_mutes_is_not_injected(self, home, monkeypatch):
         _rewrite(home)
@@ -364,7 +425,7 @@ class TestTheWorkerLookup:
         path = mate_overlays.mate_overlay_dir(home.overlay) / "pixel.json"
         _write(path, _mate_overlay(home) | {"name": "kirocrew"})
         _worker_session(monkeypatch, home, merged_servers={SERVER: {"command": "x"}})
-        assert mate_overlays.worker_overlay_spec(home.overlay, "chat-1") is None
+        assert _stub_names(mate_overlays.worker_overlay_spec(home.overlay, "chat-1")) == set()
 
     @pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")
     def test_a_symlinked_overlay_is_refused(self, home, monkeypatch):
@@ -374,14 +435,14 @@ class TestTheWorkerLookup:
         path.unlink()
         path.symlink_to(real)
         _worker_session(monkeypatch, home, merged_servers={SERVER: {"command": "x"}})
-        assert mate_overlays.worker_overlay_spec(home.overlay, "chat-1") is None
+        assert _stub_names(mate_overlays.worker_overlay_spec(home.overlay, "chat-1")) == set()
 
     @pytest.mark.parametrize("bound", ["../agents/kirocrew", "a\\b", ".."])
     def test_a_binding_that_names_a_path_is_refused(self, home, monkeypatch, bound):
         _rewrite(home)
         _worker_session(monkeypatch, home, merged_servers={SERVER: {"command": "x"}})
         monkeypatch.setattr(mate_worker, "mate_file_for_member", lambda member_id: bound)
-        assert mate_overlays.worker_overlay_spec(home.overlay, "chat-1") is None
+        assert _stub_names(mate_overlays.worker_overlay_spec(home.overlay, "chat-1")) == set()
 
     def test_an_unreadable_worker_kit_injects_nothing(self, home, monkeypatch):
         _rewrite(home)
@@ -691,7 +752,7 @@ class TestALinkedCrewmateOverlayFolder:
         elsewhere = self._plant(home)
         _write(elsewhere / "pixel.json", overlay)
         _worker_session(monkeypatch, home, merged_servers={SERVER: {"command": "x"}})
-        assert mate_overlays.worker_overlay_spec(home.overlay, "chat-1") is None
+        assert _stub_names(mate_overlays.worker_overlay_spec(home.overlay, "chat-1")) == set()
 
 
 class TestAnEditedCrewmateFile:
@@ -833,6 +894,186 @@ class TestAnAgentOfTheSameName:
         assert not (mate_overlays.mate_overlay_dir(home.overlay) / "pixel.json").exists()
         assert not (home.overlay / rewriter._FINGERPRINT_NAME).exists()
         assert approvals.live_incomplete is True
+
+
+APP = "demo-app"
+_SAME_NAME = "has the same name"
+_APP_RUNS = "so the Bot's chats run that app's agent"
+
+
+class TestAnInstalledAppsOwnExport:
+    """An app's ``<app>--<id>.json`` export wins the binding by design: said at INFO.
+
+    Every other same-name spec keeps the warning, and the overlay is refused either way.
+    """
+
+    @pytest.fixture
+    def app_home(self, home, tmp_path, monkeypatch, caplog):
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "data-home"))
+        caplog.set_level("INFO", logger="kiro_crew.mcp_gateway.rewriter")
+        return home
+
+    @staticmethod
+    def _install(app: str = APP, enabled: bool = True) -> None:
+        from kiro_crew.apps import manager
+
+        root = manager.app_dir(app)
+        _write(
+            root / manager.APP_MANIFEST_FILENAME,
+            {"name": app, "version": "1.0.0", "agents": ["agents/a.json"]},
+        )
+        _write(root / "agents" / "a.json", {"name": "pixel", "prompt": "p"})
+        manager._write_installed(
+            app, manager.InstalledApp(name=app, version="1.0.0", enabled=enabled)
+        )
+
+    @staticmethod
+    def _export(home, app: str = APP) -> Path:
+        return _write(home.agents / f"{app}--pixel.json", {"name": "pixel", "mcpServers": {}})
+
+    @staticmethod
+    def _lines(caplog, text: str) -> list[logging.LogRecord]:
+        return [r for r in caplog.records if "'pixel'" in r.getMessage() and text in r.getMessage()]
+
+    def _assert_refused(self, home, approvals) -> None:
+        assert not (mate_overlays.mate_overlay_dir(home.overlay) / "pixel.json").exists()
+        assert (home.overlay / rewriter._FINGERPRINT_NAME).exists()
+        assert approvals.live_incomplete is False
+
+    def _assert_warned(self, caplog) -> None:
+        assert [r.levelname for r in self._lines(caplog, _SAME_NAME)] == ["WARNING"]
+        assert self._lines(caplog, _APP_RUNS) == []
+
+    def test_the_only_claimant_being_the_apps_export_logs_info_not_a_warning(
+        self, app_home, caplog
+    ):
+        sidecar = _credentialed_pixel(app_home)
+        self._install()
+        self._export(app_home)
+        approvals = LaunchApprovals()
+        _rewrite(app_home, pooling=False, approvals=approvals)
+        self._assert_refused(app_home, approvals)
+        assert not sidecar.exists()
+        [line] = self._lines(caplog, _APP_RUNS)
+        assert line.levelname == "INFO" and f"'{APP}'" in line.getMessage()
+        assert self._lines(caplog, _SAME_NAME) == []
+
+    def test_a_users_own_file_still_warns(self, app_home, caplog):
+        _write(app_home.agents / "pixel.json", {"name": "pixel", "mcpServers": {}})
+        approvals = LaunchApprovals()
+        _rewrite(app_home, pooling=False, approvals=approvals)
+        self._assert_refused(app_home, approvals)
+        self._assert_warned(caplog)
+
+    @pytest.mark.parametrize(
+        ("other", "declared"), [("mine.json", "pixel"), ("PIXEL.json", "PIXEL")]
+    )
+    def test_a_second_claimant_beside_the_export_still_warns(
+        self, app_home, caplog, other, declared
+    ):
+        """A hand-written spec, also one whose name differs only by case."""
+        self._install()
+        self._export(app_home)
+        _write(app_home.agents / other, {"name": declared})
+        approvals = LaunchApprovals()
+        _rewrite(app_home, pooling=False, approvals=approvals)
+        self._assert_refused(app_home, approvals)
+        self._assert_warned(caplog)
+
+    def test_two_apps_exporting_the_name_still_warn(self, app_home, caplog):
+        for app in (APP, "other-app"):
+            self._install(app)
+            self._export(app_home, app)
+        approvals = LaunchApprovals()
+        _rewrite(app_home, pooling=False, approvals=approvals)
+        self._assert_refused(app_home, approvals)
+        self._assert_warned(caplog)
+
+    def test_another_apps_export_still_warns(self, app_home, caplog):
+        """The installed app declaring the name is not the one whose export is on disk."""
+        self._install()
+        self._export(app_home, "other-app")
+        approvals = LaunchApprovals()
+        _rewrite(app_home, pooling=False, approvals=approvals)
+        self._assert_refused(app_home, approvals)
+        self._assert_warned(caplog)
+
+    @pytest.mark.parametrize("state", ["removed", "disabled", "owner-disabled"])
+    def test_an_export_left_by_a_removed_or_disabled_app_still_warns(
+        self, app_home, caplog, monkeypatch, state
+    ):
+        """``owner-disabled``: the app's own record says enabled, the owner's disable wins."""
+        from kiro_crew.apps import protected_app_state
+
+        if state != "removed":
+            self._install(enabled=state == "owner-disabled")
+        if state == "owner-disabled":
+            monkeypatch.setattr(protected_app_state, "owner_disabled", lambda name: name == APP)
+        self._export(app_home)
+        approvals = LaunchApprovals()
+        _rewrite(app_home, pooling=False, approvals=approvals)
+        self._assert_refused(app_home, approvals)
+        self._assert_warned(caplog)
+
+    @requires_symlinks
+    def test_a_linked_export_still_warns(self, app_home, caplog):
+        self._install()
+        real = _write(app_home.tmp / "elsewhere" / "real.json", {"name": "pixel"})
+        (app_home.agents / f"{APP}--pixel.json").symlink_to(real)
+        _rewrite(app_home, pooling=False)
+        assert not (mate_overlays.mate_overlay_dir(app_home.overlay) / "pixel.json").exists()
+        self._assert_warned(caplog)
+
+    @pytest.mark.parametrize("reread", ["fails", "names-another-agent"])
+    def test_an_export_that_changes_before_its_re_read_still_warns(
+        self, app_home, caplog, monkeypatch, reread
+    ):
+        """The agents half reads the export first; the crewmate half's re-read differs."""
+        self._install()
+        export = self._export(app_home)
+        real_read = agent_discovery.read_agent_spec_strict
+        reads: list[Path] = []
+
+        def _read(path, **kwargs):
+            if Path(path) == export:
+                reads.append(export)
+                if len(reads) > 1:
+                    if reread == "fails":
+                        raise OSError("busy")
+                    return {"name": "someone-else"}
+            return real_read(path, **kwargs)
+
+        monkeypatch.setattr(agent_discovery, "read_agent_spec_strict", _read)
+        approvals = LaunchApprovals()
+        _rewrite(app_home, pooling=False, approvals=approvals)
+        assert len(reads) == 2
+        self._assert_refused(app_home, approvals)
+        self._assert_warned(caplog)
+
+    def test_an_owner_lookup_that_fails_still_warns(self, app_home, caplog, monkeypatch):
+        from kiro_crew.apps import manager
+
+        self._install()
+        self._export(app_home)
+
+        def _fail(_agent):
+            raise RuntimeError("unreadable")
+
+        monkeypatch.setattr(manager, "owning_app_for_agent", _fail)
+        approvals = LaunchApprovals()
+        _rewrite(app_home, pooling=False, approvals=approvals)
+        self._assert_refused(app_home, approvals)
+        self._assert_warned(caplog)
+
+    def test_a_malformed_export_declares_nothing_so_the_crewmate_keeps_its_overlay(
+        self, app_home, caplog
+    ):
+        """As before this change: a spec with no readable name shadows no crewmate."""
+        self._install()
+        (app_home.agents / f"{APP}--pixel.json").write_text("{", encoding="utf-8")
+        _rewrite(app_home, pooling=False)
+        assert (mate_overlays.mate_overlay_dir(app_home.overlay) / "pixel.json").exists()
+        assert self._lines(caplog, _SAME_NAME) == [] and self._lines(caplog, _APP_RUNS) == []
 
 
 @requires_symlinks

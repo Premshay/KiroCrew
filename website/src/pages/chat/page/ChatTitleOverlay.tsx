@@ -22,7 +22,7 @@ import Clickable from '../../../components/Clickable'
 import { useLabelTip } from '../../../components/InstantTip'
 import { i18nT } from '../../../i18n/t'
 import { uiLocation } from '../../../uiLocations/uiLocation'
-import { crewRootOf, hiddenMateRootOf } from '../../../lib/crewMode'
+import { crewRootOf, mateRootOf } from '../../../lib/crewMode'
 
 interface ChatTitleOverlayProps {
   embedMode?: 'chat' | 'sessions'
@@ -105,9 +105,9 @@ export default function ChatTitleOverlay({
   sidebarOpen, sidePanelWantsMount, mobileNewSessionItem, mobileSessionsToggle, onPromote, promoting,
 }: ChatTitleOverlayProps) {
   const currentCrewRoot = crewRootOf(currentSlot)
-  // A crewmate's session the mate sessions preview keeps out of the person's
-  // lists, opened from History, search or a link: the same breadcrumb, back to the mate.
-  const currentMateRoot = currentCrewRoot ? '' : hiddenMateRootOf(currentSlot)
+  // A crewmate's session, which its Bot's Sessions tab lists: the same
+  // breadcrumb, back to the mate.
+  const currentMateRoot = currentCrewRoot ? '' : mateRootOf(currentSlot)
   const breadcrumbRoot = currentCrewRoot || currentMateRoot
   return (
     <>
@@ -145,7 +145,7 @@ export default function ChatTitleOverlay({
             {/* The panel's open control, which the title row carries and the
                 breadcrumb replaces: with the panel closed, one click brings the
                 Workers list back beside the worker. */}
-            {!embedMode && !popout && !activityOpen && (
+            {(!embedMode || popout) && !activityOpen && (
               <Clickable
                 className="ml-1.5 flex items-center justify-center w-11 h-11 md:w-7 md:h-7 rounded-md transition-colors bg-transparent border-none shrink-0 pointer-events-auto text-muted hover:text-text hover:bg-bg-hover cursor-pointer"
                 onClick={toggleAct}
@@ -245,12 +245,13 @@ export default function ChatTitleOverlay({
         ))}
         {/* Activity panel open toggle — relocated here from the top bar
             (item 2.4) so opening the panel no longer narrows the now
-            full-width header. Shown only while the panel is closed; the
-            panel's own header carries the close button. Never disabled:
+            full-width header. Shown only while the panel is closed, the
+            pop-out window included; the panel's own header carries the
+            close button. Never disabled:
             below the mobile breakpoint the panel opens full width, at or
             above it opens beside the chat. There is no width at which
             the button does nothing. */}
-        {!embedMode && !popout && !activityOpen && (
+        {(!embedMode || popout) && !activityOpen && (
           <TipClickable
             className="pi-morph flex items-center justify-center w-7 h-7 rounded-md transition-colors bg-transparent border-none shrink-0 pointer-events-auto text-muted hover:text-text hover:bg-bg-hover cursor-pointer"
             onClick={toggleAct}

@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 
 import pytest
+from session_handle_helpers import bare_session_handle
 
 import kiro_crew.agent as agent_mod
 import kiro_crew.config.paths as paths_mod
@@ -921,7 +922,6 @@ async def test_a_switch_back_to_the_delegator_keeps_its_targets_in_the_stale_che
     """KAS keeps the whole batch across a mode switch, so once the session is back
     on the delegator its stale check still counts what its registered target
     auto-approves."""
-    from kiro_crew.acp.session_handle import AcpSessionHandle
     from kiro_crew.acp.types import UPDATE_CURRENT_MODE
     from kiro_crew.agent_sdk import spec_hooks
 
@@ -930,7 +930,7 @@ async def test_a_switch_back_to_the_delegator_keeps_its_targets_in_the_stale_che
     _write(agents_dir, _FETCHER)
     extras = await _extras()
     assert _ids(extras) == ["delegator", "fetcher"]
-    handle = object.__new__(AcpSessionHandle)
+    handle = bare_session_handle(runtime=None)
     KasHarness().record_session_projection(handle, extras.custom_agents, "delegator")
     handle._last_kas_mode_id = "delegator"
     handle._handle_kas_update(UPDATE_CURRENT_MODE, {"currentModeId": "fetcher"})
@@ -1041,3 +1041,174 @@ async def test_a_target_server_gets_the_ssh_agent_the_session_may_forward(
     parent, target = extras.custom_agents
     assert (kas_env_shim.SHIM_MODULE in parent["mcpServers"]["own-git"]["args"]) is forwarded
     assert (kas_env_shim.SHIM_MODULE in target["mcpServers"]["git"]["args"]) is forwarded
+
+
+@pytest.mark.asyncio
+async def test_the_session_and_its_targets_answer_from_one_scope_reading(agents_dir, monkeypatch):
+    """One session projection reads the MCP config scopes once, its sub-agent
+    targets included, and a scope's mute still reaches the target."""
+    from kiro_crew import mcp_cleanup
+
+    reads: list[int] = []
+
+    def scope_muted():
+        reads.append(1)
+        return frozenset({"muted"})
+
+    monkeypatch.setattr(mcp_cleanup, "mcp_scope_muted_aliases", scope_muted)
+    # The projection reads the user's skill tree; give it an empty one.
+    monkeypatch.setenv("KIRO_HOME", str(agents_dir.parent / "kiro"))
+    servers = {"kept": {"command": "k"}, "muted": {"command": "m"}}
+    _write(agents_dir, {**_delegator("helper", tools=("*",)), "mcpServers": servers})
+    _write(agents_dir, {**_SLACK, "name": "helper", "tools": ["*"], "mcpServers": servers})
+
+    extras = await _extras()
+
+    assert _ids(extras) == ["delegator", "helper"]
+    for agent in extras.custom_agents:
+        declared = agent.get("mcpServers") or {}
+        assert "kept" in declared and "muted" not in declared, agent["id"]
+    assert len(reads) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("held", [True, False])
+async def test_a_held_bot_limit_reaches_its_named_child_and_the_targets_it_registers(
+    agents_dir, monkeypatch, held
+):
+    """A child session under a Bot with a held read limit (``mate_held_rules``), and each
+    agent it registers, ask before a read and keep no read pre-approval."""
+    from types import SimpleNamespace
+
+    from kiro_crew import execution_context
+
+    ledger = agents_dir.parent / "mates" / "migrated.json"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(paths_mod, "kiro_home", lambda: agents_dir.parent)
+    rules = [{"text": "deny reading", "capability": "fs_read"}]
+    member = "m1" if held else "other"
+    ledger.write_text(json.dumps({"held_rules": {"zxc": {"member_id": "m1", "rules": rules}}}))
+    monkeypatch.setattr(
+        execution_context, "read_session_execution", lambda key: SimpleNamespace(member_id=member)
+    )
+    _write(agents_dir, _delegator("slack-agent"))
+    _write(agents_dir, _SLACK)
+
+    extras = await KasHarness().session_extras("delegator", work_dir=None, session_key="k")
+
+    assert _ids(extras) == ["delegator", "slack-agent"]
+    for entry in extras.custom_agents:
+        reads = [
+            r
+            for r in entry.get("permissions", {}).get("rules", [])
+            if r.get("capability") == "fs_read"
+        ]
+        asks = {"capability": "fs_read", "effect": "ask"} in reads
+        allows = [r for r in reads if r.get("effect") == "allow"]
+        assert asks is held, entry["id"]
+        if held:
+            assert not allows, entry["id"]
+
+
+def _open_delegator(**extra) -> dict:
+    spec = _delegator()
+    del spec["toolsSettings"]
+    return {**spec, **extra}
+
+
+@pytest.mark.asyncio
+async def test_with_no_list_the_notice_names_each_agent_the_backend_skips(agents_dir):
+    _write(agents_dir, _open_delegator())
+    _write(agents_dir, _SLACK)
+    _write(agents_dir, {**_SLACK, "name": "kas-ready", "permissions": {"rules": []}})
+    _write(agents_dir, {"name": "plain", "prompt": "p", "tools": ["fs_read"]})
+
+    extras = await _extras()
+
+    assert _ids(extras) == ["delegator"]
+    notice = extras.withheld_credentials_notice
+    assert "agent delegator cannot hand work to slack-agent (its agent file has" in notice
+    assert "no permissions block" in notice
+    assert "kas-ready" not in notice and "plain" not in notice
+
+
+@pytest.mark.asyncio
+async def test_with_no_list_and_no_sub_agent_tool_nothing_is_named(agents_dir):
+    _write(agents_dir, _open_delegator(tools=["fs_read"]))
+    _write(agents_dir, _SLACK)
+
+    extras = await _extras()
+
+    assert "slack-agent" not in extras.withheld_credentials_notice
+
+
+@pytest.mark.asyncio
+async def test_a_list_under_the_use_subagent_key_registers_its_target(agents_dir):
+    _write(
+        agents_dir,
+        _open_delegator(toolsSettings={"use_subagent": {"availableAgents": ["slack-agent"]}}),
+    )
+    _write(agents_dir, _SLACK)
+
+    extras = await _extras()
+
+    assert _ids(extras) == ["delegator", "slack-agent"]
+    assert "slack-agent" not in extras.withheld_credentials_notice
+
+
+def _held_read_limit(agents_dir: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from kiro_crew import execution_context
+
+    ledger = agents_dir.parent / "mates" / "migrated.json"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(paths_mod, "kiro_home", lambda: agents_dir.parent)
+    rules = [{"text": "deny reading", "capability": "fs_read"}]
+    ledger.write_text(json.dumps({"held_rules": {"zxc": {"member_id": "m1", "rules": rules}}}))
+    monkeypatch.setattr(
+        execution_context, "read_session_execution", lambda key: SimpleNamespace(member_id="m1")
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_bots_session_whose_spec_cannot_be_narrowed_is_refused(agents_dir, monkeypatch):
+    """Refused with a reason, never started with the pre-approvals its held limits cover."""
+    from kiro_crew.acp.session_handle import AcpAgentUnavailable
+    from kiro_crew.agent_sdk import kas_tool_view
+
+    _held_read_limit(agents_dir, monkeypatch)
+    _write(agents_dir, _delegator("slack-agent"))
+    _write(agents_dir, _SLACK)
+
+    def _boom(_block):
+        raise RuntimeError("narrowing failed")
+
+    monkeypatch.setattr(kas_tool_view, "permissions_block_readable", _boom)
+    with pytest.raises(AcpAgentUnavailable, match="held limits"):
+        await KasHarness().session_extras("delegator", work_dir=None, session_key="k")
+
+
+@pytest.mark.asyncio
+async def test_a_target_whose_spec_cannot_be_narrowed_is_left_out_and_the_rest_register(
+    agents_dir, monkeypatch
+):
+    from kiro_crew import mate_held_rules
+
+    _held_read_limit(agents_dir, monkeypatch)
+    other = {**_SLACK, "name": "notes-agent"}
+    _write(agents_dir, _delegator("slack-agent", "notes-agent"))
+    _write(agents_dir, _SLACK)
+    _write(agents_dir, other)
+    real = mate_held_rules.held_child_spec
+
+    def _child(spec, session_key):
+        if spec.get("name") == "slack-agent":
+            raise mate_held_rules.HeldLimitsNotApplied("could not be applied")
+        return real(spec, session_key)
+
+    monkeypatch.setattr(mate_held_rules, "held_child_spec", _child)
+    extras = await KasHarness().session_extras("delegator", work_dir=None, session_key="k")
+
+    assert _ids(extras) == ["delegator", "notes-agent"]
+    assert "slack-agent (its agent file could not be used)" in extras.withheld_credentials_notice

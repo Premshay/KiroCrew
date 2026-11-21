@@ -1,3 +1,5 @@
+import type { ConductorModeRun } from '../types'
+
 /**
  * Types for the Crew page's work-item board (`GET /api/crew-board`).
  *
@@ -34,11 +36,23 @@ export interface WorkBoardEvent {
   id: string
   ts: string
   item_id: string
-  kind: 'create' | 'bind' | 'report' | 'decision' | 'steer' | 'verdict' | 'close'
+  kind: 'create' | 'bind' | 'report' | 'decision' | 'steer' | 'verdict' | 'close' | 'ask'
   /** Present on a `report` line: the status the worker reported. */
   status: WorkReportStatus
   /** Blanked by the server on a `bind` line, whose text is a session key. */
   text: string
+}
+
+/** The conductor's ask record (`work_vocab.coerce_ask`): what it needs from the
+ *  person, why only they can decide, the answers with what each leads to, and its
+ *  pick (one of the labels, or empty). */
+export interface WorkItemAsk {
+  what: string
+  why: string
+  options: { label: string; outcome: string }[]
+  pick: string
+  pick_why: string
+  written_at: string
 }
 
 /** One masked row: the conductor's item minus `worker_session_key`, plus joins. */
@@ -86,9 +100,32 @@ export interface WorkBoardItem {
   /** The item waits on the PERSON: a blocked / question report naming one, not
    *  answered since by the conductor or a steer. Absent on an older gateway. */
   awaits_person?: boolean
+  /** The conductor's vetted question for the person (`work_ask_record`), sent only
+   *  while no newer report has superseded it. Absent otherwise. */
+  ask?: WorkItemAsk
   terminal: boolean
   alive: AliveState
   events: WorkBoardEvent[]
+  /** Where a discussion this item's worker hosts stands, from its last report
+   *  (`work_vocab.coerce_discussion`). Absent when the worker hosts none. */
+  discussion?: WorkDiscussion | null
+}
+
+/** A worker-hosted discussion, as its last `work_report` carried it. */
+export interface WorkDiscussion {
+  phase: 'talking' | 'checking' | 'asking' | 'done'
+  round?: number
+  minutes?: number
+  direction?: string
+  /** An http(s) link or an in-app path (`/chat/...`), checked server-side. */
+  thread?: string
+  agreed?: string[]
+  checking?: string[]
+  disputed?: { point: string; sides?: string }[]
+  recent?: { who: string; text: string }[]
+  /** The talk so far, one entry a round, one short line a participant.
+   *  Absent from a report written before it existed. */
+  rounds?: { round: number; lines: { who: string; text: string }[] }[]
 }
 
 /** The conductor's own record. No `worker_session_key` anywhere in it. */
@@ -105,6 +142,8 @@ export interface WorkBoardConductor {
 export interface WorkBoardResponse {
   conductor: WorkBoardConductor
   conductor_alive: AliveState
+  /** Session-owned root activity outside the work ledger. */
+  conductor_working?: boolean
   items: WorkBoardItem[]
   /**
    * Whether this gateway can take an orphaned item over. False on main: no
@@ -119,13 +158,16 @@ export interface WorkBoardResponse {
    */
   take_over_available: boolean
   /** The conductor's offered answers per open item (goal-board's agentic `asks`
-   *  field), read by the Ultra Mode Board's Needs your input. Absent on an older
+   *  field), read by the conductor mode Board's Needs your input. Absent on an older
    *  gateway. */
   asks?: Record<string, string[]>
   /** What the warm welcome's own GitHub read last saw for each open item's pull
    *  request (the `objects` fold), with its read time. Never a network read on
    *  page load. Absent on an older gateway. */
   pr_facts?: Record<string, CrewPrFacts>
+  /** Done or stopped, from the item states and the conductor's patrol, read by
+   *  the conductor mode Board's run line. Absent on an older gateway. */
+  run?: ConductorModeRun
 }
 
 export interface CrewPrRead {
@@ -159,6 +201,13 @@ export interface CrewBoardActionResult {
  *  cost nothing, fast enough that a decision request is noticed while the human is
  *  still at the desk. No websocket in this PR. */
 export const CREW_BOARD_POLL_MS = 10_000
+
+/** How long a board nobody shows stays cached, so going back to a session paints
+ *  its last board at once instead of an empty one while the read runs. React
+ *  Query's 5-minute default is shorter than an ordinary stay in another session.
+ *  The same 30 minutes as `APP_CACHE_RETENTION_MS`, and bounded for its reason: a
+ *  long-lived tab keeps only the boards shown in the last 30 minutes. */
+export const CREW_BOARD_GC_MS = 30 * 60_000
 
 /** React Query key. A board belongs to ONE conductor, so the key carries it —
  *  two conductors open in two tabs must not share a cache entry. */

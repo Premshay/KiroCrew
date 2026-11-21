@@ -12,7 +12,7 @@
  *   and only on a deployment whose `agent.acp_backend` enum offers KAS
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { render, screen, fireEvent, within, cleanup, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, within, cleanup } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { useState } from 'react'
 import { MemoryRouter } from 'react-router-dom'
@@ -125,7 +125,7 @@ describe('FeaturePreviewIntroButton', () => {
 
 describe('FeaturePreviewsSection — See-what-it-looks-like per card', () => {
   beforeEach(() => {
-    for (const k of ['mc-preview-webhooks', 'mc-preview-remote-crew-chat', 'mc-preview-crew-mode']) localStorage.removeItem(k)
+    for (const k of ['mc-preview-webhooks', 'mc-preview-remote-crew-chat']) localStorage.removeItem(k)
     // The Decisions card reads `config.json`; stubbed so these capture-button
     // cases do not wait on a fetch that cannot succeed under vitest.
     vi.spyOn(api, 'kirocrewConfig').mockResolvedValue({} as never)
@@ -162,59 +162,14 @@ describe('FeaturePreviewsSection — See-what-it-looks-like per card', () => {
     expect(screen.getByRole('switch', { name: 'Webhooks' })).toHaveAttribute('aria-checked', 'true')
   })
 
-  it('mounts the built-in KAS engine card, with its switch, in the section', async () => {
-    // The card left the KAS harness row for this page while the route is in
-    // shadow testing; it is the same card, writing `agent.kas_bundle`.
-    vi.spyOn(api, 'kasBundleStatus').mockResolvedValue({
-      enabled: false,
-      pinned_version: '0.66.33',
-      runs_version: '0.66.33',
-      installed: null,
-      installing: false,
-      progress: { done: 0, total: 0 },
-      error: '',
-    } as never)
+  it('no longer lists the KAS engine: its choice moved to the KAS harness row', () => {
     renderSection()
-    expect(await screen.findByTestId('kas-bundle-card')).toBeInTheDocument()
-    expect(screen.getByRole('switch', { name: /Run KAS on .*own engine/ })).toBeInTheDocument()
+    expect(screen.queryByTestId('kas-bundle-card')).toBeNull()
   })
 
-  it('draws no KAS engine card on a deployment that cannot select KAS', async () => {
-    // The same gate the card had on the harness row: nothing to install or switch
-    // on for a harness this deployment does not offer.
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async input =>
-      String(input).includes('/api/config/schema')
-        ? new Response(
-            JSON.stringify({
-              entries: [{ path: 'agent.acp_backend', type: 'enum', enumValues: ['kiro', 'claude'] }],
-            }),
-            { status: 200, headers: { 'Content-Type': 'application/json' } },
-          )
-        : new Response('{}', { status: 404 }),
-    )
-    vi.spyOn(api, 'kasBundleStatus').mockResolvedValue({
-      enabled: false,
-      pinned_version: '0.66.33',
-      runs_version: '0.66.33',
-      installed: null,
-      installing: false,
-      progress: { done: 0, total: 0 },
-      error: '',
-    } as never)
+  it('lists no conductor mode switch: conductor mode is on with no preview turned on', () => {
     renderSection()
-    // Fail-open while the schema is in flight, then gone once it says no KAS.
-    await waitFor(() => expect(screen.queryByTestId('kas-bundle-card')).toBeNull())
-    expect(screen.queryByRole('switch', { name: /Run KAS on .*own engine/ })).toBeNull()
-  })
-
-  it('offers Ultra Mode as a plain switch, off by default, that writes the one Crew Mode flag', () => {
-    renderSection()
-    const toggle = screen.getByRole('switch', { name: 'Ultra Mode' })
-    expect(toggle).toHaveAttribute('aria-checked', 'false')
-    expect(screen.getByTitle('Lets a chat hand tasks to a crew and track them on a Board.')).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /See what (Ultra|Crew) Mode looks like/ })).toBeNull()
-    fireEvent.click(toggle)
-    expect(localStorage.getItem('mc-preview-crew-mode')).toBe('1')
+    expect(screen.queryByRole('switch', { name: 'Conductor mode' })).toBeNull()
     expect(crewModeEnabled()).toBe(true)
   })
 

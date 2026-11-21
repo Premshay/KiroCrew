@@ -77,7 +77,7 @@ function createSuccessorHandoff({
    * in a fresh process, which needs an executable to re-exec and one attempt
    * that has not already failed.
    *
-   * @param {boolean} localGatewayOff  this launch started nothing.
+   * @param {boolean} localGatewayOff  this launch runs no gateway.
    * @param {string} remoteTarget      the crew this launch targeted, if any.
    * @returns {boolean}
    */
@@ -278,7 +278,7 @@ function createSuccessorHandoff({
       const owner = await probeGatewayPortOwner(expectPort);
       if (owner === "kirocrew" || owner === "service") return "confirm";
       if (owner === "foreign") return "foreign";
-      if (owner === "unknown") {
+      if (owner === "unknown" || owner === "unidentified") {
         glog(
           `successor check: listener probe unavailable on :${expectPort} `
           + "-- refusing to hand over to a holder that cannot be identified",

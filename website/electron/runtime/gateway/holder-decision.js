@@ -324,13 +324,15 @@ function createHolderDecision({
    * spawn anyway. That stays the answer for every holder except one: a local
    * Kiro Crew gateway for this app's own data folder that keeps failing its
    * health check past the grace window. That one is offered a stop-and-restart.
+   * `holders` receives what the owner probe found when no holder is Kiro
+   * Crew's (an unread command is null), so a spawn that then fails can name it.
    *
    * @returns {Promise<"spawn"|"healthy"|"abort"|{stopFailed:number[]}>}
    */
-  async function resolveUnresponsiveHolder() {
+  async function resolveUnresponsiveHolder({ holders = null } = {}) {
     if (!getRunLocalGateway() || getRemoteHostConfig(store, PORT)?.host) return "spawn";
     if ((await probeGatewayPortBinding(PORT)) !== "bound") return "spawn";
-    const localOwner = await probeGatewayPortOwner(PORT);
+    const localOwner = await probeGatewayPortOwner(PORT, { holders });
     if (localOwner !== "kirocrew" && localOwner !== "service") return "spawn";
     const provenPid = await sameHomeGatewayPid();
     if (!provenPid) return "spawn";
@@ -449,15 +451,19 @@ function createHolderDecision({
     // any 403 is seen, so there is no recovery after the fact.
     //
     // A `foreign` owner with no `remoteHosts` entry is exactly "cannot attribute
-    // it". `kirocrew` and `service` still adopt, and so do `none` and `unknown`:
-    // the fail-open this narrows is preserved wherever the probe did not
-    // positively find someone else holding the port.
+    // it", and so is `unidentified`: netstat named a pid on the port and its
+    // command line could not be read, so a holder demonstrably exists and only
+    // its identity is missing. `kirocrew` and `service` still adopt, and so do
+    // `none` and `unknown`: the fail-open this narrows is preserved wherever the
+    // probe did not positively find someone else holding the port. `unidentified`
+    // is NOT one of those -- the probe did find a holder -- which is why it is a
+    // value of its own rather than another spelling of `unknown`.
     //
     // `warn-stale` cannot reach here with a `foreign` owner: the bundled-path
     // probe above only runs for a `kirocrew` or `service` owner, so that action
     // is unreachable without positive local attribution.
     let adoptOwner = localOwner;
-    if (decision.action === "reuse" && localOwner === "foreign" && !remoteHost) {
+    if (decision.action === "reuse" && (localOwner === "foreign" || localOwner === "unidentified") && !remoteHost) {
       const proven = getRunLocalGateway() ? await provenWindowsHomeGateway() : null;
       if (!proven) {
         glog(`:${PORT} is served by a process this app did not start and no remote crew is configured there — refusing to adopt it`);

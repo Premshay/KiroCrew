@@ -157,7 +157,7 @@ class TestRequireDashboardUser:
 
     @pytest.mark.asyncio
     async def test_denial_is_sel_audited(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # GPT-2: an app-token denial must leave a SEL decision record naming
+        # An app-token denial must leave a SEL decision record naming
         # the endpoint, and an audit failure must never break the 403.
         calls: list[dict] = []
 
@@ -189,9 +189,6 @@ class TestIdentityAndConsentHelpers:
             class telemetry:
                 beacon_enabled = True
 
-            class dashboard:
-                privacy_acked = True
-
         class _Verdict:
             def __init__(self, ok: bool) -> None:
                 self.ok = ok
@@ -199,16 +196,16 @@ class TestIdentityAndConsentHelpers:
         seen_audit_tools: list[str] = []
         monkeypatch.setattr(feedback.KiroCrewConfig, "load", staticmethod(lambda: _Cfg()))
 
-        def _tp(*, enabled: bool, acked: bool, audit_tool: str = "") -> "_Verdict":
+        def _tp(*, enabled: bool, audit_tool: str = "") -> "_Verdict":
             seen_audit_tools.append(audit_tool)
-            return _Verdict(enabled and acked)
+            return _Verdict(enabled)
 
         monkeypatch.setattr(feedback.beacon, "telemetry_permitted", _tp)
         assert feedback._telemetry_permitted() is True
 
         _Cfg.telemetry.beacon_enabled = False
         assert feedback._telemetry_permitted() is False
-        # GPT-2: a caller-supplied audit tool is forwarded so the verdict is
+        # A caller-supplied audit tool is forwarded so the verdict is
         # recorded in the SEL trail.
         assert feedback._telemetry_permitted("feedback_submit") is False
         assert seen_audit_tools[-1] == "feedback_submit"

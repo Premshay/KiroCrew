@@ -20,6 +20,7 @@ from real_dashboard_state import (  # noqa: F401
     _settle_real_dashboard_states,
     real_dashboard_state,
 )
+from redaction_structured_cases import github_classic
 
 from kiro_crew.constants import CHANNEL_OWNER_DM_NAMESPACES
 from kiro_crew.dashboard.handlers import messaging
@@ -32,7 +33,8 @@ from kiro_crew.notifications.bridge_transport import (
 )
 from kiro_crew.notifications.bus import NotificationPayload
 
-_SECRET = "AKIAIOSFODNN7EXAMPLE"
+#: A synthetic GitHub classic token (valid checksum) the redactor removes.
+_SECRET = github_classic(seed=103)
 
 
 def _discord(owners: list[str]) -> tuple[Any, AsyncMock]:
@@ -266,7 +268,7 @@ class TestRender:
         text = render_transport_text(
             {"priority": "critical", "title": "Job failed", "body": "details", "url": "/chat/a"}
         )
-        assert text.split("\n") == ["🚨 **Job failed**", "details", "/chat/a"]
+        assert text.split("\n") == ["Critical: **Job failed**", "details", "/chat/a"]
 
     def test_default_note_has_no_marker_and_skips_empty_fields(self):
         assert render_transport_text({"priority": "default", "title": "t"}) == "**t**"

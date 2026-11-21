@@ -47,8 +47,6 @@ const CHROME_ONLY_ROLES: Record<string, string> = {
 const PAGE_ONLY_ENTRY_IDS: Record<string, string> = {
   // -- shared dashboard set (pages/chat/transcriptRenderers.tsx) --
   thinking_block: 'ThinkingBlock with disclosure state; the registry folds reasoning into the group summary',
-  recovery_inject: 'RecoveryCard for gateway-authored inject rows; the registry renders inject as prose (resolveInjectCard decides, shared)',
-  automation_notice_inject: 'a re-routed automation refusal (injectKind=automation_notice) is model-only machinery; drawn nowhere (its notice bar already shows the person), suppressed with render:()=>null',
   workflow_completion: 'WorkflowCompletionCard needs session/folder/panel hand-offs the SDK has no seam for',
   workflow_run_tool: 'launch card refining the tool line; store-connected',
   subagent_run_tool: 'launch card refining the tool line; store-connected',
@@ -56,7 +54,8 @@ const PAGE_ONLY_ENTRY_IDS: Record<string, string> = {
   conversation_card: 'the change card / guide offer row; needs the card and guide stores, which the store-free registry has none of (it leaves the role undrawn)',
   crew_dispatch_notice: 'the Crew Mode dispatch notice row; its Open Board button needs the host slot + onOpenCrewTab reveal the store-free registry has no seam for (a peer/crew window renders it inert)',
   session_send_tool: "this session's own session_send call drawn as the outgoing session-message card, refining the tool line; the registry draws the generic tool line",
-  crew_paused_notice: 'the Ultra Mode Pause all notice row; it reads the dashboard-only Ultra Mode preview flag, which the store-free registry has no seam for',
+  crew_paused_notice: 'the conductor mode Pause all notice row; it reads the dashboard-only conductor mode edition lock, which the store-free registry has no seam for',
+  mcp_sign_in_needed: "the row naming MCP servers that wait for a sign-in, drawn in the reader's language from its meta; a surface without the dashboard's row set draws the row's own English text, which says the same",
   trust_reset_notice: "a restart's Trust reset row; its Turn Trust back on button dispatches this hub's approval-mode pick from the store, which the store-free registry has none of (it leaves system rows undrawn)",
   // -- page-only --
   permission: 'undrawn here; the registry leaves it to GROUPED_ROLES',

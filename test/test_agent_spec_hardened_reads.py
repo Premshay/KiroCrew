@@ -1144,6 +1144,7 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
         ("steering_resources", "unknown"),
     ],
     "kiro_crew/cron_script_mcp.py": [("cron_resolve_mcp_server", "cron")],
+    "kiro_crew/knowledge/llm_pool.py": [("knowledge_spec_refusal", "unknown")],
     "kiro_crew/dashboard/agent_admin/agent_detail.py": [
         ("api_agent_detail", "dashboard"),
         ("api_agent_detail", "dashboard"),
@@ -1154,8 +1155,7 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
     ],
     "kiro_crew/dashboard/agent_admin/fork_publish.py": [
         # Fork/publish create closures re-read the SOURCE inside the lock too —
-        # the pre-lock snapshot can miss a concurrent refresh's writes (GPT
-        # round-10 stale-copy finding).
+        # the pre-lock snapshot can miss a concurrent refresh's writes.
         ("api_agent_fork", "dashboard"),
         ("api_agent_publish", "dashboard"),
     ],
@@ -1237,6 +1237,8 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
     # A manifest's `commands[].agent` is checked against the names its own source
     # specs declare; those live in the app root, which the app can rewrite.
     "kiro_crew/apps/manifest_containment.py": [("app_manifest_agent_names", "unknown")],
+    # The hook fingerprint a folder's project-hooks "on" is bound to.
+    "kiro_crew/project_hooks_consent.py": [("project_hooks_fingerprint", "unknown")],
 }
 
 
@@ -1283,6 +1285,8 @@ _EXPECTED_PROJECT_FILES_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
         ("side_readonly_spec", "dashboard"),
     ],
     "kiro_crew/member_essential_context.py": [("member_essentials", "context")],
+    # The hook fingerprint a folder's project-hooks "on" is bound to.
+    "kiro_crew/project_hooks_consent.py": [("project_hooks_fingerprint", "unknown")],
     # Slack's shared discovery helper forwards the operation its two routes name
     # (the listing, the name resolution); the channel is fixed, so it is a literal.
     "kiro_crew/slack/handler_runtime/agent_names.py": [("forward:operation", "slack")],
@@ -1313,6 +1317,7 @@ _EXPECTED_WARM_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
 # lookup is a hit -- names the surface a denial during that first parse belongs
 # to. The channel is ``unknown``: the background session serves several.
 _EXPECTED_WARM_SPECS_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
+    "kiro_crew/cli_commands_eval.py": [("eval_agent", "cli")],
     "kiro_crew/session_background.py": [("ensure_background", "unknown")],
 }
 
@@ -1431,6 +1436,8 @@ _EXPECTED_STRICT_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
     "kiro_crew/acp/kas_agents.py": [("kas_agent_projection", "unknown")],
     # The one-time list of agent files that keep KAS's own mcp.json behaviour.
     "kiro_crew/acp/kas_mcp_json_legacy.py": [("kas_mcp_json_legacy", "unknown")],
+    # The KAS session-start notice reads each agent the backend may skip.
+    "kiro_crew/acp/kas_subagent_targets.py": [("kas_subagent_notice", "unknown")],
     "kiro_crew/acp/managed_agent_shadow.py": [("managed_agent_shadow", "unknown")],
     "kiro_crew/agent_materialization/conductor_agents.py": [
         ("conductor_spec_regeneration", "unknown"),
@@ -1439,6 +1446,8 @@ _EXPECTED_STRICT_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
     # spec against its template; a link at the name is screened before it is followed.
     # Each repair names its own operation.
     "kiro_crew/agent_materialization/service_agents.py": [("forward:operation", "unknown")],
+    # `kirocrew agent validate` reads each spec file it checks through the same gate.
+    "kiro_crew/cli_agent_validate.py": [("agent_validate", "cli")],
     "kiro_crew/crewmate_prune_migration.py": [("crewmate_prune", "dashboard")],
     # Settings → Secrets lists the MCP servers whose env references each item; a
     # spec that fails to read marks the scan incomplete instead of reading empty.
@@ -1448,8 +1457,13 @@ _EXPECTED_STRICT_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
         ("session_tool_policy", "dashboard"),
     ],
     "kiro_crew/doctor_deadpath.py": [("doctor", "cli")],
-    # The crewmate half of the same overlay pass reads each crewmate file.
-    "kiro_crew/mcp_gateway/mate_overlays.py": [("mcp_overlay_rewrite", "unknown")],
+    "kiro_crew/execution_context.py": [("repair_session_execution", "unknown")],
+    # The crewmate half of the same overlay pass reads each crewmate file, and the
+    # export-shadowing check re-reads an app's own export to confirm its name.
+    "kiro_crew/mcp_gateway/mate_overlays.py": [
+        ("mcp_overlay_rewrite", "unknown"),
+        ("mcp_overlay_rewrite", "unknown"),
+    ],
     "kiro_crew/mcp_gateway/rewriter.py": [("mcp_overlay_rewrite", "unknown")],
     "kiro_crew/slack/handler_runtime/agent_names.py": [("slack_resolve_agent", "slack")],
     # A spawn refused because the parent's allowlist is unknown names each spec
@@ -1518,6 +1532,9 @@ _EXPECTED_DECLARED_CLAIM_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
     # The file a path reader and the pooled overlay follow for a pinned name.
     "kiro_crew/agent_parts/spec_lookup.py": [("session_agent_spec_path", "unknown")],
     "kiro_crew/mcp_gateway/session_servers.py": [("mcp_overlay_pin", "unknown")],
+    # The start refusal for a contested name on the hosts that read their servers
+    # from the session MCP read (R-SPEC-13).
+    "kiro_crew/acp/session_mcp.py": [("session_start_spec_check", "acp")],
 }
 _RATCHET_INVENTORY: dict[str, dict[str, list[tuple[str, str]]]] = {
     "declared_spec_claim": _EXPECTED_DECLARED_CLAIM_CALL_SITE_LABELS,

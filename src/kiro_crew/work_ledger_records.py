@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 # Read by no code here; the ``work_ledger`` facade serves it from this module.
@@ -26,6 +26,7 @@ from kiro_crew.work_vocab import (
     WORK_VERDICTS,
     WORK_WORKER_STATUSES,
     coerce_ask,
+    coerce_discussion,
     coerce_retired_bindings,
 )
 
@@ -136,13 +137,14 @@ CONDUCTOR_ACTIONS: frozenset[str] = frozenset(
 #: forgets a closed item once ``work_vocab.WORK_CLOSED_WINDOW`` newer closed items sit
 #: behind it. This cache keeps every record.
 MAX_ITEMS_PER_CONDUCTOR = 32
-#: How many OPEN items one GOAL may hold at once when the user set no bound: the bound
-#: on parallel work, tighter than :data:`MAX_ITEMS_PER_CONDUCTOR`. Stored as
-#: :attr:`ConductorRecord.concurrency_cap` (``work_ledger_record action=goal
-#: concurrency_cap=N``) and enforced by :func:`_create_item` only on a board that
-#: recorded a goal; queue boards that never write one (the pipeline and security
-#: conductors) keep only the store's open bound. Closed items do not count.
-DEFAULT_GOAL_CONCURRENCY_CAP = 6
+#: How many OPEN items one GOAL may hold at once when the user set no bound: the
+#: store's own open bound, so no fixed number sits below it. Host resources size
+#: each wave instead (the conductors' ``resource_status`` rule). A bound the user
+#: sets is stored as :attr:`ConductorRecord.concurrency_cap` (``work_ledger_record
+#: action=goal concurrency_cap=N``) and enforced by :func:`_create_item` only on a
+#: board that recorded a goal; queue boards that never write one (the pipeline and
+#: security conductors) keep only the store's open bound. Closed items do not count.
+DEFAULT_GOAL_CONCURRENCY_CAP = MAX_ITEMS_PER_CONDUCTOR
 #: The highest ``concurrency_cap`` a goal write accepts: a cap past the store's open
 #: bound could never be reached.
 MAX_GOAL_CONCURRENCY_CAP = MAX_ITEMS_PER_CONDUCTOR
@@ -207,6 +209,8 @@ CODE_DUPLICATE_ITEM = "duplicate_item"
 CODE_ITEM_CLOSED = "item_closed"
 CODE_ITEM_CAP_EXCEEDED = "item_cap_exceeded"
 CODE_GOAL_CONCURRENCY_CAP_REACHED = "goal_concurrency_cap_reached"
+#: A ``create`` while host memory is critical (rfc-work-ledger-resource-pressure §3.5).
+CODE_HOST_MEMORY_CRITICAL = "host_memory_critical"
 CODE_CREW_LOG_INCOMPLETE = "crew_log_incomplete"
 CODE_CACHE_DIRTY = "cache_dirty"
 CODE_DEPTH_EXCEEDED = "depth_exceeded"
@@ -288,6 +292,15 @@ class ConductorRecord:
     #: current goal then counts from the upgrade, and the next header write
     #: settles it to the board's create total (:func:`_settle_goal_base`).
     goal_items_base: int = 0
+    #: A random id minted with the board and by each ``new_goal`` (and by the next
+    #: goal write on a header from before it), so every round of one goal shares it;
+    #: the tracer keys a round's trace on it. Rides no crew-log entry: a rebuild
+    #: keeps the cache's, as it does :attr:`goal_items_base`.
+    goal_id: str = ""
+    #: When the current round began: stamped with the board, and by a goal write that
+    #: changes the round or starts a new goal. The tracer rolls a round's trace over
+    #: by its age. Rides no crew-log entry: a rebuild keeps the cache's.
+    round_started_at: str = ""
 
     @property
     def goal_items_used(self) -> int:
@@ -311,6 +324,8 @@ class ConductorRecord:
             "created_total": self.created_total,
             "concurrency_cap": self.concurrency_cap,
             "goal_items_base": self.goal_items_base,
+            "goal_id": self.goal_id,
+            "round_started_at": self.round_started_at,
         }
 
     @classmethod
@@ -341,6 +356,8 @@ class ConductorRecord:
                 if "goal_items_base" in raw
                 else LEGACY_GOAL_BASE
             ),
+            goal_id=_as_str(raw.get("goal_id")),
+            round_started_at=_as_str(raw.get("round_started_at")),
         )
 
 
@@ -379,7 +396,7 @@ class WorkItem:
     Conductor-owned: ``title``, ``acceptance``, ``state``, ``verdict``, ``decision``,
     ``worker_session_key``, ``round``, ``fails``, ``ask``.
     Worker-owned: ``status``, ``reason``, ``wake_at``, ``summary``, ``artifacts``,
-    ``pr``, ``last_report_at``.
+    ``pr``, ``discussion``, ``last_report_at``, ``received_at``.
     Server-owned: ``item_id``, ``created_at``, ``closed_at``, ``decided_at``,
     ``pending_since``.
 
@@ -421,6 +438,12 @@ class WorkItem:
     artifacts: dict[str, str] = field(default_factory=dict)
     pr: int | None = None
     last_report_at: str | None = None
+    #: The HUB's clock when it filed the last report, set only on a report ingested
+    #: from a remote peer, else ``None``. ``last_report_at`` is then the peer's own
+    #: stamp, which keys ingest dedup, so the quiet-window rules measure from this
+    #: one instead. Every report replaces it. Serialized only when set, so a local
+    #: item is stored exactly as before the field.
+    received_at: str | None = None
     created_at: str = ""
     closed_at: str | None = None
     #: When the conductor last wrote ``decide`` on this item, or ``None``. A ``decide``
@@ -436,6 +459,10 @@ class WorkItem:
     #: and ``close`` clear it. Serialized only when set, so an item that never asked
     #: is stored exactly as before.
     ask: dict[str, Any] | None = None
+    #: Where a discussion this item's worker hosts stands, from its last report
+    #: (:func:`~kiro_crew.work_vocab.coerce_discussion`), or ``None``. Every report
+    #: replaces it, so one without it clears it. Serialized only when set.
+    discussion: dict[str, Any] | None = None
     schema: int = SCHEMA_VERSION
     #: When the crew log first held this item whole (its recorded create, or the
     #: baseline its first recorded mutation carried). Empty until then: the write
@@ -452,10 +479,14 @@ class WorkItem:
             out["worker_instance_id"] = self.worker_instance_id
         if self.wake_at:
             out["wake_at"] = self.wake_at
+        if self.received_at:
+            out["received_at"] = self.received_at
         if self.retired_bindings:
             out["retired_bindings"] = [dict(b) for b in self.retired_bindings]
         if self.ask:
             out["ask"] = dict(self.ask)
+        if self.discussion:
+            out["discussion"] = dict(self.discussion)
         return out
 
     def _base_dict(self) -> dict[str, Any]:
@@ -517,11 +548,13 @@ class WorkItem:
             artifacts=artifacts,
             pr=_finite_int(raw.get("pr")),
             last_report_at=_as_opt_str(raw.get("last_report_at")),
+            received_at=_as_opt_str(raw.get("received_at")) or None,
             created_at=_as_str(raw.get("created_at")),
             closed_at=_as_opt_str(raw.get("closed_at")),
             decided_at=_as_opt_str(raw.get("decided_at")),
             pending_since=_as_opt_str(raw.get("pending_since")),
             ask=coerce_ask(raw.get("ask")),
+            discussion=coerce_discussion(raw.get("discussion")),
             recorded_at=_as_str(raw.get("recorded_at")),
             schema=_as_int(raw.get("schema"), SCHEMA_VERSION),
         )
@@ -621,6 +654,36 @@ def _now_iso() -> str:
     :mod:`kiro_crew.session_ledger` writes, so two ledgers read side by side sort
     against each other."""
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _parse_iso(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_stamp(value: str) -> datetime | None:
+    """An ISO-8601 stamp as an AWARE datetime, or ``None`` when it is not one.
+
+    :func:`_now_iso` writes local time with an offset; a stamp without one (a caller's
+    ``since``, an older record) is taken as local time, because comparing naive with
+    aware raises and a read filter must never raise.
+
+    A naive stamp at either end of the calendar (``0001-01-01T00:00:00``,
+    ``9999-12-31T23:59:59``) may not shift into the local zone, and the platform raises
+    ``OverflowError`` or ``ValueError`` depending on the host. Such a sentinel is read as
+    UTC, so ``since=0001-01-01T00:00:00`` means "everything", never a failed read.
+    """
+    parsed = _parse_iso(value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is not None:
+        return parsed
+    try:
+        return parsed.astimezone()
+    except (OverflowError, ValueError, OSError):
+        return parsed.replace(tzinfo=timezone.utc)
 
 
 # Named by the path callers import it from, so a traceback or an error chain renders

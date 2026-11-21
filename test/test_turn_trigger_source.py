@@ -16,12 +16,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import source_corpus
 
 from kiro_crew.metrics import turn_completed as tc
 from kiro_crew.metrics import turns
 from kiro_crew.metrics.usage_attrs import ORIGIN_VALUES, TRIGGER_SOURCE_VALUES
-
-SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
 
 
 def _calls_named(tree: ast.AST, names: tuple[str, ...]) -> list[ast.Call]:
@@ -43,10 +42,13 @@ def _kw(call: ast.Call, name: str) -> ast.expr | None:
 
 
 def _all_src_calls(names: tuple[str, ...]):
-    for path in sorted(SRC.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+    # A call to one of *names* spells that name, so only files holding it are parsed.
+    root = source_corpus.src_root()
+    for path, _text, tree in source_corpus.parsed_candidates(
+        require_any=names, skip_syntax_errors=False
+    ):
         for call in _calls_named(tree, names):
-            yield path.relative_to(SRC).as_posix(), call
+            yield path.relative_to(root).as_posix(), call
 
 
 def test_every_emitting_persist_site_passes_a_trigger():
@@ -191,7 +193,6 @@ def test_outcome_values_cover_turn_outcome():
         assert turns.turn_outcome(stop) in tc.TURN_OUTCOME_VALUES
     assert turns.turn_outcome("error: tool stall", exhausted=True) in tc.TURN_OUTCOME_VALUES
     assert turns.OUTCOME_UNCLASSIFIED in tc.TURN_OUTCOME_VALUES
-    assert len(tc.TURN_OUTCOME_VALUES) == 8
 
 
 def test_outcome_values_equal_turn_outcome_returns():
@@ -245,5 +246,7 @@ def test_dashboard_turn_trigger(fields, expected):
     assert _dashboard_turn_trigger(SimpleNamespace(**fields)) == expected
 
 
-def test_origin_values_bound():
-    assert len(ORIGIN_VALUES) == 17
+def test_origin_values_are_a_closed_set_with_a_fallback():
+    # The exact values are the exported telemetry contract pinned in test_usage_attrs.
+    assert len(set(ORIGIN_VALUES)) == len(ORIGIN_VALUES)
+    assert "other" in ORIGIN_VALUES

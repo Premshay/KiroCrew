@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 from chat_test_helpers import _make_state, move_transcript_past
+from redaction_structured_cases import github_classic
 
 from kiro_crew.config.loader import KiroCrewConfig, SessionSummaryConfig
 from kiro_crew.dashboard import chat_summary
@@ -142,6 +144,18 @@ def test_serves_the_cached_summary_with_liveness(tmp_path, monkeypatch):
     assert out["generated_at"] == 1_760_000_000.0
 
 
+def test_serves_workflow_liveness_with_the_cached_summary(tmp_path, monkeypatch):
+    _pin_summaries(monkeypatch, True)
+    state, caller, target = _pair(tmp_path)
+    target_key = slot_history_key(target)
+    state.workflow_service = SimpleNamespace(
+        registry=SimpleNamespace(has_pending_work_for=lambda key: key == target_key)
+    )
+    out = _read(state, caller)
+    assert out["running"] is True
+    assert out["activity"] == ["workflow"]
+
+
 def test_a_summary_older_than_the_transcript_is_flagged_stale(tmp_path, monkeypatch):
     _pin_summaries(monkeypatch, True)
     state, caller, target = _pair(tmp_path)
@@ -197,7 +211,7 @@ def test_the_payload_is_redacted_on_the_way_out(tmp_path, monkeypatch):
     """A scrubber rule added after the sidecar was written still covers it."""
     _pin_summaries(monkeypatch, True)
     state, caller, _target = _pair(tmp_path)
-    secret = "AKIA" + "ABCDEFGHIJKLMNOP"
+    secret = github_classic(seed=38)
 
     async def _cached(_log, _slot):
         return {"intents": [{"title": f"key {secret}"}], "constraints": []}, False
@@ -254,6 +268,7 @@ def test_the_tool_sends_the_verified_key_to_the_summary_route():
         "target": "chat-2",
         "title": "w",
         "running": True,
+        "activity": ["workflow"],
         "enabled": True,
         "intents": [
             {
@@ -271,7 +286,7 @@ def test_the_tool_sends_the_verified_key_to_the_summary_route():
     (get,) = dash.requests
     assert get.path == "/api/session-control/summary?target=chat-2"
     assert get.session_key == _VERIFIED
-    assert "still working" in out
+    assert "still working, active: workflow" in out
     assert "[in-progress] get the build green" in out
     assert "next: fix the snapshot tests" in out
 

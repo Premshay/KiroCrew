@@ -41,6 +41,7 @@ from kiro_crew.acp.oversized_request_errors import (
     _RE_OVERSIZED_REQUEST,
     _is_request_size_exceeded,
 )
+from kiro_crew.acp.proxy_refusal import _is_proxy_refusal, drop_proxy_refusal_lines
 from kiro_crew.acp.runtime_models import (  # noqa: F401 - facade/message compatibility surface
     DEFAULT_MODEL,
     advertised_model_ids,
@@ -50,6 +51,11 @@ from kiro_crew.acp.runtime_models import (  # noqa: F401 - facade/message compat
 from kiro_crew.acp.structured_error_data import (  # noqa: F401 - facade/message compatibility surface
     provider_data_text,
     structured_data_prose,
+)
+from kiro_crew.acp.thinking_binding_errors import (  # noqa: F401 - facade compatibility surface
+    _RE_THINKING_BOUND_TO_OTHER_CONVERSATION,
+    _RE_THINKING_SIGNATURE_INVALID,
+    _is_thinking_binding_mismatch,
 )
 from kiro_crew.acp.types import (  # noqa: F401 - facade/message compatibility surface
     ACP_BACKEND_KIRO,
@@ -119,13 +125,11 @@ class AcpError(Exception):
             self.rejected_model: str | None = None
         if not hasattr(self, "advertised"):
             self.advertised: list[str] = []
-        # Sign-in failure tags, set by :func:`_raise_acp_error` when the raw frame
-        # is a session-expiry / rejected-credential answer. ``sign_in_needed`` is
-        # set for every harness, so the task queue fails the row as auth without
-        # reading the prose; ``auth_required`` only for a harness that signs in
-        # through Crew, so the dashboard's error row offers the Kiro sign-in card.
-        self.sign_in_needed: bool = False
-        self.auth_required: bool = False
+        # Sign-in failure tags, set by :func:`_raise_acp_error` from a session-expiry or
+        # rejected-credential frame: ``sign_in_needed`` (every harness) fails the task
+        # row as auth unread; ``auth_required`` (signs in through Crew) offers the Kiro
+        # card, ``kiro_cli_sign_in`` (the Kiro CLI harness) kiro-cli's sign-in commands.
+        self.sign_in_needed = self.auth_required = self.kiro_cli_sign_in = False
         # Spent-allowance tag, set by :func:`_raise_acp_error` when the raw
         # frame is a usage-limit answer ("The monthly usage limit has been
         # reached"), so the dashboard's error row can offer a route that needs
@@ -133,6 +137,10 @@ class AcpError(Exception):
         # retry that reproduces the rejection. Terminal like ``auth_required``
         # and, like it, decided from the raw frame rather than the prose.
         self.usage_limit: bool = False
+        # When that limit opens again (epoch seconds), read from the provider's own
+        # "resets ..." clause at raise time. ``None`` when the frame names no clause
+        # :func:`kiro_crew.limit_reset.parse_limit_reset` reads.
+        self.usage_limit_reset_at: float | None = None
         # Structural-rejection tag, set by :func:`_raise_acp_error` when the raw
         # frame says the request shape is deterministic: malformed request, or
         # an unsupported image already embedded in the conversation. Unlike a
@@ -178,13 +186,13 @@ class AcpError(Exception):
         # layer never parses the user-facing card wording.
         # ``None`` means unclassified: readers fall back to the message text.
         self.connection_failure: bool | None = None
-        # Whether a TRANSIENT failure is the provider throttling (429, "Too many
-        # requests", ThrottlingException), decided from the raw frame like
-        # ``connection_failure``. The interactive ladder waits longer for it and
-        # rewinds the failed prompt before re-sending. ``None`` means unclassified.
+        # Whether a TRANSIENT failure is the provider throttling (429, "Too many requests",
+        # ThrottlingException), from the raw frame like ``connection_failure``. The ladder
+        # waits longer for it and rewinds the failed prompt. ``None`` means unclassified.
         self.throttle: bool | None = None
-        # A TRANSIENT capacity/rollout refusal (raw frame); its card offers the picker.
-        self.model_unavailable: bool = False
+        self.server_error: bool | None = None  # a TRANSIENT provider 5xx, same rules
+        self.user_rate_limit: bool = False  # a throttle on Kiro's per-user limit (every model)
+        self.model_unavailable: bool = False  # TRANSIENT capacity/rollout refusal: offer the picker
         # Set by :func:`_raise_acp_error` when the frame's ``data`` names
         # ``errorKind: cloud_credential_error``: the process cached credentials
         # it cannot reload, so the remedy is a fresh process, not a retry.
@@ -247,16 +255,17 @@ class AcpAuthRequired(AcpError):  # noqa: N818
     surface the actionable message and skip the retry ladder rather than
     reset-and-requeue the turn.
 
-    ``backend`` decides whose sign-in fixes it. Only a harness that authenticates
-    through Crew's own identity (``ACP_BACKENDS_HOST_AUTH_CALLBACK``, harness
-    parity H6) is tagged ``auth_required`` so the dashboard offers the Kiro
-    sign-in card; for every other harness that card would sign in the wrong
-    thing, so the row stays a plain error carrying that harness's own remedy.
+    ``backend`` decides whose sign-in fixes it. A harness that authenticates through
+    Crew's identity (``ACP_BACKENDS_HOST_AUTH_CALLBACK``, harness parity H6) is tagged
+    ``auth_required``, so the dashboard offers the Kiro sign-in card; the Kiro CLI
+    harness ``kiro_cli_sign_in``, so the row shows kiro-cli's sign-in commands; any
+    other keeps a plain error carrying that harness's own remedy.
     """
 
     def __init__(self, message: str = "", *, backend: str = "") -> None:
         super().__init__(message)
         self.auth_required = backend in ACP_BACKENDS_HOST_AUTH_CALLBACK
+        self.kiro_cli_sign_in = backend == ACP_BACKEND_KIRO
 
 
 class AcpSandboxInitFailed(AcpError):  # noqa: N818
@@ -688,10 +697,11 @@ _RE_AUTH_STATUS = re.compile(r"(?:HTTP|status)\s*(?:code\s*)?(?:401|403)\b", re.
 # describe the expiry in prose without a machine-readable code. Deliberately
 # excludes Bedrock's named exceptions, which _RE_AUTH already owns.
 _RE_SESSION_EXPIRED = re.compile(
-    r"\b(?:session\s+(?:has\s+)?expired|session\s+timed?\s*out"
+    r"\b(?:session\s+(?:has\s+)?expired|session\s+timed?\s*out|SignInRequiredError"
     r"|login\s+(?:has\s+)?expired|authentication\s+(?:has\s+)?expired"
     r"|not\s+logged\s+in|not\s+authenticated|not\s+signed\s+in"
-    r"|re-?authenticate|login\s+required|auth(?:entication)?\s+required)\b",
+    r"|re-?authenticate|login\s+required|auth(?:entication)?\s+required"
+    r"|access\s+denied\.\s+please\s+check\s+your\s+authentication)\b",
     re.IGNORECASE,
 )
 # Credential REJECTED rather than expired. Switching the active Kiro account
@@ -715,7 +725,12 @@ def _is_session_expired(haystack: str) -> bool:
     All three signals are terminal: retrying can neither refresh a login nor
     revive a credential the upstream has rejected. Checked before the 5xx family
     so an aborted request's transport error does not shadow the real cause.
+
+    A line that :func:`_is_proxy_refusal` claims is left out first: a proxy's 403
+    or 407 is the network refusing the request, not Kiro refusing the credential.
     """
+    if _is_proxy_refusal(haystack):
+        haystack = drop_proxy_refusal_lines(haystack)
     return bool(
         _RE_AUTH_STATUS.search(haystack)
         or _RE_SESSION_EXPIRED.search(haystack)
@@ -1112,35 +1127,6 @@ _RE_IMAGE_FORMAT_UNSUPPORTED = re.compile(
     re.IGNORECASE,
 )
 
-# A preserved-thinking signature rejection whose own provider text says the block
-# is bound to another conversation is recoverable by replacing the NATIVE
-# conversation. Both clauses must appear IN ONE FIELD: the shorter
-# invalid-signature form also covers tampered or undecryptable signatures, and
-# pairing a clause from ``data`` with unrelated prose from ``message`` would mint
-# a recoverable verdict the provider never sent.
-_RE_THINKING_SIGNATURE_INVALID = re.compile(
-    r"Invalid `signature` in `thinking` block", re.IGNORECASE
-)
-_RE_THINKING_BOUND_TO_OTHER_CONVERSATION = re.compile(
-    r"\bblock is bound to a different conversation\b", re.IGNORECASE
-)
-
-
-def _is_thinking_binding_mismatch(error: object) -> bool:
-    """Whether one raw provider field carries both binding-mismatch clauses."""
-    if not isinstance(error, dict):
-        return False
-    for key in ("data", "message"):
-        value = error.get(key)
-        if (
-            isinstance(value, str)
-            and _RE_THINKING_SIGNATURE_INVALID.search(value)
-            and _RE_THINKING_BOUND_TO_OTHER_CONVERSATION.search(value)
-        ):
-            return True
-    return False
-
-
 # A concurrent in-flight prompt on the session, in kiro-cli's words and in goose's
 # (-32602 "session already has active run `<id>`" for a prompt sent while its run is
 # live). Read by the user-facing formatter below and by `_raise_acp_error`'s
@@ -1333,7 +1319,7 @@ def _is_transient_raw_error(error: object, available_models: Sequence[str] | Non
     if _is_session_expired(haystack):
         # Session expiry is terminal — retrying can't refresh an expired login.
         return False
-    if _RE_CONNECTION.search(haystack):
+    if _RE_CONNECTION.search(haystack) or _is_proxy_refusal(haystack):
         # A temporary endpoint failure is safe for the bounded retry ladder.
         return True
     return bool(
@@ -1418,6 +1404,8 @@ def classify_provider_error(haystack: str, *, data: str | None = None) -> Provid
     match = _RE_CONNECTION.search(text) or _RE_CONNECTOR_FAILURE.search(text)
     if match:
         return ProviderErrorClass(PROVIDER_ERROR_CONNECTION, True, match.group(0))
+    if _is_proxy_refusal(text):
+        return ProviderErrorClass(PROVIDER_ERROR_CONNECTION, True, "proxy refusal")
     match = (
         _RE_5XX_NAMED.search(text)
         or _RE_5XX_STATUS.search(text)

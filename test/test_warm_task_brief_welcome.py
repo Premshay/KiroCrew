@@ -8,9 +8,11 @@ producer, and the Board's ``pr_facts`` reader.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
+from redaction_structured_cases import github_classic
 
 from kiro_crew.crew_log import projection_objects as objects
 from kiro_crew.dashboard import warm_task_brief
@@ -49,12 +51,15 @@ def _live(n, **facts):
             "read_at": "06:00", **facts}  # fmt: skip
 
 
-def _render(items, *, awaits=(), live=(), waiting=(), language="en", goal="Ship the widget"):
+def _render(
+    items, *, awaits=(), checking=(), live=(), waiting=(), language="en", goal="Ship the widget"
+):
     return welcome.render(
         language=language,
         goal=goal,
         items=items,
         awaits={i["item_id"]: i["item_id"] in awaits for i in items},
+        checking=set(checking),
         waiting=waiting,
         live=live,
         checked_at="06:01",
@@ -92,13 +97,99 @@ def test_a_waiting_item_shows_its_record_with_every_option_and_the_pick():
     assert "Nothing needs you" not in text
 
 
-def test_a_waiting_item_with_no_record_says_so_plainly():
-    item = _item(1, status="question")
-    text = _render([item], awaits={item["item_id"]})
-    assert (
-        "- Item 1 (waiting on you, checked 06:01)\n  - The reason and options were not written yet."
-        in text
+@pytest.fixture
+def same_day(monkeypatch):
+    """A frozen "now" in UTC on the stamps' own day, so HH:MM never gains a date."""
+    now = datetime(2026, 11, 14, 19, 0, tzinfo=timezone.utc)
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+
+    monkeypatch.setattr(inputs, "datetime", _Frozen)
+    monkeypatch.setattr(
+        "kiro_crew.cron_service.schedule.get_local_tz", lambda: ("UTC", timezone.utc)
     )
+
+
+REPLY_AT = "2026-11-14T18:40:00+00:00"
+REPLY = {
+    "kind": "options",
+    "text": "Merge or hold?",
+    "options": ["Merge", "Hold"],
+    "asked_at": REPLY_AT,
+}
+
+
+def _waiting_item(n, **extra):
+    return {**_item(n, status="question"), "last_report_at": "2026-11-14T18:30:00+00:00", **extra}
+
+
+WHAT_ONLY = {"what": "Pick a region", "written_at": "2026-11-14T18:35:00+00:00"}
+
+
+def test_a_record_with_only_its_what_points_at_its_question_by_time(same_day):
+    item = {
+        **_item(1, status="question", ask=WHAT_ONLY),
+        "last_report_at": "2026-11-14T18:30:00+00:00",
+    }
+    text = _render([item], awaits={item["item_id"]})
+    assert "- Pick a region (waiting on you, checked 06:01)\n  - See the question at 18:30." in text
+    assert "not written" not in text
+    untimed = _render([_item(1, status="question", ask=WHAT_ONLY)], awaits={"it_00000001"})
+    assert "  - See the question in this chat." in untimed
+
+
+def test_an_item_the_main_chat_is_still_checking_never_needs_you():
+    """A worker named a person but the question was not relayed with a record: it
+    reads under Being done now, and an open reply's choices stay their own entry."""
+    item = _item(1, status="question")
+    text = _render([item], checking={item["item_id"]}, waiting=[REPLY])
+    assert "- Item 1 (main chat is on it, checked 06:01)" in text
+    assert "waiting on you" not in text
+    assert "**Needs you**\n- Merge or hold?\n  - The choices are in the buttons below." in text
+    quiet = _render([item], checking={item["item_id"]})
+    assert "**Needs you**\nNothing needs you right now." in quiet
+
+
+def test_the_digest_render_of_a_question_time_does_not_change_with_the_date(monkeypatch):
+    """The digest render's times read neither "now" nor the zone, so an unchanged
+    welcome stays the quiet line on a later day."""
+    item = _waiting_item(1, ask=WHAT_ONLY)
+
+    def render_on(day, clock):
+        now = datetime(2026, 11, day, 19, 0, tzinfo=timezone.utc)
+
+        class _Frozen(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+
+        monkeypatch.setattr(inputs, "datetime", _Frozen)
+        return welcome.render(
+            language="en", goal="g", items=[item], awaits={item["item_id"]: True},
+            waiting=[REPLY], live=[], checked_at="", clean=warm_task_brief._clean,
+            terminal=work_item_is_terminal, clock=clock,
+        )  # fmt: skip
+
+    assert render_on(14, inputs.clock) != render_on(15, inputs.clock)
+    digest = warm_task_brief._digest_clock
+    assert render_on(14, digest) == render_on(15, digest)
+
+
+@pytest.mark.asyncio
+async def test_only_the_digest_render_uses_the_digest_clock(monkeypatch):
+    seen = []
+    monkeypatch.setattr(welcome, "render", lambda **kw: seen.append(kw["clock"]) or "x")
+    snap = SimpleNamespace(
+        work_items=(), waiting=(), conductor={"goal": "g"}, session_state={}, turns=(),
+        original_request="",
+    )  # fmt: skip
+    slot = SimpleNamespace(key="crew-a")
+    for epoch in (warm_task_brief._DIGEST_EPOCH, 1_794_682_000.0):
+        await warm_task_brief._compose(None, slot, snap, (), "en", epoch)
+    assert seen == [warm_task_brief._digest_clock, inputs.clock]
 
 
 def test_a_pick_that_is_not_one_of_the_labels_is_not_shown():
@@ -158,12 +249,13 @@ def test_a_key_is_redacted_whole_before_the_cap_cuts_it():
     body = "MIIEowIBAAKCAQEA" + "q" * 64
     text = "q? " + begin.replace("B", "&#66;", 1) + "\n" + body + "\n" + end
     kept = warm_task_brief._clean(text, 80)
-    assert "MIIEowIBAAKC" not in kept and "EGIN RSA" not in kept
+    # The body is masked before the cap; the BEGIN line may stay.
+    assert "MIIEowIBAAKC" not in kept and "REDACTED" in kept
 
 
 @pytest.mark.parametrize("language", sorted(welcome.WORDS))
 def test_every_language_has_every_word_and_none_names_the_conductor(language):
-    """No user text says "conductor" for Ultra Mode (the recorded docs/decisions rule)."""
+    """No user text calls the conductor "conductor" (the recorded docs/decisions rule)."""
     words = welcome.WORDS[language]
     assert set(words) == set(welcome.WORDS["en"]) and all(words.values())
     item = _item(1, status="question", pr=7, ask=RECORD)
@@ -176,6 +268,8 @@ def test_every_language_has_every_word_and_none_names_the_conductor(language):
     )
     assert "conductor" not in text.casefold() and "指挥" not in text
     assert not any(hole in text for hole in ("{n}", "{at}"))
+    quoted = _render([_waiting_item(1)], awaits={"it_00000001"}, waiting=[REPLY], language=language)
+    assert "{at}" not in quoted and "Merge or hold?" in quoted
 
 
 # ---------------------------------------------------------------- the pipeline
@@ -422,7 +516,7 @@ def test_a_running_item_keeps_its_own_name_not_its_ask():
     assert "- Item 1 (has a question" in text and "Merge PR 7?" not in text
 
 
-_PAT = "ghp_" + "a1B2" * 9  # built here, so no file in the tree holds a key shape
+_PAT = github_classic(seed=92)  # built here, so no file in the tree holds a key shape
 
 # (ledger text, what the chat shows). Every row shows exactly the ledger text
 # except where _clean means to change it: whitespace collapsed, ``**`` dropped,
@@ -525,7 +619,7 @@ def test_an_event_only_write_changes_the_digest_the_final_re_read_compares(monke
 
 
 def _question_item():
-    item = _item(1, status="question")
+    item = _item(1, status="question", ask=RECORD)
     item["reason"] = "needs_human"
     return item
 
@@ -547,7 +641,7 @@ async def test_a_worker_turn_ending_during_the_reads_renders_the_question_it_lef
     _arm_model(monkeypatch, slot, [base, _claimed(base), _claimed(base)])
     await warm_task_brief._prepare_warm_task_brief(state, slot)
     posted = [row["content"] for row in slot.rows if row["role"] == "assistant"]
-    assert len(posted) == 1 and "**Needs you**\n- Item 1 (waiting on you" in posted[0]
+    assert len(posted) == 1 and "**Needs you**\n- Merge PR 7? (waiting on you" in posted[0]
     assert "Nothing needs you right now." not in posted[0]
 
 

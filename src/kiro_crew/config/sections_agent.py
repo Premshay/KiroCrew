@@ -80,7 +80,18 @@ def coerce_fallback_model(raw: object) -> str:
 #: The Crew Mode conductor template's name. Equal to
 #: ``crew_mode.DEFAULT_CREW_MODE_AGENT`` (a test pins it); defined here so this owner
 #: binds no name the sections facade does not.
-_CREW_MODE_AGENT_DEFAULT = "kirocrew-team-lead"
+_CREW_MODE_AGENT_DEFAULT = "kirocrew-conductor"
+
+
+def _chat_runtime_sharing_harness_defaults() -> dict:
+    """``{harness: default}`` for ``agent.chat_runtime_sharing_harnesses``.
+
+    Imported here rather than at module level so this owner binds no new imported
+    name the sections facade would have to bind too.
+    """
+    from kiro_crew.acp_backends import CHAT_RUNTIME_SHARING_HARNESSES
+
+    return dict(CHAT_RUNTIME_SHARING_HARNESSES)
 
 
 @dataclass
@@ -109,8 +120,9 @@ class AgentConfig:
         metadata=_meta(
             "Per-role models",
             "Optional per-task-class model overrides. Keys: 'background' "
-            "(lite / heartbeat background workers) and 'subagent' (spawned "
-            "sub-agents). An empty value or 'auto' defers to the chat default "
+            "(lite / heartbeat background workers), 'subagent' (spawned "
+            "sub-agents) and 'subagent_light' (sub-agents a spawn marks "
+            "light, while Light Sub-agent Tier is on). An empty value or 'auto' defers to the chat default "
             "(agent.model) and then to the provider default, so an unpinned "
             "role stays usable on every subscription tier. Pin a cheaper model "
             "here to run background / sub-agent work on it without changing the "
@@ -125,7 +137,7 @@ class AgentConfig:
         metadata=_meta(
             "Per-role reasoning effort",
             "Optional per-task-class reasoning effort, paired with role_models "
-            "(keys: 'background', 'subagent'). Empty for a role inherits the chat "
+            "(keys: 'background', 'subagent', 'subagent_light'). Empty for a role inherits the chat "
             "default (agent.reasoning_effort) and then the provider/model default. "
             "Only applies on reasoning-capable models. Like a model pin, a "
             "'subagent' effort runs each spawned sub-agent in its own runtime "
@@ -203,7 +215,15 @@ class AgentConfig:
     )
     provider: str = field(
         default="acp",
-        metadata=_meta("Provider", "LLM provider backend (KiroACP / kiro-cli).", enum=["acp"]),
+        metadata=_meta(
+            "Provider",
+            "Deprecated: the harness is chosen by agent.acp_backend, and this build "
+            "accepts only 'acp' here, so the value changes nothing. Preserved on "
+            "load and save so an existing config, or an edition that reads it, "
+            "keeps working.",
+            enum=["acp"],
+            deprecated=True,
+        ),
     )
     mcp_registry_mode: bool = field(
         default=False,
@@ -309,9 +329,11 @@ class AgentConfig:
             "installed the gateway installs the pinned engine at the first spawn. "
             "With false, KAS still takes this route when kiro-cli's relay cannot "
             "run on the host (no kiro-cli, or one that is not signed in). "
-            "When unset, a Nightly build turns it on and every other build leaves "
-            "it off (config.loader_document.kas_bundle_build_default(), read from "
-            "the build's own stamp, not the update channel). A saved value always "
+            "When unset, a packaged build (desktop app, wheel or image, not a "
+            "source checkout) prefers the built-in engine: KAS runs on it once Kiro "
+            "Crew's own sign-in is usable, and a host signed in only to kiro-cli "
+            "keeps kiro-cli until then (acp.kas_build_default). If that first move "
+            "to the engine fails, the chat runs on kiro-cli. A saved value always "
             "wins, and save() leaves the key off disk until it is set. This "
             "dataclass default stays false so the committed config-schema snapshot "
             "is the same for every build.",
@@ -378,6 +400,26 @@ class AgentConfig:
             "accepted; redirects that leave the host are refused.",
         ),
     )
+    kas_sso_start_url: str = field(
+        default="",
+        metadata=_meta(
+            "KAS: company SSO start URL",
+            "The IAM Identity Center access portal URL the Company SSO sign-in form "
+            "starts filled in with, such as https://your-company.awsapps.com/start. "
+            "The form stays editable, and the URL this browser last submitted still "
+            "comes first. Empty uses the edition's default; the public build has "
+            "none, so the field starts empty. A URL sign-in would refuse is ignored.",
+        ),
+    )
+    kas_sso_region: str = field(
+        default="",
+        metadata=_meta(
+            "KAS: company SSO region",
+            "The AWS region the Company SSO sign-in form starts filled in with, "
+            "such as us-east-1. Used only together with agent.kas_sso_start_url. "
+            "Empty leaves the region field empty.",
+        ),
+    )
     native_skill_projection: bool = field(
         default=True,
         metadata=_meta(
@@ -402,8 +444,8 @@ class AgentConfig:
     crew_mode_agent: str = field(
         default=_CREW_MODE_AGENT_DEFAULT,
         metadata=_meta(
-            "Ultra Mode agent",
-            "The agent template a chat runs when Ultra Mode is turned on. "
+            "Conductor mode agent",
+            "The agent template a chat runs when conductor mode is turned on. "
             "Empty falls back to the default. Takes effect live for new chats; "
             "no gateway restart.",
         ),
@@ -539,9 +581,10 @@ class AgentConfig:
             "agent subprocess -- opt-in, and inside the agent it breaks the aws "
             "CLI, boto3, git-over-SSH, gh, kubectl, npm/pip registry auth, "
             ".netrc HTTPS auth, the git credential store and remote-MCP OAuth "
-            "for the same reason. Like every value of this key, a change applies "
-            "to sessions started after it; a session already running keeps the "
-            "tier it was spawned with until it ends. 'strict' changes "
+            "for the same reason. A stricter value also reaches sessions already "
+            "running: each one restarts under it at its next turn, as after any "
+            "restart; a looser value applies to sessions started after the "
+            "change. 'strict' changes "
             "nothing where Kiro Crew applies no sandbox of its own: Windows has "
             "no OS backend, and a macOS spawn delegated to kiro-cli's internal "
             "sandbox is confined by that profile instead. Set to 'off' to skip "
@@ -632,6 +675,17 @@ class AgentConfig:
             "apps_trusted, which grants the same admission to ONE named app.",
         ),
     )
+    apps_never_adopt_backend_listener: bool = field(
+        default=False,
+        metadata=_meta(
+            "Never Adopt App Backend Listener",
+            "When true, the gateway never adopts or re-binds a healthy app backend "
+            "listener that it did not start in this run, such as an uninstall survivor "
+            "or a backend an earlier gateway run started. A config that fails to "
+            "load still adopts, as when the setting is off. Defaults to false: any "
+            "healthy listener on the app's port is adopted.",
+        ),
+    )
     apps_trusted: list[str] = field(
         default_factory=list,
         metadata=_meta(
@@ -707,6 +761,19 @@ class AgentConfig:
             "as it stays connected — eight such clients would otherwise stop "
             "every app UI on the host. Raise it only when a real transfer on "
             "this host needs longer than the default allows.",
+        ),
+    )
+    apps_ui_protected_copy: bool = field(
+        default=False,
+        metadata=_meta(
+            "Serve App UI Scripts From the Protected Copy",
+            "When on, the /apps/{name}/ui/ route serves an app's .js and .mjs "
+            "files from the copy the gateway took when it installed, updated or "
+            "registered the app, kept where no sandboxed process can write, "
+            "instead of from the app's own folder. A script edited in the app's "
+            "folder then keeps serving as installed, and an app the gateway never "
+            "installed has its scripts not found. Off by default: scripts are "
+            "read from the app's folder.",
         ),
     )
     jail: str = field(
@@ -834,6 +901,23 @@ class AgentConfig:
             "per session. Clamped to 1..64.",
         ),
     )
+    chat_runtime_sharing_harnesses: dict = field(
+        default_factory=_chat_runtime_sharing_harness_defaults,
+        metadata=_meta(
+            "Chat Runtime Sharing: harnesses",
+            "Which harnesses may share one agent process between dashboard chats "
+            "while the chat_runtime_sharing feature preview is on, by harness name, "
+            "each true or false. A harness switched off keeps one process per chat. "
+            "A harness that is absent takes its default "
+            "(KAS: on, codex: off, claude: off, goose: off, deepseek: off). "
+            "Has no effect "
+            "while the preview is off. Applies to chats started after the change.",
+            properties={
+                name: {"type": "boolean", "default": default}
+                for name, default in _chat_runtime_sharing_harness_defaults().items()
+            },
+        ),
+    )
     agent_started_turns: bool = field(
         default=True,
         metadata=_meta(
@@ -934,7 +1018,11 @@ class AgentConfig:
             "Resource Critical Threshold (GB)",
             "Available memory (GB) at or below which the [RESOURCES] context line "
             "escalates to 'critically low' and advises against starting heavy work "
-            "at all. Should be <= resource_pressure_gb. 0 disables the critical tier.",
+            "at all. Should be <= resource_pressure_gb. It also arms the host memory guard, "
+            "which on Linux stops the largest Crew tool or test tree at critical memory, or "
+            "at tight memory with PSI full avg10 >= 10. 0 disables the critical tier and "
+            "turns the memory guard off. When the container's memory limit is at or under "
+            "it, the gateway logs one start-up warning naming the settings to lower.",
         ),
     )
     admission_gate: bool = field(
@@ -947,7 +1035,9 @@ class AgentConfig:
             "summaries, history consolidation) are skipped while it lasts. Subagent "
             "spawns are not gated on this posture; they wait on spawn_min_memory_gb instead. "
             "Manually triggered cron runs and direct chat turns are never gated; an unreadable "
-            "probe admits (fail-open). Set false to make the critical posture advisory-only.",
+            "probe admits (fail-open). Set false to make the critical posture advisory-only "
+            "for these deferrals; it does not stop the host memory guard (see "
+            "resource_critical_gb).",
         ),
     )
     task_queue_enabled: bool = field(
@@ -1417,6 +1507,21 @@ class AgentConfig:
             "created itself.",
         ),
     )
+    orchestrator_memory: bool = field(
+        default=False,
+        metadata=_meta(
+            "Kiro Memory",
+            "Let a new chat in your own dashboard read the memories the Kiro agent "
+            "engine already stored for you, so it recalls your preferences without "
+            "being told again. Read-only: the chat never adds, changes or deletes "
+            "a memory, and it reflects on nothing. It applies to chats you start "
+            "after turning it on, never to one already open, and only on the Kiro "
+            "agent engine (agent.acp_backend unset). Withheld from workers, Bot DM "
+            "threads, app-owned and scheduled sessions, Temporary chats, and from "
+            "every session once anyone else can reach this Crew, because the "
+            "memories are yours alone. Off by default.",
+        ),
+    )
     session_manager_chain: bool = field(
         default=False,
         metadata=_meta(
@@ -1479,7 +1584,7 @@ class AgentConfig:
         default=True,
         metadata=_meta(
             "Conductor Own-Child Sends",
-            "Let the Conductor and the Ultra Mode team lead send to and close a "
+            "Let the Conductor and the team lead send to and close a "
             "session they created themselves without an approval prompt, the way a "
             "Bot already does. A send or close aimed at any other session still "
             "prompts, and the child keeps its own approval mode. Turn this off to "
@@ -1536,18 +1641,6 @@ class AgentConfig:
             "less and so disables the per-start floor.",
         ),
     )
-    subagent_cpu_cost_cores: float = field(
-        default=1.0,
-        metadata=_meta(
-            "SubAgent CPU Cost (cores)",
-            "Deprecated and inert: CPU never sizes subagent concurrency, because "
-            "over-committing memory is an unrecoverable OOM while over-committing "
-            "CPU only slows work the adaptive controller already backs off from. "
-            "Preserved on load and save so an existing config is not rewritten "
-            "out from under the operator.",
-            deprecated=True,
-        ),
-    )
     subagent_auto_max: int = field(
         default=32,
         metadata=_meta(
@@ -1578,6 +1671,39 @@ class AgentConfig:
             "controller cuts the cap when admitted work fails (timeouts, slow "
             "starts, fd or process exhaustion), so this is a smoothing "
             "interval rather than the memory guard.",
+        ),
+    )
+    windows_background_qos: bool = field(
+        default=False,
+        metadata=_meta(
+            "Windows Background QoS",
+            "Windows only. Mark the separate processes that run a chat's task "
+            "runs, and its sub-agents when the chat cannot host them itself, as "
+            "background work when they start: below-normal priority (inherited by "
+            "the git, build and test processes they run), a lower Job object CPU "
+            "weight, and EcoQoS. Priority and weight only matter when the CPU is "
+            "busy; EcoQoS can slow that work even on an idle machine. Sub-agents "
+            "that share the chat's own process (the default while Session Sharing "
+            "is on) are not marked, because the chat runs in that process too. A "
+            "task run a person opened is not marked when it starts the process, "
+            "but one that reuses a process background work started runs marked. "
+            "Applies to processes started "
+            "after the change. Off by default; no effect on macOS or Linux.",
+        ),
+    )
+    subagent_light_tier: bool = field(
+        default=False,
+        metadata=_meta(
+            "Light Sub-agent Tier",
+            "Let a spawn mark a helper sub-agent (search, lookup, run-and-report, "
+            "summarize) as light. A light spawn runs on the model in "
+            "agent.role_models.subagent_light and the effort in "
+            "agent.role_efforts.subagent_light for whichever of the two its call "
+            "left unset; a model or effort the call names always wins. A spawn "
+            "that names an agent, a crew or a backend is not changed. A pinned "
+            "model or effort starts the sub-agent in its own process, as any "
+            "per-spawn pin does. Off by default: with it off every spawn picks the "
+            "model and effort it always has.",
         ),
     )
     subagent_max_turns: int = field(

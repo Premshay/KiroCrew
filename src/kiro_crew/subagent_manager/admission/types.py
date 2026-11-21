@@ -5,6 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Mapping
 
+# The tombstone writer owns the parent-end cause, because a restart tombstone written
+# over a parent-end one keeps it; the admission readers import it from here.
+from kiro_crew.subagent_persistence import PARENT_END_TOMBSTONE_CAUSE  # noqa: F401
+
 if TYPE_CHECKING:
     from kiro_crew import taskq as _taskq
     from kiro_crew.subagent import SubagentInfo
@@ -108,7 +112,7 @@ def tombstone_terminal_state(cause: str, outcome: str = "") -> str | None:
     live settle decided it (:func:`outcome_task_state`); the coarser ``cause``
     answers for a tombstone that recorded none. ``gateway_restart`` proves
     nothing by itself, and is the one cause missing here
-    (``test_every_tombstone_cause_has_a_terminal_state`` pins that).
+    (``test_a_gateway_restart_tombstone_proves_no_terminal_state`` pins that).
     """
     from kiro_crew import taskq
     from kiro_crew.subagent import _NEUTRAL_REAP_REASONS

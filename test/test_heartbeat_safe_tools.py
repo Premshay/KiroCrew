@@ -17,6 +17,7 @@ import os
 from unittest.mock import MagicMock
 
 import pytest
+from redaction_structured_cases import github_classic
 
 from kiro_crew import name_grant
 from kiro_crew.acp.types import AcpEvent
@@ -586,17 +587,18 @@ class TestHeartbeatApproval:
 
         sel_mock = MagicMock()
         monkeypatch.setattr("kiro_crew.slack.gateway.sel", lambda: sel_mock)
-        # Title carries an AWS access key (a polled CR comment or ticket
+        # Title carries a GitHub token (a polled CR comment or ticket
         # body could mention one, and the tool-name path is LLM-controlled).
-        bad_title = "tool_with_secret AKIAIOSFODNN7EXAMPLE inside"
+        token = github_classic(seed=162)
+        bad_title = f"tool_with_secret {token} inside"
         event = _make_event(bad_title)
         with caplog.at_level(logging.WARNING, logger="kiro_crew.slack.gateway"):
             await orchestrator._heartbeat_approval(event)
-        # The raw AWS key body must NOT appear in any log record produced
+        # The raw token must NOT appear in any log record produced
         # by this callback — redact_credentials should have replaced it.
         for record in caplog.records:
             assert (
-                "AKIAIOSFODNN7EXAMPLE" not in record.getMessage()
+                token not in record.getMessage()
             ), f"Unredacted credential leaked into log: {record.getMessage()}"
 
     @pytest.mark.asyncio
@@ -798,6 +800,17 @@ class TestHeartbeatHooks:
         # via on_tool_approval, not on_tool_call.
         assert hb.on_tool_call("ReadInternalWebsites").action != TOOL_AUTO_APPROVE
 
+    def test_drops_user_tool_identity_grants(self) -> None:
+        """The per-tool "Always allow" grants do not carry into heartbeat hooks either."""
+        from kiro_crew.hooks import TOOL_AUTO_APPROVE
+        from kiro_crew.slack.gateway import _build_heartbeat_hooks
+
+        user = self._user_hooks(auto_approve_tool_identities=["@notes/lookup"])
+        call = dict(mcp_server_name="notes", mcp_tool_name="lookup", mcp_identity_trusted=True)
+        assert user.on_tool_call("Running: @notes/lookup", **call).action == TOOL_AUTO_APPROVE
+        hb = _build_heartbeat_hooks(user)
+        assert hb.on_tool_call("Running: @notes/lookup", **call).action != TOOL_AUTO_APPROVE
+
     def test_preserves_user_auto_deny_tools(self) -> None:
         """User's auto_deny_tools narrow what runs — those must carry over.
 
@@ -996,3 +1009,33 @@ class TestRecordedWire:
         )
         messages = [r.getMessage() for r in caplog.records]
         assert any("published no trusted tool identity" in m for m in messages), messages
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("edition", ["lts", "oss"])
+async def test_an_org_ask_on_a_kas_web_call_is_refused_by_the_heartbeat(
+    orchestrator, monkeypatch, edition
+) -> None:
+    """``web_ask_rule``: the heartbeat has nobody to ask, so in LTS it refuses KAS's
+    ask on an organisation's web rule; an ``oss`` build approves it as before."""
+    from types import SimpleNamespace
+
+    from kiro_crew import web_ask_rule
+
+    monkeypatch.setattr(web_ask_rule, "edition", SimpleNamespace(is_lts=lambda: edition == "lts"))
+    sel_mock = MagicMock()
+    monkeypatch.setattr("kiro_crew.slack.gateway.sel", lambda: sel_mock)
+    event = dataclasses.replace(
+        _builtin("web_fetch", title="Fetching https://example.com"),
+        harness_tool_id="web_fetch",
+        kas_builtin_ids=True,
+        kas_managed_ask=True,
+    )
+    approved = await orchestrator._heartbeat_approval(event)
+    kwargs = sel_mock.log_tool_invocation.call_args.kwargs
+    if edition == "lts":
+        assert approved is False
+        assert kwargs["outcome"] == "denied"
+        assert kwargs["metadata"]["reason"] == "web_ask_rule"
+    else:
+        assert approved is True

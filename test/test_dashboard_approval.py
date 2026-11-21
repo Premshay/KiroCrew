@@ -29,6 +29,7 @@ from dashboard_approval_helpers import (
     _set_stream,
 )
 from named_cases_helpers import named_cases
+from redaction_structured_cases import PEM_BEGIN, PEM_BODY, github_classic
 
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.chat import _run_chat
@@ -164,6 +165,20 @@ def _assert_block_reason_recovered(slot, client, reason: str) -> None:
         f"{[m.get('content', '')[:40] for m in slot.messages if m.get('role') == 'inject']}"
     )
     assert any(reason.lower() in recovery.lower() for recovery in recoveries)
+
+
+def _recovery_prompts(client) -> list[str]:
+    """The prompts the turns after the blocked one sent to the model.
+
+    The recovery continuation is the model's copy of the reason when the harness
+    has no mid-turn steer, so these are what the model reads.
+    """
+    return [str(call.args[0]) for call in client.stream.call_args_list[1:] if call.args]
+
+
+#: ``HOOK_DENY_REASON_MAX_CHARS``, written out so these tests still collect, and
+#: fail on their assertions, when the limit is missing.
+_DENY_REASON_LIMIT = 2000
 
 
 class TestRefusalRecovery:
@@ -688,6 +703,40 @@ class TestPreToolUseHookBlockRecovery:
 
         _assert_block_reason_recovered(slot, client, reason)
 
+    @pytest.mark.asyncio
+    async def test_a_multi_sentence_recovery_instruction_reaches_the_model_whole(self, tmp_path):
+        """A deny hook's instruction is often longer than a sentence; none of it is lost."""
+        reason = "Write the plan file before editing. " + "x" * 450 + " END"
+        state, client = _make_state(
+            tmp_path,
+            context_builder=_context_builder(),
+            hook_store=_blocking_hook_store(reason),
+        )
+        slot = _make_slot()
+
+        await _drive_hook_blocked_turn(state, client, slot)
+
+        _assert_block_reason_recovered(slot, client, reason)
+        assert any(reason in prompt for prompt in _recovery_prompts(client))
+
+    @pytest.mark.asyncio
+    async def test_a_deny_reason_past_the_limit_reaches_the_model_cut_at_its_head(self, tmp_path):
+        """The bound holds: the head up to the limit arrives, nothing after it."""
+        head = "a" * _DENY_REASON_LIMIT
+        state, client = _make_state(
+            tmp_path,
+            context_builder=_context_builder(),
+            hook_store=_blocking_hook_store(head + "TAIL-PAST-THE-LIMIT"),
+        )
+        slot = _make_slot()
+
+        await _drive_hook_blocked_turn(state, client, slot)
+
+        _assert_block_reason_recovered(slot, client, head)
+        prompts = _recovery_prompts(client)
+        assert any(head in prompt for prompt in prompts)
+        assert not any("TAIL-PAST-THE-LIMIT" in prompt for prompt in prompts)
+
     def test_every_hook_deny_path_routes_through_the_shared_helper(self) -> None:
         """A fifth permission path must not be able to deny without recording the reason.
 
@@ -724,14 +773,12 @@ class TestPreToolUseHookBlockRecovery:
         ``event.title`` is LLM-controlled (``_select_tool_title``) and must be redacted
         (``_safe_reject_title``) before the broadcast, persisted row and the audit.
         """
-        # Assembled at runtime, never written as one literal: the redactor only
+        # Built at runtime, never written as one literal: the redactor only
         # fires on credential-SHAPED input (a plain sentinel passes through
-        # untouched, so this test would prove nothing), but a real key shape
-        # sitting in the source trips the source-text scanners --
-        # internal-content-scan and Semgrep's
-        # `detected-aws-access-key-id-value`. Splitting satisfies both, and
-        # matches the existing sentinels in code_review_sage's tests.
-        secret = "AKIA" + "1234567890ABCDEF"
+        # untouched, so this test would prove nothing), but a real token shape
+        # sitting in the source trips the source-text scanners. A GitHub token
+        # with a valid checksum is redacted; an AWS key ID would stay visible.
+        secret = github_classic(seed=11)
         state, client = _make_state(
             tmp_path,
             context_builder=_context_builder(),
@@ -875,10 +922,10 @@ class TestDenyRowTitleRedaction:
     Triggers: a title over ``MAX_TOOL_NAME_LEN``, and a PreToolUse hook that raises.
     """
 
-    # Assembled at runtime, never as one literal: the redactor only fires on
-    # credential-SHAPED input, and a real key shape in the source trips the
-    # source-text scanners (internal-content-scan, Semgrep).
-    _SECRET = "AKIA" + "1234567890ABCDEF"
+    # Built at runtime, never as one literal: the redactor only fires on
+    # credential-SHAPED input, and a real token shape in the source trips the
+    # source-text scanners. A GitHub token with a valid checksum is redacted.
+    _SECRET = github_classic(seed=12)
 
     def _invalid_title(self) -> str:
         # Over MAX_TOOL_NAME_LEN with is_shell False, so _validate_tool_name
@@ -1044,7 +1091,10 @@ class TestDenyRowTitleRedaction:
             ]
             if turn_file.name != "__init__.py"
         )
-        assert source.count("🚫 {event.title}") == 0, (
+        assert (
+            source.count("🚫 {event.title}") == 0
+            and source.count('"refused", f"{event.title}') == 0
+        ), (
             "a transcript row interpolates the raw model-authored title -- "
             "route the deny through _reject_invalid_tool/_reject_hook_error"
         )
@@ -1053,8 +1103,202 @@ class TestDenyRowTitleRedaction:
             "(reuse an in-scope redacted variable or _redact_display_text)"
         )
         # Each deny shape is rendered in exactly one place — its helper.
-        assert source.count('f"🚫 {title} (invalid: {error})"') == 1
-        assert source.count('f"🚫 {title} (hook error)"') == 1
+        assert source.count('tool_row("refused", f"{title} (invalid: {error})")') == 1
+        assert source.count('tool_row("refused", f"{title} (hook error)")') == 1
+
+
+# ── Hook tool_input built from the structured params ──
+
+
+class TestHookToolInputFromRawParams:
+    """A PreToolUse hook on the dashboard permission path reads ``tool_input`` built
+    from the call's ``raw_tool_params``, not parsed out of the scrubbed display text.
+
+    The display text is not always JSON: an edit's is the approval card's diff, and
+    a command holding an unterminated private-key block has its mask run past the
+    value, over the closing quote and brace. Parsed out of that text, the payload
+    would go out with no ``tool_input`` at all. The hook still sees redacted input:
+    a secret value is masked and a URL keeps its shape.
+
+    The permission arm fires the hooks at four sites -- under a context builder's
+    auto-approve, under its allow verdict before the interactive card, on the card's
+    own approve (``permission_prompt``), and on a trusted slot with no context builder
+    -- and every one is driven here (``allow_then_card`` reaches the middle two).
+    """
+
+    _TAG = "[REDACTED: credential]"
+    _TOKEN = "a1b2c3d4" * 4
+    _URL = "https://example.com/a?token=" + _TOKEN
+    _MASKED_URL = "https://example.com/a?token=" + _TAG
+
+    def _event(self, command: str) -> LLMEvent:
+        from kiro_crew.acp._dispatch_parts.surfaced_text import redact_text
+
+        display = redact_text(json.dumps({"command": command}, indent=2))
+        return LLMEvent(
+            kind=EVENT_PERMISSION_REQUEST,
+            title="Running: curl",
+            tool_kind="execute",
+            request_id="req-1",
+            tool_input=display,
+            raw_tool_params={"command": command},
+            raw_params_trusted=True,
+            is_shell=True,
+            shell_classified=True,
+        )
+
+    def _edit_event(self, params: dict) -> LLMEvent:
+        """A file-edit permission request as the KAS parser builds it: the display
+        text is the diff drawn for the approval card, the params stay a dict."""
+        from kiro_crew.acp._dispatch_parts.surfaced_text import derive_edit_diff
+
+        display = derive_edit_diff(params)
+        assert display.startswith("--- "), display
+        return LLMEvent(
+            kind=EVENT_PERMISSION_REQUEST,
+            title="Editing file",
+            tool_kind="edit",
+            request_id="req-1",
+            tool_input=display,
+            raw_tool_params=params,
+            raw_params_trusted=True,
+            is_shell=False,
+            shell_classified=True,
+        )
+
+    async def _pre_fire_inputs(
+        self, tmp_path, command: str, *, site: str, event: LLMEvent | None = None
+    ) -> list:
+        """Every ``tool_input`` the PreToolUse fires of one turn carried; the tool
+        was approved."""
+        if site == "auto_approve":
+            cb, trust, answer = _context_builder(ToolHookResult.auto_approve()), False, False
+        elif site == "allow_then_card":
+            cb, trust, answer = _context_builder(ToolHookResult.allow()), False, True
+        else:
+            assert site == "trusted_slot"
+            cb, trust, answer = None, True, False
+        state, client = _make_state(tmp_path, context_builder=cb)
+        slot = _make_slot(trust=trust)
+        client.context_usage_pct = MagicMock(return_value=0.0)
+        client._client = client
+        client.last_prompt_stats = None
+        calls = {"n": 0}
+
+        def _stream(*args, **kwargs):
+            # Only the first stream carries the request, so a recovery
+            # continuation completes instead of asking again.
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _async_iter([event or self._event(command), _complete_event()])
+            return _async_iter([_complete_event()])
+
+        client.stream = MagicMock(side_effect=_stream)
+        answerer = None
+        if answer:
+
+            async def _approve() -> None:
+                await _answer_approval(slot, "req-1", "approved")
+
+            answerer = asyncio.get_running_loop().create_task(_approve())
+        # The name-grant check resolves the command's program on this host's
+        # PATH; where it refuses (e.g. Windows), a hook auto-approve falls
+        # through to a card no one answers. This test is about tool_input.
+        _no_refusal = patch.object(
+            chat_runner, "_name_grant_refusal_for", new=AsyncMock(return_value=None)
+        )
+        with _patch_stats(), _no_refusal:
+            await _run_chat(state, slot, "hello")
+            if slot.task:
+                await slot.task
+        if answerer is not None:
+            await _drain(answerer)
+        pre = [
+            c
+            for c in state._hook_store.fire.call_args_list
+            if c.args and c.args[0] == HOOK_EVENT_PRE_TOOL_USE
+        ]
+        assert pre, state._hook_store.fire.call_args_list
+        client.approve_tool.assert_called()
+        return [c.kwargs["tool_input"] for c in pre]
+
+    @pytest.mark.asyncio
+    # No ``auto_approve``: a hook auto-approve is declined for a command line that
+    # does not tokenize (this one quotes a newline), so that site falls through to
+    # the card, which ``allow_then_card`` drives.
+    @pytest.mark.parametrize("site", ["allow_then_card", "trusted_slot"])
+    async def test_an_unterminated_private_key_fires_the_hook_without_tool_input(
+        self, tmp_path, site
+    ):
+        command = f"printf '%s' '{PEM_BEGIN}\n{PEM_BODY}'"
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(self._event(command).tool_input)  # the display text alone
+        inputs = await self._pre_fire_inputs(tmp_path, command, site=site)
+        assert inputs and all(got is None for got in inputs)
+
+    @pytest.mark.asyncio
+    async def test_a_url_reaches_the_hook_with_only_its_secret_value_masked(self, tmp_path):
+        command = f'curl -s --url "{self._URL}"'
+        inputs = await self._pre_fire_inputs(tmp_path, command, site="auto_approve")
+        assert inputs == [{"command": f'curl -s --url "{self._MASKED_URL}"'}]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("site", ["auto_approve", "allow_then_card", "trusted_slot"])
+    @pytest.mark.parametrize(
+        "params",
+        [
+            {
+                "command": "strReplace",
+                "path": "/work/src/app.py",
+                "oldStr": "x = 1\n",
+                "newStr": "x = 2\n",
+            },
+            {"command": "create", "path": "/work/src/new.py", "content": "print('hi')\n"},
+        ],
+        ids=["str_replace", "fs_write_create"],
+    )
+    async def test_a_file_edit_hands_the_hook_its_arguments_not_the_diff(
+        self, tmp_path, site, params
+    ):
+        """An edit's display text is the approval card's diff, which is not JSON; a
+        hook that guards writes by path must still read the call's own arguments."""
+        event = self._edit_event(params)
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(event.tool_input)  # the diff alone
+        inputs = await self._pre_fire_inputs(tmp_path, "", site=site, event=event)
+        assert inputs == [params] * len(inputs)
+
+    @pytest.mark.asyncio
+    async def test_the_tool_call_frames_informational_fire_carries_the_params(
+        self, tmp_path, monkeypatch
+    ):
+        """The tool-call frame's own fire (``tool_rows``) hands over the structured
+        params too, so a hook that runs there reads the same ``tool_input``."""
+        from kiro_crew.providers.base import EVENT_TOOL_CALL
+
+        fire = AsyncMock()
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner.fire_tool_hooks", fire)
+        state, client = _make_state(tmp_path)
+        slot = _make_slot()
+        command = f'curl -s --url "{self._URL}"'
+        _set_stream(
+            client,
+            [
+                LLMEvent(
+                    kind=EVENT_TOOL_CALL,
+                    title="Running: curl",
+                    tool_kind="execute",
+                    tool_call_id="tc-1",
+                    tool_input="{",
+                    raw_tool_params={"command": command},
+                ),
+                _complete_event(),
+            ],
+        )
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+        assert fire.await_count == 1
+        assert fire.await_args.kwargs["raw_tool_params"] == {"command": command}
 
 
 # ── Long read titles carrying a canonical identity ──

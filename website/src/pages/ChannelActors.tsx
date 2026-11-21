@@ -1,5 +1,6 @@
 import {
   Check,
+  Circle,
   Crown,
   Ear,
   Hourglass,
@@ -168,11 +169,6 @@ const agentColor = (idx: number) => AGENT_COLORS[idx % AGENT_COLORS.length]
  * changing shape. Each key is a literal at the `i18nT()` call, which is what lets
  * `scripts/check-i18n-keys.mjs` resolve it statically.
  *
- * Every label in both tables is converted, not just the ones the lint reports:
- * `eslint.i18n.config.js` exempts single lowercase words by shape (its stated
- * false-negative class #1), so only `working` — which carries a `●` glyph — is
- * actually flagged. Leaving its five siblings as literals would ship a badge row
- * that is half-translated in every locale.
  */
 export const STATE_BADGE: Record<string, { variant: 'ok' | 'err' | 'warn'; label: ReactNode }> = {
   pending: {
@@ -188,7 +184,7 @@ export const STATE_BADGE: Record<string, { variant: 'ok' | 'err' | 'warn'; label
   working: {
     variant: 'ok',
     get label() {
-      return <>● {i18nT('pages.channelPage.state_working')}</>
+      return <><Circle className="lucide-inline scale-75" fill="currentColor" strokeWidth={0} /> {i18nT('pages.channelPage.state_working')}</>
     },
   },
   listening: {

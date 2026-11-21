@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -18,7 +19,9 @@ from aiohttp.test_utils import TestClient, TestServer
 
 import kiro_crew.dashboard.handlers.wakatime as wt
 import kiro_crew.wakatime.service as wt_service
+from kiro_crew.config import live
 from kiro_crew.dashboard.handlers.wakatime import _csv_safe, _rows_by_project
+from kiro_crew.secrets import read_audit
 
 
 class _StubClient:
@@ -316,6 +319,7 @@ def _oauth_app() -> web.Application:
     app.router.add_post("/api/wakatime/oauth/authorize", wt.api_wakatime_oauth_authorize)
     app.router.add_get("/api/wakatime/oauth/callback", wt.api_wakatime_oauth_callback)
     app.router.add_post("/api/wakatime/oauth/disconnect", wt.api_wakatime_oauth_disconnect)
+    app.router.add_get("/api/wakatime/oauth/status", wt.api_wakatime_oauth_status)
     return app
 
 
@@ -434,6 +438,98 @@ async def test_authorize_400_when_not_configured(monkeypatch: pytest.MonkeyPatch
         resp = await client.post("/api/wakatime/oauth/authorize")
         assert resp.status == 400
         assert (await resp.json())["code"] == "not_configured"
+
+
+@pytest.fixture
+def oauth_vault(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> wt_oauth.SecretVault:
+    monkeypatch.setattr(wt_oauth, "config_dir", lambda: tmp_path)
+    return wt_oauth.SecretVault(tmp_path)
+
+
+@pytest.mark.parametrize("has_secret", [False, True])
+@pytest.mark.parametrize("connected", [False, True])
+@pytest.mark.asyncio
+async def test_status_reports_connected_and_client_configured(
+    monkeypatch: pytest.MonkeyPatch,
+    oauth_vault: wt_oauth.SecretVault,
+    has_secret: bool,
+    connected: bool,
+) -> None:
+    _allow_owner(monkeypatch)
+    monkeypatch.setattr(wt_oauth, "read_access_token", lambda: "stored-access" if connected else "")
+    if has_secret:
+        oauth_vault.set_sync(wt_oauth.CRED_WAKATIME_OAUTH_CLIENT_SECRET, "placeholder-secret")
+
+    class _Cfg:
+        class wakatime:
+            oauth_client_id = "client-123"
+
+    monkeypatch.setattr(
+        "kiro_crew.config.loader.KiroCrewConfig.load", classmethod(lambda cls: _Cfg())
+    )
+    async with TestClient(TestServer(_oauth_app())) as client:
+        resp = await client.get("/api/wakatime/oauth/status")
+        assert resp.status == 200
+        assert await resp.json() == {"connected": connected, "client_configured": has_secret}
+
+
+@pytest.mark.asyncio
+async def test_status_loads_config_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    oauth_vault: wt_oauth.SecretVault,
+) -> None:
+    # KiroCrewConfig.load reads (and may rewrite) config.json; on the gateway
+    # loop it would stall every other request.
+    _allow_owner(monkeypatch)
+    monkeypatch.setattr(wt_oauth, "read_access_token", lambda: "")
+    on_loop: list[bool] = []
+    oauth_vault.set_sync(wt_oauth.CRED_WAKATIME_OAUTH_CLIENT_SECRET, "placeholder-secret")
+
+    class _Cfg:
+        class wakatime:
+            oauth_client_id = "client-123"
+
+    def _load(cls: Any) -> Any:
+        try:
+            asyncio.get_running_loop()
+            on_loop.append(True)
+        except RuntimeError:
+            on_loop.append(False)
+        return _Cfg()
+
+    monkeypatch.setattr("kiro_crew.config.loader.KiroCrewConfig.load", classmethod(_load))
+    # The secret read beside the client-id read asks the vault's read audit
+    # whether it is on; with no live snapshot that loads config.json once per
+    # TTL and caches the answer process-wide. Start both cold so the count does
+    # not depend on which test ran first: one load for the client id, one for
+    # the audit switch.
+    monkeypatch.setattr(live, "snapshot", lambda: None)
+    monkeypatch.setattr(read_audit, "_loaded", None)
+    async with TestClient(TestServer(_oauth_app())) as client:
+        resp = await client.get("/api/wakatime/oauth/status")
+        assert resp.status == 200
+        assert (await resp.json())["client_configured"] is True
+    assert on_loop == [False, False]
+
+
+@pytest.mark.asyncio
+async def test_status_reports_disconnected_when_no_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _allow_owner(monkeypatch)
+    monkeypatch.setattr(wt_oauth, "read_access_token", lambda: "")
+
+    class _Cfg:
+        class wakatime:
+            oauth_client_id = ""
+
+    monkeypatch.setattr(
+        "kiro_crew.config.loader.KiroCrewConfig.load", classmethod(lambda cls: _Cfg())
+    )
+    async with TestClient(TestServer(_oauth_app())) as client:
+        resp = await client.get("/api/wakatime/oauth/status")
+        assert resp.status == 200
+        assert await resp.json() == {"connected": False, "client_configured": False}
 
 
 @pytest.mark.asyncio
@@ -688,3 +784,118 @@ def test_oauth_redirect_uri_falls_back_to_request_origin_when_unconfigured(
     )
     uri = wt._oauth_redirect_uri(request)
     assert uri == "http://localhost:5476/api/wakatime/oauth/callback"
+
+
+def _forwarded_request(forwarded_host: str, *, allowed: set[str], host: str = "127.0.0.1:5476"):
+    from aiohttp.test_utils import make_mocked_request
+
+    app = web.Application()
+    app["allowed_origins"] = allowed
+    return make_mocked_request(
+        "GET",
+        "/api/wakatime/oauth/authorize",
+        headers={"Host": host, "X-Forwarded-Host": forwarded_host},
+        app=app,
+    )
+
+
+_LOOPBACK_ORIGINS = {"http://127.0.0.1:5476", "http://localhost:5476"}
+
+
+@pytest.mark.parametrize(
+    ("origin", "forwarded", "expected"),
+    [
+        # tailscale serve fronts the dashboard on 443 with its MagicDNS name.
+        ("https://box.tail1234.ts.net", "box.tail1234.ts.net", "box.tail1234.ts.net"),
+        # The built-in tunnel adds its public origin at connect.
+        (
+            "https://abc123.tunnel.example.net",
+            "abc123.tunnel.example.net",
+            "abc123.tunnel.example.net",
+        ),
+        # A managed proxy or KIROCREW_CORS_ORIGINS entry with an explicit port.
+        ("https://kiro.example.com:8443", "kiro.example.com:8443", "kiro.example.com:8443"),
+        # A proxy chain: only the first, client-facing, value counts.
+        (
+            "https://kiro.example.com:8443",
+            "kiro.example.com:8443, 10.0.0.2",
+            "kiro.example.com:8443",
+        ),
+    ],
+)
+def test_oauth_redirect_uri_honors_an_allowed_forwarded_host_and_keeps_its_port(
+    monkeypatch: pytest.MonkeyPatch, origin: str, forwarded: str, expected: str
+) -> None:
+    _mock_config(monkeypatch, "")
+    request = _forwarded_request(forwarded, allowed=_LOOPBACK_ORIGINS | {origin})
+    assert wt._forwarded_host(request) == expected
+    assert wt._oauth_redirect_uri(request) == f"http://{expected}/api/wakatime/oauth/callback"
+
+
+@pytest.mark.parametrize(
+    "forwarded",
+    [
+        "evil.example",
+        "evil.example:8443",
+        "evil.example, box.tail1234.ts.net",  # the allowed host is not first
+        "box.tail1234.ts.net:abc",  # malformed port
+        "[box.tail1234.ts.net]",  # bracketed non-IPv6
+        "box.tail1234.ts.net/@evil.example",
+    ],
+)
+def test_oauth_redirect_uri_ignores_a_forwarded_host_that_is_not_allowed(
+    monkeypatch: pytest.MonkeyPatch, forwarded: str
+) -> None:
+    _mock_config(monkeypatch, "")
+    request = _forwarded_request(
+        forwarded, allowed=_LOOPBACK_ORIGINS | {"https://box.tail1234.ts.net"}
+    )
+    assert wt._oauth_redirect_uri(request) == "http://127.0.0.1:5476/api/wakatime/oauth/callback"
+
+
+def test_oauth_redirect_uri_ignores_a_forwarded_host_without_an_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_config(monkeypatch, "")
+    request = _forwarded_request("localhost:9999", allowed=set())
+    assert wt._oauth_redirect_uri(request) == "http://127.0.0.1:5476/api/wakatime/oauth/callback"
+
+
+def test_forwarded_proto_comes_from_is_https_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kiro_crew.dashboard import origin as origin_mod
+
+    _mock_config(monkeypatch, "")
+    request = _forwarded_request("box.tail1234.ts.net", allowed={"https://box.tail1234.ts.net"})
+    monkeypatch.setattr(origin_mod, "is_https_request", lambda _r: True)
+    assert (
+        wt._oauth_redirect_uri(request) == "https://box.tail1234.ts.net/api/wakatime/oauth/callback"
+    )
+    monkeypatch.setattr(origin_mod, "is_https_request", lambda _r: False)
+    assert (
+        wt._oauth_redirect_uri(request) == "http://box.tail1234.ts.net/api/wakatime/oauth/callback"
+    )
+
+
+@pytest.mark.asyncio
+async def test_authorize_host_check_uses_the_same_forwarded_host_as_the_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A forged X-Forwarded-Host must not be the "start here" host either.
+    _allow_owner(monkeypatch)
+    monkeypatch.setattr(wt, "_pending_oauth_states", {})
+    _mock_config(monkeypatch, "")
+    built: list[str] = []
+    monkeypatch.setattr(
+        wt_oauth, "build_authorize_url", lambda redirect: built.append(redirect) or ("u", "s")
+    )
+    allowed = _LOOPBACK_ORIGINS | {"https://kiro.example.com:8443"}
+    honored = _forwarded_request("kiro.example.com:8443", allowed=allowed)
+    forged = _forwarded_request("evil.example", allowed=allowed)
+    assert (await wt.api_wakatime_oauth_authorize(honored)).status == 200
+    assert (await wt.api_wakatime_oauth_authorize(forged)).status == 200
+    assert built == [
+        "http://kiro.example.com:8443/api/wakatime/oauth/callback",
+        "http://127.0.0.1:5476/api/wakatime/oauth/callback",
+    ]

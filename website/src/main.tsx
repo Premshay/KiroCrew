@@ -11,7 +11,10 @@ import './lib/installBasePath'
 // Empty in the stock build. See website/src/extensions.ts.
 import './extensions'
 import { startMemoryWatch } from './lib/memoryWatch'
-import React, { StrictMode, Suspense, lazy } from 'react'
+// Side effect only: when the slow frame log is on (Settings > Developer > Debug
+// tools), it starts here so it sees the page load. Off, it creates no observer.
+import './dev/slowFrameLog'
+import React, { StrictMode, Suspense, lazy, startTransition } from 'react'
 import { createRoot } from 'react-dom/client'
 import { withCommitProfiler, installCommitProfilerConsoleApi } from './lib/commitProfiler'
 import { Provider } from 'react-redux'
@@ -25,6 +28,8 @@ import { UIModeProvider } from './hooks/useUIMode'
 import ThemeExperienceLayer from './components/ThemeExperienceLayer'
 import { NavigationLeaveGuardProvider, NavigationBackGuard } from './components/NavigationLeaveGuard'
 import { RouteHistoryTracker } from './components/NavHistoryArrows'
+import { StandaloneRouteRecorder } from './components/StandaloneRouteRecorder'
+import { restoreStandaloneLastRoute } from './lib/standaloneLastRoute'
 import { initRum } from './rum'
 import { isEmbeddedPane } from './lib/embedded'
 import { BASE_PATH, appPathname } from './lib/basePath'
@@ -37,6 +42,7 @@ import { desktopWindowBridge, desktopWindowTarget } from './desktopWindow/deskto
 import { ensureCatalog, i18next, initI18n, isCatalogChunkError } from './i18n/lazy'
 import { DEFAULT_LANGUAGE } from './i18n/languages'
 import { LanguageProvider } from './i18n/LanguageProvider'
+import { AppMotionConfig } from './AppMotionConfig'
 import App from './App'
 import { queryClient } from './api/queryClient'
 import ErrorBoundary from './components/ErrorBoundary'
@@ -200,6 +206,11 @@ startMemoryWatch('main')
 // element enters the tree on a normal load.
 installCommitProfilerConsoleApi()
 
+// The installed web app opens at the manifest's `/`; reopen the page it last
+// showed instead (#29497). Before the router mounts, so it reads the new URL.
+// A browser tab is left alone. See lib/standaloneLastRoute.ts.
+restoreStandaloneLastRoute()
+
 const appTree = (
   <StrictMode>
     <ErrorBoundary root scope="app-shell">
@@ -225,6 +236,7 @@ const appTree = (
                         no route change unmounts it. Feeds the position store the
                         top-bar arrows and the ⌘/Ctrl+←/→ chords read. */}
                     <RouteHistoryTracker />
+                    <StandaloneRouteRecorder />
                     <Routes>
                       <Route path="/worlds-popout" element={<BrandingProvider><ProviderProvider><Suspense fallback={null}><WorldsPopout /></Suspense></ProviderProvider></BrandingProvider>} />
                       <Route
@@ -331,7 +343,13 @@ function boot(startSync: boolean): void {
   // definition for how the language is reconciled first).
   void catalogReady.then(() => {
     announceBoot('render')
-    createRoot(document.getElementById('root')!).render(rootTree)
+    const rootEl = document.getElementById('root')!
+    const root = createRoot(rootEl)
+    // The first render of the whole app is one long task when it runs
+    // synchronously. As a transition React renders it in slices and yields
+    // to the browser between them. Nothing is on screen to keep responsive yet,
+    // so the only visible effect is that this render no longer blocks input.
+    startTransition(() => { root.render(<AppMotionConfig>{rootTree}</AppMotionConfig>) })
     if (startSync) startUiPrefsSync()
   })
 }

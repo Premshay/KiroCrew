@@ -28,6 +28,7 @@ from kiro_crew.knowledge.ingestion import DUPLICATE_JOB_STATUS, IngestionPipelin
 from kiro_crew.knowledge.readers import FileReader
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.on_loop_db import OnLoopStoreError
+from kiro_crew.testing.synthetic_credentials import SAMPLE_AWS_SECRET, github_classic
 
 DEFAULT_KINDS = {"markdown", "text", "html", "json"}
 
@@ -217,10 +218,13 @@ class TestIngestArtifact:
     @pytest.mark.asyncio
     async def test_credentials_and_name_redacted(self, pipeline, art_store, kstore):
         sid, _ = ensure_artifact_source(kstore)
-        secret = "AKIAIOSFODNN7EXAMPLE"
-        name_secret = "AKIAIOSFODNN7TITLE00"
+        secret = SAMPLE_AWS_SECRET
+        name_secret = github_classic(seed=145)
         art = art_store.create(
-            name=f"Leaky {name_secret}", content=f"config key {secret} here", kind="text")
+            name=f"Leaky {name_secret}",
+            content=f"config aws_secret_access_key={secret} here",
+            kind="text",
+        )
         await ingest_artifact(pipeline, art_store, art.slug, sid, DEFAULT_KINDS)
         rows = kstore.db.execute(
             "SELECT title, content FROM items WHERE source_id = ?", (sid,)).fetchall()

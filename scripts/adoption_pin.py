@@ -52,6 +52,7 @@ from kiro_crew.apps.builtin_adoption_pins import (  # noqa: E402
     AdoptionPin,
     parse_adoption_pins,
 )
+from kiro_crew.dashboard.token_auth_app_scope import EXACT_API_ENTRY_MARK  # noqa: E402
 
 #: ``AppContext`` attributes above seam level 1, with the level that publishes each
 #: (app-kit-platform.md §32a, §32b, §36). An app reads them as ``ctx.<seam>`` or
@@ -63,6 +64,8 @@ _CONTEXT_SEAMS = {
     "auto_approve": 2,
     "app_token": 5,
     "gateway_origin": 5,
+    "chat_slots": 7,
+    "webhook_source": 7,
 }
 
 #: A receiver whose last name says it is the app's context (``ctx``, ``self._ctx``,
@@ -127,10 +130,16 @@ def _seam_level_uses(tree: Path) -> dict[str, int]:
 
     The manifest's declarations (``agentTools`` and ``permissions.agentTurns`` /
     ``workerAutoApprove`` at level 2, ``credentialMasks`` at level 3,
-    ``agentReadOnlyDirs`` at level 7), the context seams any non-test ``.py`` file
-    reaches, and the backend SDK package (level 7) any of them names. A miss lets a
-    pin adopt on a host without the seam, so the scan errs wide: a false hit only
-    asks for a higher ``--min-sdk-level``.
+    ``agentReadOnlyDirs``, an exact ``permissions.api`` entry,
+    ``permissions.chatSlots``, ``permissions.desktopCapabilities`` and
+    ``permissions.webhookSource`` at level 7, a directory entry in
+    ``credentialMasks``, a shortcut's ``platformAccelerators`` and
+    ``contributes.memoryProviders`` at level 8, and at level 10
+    ``permissions.chatLaunch`` and any ``credentialMasks`` again, where the agent tool
+    gate fences an installed app's masks as it fences the built-ins'), the context
+    seams any non-test ``.py`` file reaches, and the backend SDK package (level 7) any
+    of them names. A miss lets a pin adopt on a host without the seam, so the scan errs
+    wide: a false hit only asks for a higher ``--min-sdk-level``.
     """
     raw = json.loads((tree / "app.json").read_text(encoding="utf-8"))
     permissions = raw.get("permissions")
@@ -141,10 +150,40 @@ def _seam_level_uses(tree: Path) -> dict[str, int]:
     for flag in ("agentTurns", "workerAutoApprove"):
         if permissions.get(flag) is True:
             uses[f"app.json permissions.{flag}"] = 2
-    if raw.get("credentialMasks"):
+    masks = raw.get("credentialMasks")
+    if masks:
         uses["app.json credentialMasks"] = 3
     if raw.get("agentReadOnlyDirs"):
         uses["app.json agentReadOnlyDirs"] = 7
+    api = permissions.get("api")
+    if isinstance(api, list) and any(
+        isinstance(entry, str) and entry.strip().startswith(EXACT_API_ENTRY_MARK) for entry in api
+    ):
+        uses["app.json permissions.api exact entry"] = 7
+    if permissions.get("chatSlots") is True:
+        uses["app.json permissions.chatSlots"] = 7
+    if permissions.get("desktopCapabilities"):
+        uses["app.json permissions.desktopCapabilities"] = 7
+    if permissions.get("webhookSource") is True:
+        uses["app.json permissions.webhookSource"] = 7
+    if isinstance(masks, list) and any(isinstance(m, str) and m.endswith("/") for m in masks):
+        uses["app.json credentialMasks directory"] = 8
+    desktop = raw.get("desktop")
+    desktop = desktop if isinstance(desktop, dict) else {}
+    shortcuts = desktop.get("shortcuts")
+    if isinstance(shortcuts, list) and any(
+        isinstance(s, dict) and "platformAccelerators" in s for s in shortcuts
+    ):
+        uses["app.json desktop.shortcuts platformAccelerators"] = 8
+    contributes = raw.get("contributes")
+    if isinstance(contributes, dict) and contributes.get("memoryProviders"):
+        uses["app.json contributes.memoryProviders"] = 8
+    if masks:
+        # A former built-in's masks were on the tool gate's static rows; below level 10
+        # the adopted copy's would be fenced by the OS sandbox only.
+        uses["app.json credentialMasks tool gate"] = 10
+    if "chatLaunch" in permissions:
+        uses["app.json permissions.chatLaunch"] = 10
     for dirpath, dirnames, filenames in os.walk(tree):
         dirnames[:] = sorted(d for d in dirnames if d not in _UNSCANNED_DIRS)
         for filename in sorted(filenames):

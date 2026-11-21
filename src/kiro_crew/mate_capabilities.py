@@ -214,7 +214,12 @@ def _apply_operations(
         elif section == "resources":
             if value is True:
                 value = key
-            if not isinstance(value, str) or value != key:
+            # An object row (a knowledge base) has no string to set it to.
+            if (
+                not isinstance(value, str)
+                or value != key
+                or isinstance(rows[section].get(key), dict)
+            ):
                 raise CapabilityError("invalid_resource", 400)
             rows[section][key] = key
         elif section in ("prompt", "model"):
@@ -433,6 +438,17 @@ def worker_summary(member: str, catalog: dict[str, str]) -> dict[str, list[dict]
         """Whether a ``resources`` entry is listed as a skill: a catalog URI or ``skill://``."""
         return uri in names or uri.startswith("skill://")
 
+    def _resource_rows(value: Any) -> dict[str, Any]:
+        """The non-skill ``resources`` entries by row key: a knowledge-base object
+        is its own row, keyed ``<type>:<name>`` as its stored row is."""
+        from kiro_crew.mate_worker import resource_entries
+
+        return {
+            key: entry
+            for key, entry in resource_entries(value).items()
+            if not (isinstance(entry, str) and _is_skill(entry))
+        }
+
     # A row is ``local`` (the removable "Added to mate" band) only when the
     # crewmate's own file carries it BEYOND the worker SOURCE BASE
     # (``kirocrew-mate-worker``, derived from the default template in source and
@@ -454,6 +470,7 @@ def worker_summary(member: str, catalog: dict[str, str]) -> dict[str, list[dict]
     # list: a ``@server`` selector the merge derives from a stored ``*`` has no
     # stored row, so it carries no Remove (it goes with its server).
     stored: dict[str, dict] = {}
+    reachers: dict[str, Any] = {}
     listed_skills: set[str] = set()
     file_spec: dict[str, Any] = {}
     _path: Any = None
@@ -461,10 +478,11 @@ def worker_summary(member: str, catalog: dict[str, str]) -> dict[str, list[dict]
         from kiro_crew.agent_capabilities import _materialize, _rows
         from kiro_crew.agent_discovery import expand_skill_uri
         from kiro_crew.agent_sdk import agent_specs
-        from kiro_crew.agent_sdk.mcp_refs import entry_reaches
+        from kiro_crew.agent_sdk.mcp_refs import OtherReach, ReachIndex, glob_free
         from kiro_crew.config.loader import default_project_dir
         from kiro_crew.mate_worker import MATE_WORKER_AGENT, worker_additions
         from kiro_crew.skill_runtime.catalog import (
+            _alias_candidates,
             _alias_matches,
             _alias_roots,
             _matches_any,
@@ -481,25 +499,48 @@ def worker_summary(member: str, catalog: dict[str, str]) -> dict[str, list[dict]
         project = default_project_dir(binding.workspace) if binding else ""
         skill_path = _path or mate_config_path(member)
         skill_uris = dict.fromkeys([*catalog.values(), *_strs(spec.get("resources"))])
+        # Every Remove check below re-derives the granted skills of a candidate
+        # spec, so the catalog is expanded once and each resource's grant is
+        # memoised. A grant is a union over resources: each glob and its
+        # canonical spelling match independently, so ``granted(rs)`` is the
+        # union of ``granted([r])``.
+        skill_paths = [
+            (uri, path)
+            for uri in skill_uris
+            if (path := expand_skill_uri(uri, skill_path, project_dir=project))
+        ]
+        canonical_cache: dict[tuple[str, str], str] = {}
+        granted_by: dict[str, frozenset[str]] = {}
+
+        def _granted_by(resource: str) -> frozenset[str]:
+            hit = granted_by.get(resource)
+            if hit is None:
+                keys = {_skill_key(resource)}
+                glob = expand_skill_uri(resource, skill_path, project_dir=project)
+                if glob:
+                    globs = _with_canonical_globs([glob], project, canonical_cache)
+                    # ``_alias_matches`` is False for every path when the globs
+                    # name no ``<prefix>/*/SKILL.md`` alias inside the roots, so
+                    # skip its per-path fence check then.
+                    aliased = bool(
+                        _alias_candidates(
+                            globs, dict.fromkeys(globs), {g: g for g in globs}, alias_roots
+                        )
+                    )
+                    keys.update(
+                        _skill_key(uri)
+                        for uri, path in skill_paths
+                        if _matches_any(path, globs)
+                        or (
+                            aliased
+                            and _alias_matches(Path(path), globs, [skills_dir()], roots=alias_roots)
+                        )
+                    )
+                hit = granted_by[resource] = frozenset(keys)
+            return hit
 
         def _granted_skills(resources: list[str]) -> set[str]:
-            globs = _with_canonical_globs(
-                [
-                    glob
-                    for uri in resources
-                    if (glob := expand_skill_uri(uri, skill_path, project_dir=project))
-                ],
-                project,
-            )
-            return {_skill_key(uri) for uri in resources} | {
-                _skill_key(uri)
-                for uri in skill_uris
-                if (path := expand_skill_uri(uri, skill_path, project_dir=project))
-                and (
-                    _matches_any(path, globs)
-                    or _alias_matches(Path(path), globs, [skills_dir()], roots=alias_roots)
-                )
-            }
+            return set().union(*map(_granted_by, resources))
 
         base_skills = _granted_skills(_strs(base.get("resources"))) | set(_strs(base.get("skills")))
 
@@ -512,20 +553,25 @@ def worker_summary(member: str, catalog: dict[str, str]) -> dict[str, list[dict]
                 "mcpServers": set(adds.get("mcpServers") or {}),
                 "skills": _granted_skills(_strs(adds.get("resources")))
                 | set(_strs(adds.get("skills"))),
-                "resources": {uri for uri in _strs(adds.get("resources")) if not _is_skill(uri)},
+                "resources": set(_resource_rows(adds.get("resources"))),
             }
             for section in ("tools", "allowedTools"):
-                effective[section].update(
-                    ref
-                    for ref in _strs(spec.get(section))
-                    if any(entry_reaches(entry, ref) for entry in effective[section])
-                )
+                # In list order, and a ref reached here reaches later refs too.
+                # Indexed: this runs once per Remove check, so all-pairs matching
+                # made a Bot with hundreds of approvals time out.
+                reached = effective[section]
+                index = ReachIndex(reached)
+                for ref in _strs(spec.get(section)):
+                    if ref not in reached and index.reaches(ref):
+                        reached.add(ref)
+                        index.add(ref)
             effective["skills"] -= base_skills
             return effective
 
         stored = _rows(file_spec, catalog)
         listed_skills = set(_listed_skills(file_spec))
         local = _effective(file_spec)
+        reachers = {section: OtherReach(local[section]) for section in ("tools", "allowedTools")}
     except Exception:  # noqa: BLE001 - a summary is display only; default to inherited
         logger.debug("worker base/file unreadable; all rows read inherited", exc_info=True)
 
@@ -537,6 +583,11 @@ def worker_summary(member: str, catalog: dict[str, str]) -> dict[str, list[dict]
             listed = where == "skills" and key in listed_skills
             if key not in stored.get(where, {}) and not listed:
                 continue
+            if where in reachers and glob_free(key) and not reachers[where].reached_by_another(key):
+                # Removing an entry only shrinks the effective set (its reach pass
+                # is monotone), so with nothing else reaching *key* it surely goes.
+                # Rebuilding the file per row made a read quadratic in approvals.
+                return {"section": where, "id": key}
             ops = [{"section": where, "id": key, "action": "remove"}]
             candidate = copy.deepcopy(file_spec)
             candidate_rows = _rows(candidate, catalog)
@@ -579,9 +630,8 @@ def worker_summary(member: str, catalog: dict[str, str]) -> dict[str, list[dict]
     # row of its own: the worker reads it, so the list shows it, and one the file
     # adds carries a Remove of its stored ``resources`` row.
     rows += [
-        _row("resources", uri, uri)
-        for uri in dict.fromkeys(_strs(spec.get("resources")))
-        if not _is_skill(uri)
+        _row("resources", key, entry)
+        for key, entry in _resource_rows(spec.get("resources")).items()
     ]
     directions = ""
     if stored.get("prompt"):

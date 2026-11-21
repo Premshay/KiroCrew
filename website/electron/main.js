@@ -53,6 +53,7 @@ const { describeChromiumSandboxOff, showChromiumSandboxNotice } = require("./chr
 const { findKirocrewBin } = require("./find-bin");
 const { resolveLinuxInstall, readExternallyManaged, runStartupApply } = require("./auto-update");
 const { createStartupGatewayProbe } = require("./runtime/update/gateway-probe");
+const { createInstallSplash } = require("./runtime/update/install-splash");
 const { reregisterBundleIfManaged } = require("./mac-launch-services");
 const { initNativeLogging } = require("./native-logging");
 const { watchSessionLock } = require("./session-lock");
@@ -74,6 +75,17 @@ const {
   resumeCrewCompanion,
 } = require("./crew-companion/index");
 const { hostsDashboard, openDashboardSession } = require("./dashboard-session");
+// A session opened from outside the dashboard (a Crew Companion notification, an
+// app window) is a user-intent show: unhide the app a fullscreen tray-close hid,
+// then bring it in front, as the summon hotkey does.
+const SURFACE_APP = {
+  showApp: () => {
+    if (process.platform === "darwin" && typeof app.show === "function") app.show();
+  },
+  focusApp: () => {
+    if (process.platform === "darwin") app.focus({ steal: true });
+  },
+};
 const { openExternalSafely } = require("./external-scheme");
 const { createDeepLinkHandler, installDeepLinks, installNavigateReady } = require("./deep-link-handler");
 
@@ -153,6 +165,9 @@ const store = new Store({
     closeAction: "background",
     // Only false hides it, and only while the close button quits. See tray-icon.js.
     showTrayIcon: true,
+    // Only true hides a minimized window, and only while a tray icon can bring
+    // it back. See minimize-to-tray.js.
+    minimizeToTray: false,
     linuxFrameless: null,
     // Written by gpu-crash-fallback.js when the GPU process dies at startup;
     // read before Chromium initializes on the next launch.
@@ -302,6 +317,13 @@ let desktopMetricsRecorder = null;
 let windows = null;
 // The kirocrew:// deep-link handler (armed by the single-instance winner below).
 let deepLinks = null;
+// The window a start-time update apply shows while its command runs.
+const installSplash = createInstallSplash({
+  BrowserWindow,
+  page: path.join(__dirname, "loading.html"),
+  log: glog,
+  isQuitting: () => isQuitting,
+});
 
 /** The main window's dashboard view webContents, or null while there is none. */
 function mainDashboardContents() {
@@ -510,13 +532,19 @@ if (!app.requestSingleInstanceLock()) {
   deepLinks.handleArgv(process.argv);
 
   app.on("second-instance", (_event, argv) => {
-    // On Windows and Linux a kirocrew:// link launches a second copy with the
-    // URL in argv; route to it. Otherwise a relaunch is explicit intent to see
-    // the existing window. The window owner cancels a pending fullscreen/tray
-    // hide before restore/show/focus.
+    // During a start-time update apply the install window is the only one, so
+    // it is what a relaunch brings forward. On Windows and Linux a kirocrew://
+    // link launches a second copy with the URL in argv; route to it. Otherwise
+    // a relaunch is explicit intent to see the existing window. The window owner
+    // cancels a pending fullscreen/tray hide before restore/show/focus.
+    installSplash.raise();
     if (deepLinks && deepLinks.handleArgv(argv)) return;
     windows?.showMainWindow({ focus: true });
   });
+  // macOS reopens a running app (Dock, Finder) through `activate`, not
+  // `second-instance`, and the boot's own activate handler exists only after
+  // the apply.
+  app.on("activate", () => installSplash.raise());
 }
 
 // Factories are created at module load, before any renderer can change settings.
@@ -783,10 +811,11 @@ app.whenReady().then(async () => {
   }
 
   // An update the user armed whose quit-time apply was interrupted or failed is
-  // finished HERE: before the gateway spawns and before any window opens, so the
-  // gateway and the app are never on different versions. On success the app
-  // relaunches once into the new bundle and this launch ends; on failure the
-  // installed version starts and the updater shows the error.
+  // finished HERE: before the gateway spawns and before the main window opens, so
+  // the gateway and the app are never on different versions. While its command
+  // runs, the install window says so. On success the app relaunches once into
+  // the new bundle and this launch ends; on failure the installed version starts
+  // and the updater shows the error.
   const startupApply = await runStartupApply({
     app,
     store,
@@ -800,6 +829,7 @@ app.whenReady().then(async () => {
       stopCommand: `kirocrew stop --port ${PORT}`,
     }),
     Notification: electron.Notification,
+    showApplying: (version) => installSplash.show(version),
   });
   if (startupApply.outcome === "relaunching") return;
 
@@ -810,6 +840,9 @@ app.whenReady().then(async () => {
   ipcRegistrar.registerShell();
   windows.syncTray();
   const mainWindow = windows.createMainWindow();
+  // Only now: destroying the hidden install window while it is the last one
+  // fires window-all-closed, which quits the app on Windows and Linux.
+  installSplash.close();
 
   // An AppImage whose AppRun added --no-sandbox says why and how to fix it.
   // Shown before the gateway boot, not awaited, so a gateway that never
@@ -899,6 +932,15 @@ app.whenReady().then(async () => {
   });
   if (cleared && !mainWindow.isDestroyed()) await gateway.connect(mainWindow);
 
+  // Each app's shortcut bindings, apart from the shell's own settings. A store that
+  // cannot open leaves the host on an in-memory one.
+  let appWindowPrefsStore;
+  try {
+    appWindowPrefsStore = new Store({ name: "app-window-prefs", configFileMode: STORE_FILE_MODE });
+    tightenStoreFileMode(appWindowPrefsStore.path, { log: (message) => glog("app-window-prefs mode: " + message) });
+  } catch (error) {
+    glog("app-window-prefs: store unavailable — " + (error && error.message));
+  }
   // Optional companion surfaces start only after the primary gateway handoff.
   // Both are best-effort and must never block an otherwise usable dashboard.
   initMochi({
@@ -906,7 +948,10 @@ app.whenReady().then(async () => {
     fetchGatewayAuth: fetchMochiGatewayAuth,
     glog,
     getMainWindow: () => windows.getMainWindow(),
+    // Seeded from Mochi's own store before the host below reads them.
+    hostStores: { gatewayStore: store, prefsStore: appWindowPrefsStore },
   });
+  const appWindowDisplays = path.join(app.getPath("userData"), "app-window-displays.json");
   try {
     initCrewCompanion({
       backendUrl: BACKEND_URL,
@@ -917,6 +962,9 @@ app.whenReady().then(async () => {
       fetchGatewayAuth: () => fetchMochiGatewayAuth(BACKEND_URL),
       glog,
       getDashboardWindow: () => windows.focusedDashboardWindow() || null,
+      surfaceApp: SURFACE_APP,
+      userDataDir: app.getPath("userData"),
+      displayMemoryPath: appWindowDisplays,
     });
   } catch (error) {
     glog("crew-companion: init failed — " + (error && error.message));
@@ -929,19 +977,23 @@ app.whenReady().then(async () => {
       cookieHeader: sessionCookieHeader,
       preloadPath: path.join(__dirname, "app-window-preload.js"),
       log: glog,
-      displayMemoryPath: path.join(app.getPath("userData"), "app-window-displays.json"),
+      displayMemoryPath: appWindowDisplays,
       showDashboardSession: (slotKey) => openDashboardSession(
-        windows.focusedDashboardWindow() || null, BACKEND_URL, slotKey,
+        windows.focusedDashboardWindow() || null, BACKEND_URL, slotKey, SURFACE_APP,
       ),
       openExternal: (url) => openExternalSafely(shell.openExternal, url, glog),
+      // Which crew each app's windows show is this computer's choice, kept by the shell.
+      gatewayStore: store,
+      prefsStore: appWindowPrefsStore,
     });
     appWindowHost.start();
   } catch (error) {
     glog("app-window-host: init failed — " + (error && error.message));
   }
 
-  // Preserve the historical registration point: activation starts being
-  // handled only after boot and optional companion initialization finish.
+  // Preserve the historical registration point: the main window's activation
+  // starts being handled only after boot and optional companion initialization
+  // finish.
   app.on("activate", () => {
     windows.activateMainWindow();
   });

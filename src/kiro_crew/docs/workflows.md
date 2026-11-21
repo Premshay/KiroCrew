@@ -63,7 +63,7 @@ and send.
 
 ## What comes back
 
-Credentials and exfiltration-shaped URLs are stripped from every workflow
+Credentials, inside URLs too, are stripped from every workflow
 response before it reaches you, including from mapping *keys* and not only
 values — agent output is parsed into these structures, so a credential can arrive
 as a key.
@@ -84,4 +84,4 @@ Seatbelt sandbox; turning the sandbox off is not a recovery path.
 
 - [Subagents](subagents.md): parallel fan-out when the work needs no phases or restarts
 - [Task runner](task-runner.md): autonomous multi-step execution from a spec file
-- [Dashboard](dashboard.md): the chat side panel and the Capabilities tabs
+- [Dashboard](dashboard.md): the chat side panel and the Customize tabs

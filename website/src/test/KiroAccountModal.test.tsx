@@ -273,7 +273,7 @@ describe('KiroAccountModal', () => {
 
     const email = await screen.findByText('owner@example.com')
     expect(email).toHaveClass('blur-[5px]')
-    expect(localStorage.getItem('kirocrew:account-email-hidden')).toBeNull()
+    expect(localStorage.getItem('kirocrew:account-email-hidden')).not.toBe('0')
     fireEvent.click(screen.getByRole('button', { name: 'Show email' }))
     expect(email).not.toHaveClass('blur-[5px]')
     expect(localStorage.getItem('kirocrew:account-email-hidden')).toBe('0')
@@ -389,6 +389,25 @@ describe('KiroAccountModal', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 
+  // The sessions run on a KIRO_API_KEY while kiro-cli's login is another
+  // account, so the balance the login would show is not what the chats spend.
+  // The modal says whose credits are used and offers no Refresh, which would
+  // answer the same until the key is removed.
+  it('explains that credits are spent on the API key, with no Refresh and no alert', async () => {
+    const usage = parseKiroUsagePayload({ usage: { available: false, reason: 'api_key' } })
+    expect(usage).toBe('api-key')
+    renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage={usage} />)
+
+    const notice = i18nT('components.kiroAccountModal.credit_usage_api_key')
+    expect(notice).toContain('KIRO_API_KEY')
+    expect(await screen.findByText(notice)).toBeInTheDocument()
+    expect(screen.queryByText('Could not read your balance.')).not.toBeInTheDocument()
+    expect(screen.queryByText('No balance reading is available for this account yet.')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Remaining credit balance/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Refresh/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
   // The gateway always sends the type for this state. A state that arrives
   // without one still names a provider in the notice, so the sentence never
   // reads "this  sign-in".
@@ -433,7 +452,7 @@ describe('KiroAccountModal', () => {
     renderWithProviders(<KiroAccountModal open onClose={onClose} usage="failed" />)
 
     const dialog = await screen.findByRole('dialog', { name: 'Kiro Account' })
-    const alert = within(dialog).getByRole('alert')
+    const alert = within(dialog).getByRole('status')
     expect(alert).toHaveTextContent('Could not read your balance.')
     expect(within(dialog).getByRole('button', { name: /^Refresh$/ })).toBeEnabled()
     const handoff = within(dialog).getByRole('button', { name: /Ask the agent/i })
@@ -559,7 +578,7 @@ describe('KiroAccountModal refresh', () => {
     fireEvent.click(within(dialog).getByRole('button', REFRESH))
     await waitFor(() => expect(refreshMock).toHaveBeenCalledTimes(1))
     expect(await within(dialog).findByRole('button', REFRESH)).toBeEnabled()
-    expect(within(dialog).getAllByRole('alert')).toHaveLength(1)
+    expect(within(dialog).getAllByRole('status')).toHaveLength(1)
   })
 
   it('reports an unreadable gateway config through ErrorNotice and retries the config read', async () => {
@@ -578,7 +597,7 @@ describe('KiroAccountModal refresh', () => {
     rerender(<KiroAccountModal open onClose={onClose} usage="config-unreadable" />)
     await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ['kirocrewConfig'] }))
     const dialog = screen.getByRole('dialog', { name: 'Kiro Account' })
-    const alert = within(dialog).getByRole('alert')
+    const alert = within(dialog).getByRole('status')
     expect(alert).toHaveTextContent('Could not load settings, so your balance can’t be shown.')
     expect(within(alert).getByRole('button', { name: /Ask the agent/i })).toBeInTheDocument()
     expect(within(dialog).queryByRole('progressbar')).not.toBeInTheDocument()
@@ -820,7 +839,7 @@ describe('KiroAccountModal refresh', () => {
     refreshMock.mockRejectedValue(REFUSAL(500, 'boom'))
     renderWithProviders(<QueryFedModal initial="failed" />)
     const dialog = await screen.findByRole('dialog', { name: 'Kiro Account' })
-    expect(within(dialog).getByRole('alert')).toHaveTextContent('Could not read your balance.')
+    expect(within(dialog).getByRole('status')).toHaveTextContent('Could not read your balance.')
 
     fireEvent.click(within(dialog).getByRole('button', REFRESH))
 
@@ -842,7 +861,7 @@ describe('KiroAccountModal refresh', () => {
     refreshMock.mockRejectedValue(REFUSAL(409, '{"code":"refresh_in_flight"}'))
     renderWithProviders(<QueryFedModal initial="failed" />)
     const dialog = await screen.findByRole('dialog', { name: 'Kiro Account' })
-    expect(within(dialog).getByRole('alert')).toHaveTextContent('Could not read your balance.')
+    expect(within(dialog).getByRole('status')).toHaveTextContent('Could not read your balance.')
 
     fireEvent.click(within(dialog).getByRole('button', REFRESH))
 

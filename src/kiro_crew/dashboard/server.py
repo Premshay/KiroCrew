@@ -24,11 +24,13 @@ from aiohttp import web
 
 from kiro_crew import platform_compat, port_resolution, shutdown_event  # noqa: F401
 from kiro_crew._facade_compose import compose as _facade_compose
+from kiro_crew.agent_sdk import kas_bundle as _kas_bundle
 from kiro_crew.apps.backend import (  # noqa: F401
     _RESTART_STEADY_INTERVAL,
     revive_lost_app_backends,
     start_enabled_app_backends,
 )
+from kiro_crew.apps.frame_sources import frame_src_extra as _app_frame_src_extra  # noqa: F401
 from kiro_crew.apps.hook_reconcile import init_hook_reconciler, stop_hook_reconciler  # noqa: F401
 from kiro_crew.apps.hooks_integration import (  # noqa: F401
     _stop_spawned_backends,
@@ -80,6 +82,7 @@ from kiro_crew.dashboard.chat_utils import (  # noqa: F401
 from kiro_crew.dashboard.crash_dump_store import (  # noqa: F401
     claim_dump_notification,
     dump_age_seconds,
+    dump_fired_at,
     dump_replay_lines,
     newest_dump_with_stacks,
     open_dump_file,
@@ -244,7 +247,6 @@ from kiro_crew.dashboard.server_runtime.app_platform import (  # noqa: F401
     _kick_builtin_adoption_staging,
     _kick_default_app_installs,
     _kick_interrupted_update_sweep,
-    _reconcile_app_resources,
     _start_app_backends,
     _warm_builtin_app_names,
     _warm_materialized_agents,
@@ -346,6 +348,7 @@ from kiro_crew.dashboard.server_runtime.middleware_chain import (  # noqa: F401
     _insert_lts_gate,
     _install_api_middlewares,
     _install_dashboard_middlewares,
+    _relay_origin_middleware,
     _resolve_tailnet_trust,
     _tailnet_origin_enabled,
 )
@@ -394,8 +397,7 @@ from kiro_crew.dashboard.server_runtime.security_middleware import (  # noqa: F4
 )
 from kiro_crew.dashboard.server_runtime.service_hooks import (  # noqa: F401
     _register_kiro_service_shutdown,
-    _start_remote_puller,
-    _stop_remote_puller,
+    _sweep_remote_closes,
     _wire_status_delta_sink,
 )
 from kiro_crew.dashboard.server_runtime.session_restore import (  # noqa: F401
@@ -618,6 +620,8 @@ _BASE_CSP = (
     # The panel isolates the preview host from the dashboard host
     # (isolatePreviewHost) so host-scoped dashboard cookies are never sent to
     # the framed server. The *.localhost tunnel wildcard stays instances-gated.
+    # Also appended: the exact https origins enabled, trusted apps declare in
+    # ui.frameSources (apps/frame_sources.py), for iframes their pages draw.
     "frame-src 'self' blob: https://*.cloudfront.net{frame_src_extra}; "
     # form-action does not fall back to default-src, so without it an injected
     # <form> could post to any host. Every dashboard form posts to its own origin.
@@ -705,7 +709,7 @@ SECONDARY_LOOPBACK_FOR = {"127.0.0.1": "::1", "::1": "127.0.0.1"}
 AMBIGUOUS_LOOPBACK_HOSTS = frozenset({"localhost", "kirocrew.localhost"})
 
 
-_UNATTENDED_EXPIRY_TITLE = "🔒 Auto-approve expired while an unattended run was in progress"
+_UNATTENDED_EXPIRY_TITLE = "Auto-approve expired while an unattended run was in progress"
 
 
 # How long a mutating request waits for the startup crewmate prune before it is
@@ -719,8 +723,8 @@ _CREWMATE_PRUNE_GATE_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 #: and never lists a row the pass is removing. ``GET /api/members`` is not a
 #: pure read either: it calls ``MemberEventLogService.ensure`` for every row
 #: and ``reconcile_member_config`` appends to the member log. Every
-#: ``/api/members`` route reaches the same rows, so the whole prefix waits.
-_CREWMATE_PRUNE_GATE_HELD_PREFIXES = ("/api/members",)
+#: ``/api/members`` route (and its Crew API twin) reaches the same rows, so both wait.
+_CREWMATE_PRUNE_GATE_HELD_PREFIXES = ("/api/members", "/v1/crew/owner/bots")
 
 
 # Strong references to in-flight warm tasks, so the loop cannot collect one
@@ -962,11 +966,11 @@ async def start_dashboard(
     # dirs, which must not block the event loop during startup.
     await asyncio.get_running_loop().run_in_executor(subprocess_executor(), register_builtin_apps)
 
-    # Warm the gate's builtin app names and the materialized-agent snapshot, then
-    # reconcile every enabled app's resources; each runs its I/O on the executor.
+    # Warm the gate's builtin app names and the materialized-agent snapshot; each
+    # runs its I/O on the executor. Enabled apps' resources are reconciled once,
+    # after each app's vet, by ``start_enabled_app_backends`` below.
     await _warm_builtin_app_names()
     await _warm_materialized_agents()
-    await _reconcile_app_resources()
 
     # One-time migration: disable stale deploy_web builtin installs (now core module).
     # Idempotent — logs once and silently succeeds if already gone.
@@ -1252,10 +1256,6 @@ async def start_dashboard(
         # Register the opt-in instances startup/cleanup hooks HERE, before
         # ``runner.setup()`` freezes the app's signal lists. See
         # ``_register_instances_hooks`` for why ordering matters.
-        # Remote dispatch (preview): stop the hub's background report puller on
-        # cleanup, before the instance tunnels and the crew-log drain it uses.
-        # Imports nothing here; the puller is started after bind, below.
-        app.on_cleanup.append(_stop_remote_puller)
         _register_instances_hooks(app, state, _dashboard_sock.getsockname()[1])
         _register_browser_harness_lifecycle(app, state)
         _register_connections_warm_lifecycle(app, state)
@@ -1428,7 +1428,7 @@ async def start_dashboard(
     handlers.install_crew_log_publisher(state)
     # The OTel usage export's own subscription to the same bus, gated on telemetry
     # consent rather than on the crew-log flag above: a no-op when
-    # ``telemetry.enabled`` is off (the default), so an unopted host installs no
+    # ``telemetry.enabled`` is off, so a host that turned recording off installs no
     # subscriber and sends nothing. Kicked as a tracked task off the loop, not called
     # inline: on an opted-in host the first ``get_recorder()`` the install reaches
     # builds the recorder synchronously (SDK import plus the install-id write), which
@@ -1496,6 +1496,11 @@ async def start_dashboard(
     state._background_tasks.add(probe_task)
     probe_task.add_done_callback(state._background_tasks.discard)
 
+    # Engine guarantee: a start with no engine for this pin installs it.
+    _engine_task = asyncio.create_task(asyncio.to_thread(_kas_bundle.ensure_engine_at_startup))
+    state._background_tasks.add(_engine_task)
+    _engine_task.add_done_callback(state._background_tasks.discard)
+
     # Refresh config.json's meta stamp when an upgrade left it naming the
     # previous build. Post-bind and fire-and-forget (never awaited on
     # the boot path), and the file I/O runs in a thread so the version check —
@@ -1517,12 +1522,6 @@ async def start_dashboard(
     _stamp_task = asyncio.create_task(_refresh_meta_stamp())
     state._background_tasks.add(_stamp_task)
     _stamp_task.add_done_callback(state._background_tasks.discard)
-
-    # Remote dispatch (preview): the hub's background report puller. Post-bind and
-    # fire-and-forget; with work_ledger.remote_dispatch off it starts nothing.
-    _puller_task = asyncio.create_task(_start_remote_puller(state))
-    state._background_tasks.add(_puller_task)
-    _puller_task.add_done_callback(state._background_tasks.discard)
 
     # Start terminal orphan reaper (kills PTYs with no WS past the reaper window)
     _reaper = asyncio.create_task(handlers.reap_orphaned_terminals(app))

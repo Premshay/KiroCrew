@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 # ── Workspace API ──
 async def api_workspaces(request: web.Request) -> web.Response:
     """GET /api/workspaces — list configured workspaces."""
-    cfg = KiroCrewConfig.load()
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
     default_ws = cfg.default_workspace
     result = []
     for name, ws in cfg.workspaces.items():
@@ -131,7 +131,7 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
             {"error": "Invalid workspace name (use alphanumeric, hyphens, underscores)"},
             status=400,
         )
-    cfg = KiroCrewConfig.load()
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
     if name in cfg.workspaces:
         return web.json_response({"error": f"Workspace '{name}' already exists"}, status=409)
     copy_from = body.get("copy_from", "")
@@ -146,7 +146,7 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
     install_dst: Path | None = None
     copy_pending = False
     # Warnings carried into the success response. A copy_from whose source folder is
-    # missing still creates the workspace (empty), exactly as before, but the caller
+    # missing still creates the workspace (empty), but the caller
     # asked for a copy and got nothing -- so say so rather than return a bare success
     # that reads as "copied". Mirrors the CLI create's stderr warning on the same case.
     warnings: list[str] = []
@@ -217,7 +217,7 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": "Cannot use config root as workspace directory"}, status=400
             )
-        if src_path.is_dir():
+        if await asyncio.to_thread(src_path.is_dir):
             copy_pending = True
         else:
             # Source workspace is registered but its folder is absent on disk: the
@@ -271,7 +271,7 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
             resources=name,
         )
         return web.json_response({"error": "Invalid directory path"}, status=400)
-    if not _abs and not validated_dir.is_relative_to(data_home().resolve()):
+    if not _abs and not validated_dir.is_relative_to(await asyncio.to_thread(data_home().resolve)):
         _sel().log_api_access(
             caller=request.get("user", "dashboard"),
             operation="workspace.create",
@@ -280,7 +280,7 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
             resources=name,
         )
         return web.json_response({"error": "Invalid directory path"}, status=400)
-    if validated_dir == data_home().resolve():
+    if validated_dir == await asyncio.to_thread(data_home().resolve):
         _sel().log_api_access(
             caller=request.get("user", "dashboard"),
             operation="workspace.create",
@@ -314,7 +314,11 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
             shutil.copytree(src_path, staging, symlinks=True, ignore=_ignore_sensitive)
 
         def _drop_staging() -> None:
-            shutil.rmtree(staging, ignore_errors=True)
+            if not platform_compat.rmtree_force(staging):
+                logger.warning(
+                    "workspace create could not remove its staging copy %s; delete it by hand",
+                    staging,
+                )
 
         try:
             # drained_to_thread, not bare to_thread: a cancellation at the
@@ -413,7 +417,11 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
         # The staged tree was never installed; drop it in a worker -- an
         # inline rmtree of a large copied workspace would stall the loop.
         if staged_path is not None:
-            await asyncio.to_thread(shutil.rmtree, staged_path, ignore_errors=True)
+            if not await asyncio.to_thread(platform_compat.rmtree_force, staged_path):
+                logger.warning(
+                    "workspace create could not remove its staging copy %s; delete it by hand",
+                    staged_path,
+                )
         return web.json_response({"error": conflict.error, "code": conflict.code}, status=409)
     except asyncio.CancelledError:
         # run_config_write SHIELDS and DRAINS the worker: a CancelledError
@@ -440,7 +448,11 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
                 install_dst,
             )
         elif staged_path is not None:
-            await asyncio.to_thread(shutil.rmtree, staged_path, ignore_errors=True)
+            if not await asyncio.to_thread(platform_compat.rmtree_force, staged_path):
+                logger.warning(
+                    "workspace create could not remove its staging copy %s; delete it by hand",
+                    staged_path,
+                )
         raise
     _sel().log_api_access(
         caller=request.get("user", "dashboard"),
@@ -468,7 +480,7 @@ async def api_workspaces_update(request: web.Request) -> web.Response:
         return owner_denied
 
     name = request.match_info["name"]
-    cfg = KiroCrewConfig.load()
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
     if name not in cfg.workspaces:
         return web.json_response({"error": f"Workspace '{name}' not found"}, status=404)
     # Default cap: the body is a single directory field.
@@ -501,7 +513,7 @@ async def api_workspaces_update(request: web.Request) -> web.Response:
                 resources=name,
             )
             return web.json_response({"error": "Invalid directory path"}, status=400)
-        if not _abs and not resolved.is_relative_to(data_home().resolve()):
+        if not _abs and not resolved.is_relative_to(await asyncio.to_thread(data_home().resolve)):
             _sel().log_api_access(
                 caller=request.get("user", "dashboard"),
                 operation="workspace.update",
@@ -510,7 +522,7 @@ async def api_workspaces_update(request: web.Request) -> web.Response:
                 resources=name,
             )
             return web.json_response({"error": "Invalid directory path"}, status=400)
-        if resolved == data_home().resolve():
+        if resolved == await asyncio.to_thread(data_home().resolve):
             _sel().log_api_access(
                 caller=request.get("user", "dashboard"),
                 operation="workspace.update",
@@ -601,7 +613,7 @@ async def api_workspaces_delete(request: web.Request) -> web.Response:
         return owner_denied
 
     name = request.match_info["name"]
-    cfg = KiroCrewConfig.load()
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
     if name not in cfg.workspaces:
         return web.json_response({"error": f"Workspace '{name}' not found"}, status=404)
     if name == cfg.default_workspace:

@@ -33,12 +33,12 @@ from kiro_crew.acp._dispatch import (
     _dumps_degraded,
     _measure_tool_output,
     classify_tool_call,
+    claude_mcp_stamp,
     derive_edit_diff,
     extract_tool_purpose,
     is_rendered_edit_diff,
     log_unrenderable_content,
     make_unified_diff,
-    qualified_harness_tool_id,
     redact_text,
 )
 from kiro_crew.acp._dispatch import select_tool_title as _select_tool_title
@@ -54,10 +54,10 @@ from kiro_crew.acp.harness.copilot import (
     TOOL_CALL_CACHE_MAX_KEY_CHARS,
     note_copilot_identity_record,
 )
+from kiro_crew.acp.harness_tool_names import start_event_tool_id
 from kiro_crew.acp.native_child_stamp import parent_tool_use
+from kiro_crew.acp.read_path_arg import read_path_arg
 from kiro_crew.acp.types import (
-    ACP_BACKEND_CODEX,
-    ACP_BACKEND_DEEPSEEK,
     CC_PERMISSION_MODE_AUTO,
     EVENT_TOOL_CALL,
     EVENT_TOOL_CALL_UPDATE,
@@ -69,7 +69,10 @@ from kiro_crew.acp.types import (
     AcpEvent,
     JsonRpcMessage,
 )
-from kiro_crew.agent_sdk.backends import ACP_BACKENDS_PERMISSION_KIND_FROM_TOOL_CALL
+from kiro_crew.agent_sdk.backends import (
+    ACP_BACKEND_ANTIGRAVITY,
+    ACP_BACKENDS_PERMISSION_KIND_FROM_TOOL_CALL,
+)
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.hooks import HOOK_EVENT_POST_TOOL_USE, fire_tool_hooks, get_global_hook_store
@@ -233,7 +236,7 @@ async def _maybe_audit_unasked_tool_call(self: AcpClient, tool_result_event: "Ac
         return
     # A session that left a foreign settings file out runs pinned to ``default``
     # whatever it requested, so no classifier approved its unasked calls.
-    if self._claude_session_excludes_local():
+    if self._session_excludes_local_settings():
         return
     if getattr(self, "_audit_source", None):
         return
@@ -336,6 +339,9 @@ async def _maybe_fire_pre_tool_hooks(self: AcpClient, tool_event: "AcpEvent") ->
 
             _serialized = redact(_serialized)
             _redacted_input = _serialized
+        # The structured params, when the frame carried them, are what the
+        # payload's tool_input is built from (redacted value by value in
+        # hooks.hook_tool_input); the redacted string above is the fallback.
         await fire_tool_hooks(
             hook_store,
             # Fall back to 'unknown' when the event carries no title, matching
@@ -344,6 +350,7 @@ async def _maybe_fire_pre_tool_hooks(self: AcpClient, tool_event: "AcpEvent") ->
             tool_event.title or "unknown",
             _redacted_input,
             agent_role=self._agent or None,
+            raw_tool_params=getattr(tool_event, "raw_tool_params", None),
         )
     except Exception:
         logger.warning("ACP-layer PreToolUse hook failed", exc_info=True)
@@ -635,7 +642,7 @@ def _extract_tool_event(self: AcpClient, msg: JsonRpcMessage) -> AcpEvent | None
                 # in a turn leave the name unknown, so neither is read as the
                 # read tool the other one is.
                 if (
-                    self.backend == ACP_BACKEND_DEEPSEEK
+                    self._tool_call_ids_repeat_in_turn
                     and _harness_names.get(tool_call_id, _harness_name) != _harness_name
                 ):
                     _harness_name = ""
@@ -647,6 +654,15 @@ def _extract_tool_event(self: AcpClient, msg: JsonRpcMessage) -> AcpEvent | None
                 and self.backend in ACP_BACKENDS_PERMISSION_KIND_FROM_TOOL_CALL
             ):
                 self._tool_call_identity_unreadable[tool_call_id] = True
+            # Antigravity's bounded ``_meta.mcp`` channel: the mark describes the
+            # frame the identity caches above were just written from, so a later
+            # frame under the same id sets or clears it with them, as the
+            # handle's store does. ``_build_permission_event`` refuses on it.
+            elif self.backend == ACP_BACKEND_ANTIGRAVITY:
+                if identity.identity_unreadable:
+                    self._tool_call_identity_unreadable[tool_call_id] = True
+                else:
+                    self._tool_call_identity_unreadable.pop(tool_call_id, None)
             # Copilot only (H13): it names an MCP call nowhere but its title.
             if self._is_copilot and not identity.mcp_server_name and not is_shell:
                 self._recover_copilot_mcp_identity(tool_call_id, update)
@@ -659,15 +675,17 @@ def _extract_tool_event(self: AcpClient, msg: JsonRpcMessage) -> AcpEvent | None
                     event_mcp_server = recovered_server
                     event_tool_name = self._tool_call_tool_name.get(tool_call_id, "")
                     event_tool_trusted = event_mcp_trusted = True
-        # codex runs most calls without a permission request, so the event that
-        # starts the call names it too, for its PostToolUse spec hooks. The
-        # other backends are named by their permission request alone.
-        _event_tool_id = (
-            qualified_harness_tool_id(
-                ACP_BACKEND_CODEX, stated_harness_tool_name(self.backend, update)
-            )
-            if self.backend == ACP_BACKEND_CODEX
-            else ""
+        # A harness that runs calls without a permission request (codex,
+        # Antigravity's reads) names them on the event that starts the call, for
+        # its PostToolUse spec hooks. The other backends are named by their
+        # permission request alone.
+        _stated_tool_name = stated_harness_tool_name(self.backend, update)
+        _event_tool_id = start_event_tool_id(
+            self.backend,
+            _stated_tool_name,
+            tool_kind=kind if isinstance(kind, str) else "",
+            mcp_server=event_mcp_server,
+            mcp_tool=event_tool_name,
         )
         title = _select_tool_title(title, raw_input, kind, is_shell=is_shell) or ""
         if title:
@@ -707,6 +725,10 @@ def _extract_tool_event(self: AcpClient, msg: JsonRpcMessage) -> AcpEvent | None
             is_context_compaction=is_context_compaction,
             diff_path=_diff_path,
             harness_tool_id=_event_tool_id,
+            claude_mcp_tool_name=claude_mcp_stamp(update, _stated_tool_name, backend=self.backend),
+            # Off the RAW kind: the argument naming the file this call reads, for the
+            # row's thumbnail strip (``acp.read_path_arg``).
+            read_path_arg=read_path_arg(self.backend, update.get("kind")),
         )
         # getattr: a client built without ``__init__`` keeps no window. A native
         # sub-agent's call is not in this turn's parallel batch: the parent's open

@@ -108,7 +108,7 @@ def test_a_legacy_page_title_finds_its_explicit_canonical_location() -> None:
 def test_the_tasks_alias_keeps_the_task_runner_gate() -> None:
     d = ui_index.find_ui("tasks", "en")
     projects = next(r for r in d["results"] if r["id"] == "page.projects")
-    assert projects["placements"][0]["requires"][0]["id"] == "app_enabled"
+    assert projects["placements"][0]["requires"][0]["id"] == "page_switched_on"
 
 
 def test_no_result_hands_out_a_redirecting_route() -> None:
@@ -150,6 +150,18 @@ def test_a_setting_carries_its_route_setting_id_and_guide() -> None:
         "action_id": "settings.show",
         "params": {"setting_id": "chat.link-previews"},
     }
+
+
+def test_the_ctrl_copy_paste_setting_needs_windows_or_linux() -> None:
+    # The Terminal panel never draws this switch on a Mac, so the answer says so.
+    d = ui_index.find_ui("Ctrl+C and Ctrl+V copy and paste", "en")
+    hit = next(
+        r for r in d["results"] if r.get("setting_id") == "display.ctrl-c-and-ctrl-v-copy-and-paste"
+    )
+    (placement,) = hit["placements"]
+    conds = [r for r in placement["requires"] if r["kind"] == "condition"]
+    assert [c["id"] for c in conds] == ["not_macos"]
+    assert "Windows or Linux, not on a Mac" in conds[0]["description"]
 
 
 def test_a_credential_setting_never_carries_a_guide() -> None:
@@ -208,6 +220,13 @@ def test_ties_are_ordered_by_id_and_flagged_ambiguous() -> None:
     exact = [r["id"] for r in d["results"] if r["match"] == "exact_label"]
     assert exact == sorted(exact) and len(exact) > 1
     assert d["ambiguous"] is True
+
+
+@pytest.mark.parametrize(("query", "lang"), [("minimize to tray", "en"), ("最小化到托盘", "zh-CN")])
+def test_a_settings_own_name_does_not_tie_with_another_rows_term(query: str, lang: str) -> None:
+    d = ui_index.find_ui(query, lang)
+    assert _top(d)["id"] == "setting:display.minimize-to-tray", d["results"]
+    assert d["ambiguous"] is False
 
 
 # ── newcomer wording: curated terms find it, one shared word does not ──
@@ -533,7 +552,12 @@ def test_a_label_covering_only_part_of_the_question_is_dropped(tmp_path: Path) -
         # chat" is one of its terms), never Voice > Model.
         ("chat model", "en", "settings.sub.chat.models", "setting:voice.model"),
         ("display language", "en", "setting:display.language", "setting:voice.language"),
-        ("slack session folder", "en", "setting:channels.file-sessions-in-a-folder-slack", None),
+        (
+            "slack session folder",
+            "en",
+            "setting:channels.file-sessions-in-a-different-folder-slack",
+            None,
+        ),
         ("语音模型", "zh-CN", "setting:voice.model", "settings.sub.chat.models"),
         ("聊天模型", "zh-CN", "settings.sub.chat.models", "setting:voice.model"),
         # Task phrases ("make a schedule", "新建提醒") now answer with the two

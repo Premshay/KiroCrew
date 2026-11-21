@@ -84,7 +84,6 @@ of by truncating a name the child can point somewhere else.
 from __future__ import annotations
 
 import calendar
-import json
 import logging
 import os
 import re
@@ -99,6 +98,7 @@ from pathlib import Path
 from typing import Literal
 
 from kiro_crew import agent_scratch_users, platform_compat
+from kiro_crew.agent_scratch_build_output import native_build_output
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import (
     config_dir,
@@ -782,94 +782,6 @@ def shared_scratch_window(path: Path | None) -> Path | None:
     return path
 
 
-#: Which tree each session key last exposed as ``$KIROCREW_SCRATCH``, so a key
-#: that returns after its process ended rejoins that tree instead of starting an
-#: empty directory while the old one waits for the sweep (:func:`recorded_tree`).
-#:
-#: Kept in the managed root, not in ``session_map.json``, for the boundary: the
-#: root is masked from every sandboxed process, while the session map is
-#: agent-writable. A tree name an agent could rewrite would let it point its own
-#: key at another session's directory and mount it on the next resume. The sweep
-#: removes plain directories only, so the file is never swept.
-TREE_INDEX_FILENAME = ".trees.json"
-
-#: Largest index this module will read. A row is a session key plus a directory
-#: name, and rows whose tree is gone are pruned on every write.
-_TREE_INDEX_MAX_BYTES = 1 << 20
-
-_TREE_INDEX_LOCK = threading.Lock()
-
-
-def _read_tree_index(root: Path) -> dict[str, str]:
-    """The index rows, or empty for anything this module did not write."""
-    index = root / TREE_INDEX_FILENAME
-    _refuse_linked(index, TREE_INDEX_FILENAME)
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(index, flags)
-    except FileNotFoundError:
-        return {}
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > _TREE_INDEX_MAX_BYTES:
-            return {}
-        data = os.read(fd, _TREE_INDEX_MAX_BYTES + 1)
-    finally:
-        os.close(fd)
-    try:
-        rows = json.loads(data)
-    except ValueError:
-        return {}
-    if not isinstance(rows, dict):
-        return {}
-    return {k: v for k, v in rows.items() if isinstance(k, str) and _is_tree_name(v)}
-
-
-def _is_tree_name(name: object) -> bool:
-    """A single directory name: no separator, no ``.``/``..``."""
-    return isinstance(name, str) and name not in ("", ".", "..") and Path(name).name == name
-
-
-def record_tree(key: str, tree: Path) -> None:
-    """Remember *tree* as *key*'s work directory. Fail-open, like all scratch.
-
-    Only a directory directly under the managed root is recorded. Rows whose
-    directory is absent are dropped in the same write, so the index
-    holds at most the trees the sweep has not reclaimed yet.
-    """
-    root = scratch_root()
-    if tree.parent != root or not _is_tree_name(tree.name):
-        return
-    with _TREE_INDEX_LOCK:
-        try:
-            _refuse_linked(root, f"managed root {_SUBDIR!r}")
-            rows = _read_tree_index(root)
-            if rows.get(key) == tree.name:
-                return
-            rows[key] = tree.name
-            rows = {k: v for k, v in rows.items() if _is_plain_dir(root / v)}
-            atomic_write(root / TREE_INDEX_FILENAME, json.dumps(rows, sort_keys=True))
-        except (OSError, ScratchBoundaryError):
-            logger.debug("agent-scratch: could not record the tree for a session", exc_info=True)
-
-
-def recorded_tree(key: str) -> Path | None:
-    """The tree :func:`record_tree` last stored for *key*, or None.
-
-    Not validated here: the spawner hands it to :func:`shared_scratch_window`,
-    which checks it is still a plain directory under the root and falls back to
-    the process's own directory when it is gone.
-    """
-    root = scratch_root()
-    with _TREE_INDEX_LOCK:
-        try:
-            name = _read_tree_index(root).get(key)
-        except (OSError, ScratchBoundaryError):
-            logger.debug("agent-scratch: could not read the tree index", exc_info=True)
-            return None
-    return root / name if name else None
-
-
 def _sweep_could_reclaim(path: Path) -> bool:
     """Would :func:`sweep_dead_scratch` judge *path* reclaimable on its owner alone?
 
@@ -1254,10 +1166,13 @@ def holds_git_repository(tree: Path) -> bool:
     such as the read-only object files a partial delete strands on Windows.
     A regenerable subtree (:func:`_regenerable`) is not searched: the
     repositories test suites create in a pytest basetemp, or a package manager
-    leaves in ``node_modules``, are not work, and a tree whose only
+    leaves in ``node_modules`` or a native build in its output (the dependency
+    clones of SwiftPM and Xcode), are not work, and a tree whose only
     repositories sit in such subtrees is deleted at once.
-    Entries are read with ``lstat``; no link is followed or descended into, no
-    file is opened and no git runs. A tree that cannot be listed answers True.
+    Entries are read with ``lstat``; no link is followed or descended into and
+    no git runs. No file under the tree is ever opened: native build output is
+    judged by name and kind alone (:mod:`agent_scratch_build_output`). A tree
+    that cannot be listed answers True.
     """
     return _search(tree, basetemp_at_top=True)
 
@@ -1297,7 +1212,7 @@ def _searched_venv(path: Path, *, top_level: bool) -> bool:
     A regenerable name wins over the venv marker, and a venv that is itself a
     repository is never regenerable, so neither is searched as a venv.
     """
-    if _regenerable_name(path.name, top_level=top_level):
+    if _regenerable_name(path.name, top_level=top_level) or native_build_output(path):
         return False
     if not _is_regular_file(path / _VENV_MARKER):
         return False
@@ -1312,8 +1227,9 @@ def _is_git_directory(path: Path) -> bool:
 def _regenerable(path: Path, *, top_level: bool) -> bool:
     """Whether the plain directory *path* holds only what a tool rebuilds.
 
-    That is a directory named in :data:`_REGENERABLE_DIRNAMES`, a Python
-    virtual environment (a directory holding a REGULAR file named
+    That is a directory named in :data:`_REGENERABLE_DIRNAMES`, native
+    build output (:mod:`agent_scratch_build_output`), a Python virtual
+    environment (a directory holding a REGULAR file named
     :data:`_VENV_MARKER`), or -- when *top_level*, a direct child of a scratch
     tree -- a pytest basetemp named ``pytest-of-*``. A directory named
     ``.venv`` that holds no such file is somebody's work, not a venv.
@@ -1326,7 +1242,7 @@ def _regenerable(path: Path, *, top_level: bool) -> bool:
     project folder, or the clones ``pip install -e git+...`` puts in its
     ``src``, keep it whole.
     """
-    named = _regenerable_name(path.name, top_level=top_level)
+    named = _regenerable_name(path.name, top_level=top_level) or native_build_output(path)
     if not (named or _is_regular_file(path / _VENV_MARKER)):
         return False
     if os.path.lexists(path / ".git") or _is_git_directory(path):
@@ -1351,7 +1267,8 @@ def _strip_regenerable(tree: Path) -> None:
     """Delete the regenerable subtrees of the quarantined *tree*, in place.
 
     The quarantine keeps a tree for the repositories in it; package installs,
-    virtual environments, caches and pytest basetemps beside them are rebuilt
+    virtual environments, caches, pytest basetemps and native build output
+    beside them are rebuilt
     from the work and can be most of its size. Only a tree the sweep moved
     into the quarantine reaches here, so nothing else is using it. Running it
     again on a stripped tree changes nothing.
@@ -1363,6 +1280,7 @@ def _strip_regenerable(tree: Path) -> None:
     logged and skipped, and the next sweep tries again.
     """
     stripped = 0
+    failed: list[str] = []
     stack = [tree]
     while stack:
         current = stack.pop()
@@ -1387,10 +1305,15 @@ def _strip_regenerable(tree: Path) -> None:
                 continue
             if not _regenerable(path, top_level=top_level):
                 stack.append(path)
-            elif platform_compat.rmtree_force(path):
+            elif platform_compat.rmtree_force(
+                path, failures=failed, expect=(info.st_dev, info.st_ino)
+            ):
                 stripped += 1
-            else:
-                logger.warning("agent-scratch: could not fully remove %s; will retry", path)
+    if failed:
+        # One line per tree per sweep: a stuck tree can hold thousands of entries.
+        logger.warning(
+            "agent-scratch: could not remove %d entries under %s; will retry", len(failed), tree
+        )
     if not stripped:
         return
     logger.info("agent-scratch: removed %d rebuildable dir(s) from %s", stripped, tree)
@@ -1508,8 +1431,13 @@ def _expire_quarantine(now: float) -> int:
             continue
         if now - _tree_newest_mtime(path, fallback=now) < _UNOWNED_GRACE_SECONDS:
             continue
-        if not platform_compat.rmtree_force(path):
-            logger.warning("agent-scratch: could not fully remove %s; will retry", path)
+        failed: list[str] = []
+        if not platform_compat.rmtree_force(path, failures=failed):
+            logger.warning(
+                "agent-scratch: could not remove %d entries under %s; will retry",
+                len(failed),
+                path,
+            )
             continue
         logger.info("agent-scratch: deleted %s, whose quarantine expired", path)
         expired += 1
