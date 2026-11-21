@@ -289,7 +289,7 @@ export function crewApprovalDecidableHere(
  *  it on. A worker whose root is closed keeps its row: no panel lists it, and its
  *  own approval or question must still reach the person. `rootsOnly` keeps just
  *  the roots, for the session filter's Crew Mode chip. */
-export function crewModeView<T extends { key?: string; mode?: string; crew_root?: string; crew_mode_root?: boolean; mate_root?: string; slack_list_hidden?: boolean; pending_approval?: boolean; needs_input?: boolean }>(
+export function crewModeView<T extends { key?: string; mode?: string; crew_root?: string; crew_mode_root?: boolean; mate_root?: string; pinned?: boolean; slack_list_hidden?: boolean; pending_approval?: boolean; needs_input?: boolean }>(
   rows: T[], rootsOnly = false, mateThreads?: ReadonlySet<string>, activeKey?: string | null,
 ): T[] {
   // With `slack.show_in_session_list` off, a conversation that started in Slack
@@ -297,15 +297,18 @@ export function crewModeView<T extends { key?: string; mode?: string; crew_root?
   // session and one waiting on the person (`slackRowHidden`).
   if (rows.some(r => r.slack_list_hidden)) rows = rows.filter(r => !slackRowHidden(r, activeKey))
   if (rootsOnly) return rows.filter(r => crewModeRoot(r))
-  // A mate's session leaves the list while its mate thread is live (the mate's
-  // Sessions tab lists it), before the Crew Mode return so that branch is unchanged. `mateThreads` is the
-  // full store's (`liveMateThreads`); without it, those among `rows`.
+  // Pinning keeps a Bot's session in the person's list while the Bot is open.
+  // Use the full store's mate threads when the caller supplies them.
   const mates = mateThreads ?? liveMateThreads(rows)
-  if (mates.size) rows = rows.filter(r => { const mate = mateRootOf(r); return !mate || !mates.has(mate) })
+  if (mates.size) rows = rows.filter(r => !mateSessionHidden(r, mates))
   if (!crewModeEnabled()) return rows
   const listed = new Set<string>()
   for (const r of rows) if (r.key) listed.add(r.key)
   return rows.filter(r => !underListedRoot(r, key => listed.has(key)))
+}
+
+export function mateSessionHidden(row: { mate_root?: string; pinned?: boolean }, mates: ReadonlySet<string>): boolean {
+  return !row.pinned && mates.has(mateRootOf(row))
 }
 
 /** Whether the person's lists leave `row` out for `slack.show_in_session_list`:

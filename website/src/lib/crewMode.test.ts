@@ -331,6 +331,12 @@ describe("a Bot's sessions in the person's lists", () => {
   // A stamp an older gateway sent while a per-Bot switch existed changes nothing.
   const stale = rows.map(r => (r.key === 'mate' ? { ...r, show_sessions_in_list: true } : r))
 
+  it('keeps a pinned Bot session visible and counts its unread state', () => {
+    const pinned = rows.map(row => row.key === 'mw' ? { ...row, pinned: true } : row)
+    expect(crewModeView(pinned).map(row => row.key)).toEqual(['mate', 'mw', 'orphan', 'plain'])
+    expect([...crewMemberKeys(pinned)]).toEqual(['deep'])
+  })
+
   it('by default leaves out every session a live mate thread dispatched, and keeps the mate thread', () => {
     expect(crewModeView(rows).map(r => r.key)).toEqual(['mate', 'orphan', 'plain'])
     expect([...crewMemberKeys(rows)].sort()).toEqual(['deep', 'mw'])
