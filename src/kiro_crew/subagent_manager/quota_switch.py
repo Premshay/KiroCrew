@@ -1,14 +1,5 @@
 """Quota fall-through: a sub-agent whose vendor runs out continues elsewhere at once.
 
-Fork (Nexus), operator ruling of 2026-11-20. On 2026-11-20 Antigravity's
-individual quota ran out (first seen 11:19 IST in a chat, 11:39 IST in spawned
-runs). Each spawned run got the error inside ~5 s -- the companion ends the turn
-``stop_reason='refusal'`` with ``Antigravity provider fault: status ERROR:
-Individual quota reached ... Resets in 2h23m58s`` -- and the run ended
-``failed (refusal)``. Nothing learned from it: the tombstone's ``detail`` is
-the generic stop text, so ``spawn.route``'s tombstone scan never saw a limit,
-and the next spawn went to the same vendor and failed the same way.
-
 This module turns such an ending into a decision:
 
 1. :func:`detect` reads a failed run's error (and the tail of its partial) for
@@ -211,9 +202,8 @@ def note_chat_quota(
 
     The chat itself is not switched (that re-prefills its history); only the
     mark is written, so every later spawn avoids that vendor (Antigravity: the
-    model's quota group) until the reset. 2026-11-20 11:19 IST chat-2069 hit
-    ``Individual quota reached`` on gemini-4-hydrogen-high and nothing learned
-    from it. Only the text counts: a chat failing for another reason while
+    model's quota group) until the reset. Only the error text counts: a chat
+    failing for another reason while
     Claude's ``rate_limit_event`` reads rejected marks nothing new.
     """
     try:

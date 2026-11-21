@@ -64,35 +64,12 @@ REASON_UNUSABLE = "local_unusable"
 # Token estimate inputs for spawn.route (measured, not guessed)
 # ---------------------------------------------------------------------------
 
-#: What each local seat sends on its FIRST request beyond the first user
-#: message: Claude Code's system prompt and tool schemas under the isolated
-#: ``CLAUDE_CONFIG_DIR`` harness. Measured 2026-11-20 from the seats' own
-#: transcripts (``~/.local/share/claude-local-lane/projects/*/*.jsonl``): the
-#: first assistant turn's ``usage`` (input + cache read + cache creation) minus
-#: the first user message tokenized with the served model's vocab
-#: (``llama-tokenize``, Qwen3 tokenizer).
-#:
-#: * ``subagent`` (``local-background``, qwen-fast, 32k): the lean helper
-#:   harness (:data:`LOCAL_HELPER_TOOLS`, project and local setting tiers):
-#:   4,046 on 2026-11-20 (claude-agent-acp 0.107.0, Claude Code 2.1.325,
-#:   counted by qwen-fast's own ``/v1/messages/count_tokens``): system prompt
-#:   758, the four tool schemas 2,124, environment / model / CLAUDE.md / git /
-#:   date / attribution reminders 1,149 with a repo cwd that carries a
-#:   CLAUDE.md, rounded up. The full harness it replaces measured 15,153 on the
-#:   same run (12 tool schemas 8,602; MCP tool, agent, skill and MCP
-#:   instruction listings 4,123).
-#: * ``agent`` (``local-fleet``, qwen38-mtp on Noda, 128k): 24,895-24,982 on
-#:   2026-11-20 (n=2, repo cwd); 14,843-15,742 for n=8 earlier in November.
-#:   The latest, larger figure is used: an underestimate is the failure that costs.
+#: What each local seat sends on its first request beyond the user message. Declared seat
+#: overhead takes precedence over these defaults for older companions.
 LOCAL_HARNESS_OVERHEAD_TOKENS: dict[str, int] = {"subagent": 4050, "agent": 24982}
 
-#: The first-turn prompt a local role is trimmed to, harness included: a token
-#: TARGET, not the window. The CPU lane prefills at ~100 tokens/s at 2k, 58 at
-#: 10k and 35 at 22.5k (qwen-fast, 2026-11-20), so a first turn sized to "fits
-#: the window" took 11+ minutes and the reaper killed it at 300 s; a run sized
-#: to this target starts answering in about 2-3 minutes. Raising the lane's
-#: window does not move it: at 64k everything "fit", and that switched the
-#: window-only trim off. The GPU role has no target and keeps fitting its window.
+#: First-turn target including harness overhead. A context window defines what
+#: fits, but the prefill time can exceed the worker deadline at that size.
 LOCAL_FIRST_TURN_TARGET_TOKENS: dict[str, int] = {"subagent": 12000}
 
 #: The KiroCrew context a session injects ahead of the request (memory,
@@ -100,7 +77,7 @@ LOCAL_FIRST_TURN_TARGET_TOKENS: dict[str, int] = {"subagent": 12000}
 #: November local-fleet first messages (n=9: 7,808-40,011).
 INJECTED_CONTEXT_TOKENS = 20797
 
-#: Characters per token for a brief on the Qwen3 vocab: the 10th percentile of
+#: Characters per token for a brief, measured at the 10th percentile of
 #: 95 local-lane first messages (median 3.87). Low on purpose: it over-counts.
 CHARS_PER_TOKEN = 3.2
 
@@ -112,7 +89,7 @@ def brief_tokens(brief: str) -> int:
 #: What each switchable group that can be TRIMMED adds to the injected context.
 #: Measured 2026-11-20 on the same local-lane first messages (n=20 with a
 #: session context, ``~/.local/share/claude-local-lane/projects/*/*.jsonl``):
-#: each section tokenized with the Qwen3 vocab (``llama-tokenize``) and
+#: each section tokenized with the serving model's vocabulary and
 #: assigned to its group by its header -- memory = ``[Memory tools]``,
 #: stable profile, semantic, episodic, activity, conversation history;
 #: lessons = learned corrections, learned experience, user profile. Medians
@@ -121,8 +98,7 @@ def brief_tokens(brief: str) -> int:
 #: saves is the failure that costs (a "fits" that overflows the lane).
 CONTEXT_GROUP_TOKENS: dict[str, int] = {"memory": 3867, "lessons": 5801}
 
-#: The order groups are dropped to fit a local lane (operator ruling
-#: 2026-11-20): recall/episodic memory first, then lessons. Skills, the project
+#: Drop recall and episodic memory first, then lessons. Skills, the project
 #: group (AGENTS.md / steering) and the crew/seat spec are never trimmed.
 TRIM_ORDER: tuple[str, ...] = ("memory", "lessons")
 
@@ -133,18 +109,15 @@ KEPT_CONTEXT_TOKENS = INJECTED_CONTEXT_TOKENS - sum(CONTEXT_GROUP_TOKENS.values(
 #: What the lean helper contract (:data:`LOCAL_HELPER_CONTRACT`) saves over the
 #: shipped Kiro Crew contract (``config/prompt.md``) in the ``[AGENT SYSTEM
 #: PROMPT]`` block: 7,152 tokens for the shipped contract's block on the
-#: 2026-11-20 helper run against 190 for this one (qwen-fast count), less the
+#: measured helper run against 190 for this one, less the
 #: 127 tokens of the five safety lines added the same day.
 LEAN_CONTRACT_SAVED_TOKENS = 6835
 
-#: Output tokens each local seat reserves per request
-#: (``CLAUDE_CODE_MAX_OUTPUT_TOKENS`` on ``local-background`` and
-#: ``local-fleet`` in the engine map); the router admits input + reserve
-#: against the lane window, so the reserve comes off the input budget.
+#: Output tokens reserved per request. The router admits input plus reserve
+#: against the lane window.
 LOCAL_OUTPUT_RESERVE_TOKENS = 8192
 
-#: The window each role serves when ``health.local.ctx`` has no live reading:
-#: qwen-fast on the CPU lane, the Noda agent lane.
+#: Defaults for seats without a live or declared context window.
 LOCAL_CTX_FALLBACK: dict[str, int] = {"subagent": 32768, "agent": 131072}
 
 _ALL_GROUPS = frozenset({"memory", "lessons", "project"})
@@ -341,8 +314,7 @@ def apply_trim(info: Any, drop: list[str] | tuple[str, ...]) -> None:
 LEAN_CONTRACT_ROLES: frozenset[str] = frozenset({"subagent"})
 
 #: The built-in tools a lean helper keeps: what a coding helper needs. Grep and
-#: Glob stay (operator ruling 2026-11-20): searching code is how an agent finds
-#: what to read, and their 1,567 tokens of schema are worth that.
+#: Glob let the helper find the files it needs to read.
 LOCAL_HELPER_TOOLS: tuple[str, ...] = ("Bash", "Read", "Edit", "Write", "Grep", "Glob")
 
 #: The Claude Code setting tiers a lean helper loads: the project's, as every

@@ -1,8 +1,7 @@
 """The one rule set for subscription quota: when a vendor is "low" and when it is "out".
 
-Operator ruling of 2026-11-21: every vendor (Claude, Codex, Antigravity, DeepSeek,
-local) may hold several accounts, and quota is judged the same way for each of
-them, with the thresholds defined in ONE place. The defaults are
+A vendor may hold several accounts. Each account uses the same quota
+thresholds. The defaults are
 ``decisions.quota_limits`` (:data:`kiro_crew.config.sections_decisions.QUOTA_LIMITS_DEFAULT`:
 ``low_pct`` 50, ``out_pct`` 95); this module turns them into verdicts.
 

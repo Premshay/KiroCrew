@@ -1,10 +1,5 @@
 """A dashboard chat turn that failed on its vendor's quota marks that vendor out.
 
-Fork (Nexus), operator ruling of 2026-11-20. 11:19 IST that day chat-2069 hit
-``Antigravity provider fault: status ERROR: Individual quota reached ...`` on
-gemini-4-hydrogen-high; the chat showed the error and nothing else learned from
-it, so the spawns that followed went to the same quota group and failed alike.
-
 :func:`mark_quota_out` is called where a turn's provider failure becomes the
 chat's error (both refusal branches of ``segment_flush`` and the two error arms
 of ``turn_failures``). It writes the same ``vendor_limits`` mark a spawned run
