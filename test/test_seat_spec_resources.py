@@ -25,6 +25,7 @@ from kiro_crew.acp.types import PROVIDER_LABEL_CODEX, PROVIDER_LABEL_KAS
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_GOOSE,
     ACP_BACKEND_OPENCODE,
 )
 from kiro_crew.agent_sdk.capabilities import capabilities_for
@@ -284,16 +285,17 @@ def _notice(home, backend) -> list[str]:
     return seen
 
 
-@pytest.mark.parametrize("backend", [ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX])
+@pytest.mark.parametrize("backend", [ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_OPENCODE])
 def test_the_notice_leaves_out_absolute_entries_where_they_load(home, guide, backend):
     _write_seat(home, ["file://.kiro/steering/**/*.md", f"file://{guide}"])
     (notice,) = _notice(home, backend)
     assert "(file://.kiro/steering/**/*.md)" in notice
+    assert "file:///" not in notice
 
 
 def test_the_notice_still_names_absolute_entries_where_nothing_loads_them(home, guide):
     _write_seat(home, [f"file://{guide}"])
-    (notice,) = _notice(home, ACP_BACKEND_OPENCODE)
+    (notice,) = _notice(home, ACP_BACKEND_GOOSE)
     assert "(file:///" in notice
 
 
