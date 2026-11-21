@@ -176,8 +176,7 @@ def _normalize_model_key(name: str) -> str:
        advertised dashed ``claude-opus-4-8`` (200K, ``opus-4.8``) does NOT fold
        onto dotted ``claude-opus-4.8`` (1M, ``opus-4.8-1m``); a bare
        ``.``->``-`` fold conflates those two different-window models.
-    3. Fallback for an id the registry does not list (GPT/DeepSeek/Qwen, future
-       models, operator-typed ids): a lossless fold -- lowercase,
+    3. Fallback for unregistered model IDs: a lossless fold -- lowercase,
        ``.``->``-`` -- so behavior is identity-preserving off the registered set,
        matching ``from_provider_id``'s pass-through contract.
     """

@@ -1,8 +1,7 @@
 """Subscription headroom per vendor, from the signals each harness already emits.
 
 ``spawn.route`` (``decisions/points/spawn_route.py``) skips a vendor near or past
-its window before a spawn fails on it (POLICY.md, operator ruling of 2026-11-20).
-Every vendor is read the same way (operator ruling of 2026-11-21):
+its window before a spawn fails on it. Each reader follows the same contract:
 
 1. its reader fills ONE normalized shape (:mod:`kiro_crew.quota_rules`): vendor ->
    accounts -> windows or models -> ``{used_pct, resets_at, as_of, status}``;

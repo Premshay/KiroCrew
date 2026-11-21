@@ -12,9 +12,7 @@ models each vendor's adapter ADVERTISES, sorted by the operator's family rule
 sonnet/terra/flash/hydrogen/neon, mini haiku/luna/flash), and
 ``decisions.spawn_route`` may override a tier with explicit ids.
 
-Since the operator ruling of 2026-11-20 (nexus ``eval/decision-lane/POLICY.md``)
-the candidates span every vendor this host can run a child on, not only the
-parent's: a candidate of another vendor carries the ``backend`` that runs it --
+A candidate of another vendor carries the ``backend`` that runs it --
 a companion execution seat (``execution_seats.declared_execution_seats``) or a
 native ACP backend -- and the child keeps the parent's crew and memory identity,
 because an execution seat changes the transport, not the memory owner (fork
@@ -267,7 +265,7 @@ FAMILY_TIERS: dict[str, dict[str, tuple[str, ...]]] = {
 }
 
 #: Families never offered for a vendor, whatever the adapter advertises or the
-#: owner pins (operator ruling 2026-11-20: Antigravity Argon is dropped).
+#: owner pins.
 DROPPED_FAMILIES: dict[str, tuple[str, ...]] = {"antigravity": ("argon",)}
 
 
@@ -749,7 +747,7 @@ def drop_quota_outs(
     A quota mark is a run's own proof that the vendor (or, for Antigravity, the
     model's group) refused work until its reset, so it is a hard filter, not a
     hint for the oracle: an offered candidate that is known out would be
-    answered and fail again (quota fall-through, operator ruling 2026-11-20).
+    picked and fail again.
     """
     excluded = set(exclude_vendors)
     kept: list[dict[str, str]] = []
