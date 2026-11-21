@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -25,6 +26,16 @@ from kiro_crew import crew_mode
 sys.path.insert(0, str(Path(__file__).parent))
 
 from mcp_dashboard_folders_helpers import _FOLDERS, _call, _writes  # noqa: E402
+from redaction_structured_cases import github_classic  # noqa: E402
+
+
+def _yielding(serialize):
+    """The state's ``serialize_slots_yielding`` over a stub's synchronous rows."""
+
+    async def serialize_slots_yielding(**kwargs):
+        return serialize(**kwargs)
+
+    return serialize_slots_yielding
 
 
 @pytest.fixture(autouse=True)
@@ -38,10 +49,10 @@ def _reset_crew_mode_agent(_floor_monkeypatch):
 # ── the config key ─────────────────────────────────────────────────────────────
 
 
-def test_crew_mode_agent_defaults_to_the_team_lead():
+def test_crew_mode_agent_defaults_to_the_conductor():
     from kiro_crew.config.loader_builders import _build_agent_config
 
-    assert _build_agent_config({}).crew_mode_agent == "kirocrew-team-lead"
+    assert _build_agent_config({}).crew_mode_agent == "kirocrew-conductor"
 
 
 def test_crew_mode_agent_is_read_from_its_one_key():
@@ -54,7 +65,7 @@ def test_crew_mode_agent_is_read_from_its_one_key():
 def test_an_unusable_crew_mode_agent_falls_back_to_the_conductor(value):
     from kiro_crew.config.loader_builders import _build_agent_config
 
-    assert _build_agent_config({"crew_mode_agent": value}).crew_mode_agent == "kirocrew-team-lead"
+    assert _build_agent_config({"crew_mode_agent": value}).crew_mode_agent == "kirocrew-conductor"
 
 
 def test_swapping_the_key_swaps_the_conductor_and_joins_the_family():
@@ -331,6 +342,7 @@ async def _slots_get(monkeypatch, query: str = "", internal: bool = False) -> li
         slot_list_held_keys=lambda: [],
         slot_list_hold_channels=lambda: False,
         serialize_slots=lambda **_k: [dict(p) for p in payloads],
+        serialize_slots_yielding=_yielding(lambda **_k: [dict(p) for p in payloads]),
     )
 
     async def _noop():
@@ -506,6 +518,7 @@ def _state(rows: list[dict[str, Any]], live: dict[str, Any] | None = None) -> An
     live = live or {}
     return SimpleNamespace(
         serialize_slots=serialize_slots,
+        serialize_slots_yielding=_yielding(serialize_slots),
         slot_list_held_keys=lambda: [],
         slot_list_hold_channels=lambda: False,
         get_slot=lambda key: live.get(key),
@@ -579,6 +592,44 @@ async def test_the_worker_list_is_the_roots_tree_with_status_and_item(_open_gate
 
 
 @pytest.mark.asyncio
+async def test_a_worker_with_running_subagents_stays_working(_open_gate):
+    tree = [
+        _row("root", agent="kirocrew-conductor"),
+        _row("w1", created_by="root", subagents_running=True),
+    ]
+    resp = await _open_gate.api_crew_workers(
+        _req("GET", "/api/chat/slots/root/crew-workers", _state(tree), {"slot": "root"})
+    )
+    worker = json.loads(resp.text)["workers"][0]
+    assert worker["status"] == "working"
+    assert worker["group"] == "working"
+
+
+@pytest.mark.asyncio
+async def test_a_worker_with_a_running_workflow_stays_working(_open_gate):
+    tree = [
+        _row("root", agent="kirocrew-conductor"),
+        _row("w1", created_by="root"),
+    ]
+    live = SimpleNamespace(key="w1", linked_session_key="", running=False)
+    state = _state(tree, {"w1": live})
+    state.subagents = None
+    state.workflow_service = SimpleNamespace(
+        registry=SimpleNamespace(has_pending_work_for=lambda key: key == "dashboard:w1")
+    )
+    resp = await _open_gate.api_crew_workers(
+        _req("GET", "/api/chat/slots/root/crew-workers", state, {"slot": "root"})
+    )
+    worker = json.loads(resp.text)["workers"][0]
+    assert worker["status"] == "working"
+    assert worker["group"] == "working"
+    # Whether a report still asks the person is the Board's `awaits_person`, so
+    # the list carries neither an activity list nor a turn flag.
+    assert "activity" not in worker
+    assert "turn_running" not in worker
+
+
+@pytest.mark.asyncio
 async def test_each_row_says_where_its_worker_runs(_open_gate, monkeypatch):
     """A local worker carries no ``remote_crew`` (the page says "This machine"); a
     worker remote dispatch placed on a crew is listed, named by the registry,
@@ -612,8 +663,10 @@ async def test_each_row_says_where_its_worker_runs(_open_gate, monkeypatch):
             key("it_x"): remote("it_x", "inst-1", "Cancelled", terminal=True),
         },
     )
+    # "running" counts only from a crew pulled recently, so the working row is one.
+    fresh = {"crew_state": "connected", "ingested_at": datetime.now(timezone.utc).isoformat()}
     stored = {
-        "it_r": work_ledger.RemoteState(running=True),
+        "it_r": work_ledger.RemoteState(running=True, **fresh),
         "it_a": work_ledger.RemoteState(running=True, pending_approval=True),
         "it_x": work_ledger.RemoteState(running=True),
     }
@@ -908,7 +961,7 @@ def test_the_routes_are_registered_under_the_slot():
         "/api/chat/slots/{slot}/crew-workers/{worker}/approve": ["POST"],
         # A session's in-place recap on the crewmate Sessions tab.
         "/api/chat/slots/{slot}/crew-workers/{worker}/recap": ["GET"],
-        # Ultra Mode Pause all / Resume all.
+        # Conductor mode Pause all / Resume all.
         "/api/chat/slots/{slot}/crew-workers/pause": ["POST"],
         "/api/chat/slots/{slot}/crew-workers/resume": ["POST"],
     }
@@ -984,25 +1037,25 @@ async def test_the_board_is_adopted_for_a_swapped_in_conductor(monkeypatch):
     assert adopted == ["root"]
 
 
-# A fake AWS key id, split so no scanner reads it as a real one.
-_FAKE_KEY = "AKIA" + "ABCDEFGHIJKLMNOP"
+# A synthetic GitHub classic token with a valid checksum, which the plan redacts.
+_FAKE_KEY = github_classic(seed=41)
 
 
 def test_a_long_last_reply_is_redacted_before_it_is_cut():
     from kiro_crew.dashboard.handlers import crew_workers
 
-    secret = "AKIA" + "Q" * 16
-    text = "x" * 140 + " **AKIA**" + secret[4:] + " done"
+    secret = github_classic(seed=42)
+    text = "x" * 140 + " " + secret + " done"
     slot = SimpleNamespace(messages=[{"role": "assistant", "content": text}])
     seed = "[sent by session c via session_send] go"
     line = crew_workers._worker_line({"last_message": seed}, "", slot)
-    assert "Q" * 8 not in line
+    assert secret[4:12] not in line
 
 
 def test_a_last_reply_standing_in_for_a_seed_is_redacted():
     from kiro_crew.dashboard.handlers import crew_workers
 
-    secret = "AKIA" + "Z" * 16
+    secret = github_classic(seed=43)
     slot = SimpleNamespace(messages=[{"role": "assistant", "content": f"key {secret} saved"}])
     seed = "[sent by session c via session_send] go"
     line = crew_workers._worker_line({"last_message": seed}, "", slot)

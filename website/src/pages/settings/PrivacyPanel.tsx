@@ -1,16 +1,16 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { SlidersHorizontal } from 'lucide-react'
 import { api, ApiError } from '../../api/client'
-import { Card, CardTitle } from '../../components/ui'
-import { SettingsToggle } from '../../components/settings'
+import { SettingsCard, SettingsSection, SettingsToggle } from '../../components/settings'
 import ErrorNotice from '../../components/ErrorNotice'
 import {
   PrivacyCommandList,
   PrivacyDisclosureSections,
   TelemetryToggle,
 } from '../../components/PrivacyDisclosure'
+import { isKiroTelemetryRow } from '../../components/privacyNotice'
 import { i18nT } from '../../i18n/t'
 import { fmtList } from '../../i18n/format'
+import { useViewerIsNotOwner } from '../../hooks/sharedCrew/useSharedCrew'
 
 /** GET /api/telemetry/collection */
 interface CollectionStatus {
@@ -22,6 +22,10 @@ interface CollectionStatus {
   overlay_override?: boolean
   /** An OTLP destination is configured, so enabling here would also export. */
   otlp_configured?: boolean
+  /** A configured destination is sent to only after an explicit opt-in to recording. */
+  export_permitted?: boolean
+  /** Turning recording on is refused (409): it would also export to an operator's destination. */
+  enable_refused?: boolean
   /** Each of those destinations by name (never its URL), in export order. */
   otlp_destinations?: OtlpDestinationRow[]
   metrics_dir?: string
@@ -87,12 +91,26 @@ function MetricRecordingToggle() {
   const envPinned = !!statusQ.data?.env_pinned
   const overlayPinned = !!statusQ.data?.overlay_override
   const otlpConfigured = !!statusQ.data?.otlp_configured
+  // While recording is off, turning it on (in config.json, as the note says)
+  // would start export, so describe it as exporting. While it is on, export
+  // still waits for an explicit opt-in. Absent reads as permitted: a disclosure
+  // errs toward "sent".
   const destinations = statusQ.data?.otlp_destinations ?? []
+  // The build's Kiro telemetry destination needs no opt-in: recording on sends to
+  // it. Every other destination still waits for one (`export_permitted`), so the
+  // two are disclosed apart. An empty list (posture unknown) counts as other.
+  const kiroListed = destinations.some(isKiroTelemetryRow)
+  const otherListed = destinations.length === 0 || destinations.some(row => !isKiroTelemetryRow(row))
+  const otherExporting = otherListed && (!enabled || statusQ.data?.export_permitted !== false)
+  const otlpExporting = otlpConfigured && (otherExporting || kiroListed)
   // A configured egress endpoint pins the ENABLE direction only. Turning recording
   // OFF is exactly what a user on such a host most needs — the config route allows
   // it for that reason — so disabling the whole control here would strand them with
   // export running and no way to stop it.
-  const pinned = envPinned || overlayPinned || (otlpConfigured && !enabled)
+  // The build's own Kiro telemetry destination does not pin it: the privacy
+  // notice names it, so the server accepts the write (`enable_refused`).
+  const enableRefused = statusQ.data?.enable_refused ?? otlpConfigured
+  const pinned = envPinned || overlayPinned || (enableRefused && !enabled)
   // Two independent notes, not one priority chain: a pin reason and the egress
   // fact answer different questions ("why can't I change this" vs "where do my
   // metrics go"), and collapsing them let an env pin hide the fact that metrics
@@ -132,7 +150,7 @@ function MetricRecordingToggle() {
         description={
           // Never claim locality on a host that exports: the description is the
           // full-weight line a skimming user reads before flipping the switch.
-          otlpConfigured
+          otlpExporting
             ? i18nT('pages.settings.privacyPanel.recordMetricsDescriptionExporting')
             : i18nT('pages.settings.privacyPanel.recordMetricsDescription')
         }
@@ -175,8 +193,24 @@ function MetricRecordingToggle() {
               the dynamic-keys ratchet exists to stop, and it would make the string
               invisible to the key-reference gate. */}
           {enabled
-            ? i18nT('pages.settings.privacyPanel.recordMetricsEgressOn')
-            : i18nT('pages.settings.privacyPanel.recordMetricsEgressOff')}
+            ? otherListed
+              ? otherExporting
+                ? i18nT('pages.settings.privacyPanel.recordMetricsEgressOn')
+                : kiroListed
+                  // Beside the Kiro line below: name only the user's own collectors.
+                  ? i18nT('pages.settings.privacyPanel.recordMetricsEgressWaitingOwn')
+                  : i18nT('pages.settings.privacyPanel.recordMetricsEgressWaiting')
+              : i18nT('pages.settings.privacyPanel.recordMetricsEgressKiroOn')
+            : enableRefused
+              ? i18nT('pages.settings.privacyPanel.recordMetricsEgressOff')
+              : i18nT('pages.settings.privacyPanel.recordMetricsEgressOffBuiltin')}
+          {/* Beside a waiting collector of the user's own, the build's Kiro
+              telemetry still gets metrics, so say that on its own line. */}
+          {enabled && otherListed && !otherExporting && kiroListed && (
+            <span className="block mt-1">
+              {i18nT('pages.settings.privacyPanel.recordMetricsEgressKiroOn')}
+            </span>
+          )}
           {/* Every destination by name, so a build's own collector is named next
               to the operator's: the egress fact is incomplete without where. */}
           {destinations.length > 0 && (
@@ -203,26 +237,28 @@ function MetricRecordingToggle() {
   )
 }
 
-/** Durable disclosure surface. This page explains controls and offers the
- * in-product opt-out, but does not ask for consent or gate use of the
- * application.
+/**
+ * Settings > Privacy, laid out like Settings > Browser: the switches first, each
+ * with one line saying what it does, then everything else under a collapsed
+ * Details section (what is sent, what never is, what stays local, the command
+ * line). No title of its own: the Settings shell renders the page title and
+ * description (`privacyDisclosure.settingsLabel` / `settingsDescription`).
  *
- * The disclosure copy, the toggle, and the command list live in
- * `components/PrivacyDisclosure.tsx` because the onboarding privacy step renders
- * the same three pieces — single-sourcing them is what keeps the first-run
- * explanation and this durable panel from drifting apart. */
+ * The page explains the switches and offers the opt-out; it never asks for
+ * consent or gates use of the application.
+ */
 export function PrivacyPanel() {
+  // The same query the Record metrics switch reads (deduplicated by key), so the
+  // Details section shows the Kiro telemetry row only on a build that lists it.
+  const statusQ = useQuery<CollectionStatus>({
+    queryKey: ['telemetryCollection'],
+    queryFn: () => api.collectionStatus(),
+  })
+  const kiroTelemetry = (statusQ.data?.otlp_destinations ?? []).some(isKiroTelemetryRow)
+  const { notOwner } = useViewerIsNotOwner()
   return (
     <div aria-label={i18nT('privacyDisclosure.settingsLabel')}>
-      <Card>
-        <PrivacyDisclosureSections />
-      </Card>
-
-      <Card>
-        <CardTitle>
-          <SlidersHorizontal className="lucide-inline" aria-hidden="true" />
-          {i18nT('privacyDisclosure.controlsTitle')}
-        </CardTitle>
+      <SettingsCard>
         <TelemetryToggle
           renderControl={({ checked, onChange, disabled }) => (
             <SettingsToggle
@@ -235,15 +271,15 @@ export function PrivacyPanel() {
             />
           )}
         />
-        {/* Recording is a separate decision from the heartbeat: this one never
-            leaves the machine, so it sits below the egress control rather than
-            being folded into it. */}
         <MetricRecordingToggle />
-        <p className="text-sm text-muted leading-relaxed mt-4 mb-3">
-          {i18nT('privacyDisclosure.controlsBody')}
-        </p>
-        <PrivacyCommandList />
-      </Card>
+      </SettingsCard>
+
+      <SettingsSection title={i18nT('privacyDisclosure.detailsTitle')} collapsible>
+        <SettingsCard>
+          <PrivacyDisclosureSections shared={notOwner} kiroTelemetry={kiroTelemetry} />
+          <PrivacyCommandList />
+        </SettingsCard>
+      </SettingsSection>
     </div>
   )
 }

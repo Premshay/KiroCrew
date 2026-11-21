@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security.exfil import redact_flagged_urls
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.state_parts.chat_slot import _ChatSlot
@@ -42,7 +43,7 @@ def _checkpoint_text(value: object, limit: int) -> str:
 
     if not isinstance(value, str):
         return ""
-    text = sanitize_string(value)
+    text = redact_flagged_urls(sanitize_string(value))
     text, _ = redact_exfiltration_urls(text)
     text, _ = redact_credentials(text)
     return text[:limit]

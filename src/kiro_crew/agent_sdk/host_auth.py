@@ -61,9 +61,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Dict, FrozenSet, Mapping, Optional, Protocol, Tuple, runtime_checkable
+from typing import Any, Dict, FrozenSet, Mapping, Optional, Protocol, Tuple, runtime_checkable
 
 from kiro_crew.agent_sdk.backends import (
+    ACP_BACKEND_ANTIGRAVITY,
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
     ACP_BACKEND_COPILOT,
@@ -182,12 +183,14 @@ class AgentAuthDeclaration:
     #: EXFILTRATION -- a shell the model spawns inside the harness can read the file
     #: and send the secret somewhere. That is a real residual risk and it is carried
     #: knowingly, because the alternative is a harness that cannot sign in at all.
-    #: Four harnesses carry it today -- codex, OpenCode, pi and goose -- and the
-    #: maintainer weighed and accepted this exact trade rather than it being an
-    #: oversight. What bounds it is the subset rule above: the exclusion can only
-    #: re-open a file this same declaration put on the floor, so no harness can reach
-    #: another harness's credential or anything the floor fences for a different
-    #: reason.
+    #: Six harnesses carry it today -- codex, OpenCode, pi, goose, Copilot and
+    #: Antigravity. For codex, OpenCode, pi and goose the maintainer weighed and
+    #: accepted this exact trade rather than it being an oversight. Antigravity
+    #: declares the same exclusion for its own token files, and the maintainer
+    #: accepted it in review when the harness was added. What bounds it is the
+    #: subset rule above: the exclusion can only re-open a file this same
+    #: declaration put on the floor, so no harness can reach another harness's
+    #: credential or anything the floor fences for a different reason.
     #:
     #: It is NOT the only shape an enforced harness can take. A harness declaring
     #: :data:`ENTITLEMENT_HOST_VAULT` is fed its key as an environment variable at
@@ -424,8 +427,8 @@ _KIRO_SIGNED_OUT = (
 # sends the user to kiro-cli. :func:`sign_in_remedy` and :func:`signed_out_message`
 # name the route of the running engine in front of it once a spawn has chosen one.
 # Plain prose (no backticks, no "--") in the remedy: the panel renders it as text.
-# The path names the Kiro Agent row, because the card lives inside that row's detail.
-_KAS_CARD = "Settings → Agent Harness → Kiro Agent → Kiro sign-in"
+# The path names the Kiro account tab, which holds the card on every harness.
+_KAS_CARD = "Settings → Kiro account"
 _KAS_REMEDY = f"Sign in from {_KAS_CARD}, then send your message again."
 _KAS_SIGNED_OUT = f"Not signed in to Kiro. Sign in from {_KAS_CARD}, then send your message again."
 #: The same sign-in as a terminal names it: the command first, because a host
@@ -594,7 +597,8 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
             "checked here: the harness reads them."
         ),
         signed_out_message=(
-            "OpenCode is not signed in. Run `opencode auth login` in a terminal on "
+            "OpenCode has no model provider it can use: none is signed in, or its "
+            "key was refused. Run `opencode auth login` in a terminal on "
             "the gateway host and complete its sign-in, or name a locally served "
             "model in the project's opencode.json, then start a new chat. "
             f"{HOST_TERMINAL_NOTE}"
@@ -604,6 +608,15 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         # is still authenticated.
         host_logout_retires_children=False,
         entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
+        # opencode 1.19.1, driven live against a provider that answers 401, drops
+        # the status and answers ``session/prompt`` with -32603 ``Internal error:
+        # Incorrect API key provided.`` (data ``errorName: "APIError"``, which it
+        # also uses for other provider faults). The phrase is the OpenAI-style
+        # provider's own, relayed verbatim; a provider worded otherwise keeps the
+        # raw text. A signed-out host gives no error at all: opencode starts on its
+        # own hosted model instead, which the start-time model check refuses
+        # (``acp/no_model_provider.py``).
+        signed_out_signature="Incorrect API key provided",
     ),
     AgentAuthDeclaration(
         backend=ACP_BACKEND_GOOSE,
@@ -615,22 +628,35 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         # ``GOOSE_DISABLE_KEYRING`` selects file storage, which the harness itself
         # describes as plain text. The keyring half is fenced by the OS rather than
         # by a path, so a floor can only name this one -- which is the half an
-        # agent's file tools could otherwise read.
-        credential_leaves=(".config/goose/secrets.yaml",),
+        # agent's file tools could otherwise read. On Windows goose keeps the same
+        # file in ``%APPDATA%\Block\goose\config`` instead (its ``etcetera`` app
+        # strategy, which reads no XDG variable there; read from goose's source,
+        # not measured on a Windows host), so that folder's default under the home
+        # is the second leaf.
+        credential_leaves=(
+            ".config/goose/secrets.yaml",
+            "AppData/Roaming/Block/goose/config/secrets.yaml",
+        ),
         # Only the CONFIG home, because on this harness that IS where the secret
         # store lives -- the inverse of the opencode declaration above, whose token
         # sits under the data home and whose config home is therefore deliberately
         # absent. The data and state homes are excluded here for that same reason:
         # they hold this harness's session database and logs, and anchoring a
-        # credential on them would fence files that carry no secret.
-        home_override_env_vars=("XDG_CONFIG_HOME",),
-        # ``XDG_CONFIG_HOME`` replaces ``.config``, not the leaf's parent, so the
-        # relocated file keeps both remaining segments.
-        override_relative_leaves=("goose/secrets.yaml",),
+        # credential on them would fence files that carry no secret. ``APPDATA`` is
+        # the Windows config home. Each leaf is anchored under both variables, so
+        # each also gains one target under the other platform's root that goose
+        # never writes; a fence on an empty path refuses nothing anyone reads.
+        home_override_env_vars=("XDG_CONFIG_HOME", "APPDATA"),
+        # ``XDG_CONFIG_HOME`` replaces ``.config`` and ``APPDATA`` replaces
+        # ``AppData/Roaming``, not the leaf's parent, so each relocated file keeps
+        # the segments after its root.
+        override_relative_leaves=("goose/secrets.yaml", "Block/goose/config/secrets.yaml"),
         # The one leaf the mask must spare: this harness is enforced, so the mask
         # denies it the whole credential floor, and it resolves its own provider
         # secret from this file. The read gate still refuses the same leaf to the
-        # AGENT's file tools, so the two controls cover different readers.
+        # AGENT's file tools, so the two controls cover different readers. The
+        # Windows leaf is not spared: a goose session is refused on native Windows,
+        # where no OS sandbox applies the mask (``agent_sdk.tool_gate``).
         adapter_own_leaves=(".config/goose/secrets.yaml",),
         # Action only, and no state, because for this harness there may be no state
         # to assert: a model served locally on the operator's own machine needs no
@@ -894,6 +920,48 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         host_logout_retires_children=False,
         entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
     ),
+    AgentAuthDeclaration(
+        backend=ACP_BACKEND_ANTIGRAVITY,
+        # The standalone ACP runtime owns authentication and keeps both consumer
+        # and Gemini Enterprise tokens under its private profile. On macOS it also
+        # mirrors them into the login keychain under the ``antigravity-acp`` and
+        # ``antigravity-acp-business`` accounts; the file forms are the readable
+        # leaves that belong on Crew's credential floor. Its 1.4.4 settings loader
+        # states that ``settings.json`` holds only ``auth.type`` and
+        # ``gcp.project``/``gcp.location``; credentials are never written there.
+        # API-key auth reads ``GEMINI_API_KEY`` from the launch environment.
+        credential_leaves=(
+            ".gemini/antigravity-acp/acp_token.json",
+            ".gemini/antigravity-acp/acp_business_token.json",
+        ),
+        home_override_env_vars=("GEMINI_HOME",),
+        override_relative_leaves=(
+            "antigravity-acp/acp_token.json",
+            "antigravity-acp/acp_business_token.json",
+        ),
+        # This runtime authenticates itself from those files, so its child is the
+        # same trust carve-out as the other enforced FILE-authenticated harnesses.
+        adapter_own_leaves=(
+            ".gemini/antigravity-acp/acp_token.json",
+            ".gemini/antigravity-acp/acp_business_token.json",
+        ),
+        sign_in_remedy=(
+            "Google Antigravity ACP signs in on its own. In a terminal on the gateway "
+            "host, set auth.type to oauth-personal in "
+            "$GEMINI_HOME/antigravity-acp/settings.json and start a new chat; the "
+            f"runtime opens Google sign-in in the browser. {HOST_TERMINAL_NOTE} Kiro "
+            "Crew verifies Google Antigravity ACP 1.4.4 only and refuses other versions."
+        ),
+        signed_out_message=(
+            "Google Antigravity ACP is not signed in. In a terminal on the gateway host, "
+            "set auth.type to `oauth-personal` in "
+            "`~/.gemini/antigravity-acp/settings.json`, then start a new chat to open "
+            f"Google sign-in. {HOST_TERMINAL_NOTE}"
+        ),
+        signed_out_signature="No authentication method selected",
+        host_logout_retires_children=False,
+        entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
+    ),
 )
 
 
@@ -1022,36 +1090,44 @@ def _with_spawn_login_command(
     return text.replace(KIRO_CLI_LOGIN_COMMAND, command)
 
 
-def _with_kas_route(backend: str, text: str, *, quoted: bool) -> str:
+#: ``route`` left unset: the caller holds no runtime, so the process-wide last
+#: spawn is the best evidence of the engine.
+_LAST_SPAWN: Any = object()
+
+
+def _with_kas_route(backend: str, text: str, *, quoted: bool, route: Any = _LAST_SPAWN) -> str:
     """*text*, led by the route the running KAS engine took, for a KAS message.
 
-    The route is the one the last KAS spawn in this process recorded
-    (``acp.kas_route.last_spawn_route``), so the message names the engine that
-    answered, and nothing is said before any spawn chose one. A plain read of a
-    module slot: no file or network IO, so a message raised on the event loop
-    stays cheap.
+    *route* is the failing runtime's own (``AcpRuntime.kas_spawn_route``) when the
+    caller holds one, so a second chat spawning on another route between this
+    runtime's spawn and its error cannot change what the message says. Unset, it
+    is the one the last KAS spawn in this process recorded
+    (``acp.kas_route.last_spawn_route``). ``None`` names no route, as before any
+    spawn chose one. A plain read of a module slot: no file or network IO, so a
+    message raised on the event loop stays cheap.
     """
-    route = None
     if backend == ACP_BACKEND_KAS:
-        # Read from ``sys.modules``, never imported here: importing it would load
-        # the whole ACP package into callers that only want a string, and a
-        # process that never loaded it has spawned no KAS engine to name.
-        import sys
+        if route is _LAST_SPAWN:
+            # Read from ``sys.modules``, never imported here: importing it would
+            # load the whole ACP package into callers that only want a string, and
+            # a process that never loaded it has spawned no KAS engine to name.
+            import sys
 
-        kas_route = sys.modules.get("kiro_crew.acp.kas_route")
-        route = kas_route.last_spawn_route() if kas_route is not None else None
-        if route is not None and route.reason == "kiro_cli_launcher":  # REASON_KIRO_CLI_LAUNCHER
-            # A relay pinned to kiro-cli's launcher: only kiro-cli's own sign-in
-            # starts it, so that is the remedy. *quoted* is the message form; the
-            # panel renders the remedy as plain text.
-            command = f"`{KIRO_CLI_LOGIN_COMMAND}`" if quoted else KIRO_CLI_LOGIN_COMMAND
-            if route.crew_auth:
-                # Crew's vault answers the engine too: either sign-in can be the
-                # one that failed, so both remedies are named.
-                return f"{route.describe()}. Run {command} in your terminal, or: {text}"
-            return (
-                f"{route.describe()}. Run {command} in your terminal, then send your message again."
-            )
+            kas_route = sys.modules.get("kiro_crew.acp.kas_route")
+            route = kas_route.last_spawn_route() if kas_route is not None else None
+    else:
+        # Only a KAS message names a KAS route.
+        route = None
+    if route is not None and route.reason == "kiro_cli_launcher":  # REASON_KIRO_CLI_LAUNCHER
+        # A relay pinned to kiro-cli's launcher: only kiro-cli's own sign-in
+        # starts it, so that is the remedy. *quoted* is the message form; the
+        # panel renders the remedy as plain text.
+        command = f"`{KIRO_CLI_LOGIN_COMMAND}`" if quoted else KIRO_CLI_LOGIN_COMMAND
+        if route.crew_auth:
+            # Crew's vault answers the engine too: either sign-in can be the
+            # one that failed, so both remedies are named.
+            return f"{route.describe()}. Run {command} in your terminal, or: {text}"
+        return f"{route.describe()}. Run {command} in your terminal, then send your message again."
     return text if route is None else f"{route.describe()}. {text}"
 
 
@@ -1109,18 +1185,22 @@ def signed_out_message(
     backend: str,
     environ: Optional[Mapping[str, str]] = None,
     platform_name: Optional[str] = None,
+    *,
+    route: Any = _LAST_SPAWN,
 ) -> str:
     """The message for *backend* when the host has evidence it is signed out.
 
     Only for a caller holding that evidence -- the harness's own stderr, or the
     host identity store this core can read. Everywhere else,
     :func:`sign_in_remedy` is the honest string. The kiro-cli command it names is
-    the one runnable here, as in :func:`sign_in_remedy`.
+    the one runnable here, as in :func:`sign_in_remedy`. A caller holding the
+    failing runtime passes its ``kas_spawn_route`` as *route*, so the KAS message
+    names that runtime's engine (:func:`_with_kas_route`).
     """
     declaration = declaration_for(backend)
     return _with_spawn_login_command(
         declaration,
-        _with_kas_route(backend, declaration.signed_out_message, quoted=True),
+        _with_kas_route(backend, declaration.signed_out_message, quoted=True, route=route),
         environ,
         platform_name,
     )
@@ -1137,25 +1217,75 @@ def for_terminal(text: str) -> str:
     return text.replace(f"Sign in from {_KAS_CARD}", KAS_TERMINAL_SIGN_IN)
 
 
-def kas_signed_out_route(text: str) -> Optional[str]:
-    """The route a KAS signed-out sentence names, for a translated copy of it.
+def _leads_with(text: str, sentence: str) -> bool:
+    """Whether *text* is *sentence*, alone or followed by more text after a space."""
+    return text == sentence or text.startswith(f"{sentence} ")
 
-    ``""`` for the bare sentence (no spawn has chosen a route), the route's name
-    (``"relay"`` or ``"bundle"``) for the sentence led by the route the last spawn
-    took, and ``None`` for anything else: the launcher form that names
-    ``kiro-cli login``, any other wording, or a route that changed since the
-    sentence was written. ``None`` keeps the English, so a translation never says
-    something the sentence did not.
+
+#: :func:`kas_sentence_route` for text that is no KAS signed-out sentence.
+NOT_A_KAS_SENTENCE: Any = object()
+
+
+def kas_sentence_route(text: str) -> Any:
+    """The route a KAS signed-out sentence was written for, read from the sentence.
+
+    The ``KasRoute`` whose :func:`signed_out_message` leads *text*, ``None`` for the
+    bare sentence (written with no route), and :data:`NOT_A_KAS_SENTENCE` for any
+    other text. Read from the sentence, never from the process-wide last spawn:
+    the sentence names the route of the runtime that failed, and a second chat
+    spawning on another route before the row is drawn would otherwise make the
+    row disagree with its own text.
+
+    The sentence may be followed by more text after a space: the ACP error
+    formatter appends its model-switch note and a request id.
     """
-    if text == _KAS_SIGNED_OUT:
-        return ""
-    if text != signed_out_message(ACP_BACKEND_KAS):
+    if _leads_with(text, _KAS_SIGNED_OUT):
         return None
     import sys
 
+    # A route-led sentence was written by a process that loaded this module to
+    # spawn the engine it names; one that never loaded it wrote the bare sentence.
     kas_route = sys.modules.get("kiro_crew.acp.kas_route")
-    route = kas_route.last_spawn_route() if kas_route is not None else None
-    if route is None or route.reason == "kiro_cli_launcher":
+    if kas_route is None:
+        return NOT_A_KAS_SENTENCE
+    # Every route a spawn records (``KasHarness.resolve_spawn``). A reason added
+    # later and not listed reads as no KAS sentence, which keeps the English.
+    candidates = [
+        kas_route.RELAY,
+        kas_route.KasRoute(bundle=False, reason=kas_route.REASON_KIRO_CLI_LAUNCHER),
+        kas_route.KasRoute(bundle=False, reason=kas_route.REASON_KIRO_CLI_LAUNCHER, crew_auth=True),
+    ] + [
+        kas_route.KasRoute(bundle=True, reason=reason)
+        for reason in (
+            "",
+            kas_route.REASON_CONFIGURED,
+            kas_route.REASON_NO_KIRO_CLI,
+            kas_route.REASON_KIRO_CLI_SIGNED_OUT,
+            kas_route.REASON_SHARING_PREVIEW,
+            kas_route.REASON_BUILD_DEFAULT,
+        )
+    ]
+    for route in candidates:
+        if _leads_with(text, signed_out_message(ACP_BACKEND_KAS, route=route)):
+            return route
+    return NOT_A_KAS_SENTENCE
+
+
+def kas_signed_out_route(text: str) -> Optional[str]:
+    """The route a KAS signed-out sentence names, for a translated copy of it.
+
+    ``""`` for the bare sentence (no spawn had chosen a route), the route's name
+    (``"relay"`` or ``"bundle"``) for the sentence led by a route, and ``None`` for
+    anything else: the launcher form that names ``kiro-cli login``, or any other
+    wording. ``None`` keeps the English, so a translation never says something the
+    sentence did not. The route is the sentence's own (:func:`kas_sentence_route`).
+    The translated copy drops any tail after the sentence; the row's own text
+    keeps it.
+    """
+    route = kas_sentence_route(text)
+    if route is None:
+        return ""
+    if route is NOT_A_KAS_SENTENCE or route.reason == "kiro_cli_launcher":
         return None
     return route.name
 

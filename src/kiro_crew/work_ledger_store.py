@@ -17,9 +17,11 @@ import json
 import os
 import re
 import secrets
+import stat
 import threading
 from collections import OrderedDict
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -42,6 +44,7 @@ from kiro_crew.work_ledger_records import (
     WorkLedgerError,
     _now_iso,
     logger,
+    parse_stamp,
 )
 from kiro_crew.work_vocab import work_event_id
 
@@ -120,13 +123,96 @@ def _slot_key_is_shaped(slot_key: str) -> bool:
     return bool(slot_key) and "\0" not in slot_key and "/" not in slot_key and "\\" not in slot_key
 
 
+#: The last answer :func:`resolved_within` gave per ``(base, name)``, with what one
+#: ``lstat`` found: the leaf's ``(st_dev, st_ino)``, or ``None`` for an absent leaf kept
+#: beside its parent's. A board read builds a store path per item (event tail) and an
+#: undelivered-record path per open item, and each full resolve is one ``lstat`` per path
+#: component, every one a GIL hand-off on a busy gateway. A hit costs one ``lstat``, two
+#: for an absent leaf.
+#:
+#: A hit needs the leaf to still be the same object the full resolve proved contained:
+#: not a link, same ``(st_dev, st_ino)``. A link swapped in at the leaf, or a different
+#: object moved there, misses and goes through :func:`resolved_within` again, which
+#: refuses an escape. A directory cannot be hard-linked, so a store found by its id is
+#: that store. An absent leaf hits only while it is still absent AND its parent is still
+#: the same non-link directory, so a later create lands in the directory that was proved.
+#:
+#: Only an answer spelled exactly as ``base / name`` is kept: no link anywhere on the
+#: path when it was proved. The ``lstat`` of that spelling then follows any link put
+#: on the path later, so a root repointed at a replacement, or at nothing, reaches a
+#: different object and misses, as the full resolve would.
+#:
+#: shortcut: POSIX only, and only for a link-free data home. Windows ``lstat`` does not
+#: report a junction in ``st_mode``, and a home reached through a link would need its
+#: link chain re-read on every hit, so both take the full resolve every call, as before.
+_Kept = tuple[Path, tuple[int, int] | None, tuple[int, int] | None]
+_RESOLVED_MEMO: OrderedDict[tuple[str, str], _Kept] = OrderedDict()
+_RESOLVED_MEMO_MAX = 4096
+_RESOLVED_MEMO_LOCK = threading.Lock()
+
+
+def _leaf_identity(path: Path) -> tuple[int, int] | None:
+    """``(st_dev, st_ino)`` of a non-link at *path*, or ``None``: absent, a link, no file
+    id, or an ``lstat`` error."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if stat.S_ISLNK(st.st_mode) or not st.st_ino:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _is_absent(path: Path) -> bool:
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _still_holds(kept: _Kept) -> bool:
+    path, leaf, parent = kept
+    if leaf is not None:
+        return _leaf_identity(path) == leaf
+    return _is_absent(path) and _leaf_identity(path.parent) == parent
+
+
+def _contained(base: Path, name: str) -> Path | None:
+    """:func:`resolved_within`, served from :data:`_RESOLVED_MEMO` while its answer holds."""
+    if os.name == "nt":
+        return resolved_within(base, name)
+    key = (str(base), name)
+    with _RESOLVED_MEMO_LOCK:
+        hit = _RESOLVED_MEMO.get(key)
+    if hit is not None:
+        if _still_holds(hit):
+            return hit[0]
+        with _RESOLVED_MEMO_LOCK:
+            _RESOLVED_MEMO.pop(key, None)
+    resolved = resolved_within(base, name)
+    if resolved is None or resolved != base / name:
+        return resolved
+    leaf = _leaf_identity(resolved)
+    parent = _leaf_identity(base) if leaf is None and _is_absent(resolved) else None
+    if leaf is not None or parent is not None:
+        with _RESOLVED_MEMO_LOCK:
+            _RESOLVED_MEMO[key] = (resolved, leaf, parent)
+            _RESOLVED_MEMO.move_to_end(key)
+            while len(_RESOLVED_MEMO) > _RESOLVED_MEMO_MAX:
+                _RESOLVED_MEMO.popitem(last=False)
+    return resolved
+
+
 def conductor_dir(slot_key: str) -> Path:
     """The directory holding *slot_key*'s ledger. Does not create it."""
     if not _slot_key_is_shaped(slot_key):
         raise WorkLedgerError(
             f"invalid slot key for work ledger: {slot_key!r}", code=CODE_INVALID_VALUE
         )
-    resolved = resolved_within(_work_ledger_root(), _store_name(slot_key))
+    resolved = _contained(_work_ledger_root(), _store_name(slot_key))
     if resolved is None:
         raise WorkLedgerError(
             f"path traversal blocked for slot key: {slot_key!r}", code=CODE_INVALID_VALUE
@@ -185,7 +271,7 @@ def undelivered_path(worker_slot_key: str) -> Path:
         raise WorkLedgerError(
             f"invalid worker slot key: {worker_slot_key!r}", code=CODE_INVALID_VALUE
         )
-    resolved = resolved_within(undelivered_dir(), f"{_store_name(worker_slot_key)}.json")
+    resolved = _contained(undelivered_dir(), f"{_store_name(worker_slot_key)}.json")
     if resolved is None:
         raise WorkLedgerError(
             f"path traversal blocked for worker key: {worker_slot_key!r}",
@@ -624,7 +710,7 @@ _LISTINGS_LOCK = threading.Lock()
 
 
 def list_work_items(slot_key: str) -> list[WorkItem]:
-    """Every readable item, oldest first.
+    """Every readable item, oldest first by the instant of ``created_at``.
 
     DERIVED by listing the items directory rather than read from an index, so there
     is no third writer over a file both parties care about, and therefore no index
@@ -714,7 +800,8 @@ def _walk_items(directory: Path) -> list[WorkItem]:
             sum(len(kept) for kept in _LISTING_MEMO.values()) > _LISTING_MEMO_ITEMS
         ):
             _LISTING_MEMO.popitem(last=False)
-    items.sort(key=lambda it: (it.created_at, it.item_id))
+    stamp_floor = datetime.min.replace(tzinfo=timezone.utc)
+    items.sort(key=lambda it: (parse_stamp(it.created_at) or stamp_floor, it.item_id))
     return items
 
 
@@ -733,6 +820,7 @@ def _copy_item(item: WorkItem, directory: Path) -> WorkItem:
     copied.acceptance = acceptance
     copied.artifacts = dict(item.artifacts)
     copied.retired_bindings = [dict(b) for b in item.retired_bindings]
+    copied.discussion = _json_copy(item.discussion)
     return copied
 
 
@@ -795,11 +883,15 @@ def _read_events_unlocked(path: Path, *, strict: bool = False) -> list[WorkEvent
         if st.st_size > MAX_RECORD_BYTES:
             logger.warning("work ledger event log over the size ceiling: %s", path.name)
             return []
+        # Split on "\n" only: an event is one JSON line written with
+        # ``ensure_ascii=False``, so U+2028, U+2029 and U+0085 sit raw inside its
+        # text, and ``str.splitlines`` would cut the line there, drop both halves
+        # as unparseable and let the next append rewrite the log without it.
         if strict:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            lines = path.read_text(encoding="utf-8", errors="replace").split("\n")
         else:
             data = _memo_read_bytes(path, st, Path.read_bytes)
-            lines = data.decode("utf-8", errors="replace").splitlines()
+            lines = data.decode("utf-8", errors="replace").split("\n")
     except FileNotFoundError:
         return []
     except OSError:
@@ -867,8 +959,13 @@ def _append_event_locked(
     *,
     status: str | None = None,
     id_salt: str = "",
+    fixed_id: str | None = None,
 ) -> WorkEvent:
     """Append one event to *item_id*'s log. THE CALLER MUST HOLD THE ITEM LOCK.
+
+    *fixed_id*, when given, is the event's id instead of the content address: an
+    ingested peer report keeps the peer's own event id. A log that already holds
+    that id is left as it is, so filing the same peer event twice is a no-op.
 
     Stamps ``ts`` here, under the lock and immediately before the write, so file
     order and timestamp order agree. A caller that built its entry first and then
@@ -889,7 +986,7 @@ def _append_event_locked(
     incoming = WorkEvent(
         # *id_salt* tells apart two events the same second with the same text: an
         # ingested remote report passes the peer's own event identity.
-        id=event_id(ts, item_id, kind, trimmed + id_salt, status=status),
+        id=fixed_id or event_id(ts, item_id, kind, trimmed + id_salt, status=status),
         ts=ts,
         item_id=item_id,
         kind=kind,
@@ -897,7 +994,12 @@ def _append_event_locked(
         text=trimmed,
     )
     path = item_events_path(slot_key, item_id)
-    events = _coalesce_progress(_read_events_unlocked(path, strict=True), incoming)
+    held = _read_events_unlocked(path, strict=True)
+    if fixed_id:
+        already = next((event for event in held if event.id == fixed_id), None)
+        if already is not None:
+            return already
+    events = _coalesce_progress(held, incoming)
     events.append(incoming)
     if len(events) > MAX_EVENTS_PER_ITEM:
         events = events[-MAX_EVENTS_PER_ITEM:]
@@ -955,6 +1057,7 @@ def _commit_item_locked(
     *,
     status: str | None = None,
     id_salt: str = "",
+    fixed_id: str | None = None,
 ) -> WorkEvent:
     """Persist one item change AND the event that explains it. HOLD THE ITEM LOCK.
 
@@ -971,7 +1074,9 @@ def _commit_item_locked(
     _require_record_fits(payload)
     events_path = item_events_path(slot_key, item.item_id)
     log_before = _read_text_or_none(events_path)
-    event = _append_event_locked(slot_key, item.item_id, kind, text, status=status, id_salt=id_salt)
+    event = _append_event_locked(
+        slot_key, item.item_id, kind, text, status=status, id_salt=id_salt, fixed_id=fixed_id
+    )
     try:
         _write_record(item_path(slot_key, item.item_id), payload)
     except BaseException:

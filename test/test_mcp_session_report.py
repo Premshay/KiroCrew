@@ -5,6 +5,8 @@ from __future__ import annotations
 import inspect
 import sys
 
+from redaction_structured_cases import github_classic
+
 from kiro_crew.acp import session_handle
 from kiro_crew.acp.mcp_session_report import (
     _BUCKET_CAP,
@@ -27,6 +29,10 @@ from kiro_crew.acp.types import (
     METHOD_SESSION_UPDATE,
     JsonRpcMessage,
 )
+
+# A GitHub token with a valid checksum, which the plan redacts. An AWS key ID
+# stays visible as an identifier, so it cannot show that a value is redacted.
+_SECRET_TOKEN = github_classic(seed=33)
 
 
 def _frame(method: str, name: str = "", **params: object) -> JsonRpcMessage:
@@ -82,6 +88,8 @@ class TestBuckets:
             "states_omitted": 0,
             "failures": {},
             "restart_to_load": [],
+            "reload_pending": [],
+            "sign_in_suspected": [],
         }
 
     def test_failure_records_its_reason(self):
@@ -119,6 +127,8 @@ class TestBuckets:
             "states_omitted": 0,
             "failures": {},
             "restart_to_load": [],
+            "reload_pending": [],
+            "sign_in_suspected": [],
         }
 
     def test_initialized_then_failure_moves_to_failed(self):
@@ -243,10 +253,10 @@ class TestSanitization:
         # A failing server's startup error can carry a credential; this payload
         # reaches a browser.
         r = McpSessionReport()
-        r.record_frame(_failed("s", "denied for AKIAIOSFODNN7EXAMPLE"), owned=True)
+        r.record_frame(_failed("s", f"denied for {_SECRET_TOKEN}"), owned=True)
         payload = r.payload()
         assert payload is not None
-        assert "AKIAIOSFODNN7EXAMPLE" not in payload["failures"]["s"]
+        assert _SECRET_TOKEN not in payload["failures"]["s"]
 
     def test_failure_text_is_capped(self):
         r = McpSessionReport()
@@ -697,7 +707,7 @@ class TestKasReadinessExposure:
         ready.record(_tags("@kirocrew-dashboard/ping"))
         assert not ready.pending
         # A later full tag snapshot without the dashboard tag retracts the TAG
-        # evidence, as before this change; the core's catalog evidence stays.
+        # evidence; the core's catalog evidence stays.
         ready.record(self._builtin_tags())
         assert ready.pending == "kirocrew-dashboard: tools not advertised"
         assert "kirocrew-core" in ready.advertised

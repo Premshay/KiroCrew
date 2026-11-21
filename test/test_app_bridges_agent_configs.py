@@ -398,6 +398,91 @@ class TestNeutralizeEntryShape:
         assert missing == [], f"entries without command: {missing}"
 
 
+class TestAGrantResolvesWhatTheDefaultAgentMounts:
+    """A built-in app's grant takes its launch spec from the servers the default agent mounts.
+
+    The rebuild merges the MCP page's store, registry installs and edition servers
+    over the global ``mcp.json`` into the default agent's spec, the store winning a
+    tie. A copied server that is muted (turned off, or a ``secret://`` reference
+    nothing resolves) is withheld, and so is another app's own server.
+    """
+
+    def test_a_grant_takes_the_mounted_spec_and_withholds_a_muted_one(self, tmp_path, monkeypatch):
+        from kiro_crew import agent as agent_mod
+        from kiro_crew.apps import bridges
+        from kiro_crew.mcp_provenance import DERIVED_KEY, WITHHELD_KEY
+
+        spec = tmp_path / "kirocrew.json"
+        mounted = {
+            "store-srv": {"command": "store-cmd", DERIVED_KEY: {"from": "kirocrew"}},
+            "both-srv": {"command": "store-cmd"},
+            "off-srv": {"command": "off-cmd", "disabled": True},
+            "vault-srv": {"command": "vault-cmd", "disabled": True, WITHHELD_KEY: True},
+            "other-app:srv": {"command": "other-cmd"},
+        }
+        spec.write_text(json.dumps({"mcpServers": mounted}), encoding="utf-8")
+        monkeypatch.setattr(bridges, "_mcp_json_path", lambda: spec)
+        monkeypatch.setattr(agent_mod, "_app_owned_mcp_keys", lambda: {"other-app:srv": True})
+        monkeypatch.setattr(
+            bridges,
+            "_global_mcp_specs",
+            lambda: {
+                "both-srv": {"command": "global-cmd"},
+                "off-srv": {"command": "off-cmd"},
+                "global-srv": {"command": "global-cmd"},
+                "global-off-srv": {"command": "global-cmd", "disabled": True},
+            },
+        )
+        names = [*mounted, "global-srv", "global-off-srv"]
+        out = bridges._apply_agent_mcp_policy(
+            {"name": "a", "tools": [], "mcpServers": {}},
+            "a",
+            {"agents": {"a": {"servers": {name: {} for name in names}}}},
+            builtin=True,
+        )
+        assert out["mcpServers"] == {
+            "store-srv": {"command": "store-cmd"},
+            "both-srv": {"command": "store-cmd"},
+            "global-srv": {"command": "global-cmd"},
+        }
+        assert out["tools"] == ["@store-srv", "@both-srv", "@global-srv"]
+
+    def test_a_user_installed_app_grant_never_reaches_a_mounted_only_server(
+        self, app_env, tmp_path, monkeypatch
+    ):
+        """A user-installed app writes its own grant file, so its grant keeps main's
+        sources, even under a shipped built-in's name; once the built-in holds the
+        install, the same grant copies the server, which shows the grant was read."""
+        from kiro_crew import agent as agent_mod
+        from kiro_crew.apps import bridges, execution
+        from kiro_crew.apps.manager import InstalledApp, _write_installed, app_dir
+
+        mounted = {"mcpServers": {"store-srv": {"command": "store-cmd"}}}
+        (tmp_path / "mcp.json").write_text(json.dumps(mounted), encoding="utf-8")
+        monkeypatch.setattr(bridges, "_global_mcp_specs", lambda: {})
+        monkeypatch.setattr(agent_mod, "_app_owned_mcp_keys", lambda: {})
+        src = _make_app_source(tmp_path, name="grant-app")
+        monkeypatch.setattr(execution, "_builtin_manifest_sources", lambda: (src.parent.resolve(),))
+        manifest = AppManifest.from_dict(json.loads((src / APP_MANIFEST_FILENAME).read_text()))
+        grant = {"agents": {"my-agent": {"servers": {"store-srv": {}}}}}
+        policy = app_dir("grant-app") / "data" / bridges.AGENT_MCP_POLICY_FILE
+        policy.parent.mkdir(parents=True)
+        policy.write_text(json.dumps(grant), encoding="utf-8")
+        written = app_env["kiro_agents"] / "grant-app--my-agent.json"
+
+        _write_installed("grant-app", InstalledApp(name="grant-app", source=str(src)))
+        bridges._register_agents("grant-app", manifest, src)
+        user_installed = json.loads(written.read_text())
+        assert "store-srv" not in user_installed.get("mcpServers", {})
+        assert "@store-srv" not in user_installed.get("tools", [])
+
+        _write_installed("grant-app", InstalledApp(name="grant-app", source="builtin"))
+        bridges._register_agents("grant-app", manifest, src)
+        assert json.loads(written.read_text())["mcpServers"]["store-srv"] == {
+            "command": "store-cmd"
+        }
+
+
 class TestDeclaredMcpToolsAreEnforced:
     """``permissions.mcpTools`` scopes an app agent's managed tools.
 
@@ -731,12 +816,12 @@ class TestRegisterPrunesUpgradedAwayResources:
         register_app("test-app")
         assert ghost_link.exists(), "register_app must not prune on the event loop"
 
-        # The off-loop boot reconcile is the one path that prunes. Ensure the app
-        # is enabled so reconcile processes it (it skips disabled apps).
+        # The off-loop boot reconcile is the one path that prunes. The gateway boot
+        # runs it per ENABLED, admitted app, so the app is enabled first.
         from kiro_crew.apps.manager import enable_app
 
         enable_app("test-app")
-        bridges_mod.reconcile_enabled_app_resources()
+        bridges_mod.reconcile_enabled_app_resources("test-app")
 
         assert not ghost_link.exists(), "a removed agent must be pruned by reconcile"
         after = _json.loads(bridges_mod._mcp_json_path().read_text(encoding="utf-8"))
@@ -1471,3 +1556,61 @@ class TestRenderFailureIsClassifiedByCause:
         collected: list[str] = []
         assert brmod._render_shipped_agent("app", src, io_failures=collected) is None
         assert collected == []
+
+
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+
+class TestAnAgentFileSavedWithAByteOrderMark:
+    """A Windows editor saves UTF-8 "with BOM"; the three agent-file readers accept it.
+
+    Each reader decoded strictly and handed ``json.loads`` text starting with U+FEFF,
+    which it refuses, so the marked file was skipped while the same file without the
+    mark registered. Invalid JSON after the mark is still refused.
+    """
+
+    def _mark_agent(self, root: Path, body: bytes) -> None:
+        (root / "agents" / "my-agent.json").write_bytes(_UTF8_BOM + body)
+
+    def test_a_marked_agent_registers_under_the_same_name(self, tmp_path, app_env):
+        root, manifest = _installed_templated_app(tmp_path, app_env["home"], {"prompt": "hi"})
+        self._mark_agent(root, json.dumps({"name": "my-agent", "prompt": "hi"}).encode())
+
+        assert _register_agents("test-app", manifest, root) == ["test-app/my-agent"]
+        written = app_env["kiro_agents"] / "test-app--my-agent.json"
+        # kiro-cli reads the re-serialized spec, which carries no mark.
+        assert not written.read_bytes().startswith(_UTF8_BOM)
+        assert json.loads(written.read_text(encoding="utf-8"))["name"] == "my-agent"
+
+    def test_a_marked_template_renders_and_the_copy_carries_no_mark(self, tmp_path, app_env):
+        from kiro_crew.apps.bridges import _render_shipped_agent
+
+        template = tmp_path / "a.json"
+        template.write_bytes(_UTF8_BOM + json.dumps({"name": "a", "command": "{UV_BIN}"}).encode())
+
+        out = _render_shipped_agent("pptx-maker", template)
+        assert out is not None
+        assert not out.read_bytes().startswith(_UTF8_BOM)
+        assert json.loads(out.read_text(encoding="utf-8"))["name"] == "a"
+
+    def test_a_marked_agent_does_not_abort_the_stale_agent_prune(self, tmp_path, app_env):
+        from kiro_crew.apps import bridges as bridges_mod
+
+        root, manifest = _installed_templated_app(tmp_path, app_env["home"], {"prompt": "hi"})
+        self._mark_agent(root, json.dumps({"name": "my-agent"}).encode())
+        stale = app_env["kiro_agents"] / "test-app--gone.json"
+        stale.write_text('{"name": "gone"}', encoding="utf-8")
+
+        bridges_mod._prune_stale_app_resources("test-app", manifest, root)
+        assert not stale.exists(), "a readable marked agent must not skip the prune"
+
+    def test_invalid_json_after_a_mark_is_still_refused(self, tmp_path, app_env):
+        from kiro_crew.apps.bridges import _render_shipped_agent
+
+        root, manifest = _installed_templated_app(tmp_path, app_env["home"], {"prompt": "hi"})
+        self._mark_agent(root, b"{ not json")
+        assert _register_agents("test-app", manifest, root) == []
+
+        template = tmp_path / "b.json"
+        template.write_bytes(_UTF8_BOM + b'{"name": "b", "command": "{UV_BIN}"')
+        assert _render_shipped_agent("pptx-maker", template) is None

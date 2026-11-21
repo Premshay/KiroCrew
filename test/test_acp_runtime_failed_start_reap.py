@@ -13,10 +13,12 @@ import asyncio
 import os
 import sys
 import textwrap
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
+import kiro_crew.acp.runtime as runtime_mod
 from kiro_crew import platform_compat
 from kiro_crew.acp import skill_projection
 from kiro_crew.acp.harness.base import SpawnPlan
@@ -76,6 +78,15 @@ async def _await_gone(pid: int, *, what: str) -> None:
     await async_wait_until(lambda: _gone(pid), describe=lambda: what)
 
 
+@pytest.fixture
+def _private_subprocess_pool(_floor_monkeypatch):
+    # spawn() hops onto ``subprocess_executor`` before the scan the test waits for, and
+    # that pool is shared by every test on this xdist worker.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        _floor_monkeypatch.setattr(runtime_mod, "subprocess_executor", lambda: pool)
+        yield
+
+
 @pytest.mark.asyncio
 async def test_a_failed_init_leaves_no_child_processes(tmp_path, monkeypatch, caplog):
     script = tmp_path / "fake_agent.py"
@@ -92,7 +103,7 @@ async def test_a_failed_init_leaves_no_child_processes(tmp_path, monkeypatch, ca
     child_pid: list[int] = []
     start_ids: dict[int, str | None] = {}
 
-    async def _failing_handshake(_caps):
+    async def _failing_handshake(_caps, *_budget):
         # Wait for the tree to exist, then fail the way a stalled kiro-cli does.
         await async_wait_until(pid_file.exists, describe=lambda: f"{pid_file} was never written")
         pid = int(pid_file.read_text())
@@ -131,6 +142,7 @@ async def test_a_failed_init_leaves_no_child_processes(tmp_path, monkeypatch, ca
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("_private_subprocess_pool")
 async def test_a_cancel_during_the_failed_start_scan_still_reaps_the_tree(tmp_path, monkeypatch):
     """A newer slot signal cancelling the spawn mid-cleanup must not skip the reap.
 
@@ -153,7 +165,7 @@ async def test_a_cancel_during_the_failed_start_scan_still_reaps_the_tree(tmp_pa
     child_pid: list[int] = []
     start_ids: dict[int, str | None] = {}
 
-    async def _failing_handshake(_caps):
+    async def _failing_handshake(_caps, *_budget):
         await async_wait_until(pid_file.exists, describe=lambda: f"{pid_file} was never written")
         pid = int(pid_file.read_text())
         child_pid.append(pid)

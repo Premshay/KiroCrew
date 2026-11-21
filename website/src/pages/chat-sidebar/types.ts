@@ -1,7 +1,7 @@
 /** View types the sidebar's owners share. `Slot` is the sidebar's narrowed view of a
  *  chat slot; the wire type is `ChatSlot` in ../../types. */
 import type { CodeChannelInfo, CrewWorkFacts, SessionLink, SourceProviderId, WorkAggregate } from '../../types'
-import type { SessionAttribution } from '../../api/sharedCrew'
+import type { PublicPrincipal, SessionAttribution } from '../../api/sharedCrew'
 
 export interface Slot {
   key: string
@@ -90,6 +90,9 @@ export interface Slot {
   // offers (`is_interruption_stale`). The row and the composer still treat the
   // session as interrupted; only the "Resume N sessions" row leaves it out.
   interrupted_stale?: boolean
+  // The interrupted turn ended on a sign-in error with nothing after it
+  // (`newest_error_is_sign_in`), so the row names the sign-in first.
+  interrupted_by_sign_in?: boolean
   // The slot snapshot can report live child work before the detailed activity
   // map hydrates after reconnect. Never present that gap as an idle interruption.
   subagents_running?: boolean
@@ -127,6 +130,10 @@ export interface Slot {
   created?: string
   /** Shared Crew creator, when the gateway records one. Display only. */
   attribution?: SessionAttribution | null
+  /** Shared Crew: who has written here, creator first (`shared_crew.participants`). Display only. */
+  participants?: PublicPrincipal[]
+  /** How many people the gateway's capped `participants` list dropped. */
+  participants_dropped?: number
   last_ts?: string
   // Settled activity instant: the last prompt or turn completion, NOT every
   // streamed row. What the list is ordered, segmented and labelled by — see

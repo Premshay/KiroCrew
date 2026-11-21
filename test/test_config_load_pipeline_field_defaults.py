@@ -42,6 +42,12 @@ _READ_STAGE_DEPARTURES = {
     ("agent", "crew_panel"): False,
     # Fail closed the same way: a malformed value must not start storing MCP tokens.
     ("agent", "kas_persist_mcp_sign_in"): False,
+    # Fail closed: a malformed relay switch reads as off, never as unset, so it cannot
+    # let a team key start hosting (``config/section_builders._relay_enabled``).
+    ("tunnel", "relay_enabled"): False,
+    # Fail closed: a wrong-typed Region is kept as text so the relay refuses it,
+    # never repaired to "", which would lease from us-east-1.
+    ("tunnel", "relay_lease_region"): "{'not': 'a string'}",
     # Fail closed: a malformed value must not auto-approve conductor sends.
     ("agent", "conductor_own_child_verbs"): False,
     # Fail closed: a malformed value must not move kiro-cli's KAS extract.
@@ -52,6 +58,9 @@ _READ_STAGE_DEPARTURES = {
     # an absent key: it takes the Kiro CLI floor, never the KAS product default.
     ("agent", "acp_backend"): "",
     ("skills", "project_skills_enabled"): False,
+    # Fail closed: a present non-bool must not ride the on default back into
+    # local recording.
+    ("telemetry", "enabled"): False,
     # Resolved by the loader's own degradation rule before the enum check runs.
     ("stt", "provider"): "off",
     # An unreadable stored choice may have been a privacy choice: Temporary.

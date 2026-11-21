@@ -17,6 +17,7 @@ import { useTheme } from '../hooks/useTheme'
 import { useAppDispatch } from '../store'
 import { buildSrcdoc, readThemeVars } from '../lib/widgetSrcdoc'
 import { artifactFrame } from '../lib/artifactFrame'
+import { activeCompareKey, COMPARE_NONE, compareSnapshot, isComparableKind, stateKey } from '../lib/artifactCompare'
 import { api } from '../api/client'
 import { useConfirm } from '../components/ConfirmDialog'
 import { useReadingWidth } from '../hooks/useReadingWidth'
@@ -33,7 +34,7 @@ import { useGuideSelection } from '../guide/guidePredicates'
 export function useArtifactDetailPageState() {
   const { slug = '' } = useParams<{ slug: string }>()
   const navigate = useNavigate()
-  const { confirm, confirmDialog, confirmOpen } = useConfirm()
+  const { confirm, cancel: cancelConfirm, confirmDialog, confirmOpen } = useConfirm()
   // Claimed once from the library's "New Artifact" action, which creates the
   // document empty and hands it over here. Two behaviours hang off it: the editor
   // opens focused (so the user starts typing rather than hunting for an Edit
@@ -93,8 +94,22 @@ export function useArtifactDetailPageState() {
   const queryClient = useQueryClient()
   const dispatch = useAppDispatch()
   const { theme, colorTheme, themeVersion } = useTheme()
-  const [selectedVersion, setSelectedVersion] = useState<number | null>(null)
-  const [editing, setEditing] = useState(false)
+  const [selectedVersion, setSelectedVersionRaw] = useState<number | null>(null)
+  // The state the "Compare with" select names (`live`, a snapshot number, or `none`).
+  const [compareWith, setCompareWith] = useState(COMPARE_NONE)
+  // A request the page can no longer draw is cleared where it stops being
+  // drawable, so what is stored always matches what the select shows: it must
+  // not come back later without the reader picking it again. Viewing the state
+  // that was to be compared, and starting an edit, are the two ways it happens.
+  const setSelectedVersion = useCallback((version: number | null) => {
+    setSelectedVersionRaw(version)
+    setCompareWith((wanted) => (wanted === stateKey(version) ? COMPARE_NONE : wanted))
+  }, [])
+  const [editing, setEditingRaw] = useState(false)
+  const setEditing = useCallback((next: boolean) => {
+    setEditingRaw(next)
+    if (next) setCompareWith(COMPARE_NONE)
+  }, [])
   // While editing, the user can flip to a rendered preview of the edit
   // buffer (matches the side panel's Edit/Preview toggle). Stays in edit
   // mode — content isn't committed until Save and isn't discarded until
@@ -158,9 +173,9 @@ export function useArtifactDetailPageState() {
   const ime = useImeGuard()
 
   return {
-    slug, navigate, confirm, confirmDialog, confirmOpen, blankClaim, justCreatedBlank, renaming, setRenaming,
+    slug, navigate, confirm, cancelConfirm, confirmDialog, confirmOpen, blankClaim, justCreatedBlank, renaming, setRenaming,
     nameDraft, setNameDraft, queryClient, dispatch, theme, colorTheme, themeVersion, selectedVersion,
-    setSelectedVersion, editing, setEditing, previewDuringEdit, setPreviewDuringEdit, readingWidth,
+    setSelectedVersion, compareWith, setCompareWith, editing, setEditing, previewDuringEdit, setPreviewDuringEdit, readingWidth,
     toggleReadingWidth, mdPreviewStyle, editedContent, setEditedContent, saving, setSaving, saveError,
     setSaveError, editGenerationRef, editBaseTokenRef, overwriteTokenRef, tokenWriteInFlightRef, saveConflict,
     setSaveConflict, contextError, setContextError, contextErrorIsRefresh, setContextErrorIsRefresh,
@@ -179,10 +194,10 @@ export function useArtifactDetailPageDocument({
   popout: boolean
 }) {
   const {
-    slug, setRenaming, setNameDraft, theme, colorTheme, themeVersion, selectedVersion, setSelectedVersion,
-    editing, setEditing, setPreviewDuringEdit, mdPreviewStyle, editedContent, setEditedContent, setSaveError,
+    slug, setRenaming, setNameDraft, theme, colorTheme, themeVersion, selectedVersion, setSelectedVersion, compareWith, setCompareWith,
+    editing, setEditing, setPreviewDuringEdit, mdPreviewStyle, editedContent, setEditedContent, setSaveError, setSaving,
     editGenerationRef, editBaseTokenRef, overwriteTokenRef, setSaveConflict, setContextError,
-    setContextErrorIsRefresh, setAddingTag, setNewTag,
+    setContextErrorIsRefresh, setAddingTag, setNewTag, cancelConfirm,
   } = stateRead
   // Bidirectional anchor↔comment linking: flash a sidebar row when
   // its in-iframe highlight is clicked; scroll the iframe highlight when a
@@ -199,7 +214,12 @@ export function useArtifactDetailPageDocument({
   // exist), and stale edit state would leak into the new artifact.
   useEffect(() => {
     editGenerationRef.current += 1
+    // Withdraw a question raised for the artifact being left.
+    cancelConfirm()
+    // A revert still on the wire skips its own reset once the generation moves.
+    setSaving(false)
     setSelectedVersion(null)
+    setCompareWith(COMPARE_NONE)
     setEditing(false)
     setEditedContent('')
     // Reset with the rest of the edit state: this flag is per-document, and
@@ -222,7 +242,7 @@ export function useArtifactDetailPageDocument({
     // No reset of the touched flag here -- it is keyed by slug, so a different
     // artifact already gets a fresh verdict, and clearing it at this point would
     // race the departing document's cleanup.
-  }, [slug, editBaseTokenRef, editGenerationRef, overwriteTokenRef, setAddingTag, setContextError, setContextErrorIsRefresh, setEditedContent, setEditing, setNameDraft, setNewTag, setPreviewDuringEdit, setRenaming, setSaveConflict, setSaveError, setSelectedVersion])
+  }, [slug, cancelConfirm, editBaseTokenRef, editGenerationRef, overwriteTokenRef, setAddingTag, setContextError, setContextErrorIsRefresh, setEditedContent, setEditing, setNameDraft, setNewTag, setPreviewDuringEdit, setRenaming, setSaveConflict, setSaveError, setSaving, setSelectedVersion, setCompareWith])
 
   const detailQuery = useQuery<Artifact>({
     queryKey: ['artifact', slug],
@@ -267,6 +287,22 @@ export function useArtifactDetailPageDocument({
   })
 
   const artifact = isCurrent ? detailQuery.data : versionQuery.data
+  // The state set beside the one on screen. A request that cannot be drawn (the
+  // same state, a snapshot no longer listed, a kind with no text, an edit in
+  // progress) leaves the page as it was, with no refusal.
+  const compareKey = !editing && artifact && isComparableKind(artifact.kind)
+    ? activeCompareKey(compareWith, selectedVersion, versions)
+    : null
+  const compareSnapshotNo = compareSnapshot(compareKey)
+  const compareVersionQuery = useQuery<Artifact>({
+    queryKey: ['artifact', slug, 'version', compareSnapshotNo],
+    queryFn: () => api.artifactVersion(slug, compareSnapshotNo as number),
+    enabled: !!slug && compareSnapshotNo !== null,
+  })
+  const compareArtifact = compareKey === null
+    ? undefined
+    : compareSnapshotNo === null ? detailQuery.data : compareVersionQuery.data
+  const shownKey = stateKey(selectedVersion)
   const editable = !!artifact && isEditableKind(artifact.kind) && isCurrent
   const dirty = editing && !!artifact && editedContent !== (artifact.content ?? '')
 
@@ -289,6 +325,7 @@ export function useArtifactDetailPageDocument({
   return {
     iframeScrollTarget, setIframeScrollTarget, previewRef, bodyRef, iframeBodyRef, detailQuery, versionsQuery,
     eventsQuery, versions, effectiveVersion, isCurrent, versionQuery, artifact, editable, dirty, usesIframe,
+    compareKey, compareArtifact, compareVersionQuery, shownKey,
     contentWidthStyle, exportSrcdoc,
   }
 }

@@ -157,7 +157,7 @@ def _memory_document_undecodable_response(name: str) -> web.Response:
 
 
 async def _memory_write_gate(
-    state: DashboardState, request: web.Request, operation: str
+    state: DashboardState, request: web.Request, operation: str, *, store: str | None = None
 ) -> web.Response | None:
     """The memory-mutation authorization cascade, or ``None`` when the call may proceed.
 
@@ -210,6 +210,17 @@ async def _memory_write_gate(
             },
             status=403,
         )
+    # While a memory provider replaces Crew's memory for this store, Crew's own
+    # memory stays exactly as it was, so switching back loses nothing. The
+    # settings write and a manual consolidation are not writes to that memory.
+    # *store* is the store a route resolved from its body; the rest name it in the query.
+    if operation not in ("settings.write", "memory.consolidate"):
+        from kiro_crew.dashboard.handlers.memory_provider import provider_active_refusal
+
+        target = (request.query.get("store") or "") if store is None else store
+        refusal = await provider_active_refusal(target)
+        if refusal is not None:
+            return refusal
     return None
 
 
@@ -285,10 +296,14 @@ def _validate_private_profile_update(
 
     from kiro_crew.config.loader import resolve_agent_bindings
     from kiro_crew.member_essential_context import ESSENTIAL_MAX_CHARS, MemberEssentialContextError
+    from kiro_crew.memory_provider.contract import MAX_DOCUMENT_TEXT
 
-    if len(content) > ESSENTIAL_MAX_CHARS:
+    # A profile file is also a memory-provider document, so it must fit both
+    # caps: a move or export refuses a document over MAX_DOCUMENT_TEXT by name.
+    limit = min(ESSENTIAL_MAX_CHARS, MAX_DOCUMENT_TEXT)
+    if len(content) > limit:
         raise MemberEssentialContextError(
-            f"{filename} exceeds the {ESSENTIAL_MAX_CHARS}-character essential context budget"
+            f"{filename} exceeds the {limit}-character limit for a profile document"
         )
 
     builder = state.context_builder
@@ -1402,7 +1417,10 @@ async def api_memory_consolidate(request: web.Request) -> web.Response:
             },
             status=403,
         )
+    # bool("false") is True: the shared reader maps the usual spellings, and any
+    # other value keeps the same truth test as before.
     include_history = body.get("include_history", True)
+    include_history = _coerce_bool(include_history, bool(include_history))
     # Claim the key before the eligibility probe below, which awaits. Testing
     # membership and adding must happen with no yield between them: the probe
     # offloads a transcript read, and a check-then-act spanning that await lets

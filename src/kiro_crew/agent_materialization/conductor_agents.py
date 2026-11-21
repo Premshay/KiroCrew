@@ -29,6 +29,7 @@ from kiro_crew.agent_files import (
     SECURITY_CONDUCTOR_AGENT_FILENAME as _SECURITY_CONDUCTOR_AGENT_FILENAME,
 )
 from kiro_crew.agent_materialization import auto_approve, managed_mcp, skill_resources
+from kiro_crew.context_assembly.output_contract import ASK_CORE, CONDUCTOR_ASK_TAIL
 
 
 def _conductor_prompt(charter: str) -> str:
@@ -37,6 +38,14 @@ def _conductor_prompt(charter: str) -> str:
     charter does not already state the ledger flow -- the pipeline and security
     conductors; ``_conductor_spec`` keeps the goal conductor's charter as is."""
     return charter + agent_mod._CONDUCTOR_WORK_LEDGER_PROTOCOL
+
+
+def with_conductor_ask(charter: str) -> str:
+    """*charter* followed by the shared ask core and conductor tail
+    (``context_assembly.output_contract``), the ask policy the team lead and the
+    goal conductors carry at agent rank. Appended here, at install, because an
+    ``agent_parts`` owner may not import a project module."""
+    return f"{charter.rstrip()}\n\n{ASK_CORE}{CONDUCTOR_ASK_TAIL}"
 
 
 def _conductor_shipped(
@@ -189,7 +198,7 @@ _HISTORY_DASHBOARD_VERBS: frozenset[str] = frozenset(
 # ledger verbs were on the goal AND pipeline conductors for one release before the
 # ledger flow moved to its own spec, and came back to the goal conductor with
 # ``work_brief`` when it took the alias's spec over; they are the base every
-# conductor ships. ``work_report``, the worker's verb, joined them so a
+# conductor ships (with ``work_ask_record``, recorded per spec below). ``work_report``, the worker's verb, joined them so a
 # nested conductor reports without a prompt; the pipeline and security
 # conductors have never shipped it.
 _HISTORY_WORK_VERBS: frozenset[str] = frozenset(
@@ -210,8 +219,9 @@ _HISTORY_CHECK_VERBS: frozenset[str] = frozenset(
 #: today: the goal conductor's bare ``@kirocrew-core`` and ``patrol_budget``. Beyond
 #: each spec's current tuple the table holds exactly those entries (pinned by test),
 #: so an entry can join it only as a grant some release is shown to have shipped. The pipeline
-#: conductor's two work-ledger verbs were shipped for one release, retired, and are
-#: shipped again as the base every conductor holds.
+#: conductor's read and record verbs were shipped for one release, retired, and are
+#: shipped again as the base every conductor holds; ``work_ask_record`` joined that
+#: base later.
 _SHIPPED_GRANT_HISTORY: dict[str, frozenset[str]] = {
     "kirocrew-conductor": (
         frozenset({"session", "report", "tool_search", "@kirocrew-core"})
@@ -238,6 +248,7 @@ _SHIPPED_GRANT_HISTORY: dict[str, frozenset[str]] = {
         | _HISTORY_CORE_VERBS
         | _HISTORY_DASHBOARD_VERBS
         | {"@kirocrew-work/work_ledger_read", "@kirocrew-work/work_ledger_record"}
+        | {"@kirocrew-work/work_ask_record"}
     ),
     "kirocrew-security-conductor": (
         frozenset({"session", "report", "tool_search"})
@@ -245,6 +256,7 @@ _SHIPPED_GRANT_HISTORY: dict[str, frozenset[str]] = {
         | _HISTORY_DASHBOARD_VERBS
         | {"@kirocrew-dashboard/chat_folder_file_self"}
         | {"@kirocrew-work/work_ledger_read", "@kirocrew-work/work_ledger_record"}
+        | {"@kirocrew-work/work_ask_record"}
     ),
 }
 
@@ -713,7 +725,7 @@ def _conductor_spec(
     config["description"] = description
     # The charter already states the work-ledger flow in detail, so the shared
     # protocol block (``_conductor_prompt``) is not appended here.
-    config["prompt"] = agent_mod._CONDUCTOR_SYSTEM_PROMPT
+    config["prompt"] = with_conductor_ask(agent_mod._CONDUCTOR_SYSTEM_PROMPT)
     # The skills this prompt names: ``goal-conductor`` carries the operating
     # procedure it says to read first, ``dashboard`` is how it changes the page
     # it reports on, and ``WIDGET_POINTER_SKILLS`` are how it draws the

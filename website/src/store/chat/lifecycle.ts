@@ -8,14 +8,17 @@ import type { ChatSlot, SessionInfo } from '../../types'
 import { api } from '../../api/client'
 import { resolveDefaultMemoryMode } from '../../api/queryClient'
 import { crewModeCatalogKnown, crewModeEnabled, newChatCrewModeAgent, setCrewModeCatalog } from '../../lib/crewMode'
+import { featurePreviewLockKnown, whenFeaturePreviewLockKnown } from '../../utils/editionLocks'
 import { addSlotOptimistic, updateSlot } from '../dashboardSlice'
 import { paletteSize, resolveDefaultColor } from '../../utils/sessionColors'
-import { isChatPageSurface } from '../../utils/channelOrigin'
+import { isChatPageSurface, slotChannelNamespace } from '../../utils/channelOrigin'
 import { mergePreservedPastes } from '../../utils/pasteTokens'
 import { findReport, parseErrorCode } from '../../utils/errorReport'
 import { errMessage } from '../../utils/thunkError'
 import { writePrefill } from '../../utils/navIntent'
 import type { HistoryDeleteRefusal } from '../../utils/historyDeleteRefusal'
+import { removePromptStashKeys, snapshotPromptStash } from '../../utils/promptStash'
+import { stripDashboardSessionPrefixes } from '../../monitoring/automation'
 import { entryActivityOpen, type ChatState } from './state'
 import { filterMessages, safeKey } from './wire'
 import { enterActiveSlot, pushHistory } from './runState'
@@ -42,7 +45,7 @@ export const fetchHistory = createAsyncThunk(
 type NewChatConfig = { default_memory_mode?: unknown; new_chat_crew_mode?: unknown }
 
 /**
- * `dashboard.new_chat_crew_mode`: turn Ultra Mode on for a just-created New chat
+ * `dashboard.new_chat_crew_mode`: turn conductor mode on for a just-created New chat
  * the way a press of the composer chip does, by the ordinary agent switch to the
  * conductor (docs/decisions/2026-10-27-crew-mode-is-a-composer-switch-to-the-conductor-template.md):
  * the create itself is unchanged. Runs before the create's `fulfilled`, so the chat
@@ -61,10 +64,13 @@ type NewChatConfig = { default_memory_mode?: unknown; new_chat_crew_mode?: unkno
  * broadcast would otherwise leave the row showing the plain agent.
  */
 async function startNewChatInCrewMode(slot: ChatSlot, config: NewChatConfig | undefined, publish: (patch: Partial<ChatSlot> & { key: string }) => void): Promise<void> {
-  if (!crewModeEnabled() || !slot?.key) return
+  if (!slot?.key || (crewModeEnabled() === false && featurePreviewLockKnown())) return
   try {
     const cfg = config ?? await api.dashboardConfig() as NewChatConfig
     if (cfg?.new_chat_crew_mode !== true) return
+    // One-shot: the page's first chat can be made before the edition lock is known.
+    await whenFeaturePreviewLockKnown()
+    if (!crewModeEnabled()) return
     if (!crewModeCatalogKnown()) {
       const catalog = await api.agentCatalog(slot.key)
       setCrewModeCatalog(catalog.crew_mode_agent, catalog.conductor_agents, catalog.default_agent)
@@ -451,6 +457,19 @@ export const promoteSlot = createAsyncThunk(
     return d
   },
 )
+/** The slot whose prompt stash a history delete of `key` owns, or null when
+ *  ownership cannot be read from the name. Two shapes are refused: a stacked
+ *  alias (`dashboard_dashboard_<slot>`), and a dashboard row whose stem is a
+ *  channel slot (`dashboard_slack_<ts>`). The gateway deletes that dashboard
+ *  transcript while the channel session `slack_<ts>` survives, so the stash
+ *  under that key is the channel's and must stay. */
+function stashOwnerSlot(key: string): string | null {
+  let slot = key
+  if (slot.startsWith('dashboard:')) slot = slot.slice('dashboard:'.length)
+  else if (slot.startsWith('dashboard_')) slot = slot.slice('dashboard_'.length)
+  if (!slot || stripDashboardSessionPrefixes(slot) !== slot) return null
+  return slotChannelNamespace(slot) ? null : slot
+}
 
 /** Delete a history row. A refusal REJECTS WITH A VALUE rather than throwing:
  *  `api.deleteSession` throws an `ApiError` on any non-2xx, and the thunk
@@ -467,8 +486,17 @@ export const deleteHistorySession = createAsyncThunk<
 >(
   'chat/deleteHistorySession',
   async (key, { getState, rejectWithValue }) => {
+    // Only a key that names one slot unambiguously owns its stash. A stacked
+    // alias (`dashboard_dashboard_<slot>`) is a separate transcript the gateway
+    // can delete while the canonical one and its slot survive, so its stash is
+    // kept; "Clear other sessions" can still reclaim it.
+    const slot = stashOwnerSlot(key)
+    // Listed before the DELETE: only the deleted session's own entries are
+    // cleared, never one stashed while the request was in flight.
+    const stashKeys = slot ? await snapshotPromptStash(slot) : []
     try {
-      await api.deleteSession(key)
+      const response = await api.deleteSession(key) as { ok?: unknown }
+      if (response?.ok === true) await removePromptStashKeys(stashKeys)
       return key
     } catch (e) {
       // Duck-typed on `body`, not `instanceof ApiError`, so a mocked transport
@@ -603,6 +631,9 @@ export function addLifecycleCases(builder: ActionReducerMapBuilder<ChatState>): 
       else {
         enterActiveSlot(state, action.payload.key, 'request')
         noteRequestActivation(state, origin)
+        // A chat the user asked for is a new gesture: the last switch's
+        // failure notice is about a click they moved past.
+        state.switchSlotGone = null
       }
       state.lastCreatedActivation = { slot: action.payload.key, requestId: action.meta.requestId, seq: origin.seq, burst: origin.burst }
       // A default-folder create learns its folder only from this response, so

@@ -72,7 +72,15 @@ _LESSON_EXPERIENCE_CAP = _budget(0.05)  # learned experience (on-demand tier)  =
 _SEMANTIC_MEMORY_CAP = _budget(0.077)  # semantic memory (vector)             = 7.7%
 _EPISODIC_MEMORY_CAP = _budget(0.077)  # episodic memory (vector)             = 7.7%
 _SKILLS_CAP = _budget(0.15)  # skills top-K block (lazy-loaded)     = 15%
-_STEERING_CAP = _budget(0.10)  # steering resource files              = 10%
+# Bound on the ``[FOLDER STEERING ...]`` section (its only reader). Window-
+# INDEPENDENT and NOT a share of ``_CONTEXT_BUDGET_BASE``, for the same reason as
+# the rule allowance above: every document it carries is an every-session
+# standing rule, and on a harness that does not load ``.kiro/steering`` itself
+# this section is the only path the global and project trees have to the model.
+# A 10% share of the pinned base (3,300) held about one small file. Derived like
+# the two startup allowances above: the steering share (10%) of the 165_000
+# reference base a 1M-window session had before the base was pinned.
+_STEERING_CAP = 16_500
 _PER_MESSAGE_CAP = 8_000  # truncate individual messages on fallback path
 # Historical char cap for the episodic-memory block injected on new sessions
 # (build_message). Bounds the top-8 episodic fragments; scaled down with the
@@ -323,17 +331,26 @@ class ContextParts:
     so the blocks do not use up its pool either.
     """
 
-    __slots__ = ("authored", "parts", "protected")
+    __slots__ = ("authored", "held_chars", "parts", "protected")
 
     def __init__(self) -> None:
         self.parts: list[str] = []
         self.protected: set[int] = set()
         self.authored: set[int] = set()
+        self.held_chars = 0
 
     def append_required(self, text: str) -> None:
         # User rules, preferences and steering are not disposable background.
         self.protected.add(len(self.parts))
         self.parts.append(text)
+
+    def charge_held(self, text: str) -> None:
+        """Charge a protected block the session head carries instead of this message.
+
+        The model still reads it, so it keeps its protected charge and memory
+        admission is the same as when the block was in the message.
+        """
+        self.held_chars += len(text)
 
     def append_authored(self, text: str) -> None:
         """Append a protected block sized by its own startup allowance, not the pool."""

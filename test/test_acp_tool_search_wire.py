@@ -189,6 +189,40 @@ class TestKasNeverDefer:
     def test_no_mcp_grant_lists_nothing(self, spec):
         assert self._ids(spec) == []
 
+    def test_an_added_server_s_whole_grant_and_wildcard_share_stay_deferred(self):
+        from kiro_crew.agent_sdk.tool_search import kas_never_defer_ids
+
+        spec = {
+            "tools": ["*", "@kirocrew-core", "@example-app:example-mcp"],
+            "mcpServers": {"kirocrew-core": {}, "example-app:example-mcp": {}},
+        }
+        assert kas_never_defer_ids(spec, self.TOOLS.get, added_servers=("kirocrew-core",)) == [
+            "example-app:example-mcp::read_state",
+            "example-app:example-mcp::write_state",
+        ]
+
+    def test_an_added_server_s_tool_the_author_names_stays_direct(self):
+        from kiro_crew.agent_sdk.tool_search import kas_never_defer_ids
+
+        spec = {
+            "tools": ["@kirocrew-core", "@kirocrew-core/memory_recall", "@kirocrew-core/skill_f*"]
+        }
+        assert kas_never_defer_ids(spec, self.TOOLS.get, added_servers=("kirocrew-core",)) == [
+            "kirocrew-core::memory_recall",
+            "kirocrew-core::skill_fetch",
+        ]
+
+    def test_a_custom_agent_keeps_the_server_wait_direct(self):
+        from kiro_crew.agent_sdk.tool_search import custom_agent_never_defer_ids
+
+        tools = {"kirocrew-core": ["mcp_server_wait", "memory_recall"], "srv": ["one", "two"]}
+        spec = {"tools": ["fs_read", "@srv", "@kirocrew-core"]}
+        assert custom_agent_never_defer_ids(spec, tools.get, ("kirocrew-core",)) == [
+            "kirocrew-core::mcp_server_wait",
+            "srv::one",
+            "srv::two",
+        ]
+
     def test_without_the_loader_the_payload_carries_the_list(self):
         out = kas_client_meta_settings(
             ToolSearchSettings(True, 5, 50_000),
@@ -258,6 +292,34 @@ class TestHandshakeNeverDefer:
             "kirocrew-core::skill_search",
             "srv::one",
         ]
+
+    def test_a_custom_agent_defers_the_crew_servers_crew_added(self, monkeypatch):
+        """Only the added server's whole grant leaves the list; the author's tools stay."""
+        from kiro_crew.acp import runtime_spawn_launch
+
+        seen = []
+
+        def added(agent, spec):
+            seen.append(agent)
+            return ("kirocrew-core",)
+
+        monkeypatch.setattr(runtime_spawn_launch, "crew_added_servers", added)
+        wire = self._caps(monkeypatch, {"tools": ["@kirocrew-core", "@srv/one"]}, agent="mine")
+        assert seen == ["mine"]
+        assert wire["enabled"] is False
+        assert wire["neverDefer"] == ["kirocrew-core::mcp_server_wait", "srv::one"]
+
+    def test_a_host_that_does_not_read_the_channel_is_not_asked(self, monkeypatch):
+        from kiro_crew.acp import runtime_spawn_launch
+
+        def added(agent, spec):
+            raise AssertionError("judged only for a host that reads _meta.kiro.settings")
+
+        monkeypatch.setattr(runtime_spawn_launch, "crew_added_servers", added)
+        wire = self._caps(
+            monkeypatch, {"tools": ["@kirocrew-core"]}, agent="mine", backend=ACP_BACKEND_KIRO
+        )
+        assert wire["neverDefer"] == ["kirocrew-core::memory_recall", "kirocrew-core::skill_search"]
 
     def test_a_spec_with_the_loader_and_no_declared_job_tools_still_defers(self, monkeypatch):
         """An operator's own agent, an app's agent, a crew member's template: no
@@ -335,6 +397,79 @@ class TestHandshakeNeverDefer:
         assert wire["neverDefer"] == []
 
 
+class TestHandshakeCodeIntelligence:
+    """KAS creates a session's ``code`` tool only when ``initialize`` enables
+    ``codeIntelligence``, so every KAS handshake must still carry it after the
+    spawn fills the rest of the settings channel."""
+
+    _ON = {"enabled": True}
+
+    @pytest.fixture(autouse=True)
+    def _private_kiro_home(self, tmp_path, _floor_monkeypatch):
+        """A private kiro home and workspace: no developer's own ``cli.json`` is read."""
+        self._global_cli = tmp_path / "kiro" / "settings" / "cli.json"
+        self._work = tmp_path / "work"
+        self._global_cli.parent.mkdir(parents=True)
+        (self._work / ".kiro" / "settings").mkdir(parents=True)
+        _floor_monkeypatch.setenv("KIRO_HOME", str(tmp_path / "kiro"))
+
+    def _caps(self, monkeypatch, *, tool_search, telemetry_on=True):
+        from kiro_crew.acp import kas_secret_storage, runtime_spawn_launch
+
+        monkeypatch.delenv(MANDATORY_MCPS_ENV, raising=False)
+        monkeypatch.setattr(kas_secret_storage, "persistence_enabled", lambda: False)
+        monkeypatch.setattr(runtime_spawn_launch, "_known_server_tool_names", {}.get, raising=False)
+        monkeypatch.setattr(
+            "kiro_crew.acp.kas_cli_settings._warn_opt_out_unconfirmed", lambda: None
+        )
+        rt = AcpRuntime(acp_backend=ACP_BACKEND_KAS)
+        rt._agent_env_override = {}
+        rt._kas_telemetry_override = telemetry_on
+        rt._work_dir = self._work
+        rt._tool_search = ToolSearchSettings(True, 5, 50_000) if tool_search else None
+        rt._projected_spawn_spec = lambda: {"tools": ["tool_search", "@kirocrew-core"]}
+        return asyncio.run(runtime_spawn_launch._handshake_client_capabilities(rt))
+
+    @pytest.mark.parametrize("telemetry_on", [True, False])
+    def test_tool_search_off_still_enables_code_intelligence(self, monkeypatch, telemetry_on):
+        kiro = self._caps(monkeypatch, tool_search=False, telemetry_on=telemetry_on)["_meta"][
+            "kiro"
+        ]
+        assert kiro["settings"] == {"codeIntelligence": self._ON}
+        assert kiro["telemetryEnabled"] is telemetry_on
+        assert kiro["openExternalUrl"] is True
+        assert kiro["userInput"] is True
+
+    @pytest.mark.parametrize("telemetry_on", [True, False])
+    def test_tool_search_on_keeps_code_intelligence_beside_it(self, monkeypatch, telemetry_on):
+        kiro = self._caps(monkeypatch, tool_search=True, telemetry_on=telemetry_on)["_meta"]["kiro"]
+        assert set(kiro["settings"]) == {"codeIntelligence", "toolSearch"}
+        assert kiro["settings"]["codeIntelligence"] == self._ON
+        assert kiro["settings"]["toolSearch"]["enabled"] is True
+        assert kiro["telemetryEnabled"] is telemetry_on
+        assert kiro["openExternalUrl"] is True
+        assert kiro["userInput"] is True
+
+    @pytest.mark.parametrize("tool_search", [False, True])
+    @pytest.mark.parametrize(
+        ("global_value", "workspace_value", "enabled"),
+        [(False, None, False), (False, True, True), (None, False, False), (False, "no", False)],
+    )
+    def test_kiro_cli_enable_code_intelligence_decides_it(
+        self, monkeypatch, tool_search, global_value, workspace_value, enabled
+    ):
+        """kiro-cli's ``chat.enableCodeIntelligence``, the workspace file winning."""
+        for path, value in (
+            (self._global_cli, global_value),
+            (self._work / ".kiro" / "settings" / "cli.json", workspace_value),
+        ):
+            if value is not None:
+                path.write_text(json.dumps({"chat.enableCodeIntelligence": value}))
+        kiro = self._caps(monkeypatch, tool_search=tool_search)["_meta"]["kiro"]
+        assert kiro["settings"]["codeIntelligence"] == {"enabled": enabled}
+        assert ("toolSearch" in kiro["settings"]) is tool_search
+
+
 class TestKnownServerToolNames:
     def test_a_crew_server_is_never_imported_into_the_gateway(self, monkeypatch):
         """Its declaration module sits in an agent-writable package, so the
@@ -376,7 +511,10 @@ class TestKnownServerToolNames:
 class TestWithClientMetaSettings:
     def test_fills_the_channel_and_keeps_the_declaration(self):
         out = with_client_meta_settings(KAS_CLIENT_CAPABILITIES, {"toolSearch": {"enabled": True}})
-        assert out["_meta"]["kiro"]["settings"] == {"toolSearch": {"enabled": True}}
+        assert out["_meta"]["kiro"]["settings"] == {
+            "codeIntelligence": {"enabled": True},
+            "toolSearch": {"enabled": True},
+        }
         assert {k: v for k, v in out.items() if k != "_meta"} == {
             k: v for k, v in KAS_CLIENT_CAPABILITIES.items() if k != "_meta"
         }
@@ -385,7 +523,9 @@ class TestWithClientMetaSettings:
         before = json.dumps(KAS_CLIENT_CAPABILITIES, sort_keys=True)
         with_client_meta_settings(KAS_CLIENT_CAPABILITIES, {"toolSearch": {"enabled": True}})
         assert json.dumps(KAS_CLIENT_CAPABILITIES, sort_keys=True) == before
-        assert KAS_CLIENT_CAPABILITIES["_meta"]["kiro"]["settings"] == {}
+        assert KAS_CLIENT_CAPABILITIES["_meta"]["kiro"]["settings"] == {
+            "codeIntelligence": {"enabled": True}
+        }
 
     def test_empty_settings_is_an_equal_copy(self):
         out = with_client_meta_settings(KAS_CLIENT_CAPABILITIES, {})

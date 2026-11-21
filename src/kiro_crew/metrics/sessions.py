@@ -131,8 +131,10 @@ END_REASON_SHUTDOWN = "shutdown"
 #: than folded into ``reset``: it pops the registry directly and never calls
 #: ``reset``, and an identity change is a different event from an idle sweep.
 #: ``reload_provider_factory`` reports this too for the registry it clears on a
-#: provider switch -- both are "this process is not the right host for these
-#: sessions", which is why they share a label rather than minting a second one.
+#: provider switch, and so does ``SessionAllocationService._evict_stale_session``
+#: for a stricter ``agent.sandbox`` -- each is "this process is not the right host
+#: for these sessions", which is why they share a label rather than minting a
+#: second one.
 END_REASON_RETIRED = "retired"
 #: ``CompactionCoordinator._recycle_held`` -- context overflow replaced the
 #: provider in place. Also pops directly rather than routing through ``reset``.
@@ -368,6 +370,18 @@ async def record_session_started(
         )
     except Exception:
         logger.debug("session started counter failed", exc_info=True)
+        return
+    # The app this session runs under, counted only once session.started is, so
+    # it never counts more. ``owning_app`` is the trusted slot app session
+    # allocation set; the recorder swallows its own failures.
+    owning_app = getattr(provider, "owning_app", "")
+    if isinstance(owning_app, str) and owning_app:
+        try:
+            from kiro_crew.metrics.feature_usage import record_app_session_started
+
+            record_app_session_started(owning_app, kind)
+        except Exception:
+            logger.debug("app session started counter failed", exc_info=True)
 
 
 def started_trigger_of(session_key: str) -> str | None:
@@ -591,8 +605,11 @@ def _owner_still_running(pid: object, start_id: object) -> bool:
     return live_start_id == start_id
 
 
-async def record_session_ended(session_key: str, *, end_reason: str) -> None:
+async def record_session_ended(session_key: str, *, end_reason: str) -> bool:
     """Emit *session_key*'s lifetime; never raises.
+
+    Returns True when a cancellation reached the crumb hop and was absorbed, so
+    the caller can re-raise it once its own post-pop cleanup has run.
 
     **The pop and the sample stay in the same tick as the registry removal they
     report; only the unlink leaves it.** The start time is popped from the
@@ -625,9 +642,15 @@ async def record_session_ended(session_key: str, *, end_reason: str) -> None:
     ``finally`` BELOW this call, and ``discard_conversation`` and ``reset`` clear
     the resume SID after the lock. Raising here would skip that cleanup and leave a
     destroyed session's mapping for the next boot to resume. The swallowed
-    ``CancelledError`` is not re-delivered, so the caller runs to completion
-    (``test_a_cancelled_end_lets_its_callers_post_pop_cleanup_run``). The crumb is
-    safe either way: :func:`_unlink_generations` shields its hop.
+    ``CancelledError`` is not re-delivered here, so the caller runs to completion
+    (``test_a_cancelled_end_lets_its_callers_post_pop_cleanup_run``); the return
+    value tells it to raise ``CancelledError`` once that cleanup is done. A caller
+    that drops it turns a timeout around it into an unbounded wait: the timeout
+    fired once, and nothing re-delivers it. shortcut: only ``reset`` re-raises it
+    today, since it is the verb timeout-bounded injection and retry paths call; the
+    other end paths still drop it, so give them the same tail when one is found
+    under a timeout. The crumb is safe either way:
+    :func:`_unlink_generations` shields its hop.
 
     Must not take ``_crumb_io_lock``: worker threads hold it across filesystem
     latency, so waiting on it would park the loop. No lock is needed -- the backfill
@@ -635,7 +658,7 @@ async def record_session_ended(session_key: str, *, end_reason: str) -> None:
     self-corrects by re-checking the generation this function has just popped.
     """
     if not session_key or end_reason not in END_REASONS:
-        return
+        return False
     with _live_lock:
         started_at = _live_starts.pop(session_key, None)
         harness = _start_harnesses.pop(session_key, HARNESS_UNKNOWN)
@@ -643,7 +666,7 @@ async def record_session_ended(session_key: str, *, end_reason: str) -> None:
         # No generation of ours to consume, so nothing is unlinked. The entry was
         # evicted (which unlinks at eviction time) or never recorded, and files
         # sharing this digest belong to other processes or earlier runs.
-        return
+        return False
     try:
         _emit_duration(session_key, time.time() - started_at, end_reason, harness)
     except Exception:
@@ -654,10 +677,16 @@ async def record_session_ended(session_key: str, *, end_reason: str) -> None:
     # this writer and this generation, so no concurrent session's record is
     # reachable from here.
     try:
-        await _unlink_generations(((session_key, started_at),))
+        return await _unlink_generations(((session_key, started_at),))
+    except asyncio.CancelledError:
+        # Absorbed so the caller's post-pop cleanup still runs; the caller
+        # re-raises it after that cleanup. See the docstring.
+        logger.debug("session end crumb handoff cancelled", exc_info=True)
+        return True
     except BaseException:
         # Absorbed so the caller's post-pop cleanup still runs; see the docstring.
         logger.debug("session end crumb handoff interrupted", exc_info=True)
+    return False
 
 
 async def record_sessions_ended(session_keys: Iterable[str], *, end_reason: str) -> None:
@@ -857,8 +886,10 @@ def _last_activity(session_key: str) -> float | None:
         return None
 
 
-async def _unlink_generations(generations: Sequence[tuple[str, float]]) -> None:
+async def _unlink_generations(generations: Sequence[tuple[str, float]]) -> bool:
     """Consume the crumbs of *generations* on a worker thread; never raises.
+
+    Returns True when the await was cancelled, which this absorbs.
 
     **The hop is AWAITED, not queued.** ``shutdown_maintenance_executor`` drains
     with ``cancel_futures=True``, so a fire-and-forget unlink is dropped at
@@ -888,8 +919,7 @@ async def _unlink_generations(generations: Sequence[tuple[str, float]]) -> None:
       hook runs queued items before its sentinel.
     * A worker finishing after the loop closed cannot raise "Event loop is closed"
       -- ``_chain_future._call_set_state`` returns early when ``dest_loop.is_closed()``
-      rather than calling ``call_soon_threadsafe``
-      (``test_the_crumb_write_is_never_a_loop_bound_future``). The normal path
+      rather than calling ``call_soon_threadsafe``. The normal path
       awaits to completion; only a cancellation abandons the future.
 
     The start path must not do this: its write is ORDERED under the caller's
@@ -904,7 +934,7 @@ async def _unlink_generations(generations: Sequence[tuple[str, float]]) -> None:
     the files that scan reads are disjoint sets.
     """
     if not generations:
-        return
+        return False
     paths = [_crumb_path(session_key, started_at) for session_key, started_at in generations]
     try:
         hop = asyncio.get_running_loop().run_in_executor(None, _unlink_all, paths)
@@ -914,13 +944,17 @@ async def _unlink_generations(generations: Sequence[tuple[str, float]]) -> None:
         # backfill rather than unlinking on the loop; its ownership check means the
         # crumb is only ever claimed once this process is gone.
         logger.debug("session crumb unlink could not be scheduled", exc_info=True)
-        return
+        return False
     try:
         await asyncio.shield(hop)
-    except BaseException:
+    except asyncio.CancelledError:
         # The shield was cancelled, not the hop: the executor still owns the work
         # and runs it. Nothing is retried here, and nothing runs on the loop.
         logger.debug("session crumb unlink hop abandoned to its worker", exc_info=True)
+        return True
+    except BaseException:
+        logger.debug("session crumb unlink hop abandoned to its worker", exc_info=True)
+    return False
 
 
 def _unlink_all(paths: Sequence[Path]) -> None:

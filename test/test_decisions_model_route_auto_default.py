@@ -1,7 +1,7 @@
 """The auto default: a slot the OWNER left on ``auto`` routes while the preview is on.
 
 There are two ways into ``model.route`` and both are the owner's own choice: the
-explicit ``Auto (Jev)`` pick (``slot.jev_route``), and a slot model of ``auto`` --
+explicit ``Auto (decision model)`` pick (``slot.jev_route``), and a slot model of ``auto`` --
 the picker's inherit row, which the sentinel pick resolves to. A slot that DOES
 name a model is never routed: a pin is the owner answering this point by hand.
 
@@ -11,7 +11,7 @@ an owner action, so it is dropped on purpose. Admitting it was also uneven: on a
 seam that backfills a resolved model into ``slot.model``
 (``_backfill_canonical_model``) before the gate is read the slot was already
 pinned and nothing routed, while on a seam that backfills ``""`` the same slot DID
-route -- one state, two behaviours, and a composer chip that said ``Auto (Jev)``
+route -- one state, two behaviours, and a composer chip that said ``Auto (decision model)``
 for a turn that in the first case ran on the backend default. The chip and the
 gate now agree that only a choice arms routing.
 
@@ -36,7 +36,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from test_decisions_strip_rides_message import _quiet_sel, _runner_state, _settle, _slot
+from test_decisions_strip_rides_message import (  # noqa: F401 - the fixture is used by name
+    _quiet_sel,
+    _runner_state,
+    _settle,
+    _slot,
+    generous_decision_log_append,
+)
 
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.config.sections import DECISION_PROVIDER_ENDPOINT_DEFAULT, DecisionsConfig
@@ -46,6 +52,8 @@ from kiro_crew.decisions import log as log_mod
 from kiro_crew.decisions import outcomes
 from kiro_crew.decisions.types import Answer
 from kiro_crew.providers.base import LLMEvent
+
+pytestmark = pytest.mark.usefixtures("generous_decision_log_append")
 
 ADVERTISED = ["model-a", "model-b", "model-c"]
 
@@ -175,7 +183,7 @@ class TestWhichSlotsAreArmed:
         this gate is read: the slot's first session backfills the resolved model into
         ``slot.model``, so a turn admitted on ``""`` is already pinned by the time the
         question would be asked. Arming it bought no routing and made the composer
-        chip claim ``Auto (Jev)`` for turns that ran on the backend default."""
+        chip claim ``Auto (decision model)`` for turns that ran on the backend default."""
         slot = _slot("chat-unchosen")
         assert slot.model == "", "a fresh slot must name no model for this to mean anything"
 

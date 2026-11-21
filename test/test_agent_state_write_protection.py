@@ -81,7 +81,7 @@ class TestAgentStateSidecarWriteProtection:
         assert "agent_model_state.json.lock" in sandbox._CREW_PRECREATE_READONLY_FILE_LEAVES
 
     def test_template_spec_lock_is_sealed_by_the_sandbox(self) -> None:
-        # GPT rounds 39-40: the whole KIRO AGENTS tree is sealed read-only —
+        # The whole KIRO AGENTS tree is sealed read-only —
         # the fork specs are what governance sanitizes, so a sandboxed write
         # to one hands the next spawn forged grants; the advisory lock is
         # covered by the same directory seal. Resolved per spawn (never a
@@ -113,6 +113,13 @@ class TestAgentStateSidecarWriteProtection:
         matches = [e for e in entries if e.endswith("agent_model_state.json")]
         # Both data-home spellings, so a legacy install is gated too.
         assert len(matches) == 2, entries
+
+    @pytest.mark.parametrize("prefix", _PREFIXES)
+    def test_session_records_are_write_protected_for_agent_tools(self, prefix: str) -> None:
+        """A record forged with the file-write tool would attest a session key."""
+        record = f"{prefix}/session-tokens/session_token_{'a' * 64}.sig"
+        assert is_sensitive_write_path(record)
+        assert is_sensitive_write_path(str(Path.home() / record[2:]))
 
     def test_sibling_data_home_paths_unaffected(self) -> None:
         """A prefix-neighbour of the entry must not be caught by it."""

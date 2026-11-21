@@ -73,7 +73,15 @@ _CONTROL_OR_SHELL_RE = re.compile(r"[\x00-\x1f\x7f\s\"'`\$\\;&|<>(){}\[\]*?!~#]"
 
 
 class LoginTargetError(ValueError):
-    """The supplied identity target is not one ``kiro-cli login`` can act on."""
+    """The supplied identity target is not one ``kiro-cli login`` can act on.
+
+    ``reason`` names the start-URL rule a refusal broke, so the dashboard can say
+    it in the user's language; a refusal that names no rule leaves it empty.
+    """
+
+    def __init__(self, message: str, *, reason: str = "") -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 def normalize_start_url(raw: str) -> str:
@@ -94,7 +102,9 @@ def normalize_start_url(raw: str) -> str:
     if not value:
         raise LoginTargetError("start URL is required for an Identity Center sign-in")
     if _CONTROL_OR_SHELL_RE.search(value):
-        raise LoginTargetError("start URL contains characters that are not allowed")
+        raise LoginTargetError(
+            "the URL contains a space or a symbol that is not allowed", reason="characters"
+        )
     if "://" not in value:
         value = "https://" + value
     # urlsplit and its .port accessor raise bare ValueError on malformed input
@@ -104,18 +114,23 @@ def normalize_start_url(raw: str) -> str:
         parts = urlsplit(value)
         port = parts.port
     except ValueError as exc:
-        raise LoginTargetError("start URL is not a valid URL") from exc
+        raise LoginTargetError("that does not look like a web address", reason="not_a_url") from exc
     if parts.scheme != "https":
-        raise LoginTargetError("start URL must use https")
+        raise LoginTargetError("the URL must begin with https://", reason="not_https")
     if parts.username is not None or parts.password is not None:
-        raise LoginTargetError("start URL must not carry credentials")
+        raise LoginTargetError(
+            "the URL must not include a user name or password", reason="credentials"
+        )
     if port is not None:
-        raise LoginTargetError("start URL must use the default https port")
+        raise LoginTargetError(
+            "the URL must not include a port number (a colon and digits after the site name)",
+            reason="port",
+        )
     if parts.query or parts.fragment:
-        raise LoginTargetError("start URL must not carry a query or fragment")
+        raise LoginTargetError("the URL must not include anything after a ? or #")
     host = (parts.hostname or "").lower()
     if not _HOSTNAME_RE.fullmatch(host):
-        raise LoginTargetError("start URL host must be a valid DNS hostname")
+        raise LoginTargetError("that does not look like a web address", reason="hostname")
     path = parts.path.rstrip("/") or "/start"
     return f"https://{host}{path}"
 
@@ -209,6 +224,15 @@ class KiroLoginTarget:
             return f"IAM Identity Center ({self.start_url}, {self.region})"
         return "Builder ID"
 
+    def login_command(self) -> str:
+        """The ``cloud login`` command for this target: Identity Center flags when pinned."""
+        login_cmd = "kirocrew cloud login"
+        if self.is_identity_center:
+            login_cmd += (
+                f" --identity-provider {self.start_url} --license pro --idp-region {self.region}"
+            )
+        return login_cmd
+
     def recovery_command(self) -> str:
         """The two commands that sign the wrong session out and the right one in.
 
@@ -217,13 +241,8 @@ class KiroLoginTarget:
         Identity Center flags for a pinned target, the bare command for the
         Builder ID default.
         """
-        login_cmd = "kirocrew cloud login"
-        if self.is_identity_center:
-            login_cmd += (
-                f" --identity-provider {self.start_url} --license pro --idp-region {self.region}"
-            )
         # Two commands, not an `&&` chain: Windows PowerShell 5.1 cannot parse `&&`.
-        return f"`kirocrew cloud logout`, then `{login_cmd}`"
+        return f"`kirocrew cloud logout`, then `{self.login_command()}`"
 
 
 # ── whoami parsing (shared with the dashboard's credit readout) ─────────────

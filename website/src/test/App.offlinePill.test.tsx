@@ -16,19 +16,27 @@
  * the generic "Gateway offline" that points a screen-reader user at
  * reconnection when pasting a token is the fix (issue #9692).
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { act, screen, waitFor, within } from '@testing-library/react'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import type { QueryClient } from '@tanstack/react-query'
 import { renderWithProviders } from './helpers'
 import { namedCeiling } from './namedCeiling'
 import type { RootState } from '../store'
 import { sseConnected, sseDisconnected } from '../store/dashboardSlice'
+import { relayPaneOpened, setActiveId } from '../store/instancesSlice'
 import App from '../App'
 import en from '../i18n/locales/en.manual.json'
+import { QUIET_RECONNECT_GRACE_MS } from '../utils/reconnectBackoff'
 
 // Match the App.test.tsx mock setup. Differ only in `isAuthBannerShown`
 // where each test controls it explicitly.
-vi.mock('../pages/ChatPage', () => ({ default: () => <div data-testid="chat-page">ChatPage</div> }))
+// A layer the page portals out of <main>, as the guide pill and a page's Modal do.
+vi.mock('../pages/ChatPage', async () => {
+  const { OverlayPortal } = await import('../components/overlayRoot')
+  return {
+    default: () => <div data-testid="chat-page">ChatPage<OverlayPortal><div data-testid="chat-page-layer"><input aria-label="layer draft" /></div></OverlayPortal></div>,
+  }
+})
 vi.mock('../pages/SystemPage', () => ({ default: () => null }))
 vi.mock('../pages/ProjectsPage', () => ({ default: () => null }))
 vi.mock('../pages/LogsPage', () => ({ default: () => null }))
@@ -307,6 +315,195 @@ describe('App before the first socket opens — connecting, not offline (#34947)
     act(() => { store.dispatch(sseDisconnected()) })
     expect(statusText(connDot())).toBe(en.app.gateway_offline_reconnecting)
     expect(screen.getByTestId('topbar-offline-notice')).toHaveTextContent(en.app.gateway_offline_reconnecting)
+    await shellSettled(queryClient)
+  })
+})
+
+describe('App in a relay Crew window — a calm reconnecting view while it retries', () => {
+  const RELAY_UA = 'Mozilla/5.0 (Macintosh) Electron/44 kiroCrewRelayWindow'
+  beforeEach(() => {
+    isAuthBannerShownMock.mockReset()
+    isAuthBannerShownMock.mockReturnValue(false)
+    vi.spyOn(window.navigator, 'userAgent', 'get').mockReturnValue(RELAY_UA)
+  })
+  afterEach(() => { vi.restoreAllMocks() })
+
+  it('shows the centre view and a warn connecting dot, with no danger styling, while retrying', async () => {
+    const { store, queryClient } = renderWithProviders(<App />, { route: '/chat' })
+    const view = screen.getByTestId('relay-reconnecting')
+    // Mounted before the drop, so its polite region announces it.
+    expect(view).toHaveAttribute('role', 'status')
+    expect(view).toHaveAttribute('aria-live', 'polite')
+    expect(view).toHaveTextContent('')
+    act(() => { store.dispatch(sseConnected()) })
+    act(() => { store.dispatch(sseDisconnected()) })
+    expect(view).toHaveTextContent(en.app.relay_crew_reconnecting)
+    expect(view).toHaveTextContent(en.app.relay_crew_dropped)
+    expect(view).toHaveTextContent('reconnecting on its own')
+    // The covered content is out of the focus order, so keystrokes cannot reach a hidden composer.
+    const main = document.getElementById('main-content')
+    expect(main).toHaveAttribute('inert')
+    expect(main).toHaveClass('isolate')
+    const spinner = view.querySelector('svg')
+    expect(spinner?.classList.contains('animate-spin')).toBe(true)
+    expect(spinner?.classList.contains('motion-reduce:animate-none')).toBe(true)
+    // The top bar: no red capsule, no error notice, a spinning warn glyph and the quiet word.
+    expect(connDot().closest('.tb-capsule')).not.toHaveClass('glass-danger')
+    expect(connDot().querySelector('svg')?.getAttribute('data-conn-state')).toBe('reconnecting')
+    expect(screen.queryByTestId('topbar-offline-notice')).toBeNull()
+    expect(screen.getByTestId('topbar-reconnecting')).toHaveTextContent(en.app.relay_crew_connecting)
+    // One live region speaks the state: the capsule's stays quiet.
+    expect(statusText(connDot())).toBe('')
+    // Reconnected: the view empties and the capsule speaks again.
+    act(() => { store.dispatch(sseConnected()) })
+    expect(view).toHaveTextContent('')
+    expect(main).not.toHaveAttribute('inert')
+    expect(main).not.toHaveClass('isolate')
+    expect(screen.queryByTestId('topbar-reconnecting')).toBeNull()
+    expect(statusText(connDot())).toBe(en.app.gateway_connected)
+    await shellSettled(queryClient)
+  })
+
+  it('gives focus back to the element the retry made inert once it reconnects', async () => {
+    const { store, queryClient } = renderWithProviders(<App />, { route: '/chat' })
+    act(() => { store.dispatch(sseConnected()) })
+    const composer = document.createElement('textarea')
+    document.getElementById('main-content')!.appendChild(composer)
+    composer.focus()
+    act(() => { store.dispatch(sseDisconnected()) })
+    // jsdom has no inert focus fixup; stand in for the browser dropping focus to <body>.
+    composer.blur()
+    expect(document.activeElement).toBe(document.body)
+    act(() => { store.dispatch(sseConnected()) })
+    expect(document.activeElement).toBe(composer)
+    // Focus the user moved elsewhere during the retry is left where they put it.
+    const elsewhere = document.createElement('button')
+    document.body.appendChild(elsewhere)
+    act(() => { store.dispatch(sseDisconnected()) })
+    composer.blur()
+    elsewhere.focus()
+    act(() => { store.dispatch(sseConnected()) })
+    expect(document.activeElement).toBe(elsewhere)
+    composer.remove()
+    elsewhere.remove()
+    await shellSettled(queryClient)
+  })
+
+  it.each([
+    ['refused', en.app.relay_access_refused],
+    ['session_ended', en.app.relay_session_ended],
+  ] as const)('keeps the danger styling for a real failure (%s)', async (cause, text) => {
+    const { store, queryClient } = renderWithProviders(<App />, { route: '/chat' })
+    act(() => { store.dispatch(sseDisconnected(cause)) })
+    expect(screen.getByTestId('relay-reconnecting')).toHaveTextContent('')
+    expect(connDot().closest('.tb-capsule')).toHaveClass('glass-danger')
+    expect(connDot().querySelector('svg')?.getAttribute('data-conn-state')).toBe('offline')
+    expect(screen.getByTestId('topbar-offline-notice')).toHaveTextContent(text)
+    expect(screen.queryByTestId('topbar-reconnecting')).toBeNull()
+    expect(statusText(connDot())).toBe(text)
+    await shellSettled(queryClient)
+  })
+})
+
+describe('App on this machine with the gateway gone — one calm view over every panel', () => {
+  beforeEach(() => {
+    isAuthBannerShownMock.mockReset()
+    isAuthBannerShownMock.mockReturnValue(false)
+  })
+
+  it('covers the panels while offline and shows them again once the gateway is back', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const { store, queryClient } = renderWithProviders(<App />, { route: '/chat' })
+    act(() => { store.dispatch(sseConnected()) })
+    const main = document.getElementById('main-content')!
+    expect(screen.queryByTestId('host-offline')).toBeNull()
+    expect(main).not.toHaveAttribute('inert')
+    // The panels show while connected: the gate covers them only offline.
+    expect(screen.getByTestId('chat-page')).toBeVisible()
+    act(() => { store.dispatch(sseDisconnected()) })
+    // A drop shorter than the quiet-reconnect grace covers nothing.
+    expect(screen.queryByTestId('host-offline')).toBeNull()
+    act(() => { vi.advanceTimersByTime(QUIET_RECONNECT_GRACE_MS) })
+    vi.useRealTimers()
+    const view = screen.getByTestId('host-offline')
+    expect(view).toHaveTextContent("The gateway isn't running on this machine.")
+    // It names the way back, not just a wait.
+    expect(view).toHaveTextContent('kirocrew gateway')
+    expect(view).toHaveTextContent(en.app.host_offline_sessions_kept)
+    // No second live region: the top bar's status already speaks the drop,
+    // and its "Gateway offline — reconnecting" stays.
+    expect(view).not.toHaveAttribute('aria-live')
+    expect(statusText(connDot())).toBe(en.app.gateway_offline_reconnecting)
+    expect(screen.getByTestId('topbar-offline-notice')).toHaveTextContent(en.app.gateway_offline_reconnecting)
+    // Every panel under it (folders, board columns, the guide, the composer) is hidden and inert.
+    expect(main).toHaveAttribute('inert')
+    expect(main).toHaveAttribute('aria-hidden', 'true')
+    // What the panels portal out of main (the guide's error pill) goes with them.
+    expect(screen.queryByTestId('chat-page-layer')).toBeNull()
+    act(() => { store.dispatch(sseConnected()) })
+    expect(screen.queryByTestId('host-offline')).toBeNull()
+    expect(main).not.toHaveAttribute('inert')
+    expect(screen.getByTestId('chat-page-layer')).toBeInTheDocument()
+    await shellSettled(queryClient)
+  })
+
+  it('leaves a relay reason to its own surface', async () => {
+    const { store, queryClient } = renderWithProviders(<App />, { route: '/chat' })
+    act(() => { store.dispatch(sseDisconnected('refused')) })
+    expect(screen.queryByTestId('host-offline')).toBeNull()
+    expect(document.getElementById('main-content')).not.toHaveAttribute('inert')
+    await shellSettled(queryClient)
+  })
+})
+
+describe('App in a relay Crew pane — the desktop app draws the only top bar', () => {
+  const PANE_UA = 'Mozilla/5.0 (Macintosh) Electron/44 kiroCrewRelayWindow kiroCrewRelayPane'
+  const WINDOW_UA = 'Mozilla/5.0 (Macintosh) Electron/44 kiroCrewRelayWindow'
+  beforeEach(() => {
+    isAuthBannerShownMock.mockReset()
+    isAuthBannerShownMock.mockReturnValue(false)
+  })
+  afterEach(() => { vi.restoreAllMocks() })
+
+  it('drops its own header and the header row, and still speaks the connection state', async () => {
+    vi.spyOn(window.navigator, 'userAgent', 'get').mockReturnValue(PANE_UA)
+    const { store, queryClient } = renderWithProviders(<App />, { route: '/chat' })
+    expect(document.querySelector('header.topbar')).toBeNull()
+    expect(screen.getByTestId('dashboard-shell').style.gridTemplateRows).toBe('0px minmax(0,1fr)')
+    act(() => { store.dispatch(sseConnected()) })
+    expect(screen.getByTestId('relay-pane-gateway-status')).toHaveTextContent(en.app.gateway_connected)
+    await shellSettled(queryClient)
+  })
+
+  it.each([['a relay Crew window', WINDOW_UA], ['a plain dashboard', 'Mozilla/5.0 (Macintosh)']])(
+    'keeps its header without the pane marker (%s)', async (_label, ua) => {
+      vi.spyOn(window.navigator, 'userAgent', 'get').mockReturnValue(ua)
+      const { queryClient } = renderWithProviders(<App />, { route: '/chat' })
+      expect(document.querySelector('header.topbar')).not.toBeNull()
+      expect(screen.getByTestId('dashboard-shell').style.gridTemplateRows).toBe('')
+      expect(screen.queryByTestId('relay-pane-gateway-status')).toBeNull()
+      await shellSettled(queryClient)
+    })
+})
+
+describe('App with a relay Crew tab in front — the local page and what it portals go off screen', () => {
+  beforeEach(() => {
+    isAuthBannerShownMock.mockReset()
+    isAuthBannerShownMock.mockReturnValue(false)
+  })
+
+  it('takes the layer the page portalled out of <main> off screen, and brings the same one back with its typed text', async () => {
+    const { store, queryClient } = renderWithProviders(<App />, { route: '/chat' })
+    act(() => { store.dispatch(sseConnected()) })
+    const layer = screen.getByTestId('chat-page-layer')
+    const draft = within(layer).getByLabelText('layer draft') as HTMLInputElement
+    fireEvent.change(draft, { target: { value: 'half a thought' } })
+    act(() => { store.dispatch(relayPaneOpened({ id: 'r1', name: 'R1' })) })
+    expect(document.getElementById('main-content')).toHaveAttribute('inert')
+    expect(screen.queryByTestId('chat-page-layer')).toBeNull()
+    act(() => { store.dispatch(setActiveId(null)) })
+    expect(screen.getByTestId('chat-page-layer')).toBe(layer)
+    expect(draft.value).toBe('half a thought')
     await shellSettled(queryClient)
   })
 })

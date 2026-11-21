@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Coroutine
 from kiro_crew.config.loader import ACTIVATION_REVIEW, KiroCrewConfig
 from kiro_crew.messaging.link import legacy_key
 from kiro_crew.messaging.queue_drain import entries_queued_by, owner_token, tag_entry
+from kiro_crew.sel import sel
 from kiro_crew.session import unlink_queued_temp_paths
 from kiro_crew.session_lifecycle import hand_queue_to_successor
 from kiro_crew.slack.handler import (
@@ -37,6 +38,8 @@ from kiro_crew.slack.handler import (
     is_yolo_mode,
     slack_cfg,
 )
+from kiro_crew.slack.linked_thread_images import set_inbound_files as set_linked_thread_files
+from kiro_crew.slack.shared_access import prime_shared_user
 from kiro_crew.slack.transport_dispatch import handle_message_transport
 from kiro_crew.start_priority import person_priority
 
@@ -70,14 +73,19 @@ def _entry_owner(sender_id: str, channel: str) -> str:
     return owner_token(_CHANNEL, (sender_id, channel))
 
 
-def _queue_tags(sender_id: str, channel: str) -> dict[str, Any]:
+def _queue_tags(sender_id: str, channel: str, *, shared: bool = False) -> dict[str, Any]:
     """The channel and owner tags every Slack queue entry carries.
 
     Attached to the session queue's kwargs and to a pre-session ``_pending_queue``
     entry's kwargs alike, so a ``!stop`` scoped by owner can tell the caller's entries
-    from the rest on both.
+    from the rest on both. *shared* is the admission decision ``_route_message``
+    made for the sender (``slack.shared_access``); an entry it marks is re-checked by
+    :func:`_dispatch_queued`, which drops it if their access ended before it ran.
     """
-    return tag_entry({}, _CHANNEL, _entry_owner(sender_id, channel))
+    tags: dict[str, Any] = dict(tag_entry({}, _CHANNEL, _entry_owner(sender_id, channel)))
+    if shared:
+        tags["shared_sender"] = True
+    return tags
 
 
 class _StopHold:
@@ -533,6 +541,8 @@ def _resolve_approval_mode(orch: "GatewayOrchestrator") -> str:
 
     Normalized to handle_message's auto/interactive contract; reads/yolo are
     gated separately (gateway approval-event path, global YOLO/trust).
+    A native turn started by a click or modal uses ``_configured_approval_mode``
+    instead, which leaves the YOLO fold below out.
     """
     # Runtime YOLO (owner-toggled via the `yolo` slash command, TTL-capped safety_override)
     # auto-approves all tools. The native loop checks is_yolo_mode() inline; the
@@ -541,6 +551,16 @@ def _resolve_approval_mode(orch: "GatewayOrchestrator") -> str:
     # paths then honor the runtime toggle consistently.
     if is_yolo_mode():
         return APPROVAL_AUTO
+    return _configured_approval_mode(orch)
+
+
+def _configured_approval_mode(orch: "GatewayOrchestrator") -> str:
+    """The CLI --approval flag, else config, normalized; runtime YOLO is not folded in.
+
+    For a turn started on the native path by a click or modal: the permission
+    ladder checks live YOLO per request, so a timed YOLO that ends mid-turn
+    stops auto-approving there instead of riding a mode captured at turn start.
+    """
     mode = orch._approval_mode or orch._cfg.agent.approval_mode
     return APPROVAL_AUTO if mode == APPROVAL_AUTO else APPROVAL_INTERACTIVE
 
@@ -570,13 +590,38 @@ async def _dispatch_queued(
     if not isinstance(_q_spool_text, str):
         _q_spool_text = None
     _q_spool_attachments = int(kwargs.get("spool_attachments") or 0)
+    _q_spool_attachment_names = tuple(kwargs.get("spool_attachment_names") or ())
     # Whether the queued message was a voice memo, so it is still answered in kind.
     _q_had_voice_input = bool(kwargs.get("had_voice_input", False))
     if client:
         try:
             await client.remove_reaction(channel, msg_ts, "hourglass_flowing_sand")
         except Exception:
+            # The ⏳ reaction is cosmetic; the message is dispatched either way.
             pass
+    # A removal or switch-off applies to the next event, queued ones included.
+    _q_sender = str(kwargs.get("sender_id", "") or "")
+    if kwargs.get("shared_sender"):
+        # A confirmation that aged out while the message waited is asked again,
+        # so only a real removal drops it.
+        await prime_shared_user(_q_sender, orch)
+    # Read through the handler at call time: interactions imports this module early,
+    # and a module-level binding would split the events facade's copy of the name.
+    from kiro_crew.slack import handler as slack_handler
+
+    if kwargs.get("shared_sender") and not (
+        slack_handler.is_allowed_user(_q_sender) or slack_handler.is_shared_user(_q_sender)
+    ):
+        sel().log_api_access(
+            caller=_q_sender,
+            operation="slack.message",
+            outcome="denied",
+            source="slack",
+            resources=f"channel={channel} queued",
+            error="shared access ended while queued",
+        )
+        unlink_queued_temp_paths(kwargs)
+        return
     # Route the queued follow-up through the SAME gate as the initial message so
     # behavior is consistent mid-conversation: a thread that took the transport
     # path must keep taking it for its queued follow-ups (not silently fall back
@@ -587,6 +632,8 @@ async def _dispatch_queued(
         getattr(getattr(slack_cfg(orch), "messaging", None), "use_transport", False) is True
         and _activation != ACTIVATION_REVIEW
     )
+    # This entry's own files, never the ones of the message whose task queued it.
+    set_linked_thread_files(kwargs.get("image_temp_paths") or [])
     try:
         if _use_transport:
             await handle_message_transport(
@@ -623,6 +670,7 @@ async def _dispatch_queued(
                 start_priority=person_priority(not from_trusted_bot),
                 spool_text=_q_spool_text,
                 spool_attachments=_q_spool_attachments,
+                spool_attachment_names=_q_spool_attachment_names,
                 had_voice_input=_q_had_voice_input,
             )
             return
@@ -648,6 +696,7 @@ async def _dispatch_queued(
             had_voice_input=_q_had_voice_input,
             spool_text=_q_spool_text,
             spool_attachments=_q_spool_attachments,
+            spool_attachment_names=_q_spool_attachment_names,
             start_priority=person_priority(not from_trusted_bot),
         )
     finally:

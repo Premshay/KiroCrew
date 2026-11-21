@@ -24,7 +24,9 @@ A caller that builds its provider on its own thread and event loop calls
 
 The warm pool's other kiro-cli gate lives here too, so the pool reaches the ACP
 layer through this boundary: :func:`kas_extract_held` holds a KAS relay pool while
-kiro-cli's unpacked engine is recorded broken (:mod:`kiro_crew.acp.kas_extract_repair`).
+kiro-cli's unpacked engine is recorded broken (:mod:`kiro_crew.acp.kas_extract_repair`),
+and :func:`warm_pool_start_held` adds the hold a signed-out start records
+(:mod:`kiro_crew.acp.kiro_signin_hold`).
 """
 
 from __future__ import annotations
@@ -37,6 +39,12 @@ from kiro_crew.kiro_cli import _KAS_HELP_PROBE_TIMEOUT_SECS
 
 #: The longest a spawn waits for the verdict, measured from the arm time.
 KAS_FLOOR_WAIT_SECS: float = float(_KAS_HELP_PROBE_TIMEOUT_SECS)
+
+#: How long the gateway waits before each new ask about a stored Kiro CLI pick
+#: whose verdict is still unknown (a probe that timed out on a busy host, a run the
+#: sandbox launcher ended). Spawns never wait for these asks: the first verdict
+#: releases them, and a later confirmation moves new sessions onto KAS.
+KIRO_PICK_VERDICT_RETRY_SECS: tuple[float, ...] = (60.0, 300.0, 900.0)
 
 #: The armed verdict, its loop-time deadline and main / member early-release signals.
 _armed: (
@@ -141,3 +149,32 @@ async def kas_extract_held(provider: object) -> bool:
     from kiro_crew.acp.kas_extract_repair import warm_pool_held
 
     return await warm_pool_held(provider)
+
+
+async def warm_pool_start_held(provider: object) -> bool:
+    """Whether the warm pool should not start *provider* now, for any recorded cause.
+
+    The causes are a broken KAS extract (:func:`kas_extract_held`) and a kiro-cli
+    sign-in that failed a start (:mod:`kiro_crew.acp.kiro_signin_hold`).
+    """
+    from kiro_crew.acp import kiro_signin_hold
+
+    backend = _pool_backend(provider)
+    held = backend is not None and kiro_signin_hold.held(backend)
+    return held or await kas_extract_held(provider)
+
+
+def _pool_backend(provider: object) -> str | None:
+    """The harness id *provider* starts, or None when it names none."""
+    backend = getattr(getattr(provider, "_client", None), "backend", None)
+    return backend if isinstance(backend, str) else None
+
+
+def note_warm_pool_start_failed(exc: BaseException, provider: object) -> None:
+    """Record a pool start failure that every retry would repeat until sign-in returns."""
+    from kiro_crew.acp import kiro_signin_hold
+    from kiro_crew.acp.transport_errors import AcpAuthRequired
+
+    backend = _pool_backend(provider)
+    if isinstance(exc, AcpAuthRequired) and backend is not None:
+        kiro_signin_hold.note_signed_out(backend)

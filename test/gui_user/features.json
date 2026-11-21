@@ -496,7 +496,7 @@
         "seed": "sessions-long-history",
         "members": [],
         "feature_flags": [],
-        "notes": "Uses pages/chat/pagination.ts and EarlierMessagesBar; sessions-long-history initial load returns 8 live rows with has_more=true, next_before=60, and paging reads the archive segment."
+        "notes": "Uses pages/chat/pagination.ts and EarlierMessagesBar. The chat opens the pinned long-history session with a 100-row page (OLDER_PAGE_LIMIT) cut from its 129-row corpus (120 archived + 9 live rows), so the first page answers has_more=true and Load earlier pages into the archive segment. The no-limit slot read returns the 9 live rows with has_more=true, next_before=120."
       },
       "runnable": "nightly",
       "estimated_steps": 4,
@@ -1012,7 +1012,7 @@
         "seed": "apps-installed",
         "members": [],
         "feature_flags": [],
-        "notes": "At least one enabled fixture app declaring contributes.panelTabs (bundled ESM tab) and contributes.sessionControls with a status route."
+        "notes": "No seed carries this: panelTabs[].entry and sessionControls[].entryPoint are ESM modules. Stage one app before the test: <dir>/app.json = {\"name\": \"fixture-notes-ui\", \"displayName\": \"Fixture Notes UI\", \"version\": \"1.0.0\", \"description\": \"GUI-lane staging app\", \"author\": \"kirocrew-fixture\", \"ui\": {\"entry\": \"page.mjs\", \"pages\": [{\"route\": \"/apps/fixture-notes-ui\", \"label\": \"Fixture Notes UI\"}]}, \"contributes\": {\"panelTabs\": [{\"id\": \"notes\", \"title\": \"Fixture notes\", \"menuLabel\": \"Fixture notes\", \"icon\": \"FileText\", \"entry\": \"panel.mjs\"}], \"sessionControls\": [{\"id\": \"notes-chip\", \"entryPoint\": \"control.mjs\", \"label\": \"Fixture notes\", \"icon\": \"Tag\"}]}}, and <dir>/ui/page.mjs, panel.mjs and control.mjs each a one-line `export default function X() { return '<some text>' }`. Install it with `KIROCREW_HOME=<lane home> KIROCREW_PORT=<lane port> kirocrew app install <dir>`, then, as the dashboard owner, POST /api/security/trusted-apps/fixture-notes-ui with {} and POST /api/apps/fixture-notes-ui/enable with {} (`kirocrew app enable` is refused: third-party app execution is off by default). /chat then shows a 'Fixture notes' chip in the composer bar and a 'Fixture notes' row in the side panel's + menu that opens the tab. The chip has no statusPath, which would need an app backend."
       },
       "runnable": "nightly",
       "estimated_steps": 4,
@@ -1405,7 +1405,7 @@
         "seed": "apps-installed",
         "members": [],
         "feature_flags": [],
-        "notes": "APPS_NAV_LIMIT = 6; state persisted in 'mc-apps-expanded'; needs more than 6 enabled apps with UI pages."
+        "notes": "APPS_NAV_LIMIT = 6; state persisted in 'mc-apps-expanded'. apps-installed ships seven enabled local apps with a ui.pages route (fixture-notes, fixture-board, fixture-clock, fixture-diary, fixture-inbox, fixture-ledger, fixture-tasks), so the toggle renders from the seed alone."
       },
       "runnable": "nightly",
       "estimated_steps": 3,
@@ -2124,15 +2124,15 @@
     {
       "id": "capabilities-agent-templates",
       "feature": "capabilities",
-      "title": "Agent templates inside a crew's Template pane",
+      "title": "The agent template a bot is built from",
       "user_story": "As an operator, I want to inspect the harness-level agent definitions crews bind to, so that I understand what a crew actually runs.",
       "start_url": "/capabilities",
-      "entry_path": "Customize → Mates tab → open a mate → Template pane (the shared definitions live on the Custom agents tab)",
+      "entry_path": "Customize → Bots tab → open a bot → General pane → Built from field (the shared definitions live on the Custom agents tab, ?tab=templates)",
       "preconditions": {
         "seed": "minimal",
         "members": [],
         "feature_flags": [],
-        "notes": ""
+        "notes": "Nothing to stage: minimal boots with two bots on the Bots tab (default, built from kirocrew, and Bot)."
       },
       "runnable": "nightly",
       "estimated_steps": 2,
@@ -2144,7 +2144,7 @@
       "merged_from": [
         "capabilities-agent-templates"
       ],
-      "component": "website/src/components/crew/AgentTemplateDetail.tsx"
+      "component": "website/src/components/crew/CrewEditorNextDialog.tsx"
     },
     {
       "id": "capabilities-crew-appearance-library",
@@ -2537,7 +2537,7 @@
         "seed": "memory-populated",
         "members": [],
         "feature_flags": [],
-        "notes": "DRILL_VIEWS in OverviewPage.tsx; TunnelStatus appears on the hero. The Kiro sign-in card does not: it lives on Settings > Agent Harness."
+        "notes": "DRILL_VIEWS in OverviewPage.tsx; TunnelStatus appears on the hero. The Kiro sign-in card does not: it lives on Settings > Kiro account."
       },
       "runnable": "smoke",
       "estimated_steps": 3,
@@ -3622,7 +3622,7 @@
         "src/kiro_crew/apps/builtins/workflows/app.json",
         "src/kiro_crew/apps/builtins/workflows/server.py",
         "website/src/apps/workflows/WorkflowsPage.tsx",
-        "website/src/apps/workflows/WorkflowsRuns.tsx"
+        "website/src/components/workflows/WorkflowsRuns.tsx"
       ],
       "priority": "P2",
       "merged_from": [
@@ -3666,7 +3666,7 @@
         "seed": "apps-installed",
         "members": [],
         "feature_flags": [],
-        "notes": "Fixture app ships a static UI. Sample two or three builtin routes (e.g. /worlds, /channels). Installed apps do not highlight Discover or Library; orphaned apps tint warn."
+        "notes": "The seed gives fixture-notes a ui.pages route, so it has an Apps rail row and /apps/fixture-notes opens; it shows the 'Agent-only app' notice because a seed ships no UI bundle. For an app-owned page body, stage the fixture-notes-ui app described in chat-app-contributed-panel-tabs and open /apps/fixture-notes-ui, which renders its page.mjs text. Sample two or three builtin routes (e.g. /worlds, /channels). Installed apps do not highlight Discover or Library; orphaned apps tint warn."
       },
       "runnable": "nightly",
       "estimated_steps": 2,
@@ -5549,25 +5549,25 @@
     {
       "id": "kas-auth-sign-in-card-signed-out",
       "feature": "auth",
-      "title": "Kiro sign-in card on Settings > Agent Harness (signed-out state)",
+      "title": "Kiro sign-in card on Settings > Kiro account (signed-out state)",
       "user_story": "As an operator, I want to see whether Kiro Crew holds a Kiro identity and how to sign in, so that I can fix a session that cannot start.",
-      "start_url": "/settings/agent",
-      "entry_path": "Settings > Agent Harness > scroll below the backend switch to the 'Kiro sign-in' card (deep link /settings/agent?highlight=key:kiro-sign-in)",
+      "start_url": "/settings/kiro-account",
+      "entry_path": "Settings > Kiro account > the 'Kiro sign-in' card (deep link /settings/kiro-account?highlight=key:kiro-sign-in)",
       "preconditions": {
         "seed": "minimal",
         "members": [
           "nova-sky"
         ],
         "feature_flags": [],
-        "notes": "No vault identity on the seeded home; KasLoginGate is not mounted at app root, the card embeds the same views. KiroSignInCard (pages/developer) mounts only inside the KAS row's detail on Agent Harness (AgentBackendTab.tsx), and only while KAS is an offered backend, so the seeded host must offer KAS. Settings > Overview carries only a one-line pointer (while KAS is the selected backend) and the card is not in Settings search. The shipped scenario auth-sign-in-card-signed-out drives the same card."
+        "notes": "No vault identity on the seeded home; KasLoginGate is not mounted at app root, the card embeds the same views. KiroSignInCard (pages/developer) mounts on its own Settings > Kiro account tab (SettingsPage.tsx) on any harness, while the build offers KAS as a backend, so the seeded host must offer KAS. The Kiro Agent row on Agent Harness carries a one-line status and a link to that tab. The shipped scenario auth-sign-in-card-signed-out drives the same card."
       },
       "runnable": "smoke",
       "estimated_steps": 2,
-      "rationale": "Newly merged UI. The card reads a local kas-login status and renders deterministically on a fresh home with no network; two actions (open Agent Harness, assert card copy/CTA). Completing the sign-in itself (the embedded KAS login) needs a real external identity and is out of scope; the scenario asserts the card's states, not a finished login.",
+      "rationale": "Newly merged UI. The card reads a local kas-login status and renders deterministically on a fresh home with no network; two actions (open Kiro account, assert card copy/CTA). Completing the sign-in itself (the embedded KAS login) needs a real external identity and is out of scope; the scenario asserts the card's states, not a finished login.",
       "source": [
         "docs/feature-map/README.md",
         "docs/system-specs/modules/kas-auth.md",
-        "website/src/pages/developer/AgentBackendTab.tsx",
+        "website/src/pages/SettingsPage.tsx",
         "website/src/pages/developer/KiroSignInCard.tsx",
         "website/src/pages/developer/kiroSignInLink.ts"
       ],
@@ -5665,15 +5665,15 @@
     {
       "id": "onboarding-first-run-wizard",
       "feature": "onboarding",
-      "title": "First-run onboarding: Import, Privacy, Customize tour",
-      "user_story": "As a first-time user, I want a guided setup covering import review, privacy, and customization, so that the dashboard is set up and I understand the product before my first chat.",
+      "title": "First-run onboarding: Import, Customize tour",
+      "user_story": "As a first-time user, I want a guided setup covering import review and customization, so that the dashboard is set up and I understand the product before my first chat.",
       "start_url": "/",
-      "entry_path": "Open dashboard root on a fresh home with fresh localStorage (no mc-onboarded / mc-import-onboarded / mc-privacy-acked) > AgentImportFlow > PrivacyChapter (mandatory) > OnboardingFlow tour (theme, about you, Schedule, Apps, Sessions)",
+      "entry_path": "Open dashboard root on a fresh home with fresh localStorage (no mc-onboarded / mc-import-onboarded) > AgentImportFlow > OnboardingFlow tour (theme, about you, Schedule, Apps, Sessions)",
       "preconditions": {
         "seed": "onboarding-fresh",
         "members": [],
         "feature_flags": [],
-        "notes": "boot.sh's seed_home.py forces dashboard.onboarded=true and import_onboarded=true for every seed; the lane must skip that patch (or reset both via PUT /api/config/theme) to reach the wizard. The Kiro CLI prerequisite gate is satisfied by the fake backend's deterministic --version/whoami. OnboardingShellHost mounts chrome once; 'Skip all' still routes through Privacy; /onboarding slash command reopens the tour; the startup video is gated behind these."
+        "notes": "boot.sh's seed_home.py forces dashboard.onboarded=true and import_onboarded=true for every seed; the lane must skip that patch (or reset both via PUT /api/config/theme) to reach the wizard. The Kiro CLI prerequisite gate is satisfied by the fake backend's deterministic --version/whoami. OnboardingShellHost mounts chrome once; 'Skip all' ends first run; /onboarding slash command reopens the tour; the startup video is gated behind these."
       },
       "runnable": "nightly",
       "estimated_steps": 6,
@@ -5682,7 +5682,6 @@
         "website/src/App.tsx",
         "website/src/components/OnboardingFlow.tsx",
         "website/src/components/AgentImportFlow.tsx",
-        "website/src/components/PrivacyChapter.tsx",
         "src/kiro_crew/tests_fixtures/onboarding-fresh/fixture.yaml",
         "scripts/gui-user-test/seed_home.py",
         "docs/system-specs/modules/config.md",
@@ -5998,7 +5997,7 @@
         "seed": "rich",
         "members": [],
         "feature_flags": [],
-        "notes": "The Kiro sign-in card is not on Overview, it lives on Settings > Agent Harness (Overview shows a one-line pointer only while KAS is the selected backend). | Segment-less /settings resolves to the default tab; rail groups Preferences and System are rendered by SidePanelLayout."
+        "notes": "The Kiro sign-in card is not on Overview, it lives on Settings > Kiro account. | Segment-less /settings resolves to the default tab; rail groups Preferences and System are rendered by SidePanelLayout."
       },
       "runnable": "smoke",
       "estimated_steps": 2,
@@ -6027,11 +6026,11 @@
         "seed": "minimal",
         "members": [],
         "feature_flags": [],
-        "notes": "PrivacyPanel.tsx; same content as onboarding PrivacyChapter. | configKey telemetry.enabled; toggle disables itself when env var or config overlay pins the value; 409 = egress refusal."
+        "notes": "PrivacyPanel.tsx; the privacy disclosure. | configKey telemetry.enabled; toggle disables itself when env var or config overlay pins the value; 409 = egress refusal."
       },
       "runnable": "smoke",
       "estimated_steps": 2,
-      "rationale": "Static disclosure page (same content as onboarding PrivacyChapter) plus one Record-metrics toggle whose PATCH is stubbable; cheap and legally relevant to keep pixel-stable.",
+      "rationale": "Static disclosure page plus one Record-metrics toggle whose PATCH is stubbable; cheap and legally relevant to keep pixel-stable.",
       "source": [
         "docs/feature-map/README.md",
         "website/src/pages/settings/PrivacyPanel.tsx",
@@ -6653,19 +6652,19 @@
     {
       "id": "settings-releases",
       "feature": "settings",
-      "title": "Settings › Releases",
-      "user_story": "As a user, I want a release channel, update check and changelog, so that I stay current on my terms.",
-      "start_url": "/settings/releases",
-      "entry_path": "Settings → Releases",
+      "title": "Settings › About › Release notes",
+      "user_story": "As a user, I want a release channel, update check and the release notes in one place, so that I stay current on my terms.",
+      "start_url": "/settings/about",
+      "entry_path": "Settings → About → What's new / Earlier releases (old /settings/releases links redirect here)",
       "preconditions": {
         "seed": "minimal",
         "members": [],
         "feature_flags": [],
-        "notes": "Update check hits the network; stub it. Do not apply an update. | Fixed-height contained tab; rows come from CHANGELOG.md sections plus the running build. | updateAffordance decides apply vs command; About also hosts Support/ReportProblemCard and MobileLoginCard."
+        "notes": "Update check hits the network; stub it. Do not apply an update. | Rows come from CHANGELOG.md sections plus the running build; five earlier releases, then Show 5 more. | updateAffordance decides apply vs command; About also hosts Support/ReportProblemCard and MobileLoginCard."
       },
       "runnable": "nightly",
       "estimated_steps": 3,
-      "rationale": "Changelog and channel selector render offline; applying an update is excluded.",
+      "rationale": "Release notes and channel selector render offline; applying an update is excluded.",
       "source": [
         "docs/feature-map/README.md",
         "website/src/pages/settings/ReleasesPanel.tsx",
@@ -7716,7 +7715,7 @@
         "seed": "minimal",
         "members": [],
         "feature_flags": [],
-        "notes": ""
+        "notes": "minimal leaves telemetry off, so the pane opens on 'Telemetry is off'. Stage before navigating: `KIROCREW_HOME=<lane home> kirocrew config set telemetry.enabled true` (applies live, no restart), send one chat turn (POST /api/chat {\"message\": \"hello\", \"slot\": \"starter\"}), then wait for the first metrics-*.jsonl shard under <lane home>/metrics (the exporter flushes every telemetry.export_interval_seconds, default 60). The next dashboard load opens the 'Performance metrics are on' notice; press Keep on. The pane then shows turn latency, the Latency/Startup tabs and the Instruments table."
       },
       "runnable": "nightly",
       "estimated_steps": 2,

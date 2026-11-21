@@ -14,6 +14,7 @@ import copy
 from typing import Any
 from urllib.parse import quote
 
+from kiro_crew.conductor_patrol import reply_line
 from kiro_crew.mcp_tools.dashboard_client import DashboardError
 from kiro_crew.mcp_tools.table import ToolContext
 from kiro_crew.platform import redact_via_context as redact
@@ -27,15 +28,24 @@ CREW_TOOLS = (
     "session_close",
 )
 
+#: The goal-conductor skill keeps its remote-dispatch procedure out of SKILL.md, so
+#: a conductor learns of it only from these descriptions, which exist only while
+#: the preview is on.
+_READ_FIRST = (
+    "Before your first crew or work_item call, read references/remote-dispatch.md "
+    "in the goal-conductor skill's directory and follow it."
+)
+
 _CREW_PROPERTY: dict[str, Any] = {
     "type": "string",
     "description": (
         "Preview. Run this on a connected remote crew instead of this machine: the "
         "crew's instance id or exact name. The session lives on that crew and shows "
-        "in its sidebar group. With crew, session_create takes only title, agent and "
-        "model (omit agent to get the crew's own default), and send, read, stop and "
+        "in its sidebar group. With crew, session_create takes only title, agent, "
+        'agent_kind ("template" only) and model (omit agent to get the crew\'s own '
+        "default), and send, read, stop and "
         "close reach only a crew session YOU opened with session_create(crew=) on "
-        "that same crew; pass the key it returned as target."
+        "that same crew; pass the key it returned as target. " + _READ_FIRST
     ),
 }
 
@@ -48,8 +58,26 @@ _WORK_ITEM_PROPERTY: dict[str, Any] = {
         "Omit crew and the hub picks the connected crew with the most headroom; when "
         "none has room the item stays unbound, and only a turn the owner sends can "
         "retry. Its reports reach your next work_ledger_read, and a decide reaches "
-        "the worker."
+        "the worker. " + _READ_FIRST
     ),
+}
+
+
+_REQUIRES_PROPERTY: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "Preview, with work_item. What the crew must have: tags (words the crew's "
+        "operator set in work_ledger.remote_dispatch_tags) and logins (gh, glab or "
+        'az, each reported "valid" by that crew), e.g. {"logins": ["gh"]}. Placement '
+        "skips a crew that lacks any of them; with crew, that crew is checked. When "
+        "none qualifies the call is refused crew_requirements_unmet naming what each "
+        "crew lacked."
+    ),
+    "properties": {
+        "tags": {"type": "array", "items": {"type": "string"}},
+        "logins": {"type": "array", "items": {"type": "string"}},
+    },
+    "additionalProperties": False,
 }
 
 
@@ -65,6 +93,7 @@ def with_crew_schema(tools: list[dict[str, Any]], enabled: bool) -> list[dict[st
             props["crew"] = dict(_CREW_PROPERTY)
             if tool.get("name") == "session_create":
                 props["work_item"] = dict(_WORK_ITEM_PROPERTY)
+                props["requires"] = copy.deepcopy(_REQUIRES_PROPERTY)
         out.append(tool)
     return out
 
@@ -75,7 +104,11 @@ def _on(resp: dict[str, Any]) -> str:
 
 
 def run_crew_create(args: dict[str, Any], ctx: ToolContext) -> str:
-    payload = {k: args[k] for k in ("crew", "title", "agent", "model", "work_item") if k in args}
+    payload = {
+        k: args[k]
+        for k in ("crew", "title", "agent", "agent_kind", "model", "work_item", "requires")
+        if k in args
+    }
     extra = sorted(k for k in args if k not in payload and args.get(k) not in (None, ""))
     if extra:
         return f"Error: session_create with crew does not take {', '.join(extra)}."
@@ -100,6 +133,19 @@ def run_crew_create(args: dict[str, Any], ctx: ToolContext) -> str:
             f" The hub picked this crew by headroom; pass crew=`{resp.get('crew')}` "
             "(its id) on every follow-up call."
         )
+    skipped = resp.get("skipped")
+    names = [
+        str(s.get("crew_name") or s.get("crew"))
+        for s in (skipped if isinstance(skipped, list) else [])
+        if isinstance(s, dict) and (s.get("crew_name") or s.get("crew"))
+    ]
+    if names:
+        # A crew skipped because it already holds a worker for this item, left
+        # running there (a create whose reply was lost).
+        note += (
+            f" Skipped {', '.join(f'`{n}`' for n in names)}: it already holds a "
+            "worker for this item, left running there."
+        )
     if "previous_branch" in resp:
         # Wave 8: a redispatch of a retired item. Two workers never share a branch.
         last = resp.get("previous_branch")
@@ -108,10 +154,13 @@ def run_crew_create(args: dict[str, Any], ctx: ToolContext) -> str:
             f" This item was retired from another crew: seed the worker to {start}"
             "push a NEW branch name."
         )
+    # A bound worker's reports are pulled only on the conductor's work-ledger
+    # patrol tick, so its create says whether one runs, as a local bind does.
+    patrol = reply_line(resp) if resp.get("work_item_id") else ""
     return redact(
         f"\U0001f195 Opened `{resp.get('target')}`{title} {_on(resp)}{agent}. It is empty "
         f"and waiting in that crew's sidebar group.{note} Pass crew and this key as "
-        "target to session_send, session_read_message, session_stop and session_close."
+        f"target to session_send, session_read_message, session_stop and session_close.{patrol}"
     )
 
 
@@ -137,17 +186,19 @@ def run_crew_send(args: dict[str, Any], ctx: ToolContext) -> str:
 
 
 def run_crew_read(args: dict[str, Any], ctx: ToolContext) -> str:
-    if args.get("since") is not None:
-        return "Error: session_read_message with crew does not take since."
     query = (
         f"target={quote(str(args['target']))}&crew={quote(str(args['crew']))}"
         f"&limit={int(args.get('limit', 20))}"
     )
+    if args.get("since") is not None:
+        query += f"&since={int(args['since'])}"
     try:
         resp = ctx.client.get(f"/api/session-control/read?{query}", session_key=ctx.caller_key)
     except DashboardError as refused:
         return redact(f"Error: could not read that crew session: {refused.error}")
     state = "still working" if resp.get("running") else "idle"
+    if "total" in resp:
+        state += f"; total={resp['total']}"
     lines = [
         f"\U0001f4d6 `{resp.get('target', '')}` {_on(resp)} — {resp.get('title', '')} ({state})"
     ]
@@ -155,7 +206,12 @@ def run_crew_read(args: dict[str, Any], ctx: ToolContext) -> str:
     if not rows:
         lines.append("No messages yet.")
     for row in rows:
-        lines.append(f"[{row.get('role') or '?'}] {row.get('content') or ''}")
+        at = f"[{row['index']}] " if "index" in row else ""
+        lines.append(f"{at}[{row.get('role') or '?'}] {row.get('content') or ''}")
+    if "next_since" in resp:
+        lines.append(f"Pass since={resp['next_since']} on your next read to see only what is new.")
+    elif "total" in resp and resp.get("running"):
+        lines.append("No cursor while it is still working: read again without since.")
     return redact("\n".join(lines))
 
 

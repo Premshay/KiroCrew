@@ -45,7 +45,7 @@ async def api_slack_pins(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     not_object = body_not_object_error(body)
     if not_object is not None:
         return not_object
@@ -145,7 +145,7 @@ async def api_slack_reactions(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     not_object = body_not_object_error(body)
     if not_object is not None:
         return not_object
@@ -234,7 +234,7 @@ def _missing_scope_message(needed: str) -> str:
         f"This Slack action requires {scope_clause}, which is not granted to this app. "
         "Reinstall the app after granting the required permissions in the Slack Dashboard. "
         f"Alternatively, {add_clause} the app manifest and recreate the app by following "
-        "the steps in docs/guides/slack-setup.md."
+        "the steps in https://github.com/kirodotdev/KiroCrew/blob/main/docs/guides/slack-setup.md"
     )
 
 
@@ -247,7 +247,7 @@ async def api_slack_profile(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     not_object = body_not_object_error(body)
     if not_object is not None:
         return not_object
@@ -477,15 +477,17 @@ async def api_slack_manifest(request: web.Request) -> web.Response:
     Slack app creation without the CLI: the bundled template gets the user's
     alias substituted, and the comment-stripped YAML is URL-encoded into
     Slack's new-app deep link. ``command`` is the slash command that manifest
-    registers. The gateway answers only ``/{slack.command}`` and this endpoint
-    writes no config, so a caller that passes ``?alias=`` gets the value its
-    ``kirocrew config set slack.command`` step needs. With no alias, the
+    registers. The gateway answers it as it is and this endpoint writes no
+    config, so a caller that passes ``?alias=`` saves it as ``slack.command``
+    (applied live, no restart) for later manifest updates to keep it. With no
+    alias, the
     endpoint renders for this install: the alias the saved ``slack.command`` was
     generated from, and that command, so a manifest copied to update an existing
     app keeps its slash command. Serves only the public template — no secrets.
     """
     from kiro_crew import slack_manifest
     from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.dashboard.handlers._update_announce import https_url
     from kiro_crew.slack.features import manifest_features
 
     try:
@@ -521,5 +523,10 @@ async def api_slack_manifest(request: web.Request) -> web.Response:
             "create_url": create_url,
             "command": command or slack_manifest.slash_command(alias),
             "features": [f for f in slack_manifest.FEATURES if f in features],
+            # The setup wizard's link to this organization's own guide: only a
+            # bounded https:// URL (the shared check), and the dashboard checks
+            # again before it renders one.
+            "org_guide_url": https_url(getattr(getattr(cfg, "slack", None), "setup_guide_url", ""))
+            or None,
         }
     )

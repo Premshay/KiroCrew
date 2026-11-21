@@ -1,10 +1,13 @@
 """Tests for ACP client: model-substitution advisories and the session/new re-issue."""
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 from acp_client_helpers import _native_projection_for_fake_processes  # noqa: F401 - fixture
 from acp_client_helpers import _pin_the_installed_kiro_cli_version  # noqa: F401 - fixture
+from claude_settings_tier_helpers import empty_claude_settings_tiers
+from redaction_structured_cases import github_classic
 
 import kiro_crew.acp.client as acp_client
 from kiro_crew.acp.client import (
@@ -250,6 +253,11 @@ class TestSubstitutionFollow:
     This is the no-sessionId path the earlier suite did not cover.
     """
 
+    @pytest.fixture(autouse=True)
+    def _empty_user_and_managed_tiers(self, tmp_path, _floor_monkeypatch):
+        """The re-seed compares rendered bytes, which the host's ``~/.claude`` would change."""
+        empty_claude_settings_tiers(tmp_path, _floor_monkeypatch)
+
     def _advisory_resp(self):
         # Mirrors what _wait_for_response returns on the advisory: empty dict,
         # plus it sets _last_substitution_model as a side effect (simulated here).
@@ -257,8 +265,7 @@ class TestSubstitutionFollow:
 
     @pytest.mark.asyncio
     async def test_adopts_substitute_and_reissues(self, tmp_path):
-        client = AcpClient(work_dir=tmp_path)
-        client._acp_backend = ACP_BACKEND_CLAUDE
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
         client._model = "global.anthropic.claude-opus-4-8[1m]"
         # Avoid touching the real filesystem seeding.
         client._write_claude_local_settings = MagicMock()  # type: ignore[assignment]
@@ -340,15 +347,15 @@ class TestSubstitutionFollow:
             lambda wire_servers: guard_calls.append(list(wire_servers or []))
         )
         sent = []
-        settings = tmp_path / ".claude" / "settings.local.json"
 
         async def _send(method, params):
             sent.append(list(params.get("mcpServers") or []))
             if len(sent) == 1 and lose_surface:
-                # A link: the one shape that can be neither governed nor left out
-                # of the session's setting sources.
-                settings.unlink()
-                settings.symlink_to(tmp_path / "elsewhere.json")
+                # The path turns unusable (a link, or a sensitive target): the one
+                # shape that can be neither governed nor left out of the session's
+                # setting sources. Patched rather than built with a real symlink,
+                # so the case runs on hosts without symlink privilege.
+                monkeypatch.setattr(acp_client, "_claude_settings_usable", lambda _path: False)
             return len(sent)
 
         waits = 0
@@ -391,9 +398,180 @@ class TestSubstitutionFollow:
         assert guards == [original, original]
 
     @pytest.mark.asyncio
+    async def test_retry_on_cold_cache_seeds_the_substitute_model(self, tmp_path, monkeypatch):
+        # A cold advertised-model cache (no session/new ever succeeded, which is
+        # the case when the pinned model is restricted from the start) must not
+        # leave ``model`` out of settings.local.json on the retry: the user's own
+        # settings.json still names the restricted model, and the retry would be
+        # refused the same way.
+        from kiro_crew import model_registry
+        from kiro_crew.acp import seed_provenance as sp
+
+        monkeypatch.setattr(model_registry, "_ADVERTISED_MODELS", {})
+        monkeypatch.setattr(sp, "_RECORDS", {})
+        monkeypatch.setattr(sp, "_LIVE", {})
+        monkeypatch.setattr(sp, "_SHARERS", {})
+        monkeypatch.setattr(sp, "_sidecar_path", lambda: tmp_path / "seeds.json")
+
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        client._model = "global.anthropic.claude-opus-4-8[1m]"
+        client._write_claude_local_settings()
+        client._resolve_session_mcp_servers = lambda: []  # type: ignore[assignment]
+        client._pooled_mcp_servers = lambda: []  # type: ignore[assignment]
+        settings = tmp_path / ".claude" / "settings.local.json"
+        seeded = []
+
+        async def _send(method, params):
+            seeded.append(json.loads(settings.read_text()).get("model"))
+            return len(seeded)
+
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
+            if len(seeded) == 1:
+                client._last_substitution_model = "global.anthropic.claude-opus-5-5"
+                return {}
+            return {"sessionId": "retry-session"}
+
+        client._send_request = _send  # type: ignore[assignment]
+        client._wait_for_response = _wait  # type: ignore[assignment]
+
+        response = await client._new_session_following_substitution()
+        assert response == {"sessionId": "retry-session"}
+        # The first attempt leaves the model to the adapter, as before.
+        assert seeded == [None, "global.anthropic.claude-opus-5-5"]
+
+    _PIN = "global.anthropic.claude-opus-4-8[1m]"
+    _OTHER = "global.anthropic.claude-sonnet-4-6[1m]"
+
+    def _warm_pinned_client(self, tmp_path, monkeypatch, advertised):
+        """A client pinned to ``_PIN`` on a warm cache advertising *advertised*."""
+        from kiro_crew import model_registry
+        from kiro_crew.acp import seed_provenance as sp
+
+        monkeypatch.setattr(sp, "_RECORDS", {})
+        monkeypatch.setattr(sp, "_LIVE", {})
+        monkeypatch.setattr(sp, "_SHARERS", {})
+        monkeypatch.setattr(sp, "_sidecar_path", lambda: tmp_path / "seeds.json")
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        monkeypatch.setattr(
+            model_registry,
+            "_ADVERTISED_MODELS",
+            {client._model_registry_namespace: tuple(advertised)},
+        )
+        client._model = self._PIN
+        client._write_claude_local_settings()
+        client._resolve_session_mcp_servers = lambda: []  # type: ignore[assignment]
+        client._pooled_mcp_servers = lambda: []  # type: ignore[assignment]
+        return client
+
+    async def _start_refused(self, client, tmp_path, substitute, *, refusals):
+        """Run one start whose first *refusals* session/new calls name *substitute*;
+        returns the ``model`` each session/new went out with and the response."""
+        settings = tmp_path / ".claude" / "settings.local.json"
+        seeded = []
+
+        async def _send(method, params):
+            seeded.append(json.loads(settings.read_text()).get("model"))
+            return len(seeded)
+
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
+            if len(seeded) <= refusals:
+                client._last_substitution_model = substitute
+                return {}
+            return {"sessionId": "retry-session"}
+
+        client._send_request = _send  # type: ignore[assignment]
+        client._wait_for_response = _wait  # type: ignore[assignment]
+        response = await client._new_session_following_substitution()
+        return seeded, response
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("substitute", [_OTHER, _PIN], ids=["other_model", "the_pin"])
+    async def test_a_served_pin_survives_a_refused_inherited_default(
+        self, tmp_path, monkeypatch, substitute
+    ):
+        # The seed names no pin, so the refused model is the user's inherited
+        # default. A pin the backend advertises is served: the retry names it,
+        # whether the advisory offers another model or the pin itself.
+        client = self._warm_pinned_client(tmp_path, monkeypatch, [self._PIN, self._OTHER])
+        seeded, response = await self._start_refused(client, tmp_path, substitute, refusals=1)
+        assert response == {"sessionId": "retry-session"}
+        assert seeded == [None, self._PIN]
+        assert client._model == self._PIN
+
+    @pytest.mark.asyncio
+    async def test_a_pin_not_served_adopts_the_substitute(self, tmp_path, monkeypatch):
+        client = self._warm_pinned_client(tmp_path, monkeypatch, [self._OTHER])
+        seeded, response = await self._start_refused(client, tmp_path, self._OTHER, refusals=1)
+        assert response == {"sessionId": "retry-session"}
+        assert seeded == [None, self._OTHER]
+        assert client._model == self._OTHER
+
+    @pytest.mark.asyncio
+    async def test_a_refused_pin_falls_back_once_to_the_offered_model(self, tmp_path, monkeypatch):
+        # A session on the offered model beats one that never starts.
+        client = self._warm_pinned_client(tmp_path, monkeypatch, [self._PIN, self._OTHER])
+        seeded, response = await self._start_refused(client, tmp_path, self._OTHER, refusals=2)
+        assert response == {"sessionId": "retry-session"}
+        assert seeded == [None, self._PIN, self._OTHER]
+        assert client._model == self._OTHER
+
+    @pytest.mark.asyncio
+    async def test_a_start_never_retries_more_than_twice(self, tmp_path, monkeypatch):
+        client = self._warm_pinned_client(tmp_path, monkeypatch, [self._PIN, self._OTHER])
+        seeded, response = await self._start_refused(client, tmp_path, self._OTHER, refusals=9)
+        assert response == {}
+        assert seeded == [None, self._PIN, self._OTHER]
+
+    @pytest.mark.asyncio
+    async def test_a_sibling_sharing_the_seed_carries_the_retry_model_inline(
+        self, tmp_path, monkeypatch
+    ):
+        # A shared seed is not rewritten, so the retry's model must reach the
+        # adapter on the envelope's flag tier, or the retry inherits the refused
+        # default again.
+        owner = self._warm_pinned_client(tmp_path, monkeypatch, [self._PIN, self._OTHER])
+        sibling = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        sibling._model = self._PIN
+        sibling._write_claude_local_settings()
+        assert sibling._claude_settings_shared is True
+        assert owner._claude_settings_authored is True
+        sibling._resolve_session_mcp_servers = lambda: []  # type: ignore[assignment]
+        sibling._pooled_mcp_servers = lambda: []  # type: ignore[assignment]
+        sent = []
+
+        async def _send(method, params):
+            sent.append(json.loads(json.dumps(params)))
+            return len(sent)
+
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
+            if len(sent) == 1:
+                sibling._last_substitution_model = self._OTHER
+                return {}
+            return {"sessionId": "retry-session"}
+
+        sibling._send_request = _send  # type: ignore[assignment]
+        sibling._wait_for_response = _wait  # type: ignore[assignment]
+        response = await sibling._new_session_following_substitution()
+        assert response == {"sessionId": "retry-session"}
+        first, retry = sent
+        assert "model" not in (first.get("_meta") or {}).get("claudeCode", {}).get(
+            "options", {}
+        ).get("settings", {})
+        assert retry["_meta"]["claudeCode"]["options"]["settings"]["model"] == self._PIN
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_of_the_model_the_seed_names_is_not_retried(
+        self, tmp_path, monkeypatch
+    ):
+        # No served pin: the one retry names the substitute, and its refusal stands.
+        client = self._warm_pinned_client(tmp_path, monkeypatch, [self._OTHER])
+        seeded, response = await self._start_refused(client, tmp_path, self._OTHER, refusals=9)
+        assert response == {}
+        assert seeded == [None, self._OTHER]
+
+    @pytest.mark.asyncio
     async def test_happy_path_no_retry(self, tmp_path):
-        client = AcpClient(work_dir=tmp_path)
-        client._acp_backend = ACP_BACKEND_CLAUDE
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
         client._model = "global.anthropic.claude-sonnet-4-6[1m]"
         client._write_claude_local_settings = MagicMock()  # type: ignore[assignment]
 
@@ -418,28 +596,36 @@ class TestSubstitutionFollow:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("model", "substitute"),
+        ("model", "substitute", "adopted"),
         [
             # Advisory fired but substitute could not be parsed (None) -> we do NOT
             # retry; caller gets an empty resp and raises a clear error upstream.
             pytest.param(
                 "global.anthropic.claude-opus-4-8[1m]",
                 None,
+                None,
                 id="no_infinite_retry_when_substitute_unparseable",
             ),
-            # Defensive: if the gateway "substitutes" to the model we already asked
-            # for, don't loop -- treat as terminal (no retry).
+            # The seed already names the substitute, so the backend refused it as
+            # named: don't loop -- treat as terminal (no retry).
             pytest.param(
                 "global.anthropic.claude-sonnet-4-6[1m]",
                 "global.anthropic.claude-sonnet-4-6[1m]",
-                id="no_retry_when_substitute_same_as_current",
+                "global.anthropic.claude-sonnet-4-6[1m]",
+                id="no_retry_when_the_seed_already_names_the_substitute",
             ),
         ],
     )
-    async def test_terminal_advisory_is_not_retried(self, tmp_path, model, substitute):
-        client = AcpClient(work_dir=tmp_path)
-        client._acp_backend = ACP_BACKEND_CLAUDE
+    async def test_terminal_advisory_is_not_retried(
+        self, tmp_path, monkeypatch, model, substitute, adopted
+    ):
+        from kiro_crew import model_registry
+
+        monkeypatch.setattr(model_registry, "_ADVERTISED_MODELS", {})
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
         client._model = model
+        if adopted is not None:
+            client._adopted_substitute_model = adopted
         client._write_claude_local_settings = MagicMock()  # type: ignore[assignment]
 
         sent = []
@@ -475,8 +661,7 @@ class TestSubstitutionWrappersAndRedaction:
         next handshake step crash on the opaque "Cannot set config option before
         session is initialized" guard.
         """
-        client = AcpClient(work_dir=tmp_path)
-        client._acp_backend = ACP_BACKEND_CLAUDE
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
         client._process = MagicMock()
         client._process.returncode = None
 
@@ -505,8 +690,7 @@ class TestSubstitutionWrappersAndRedaction:
         (no substitution happened), the AcpError text MUST NOT include the
         "even after adopting substitute model" clause.
         """
-        client = AcpClient(work_dir=tmp_path)
-        client._acp_backend = ACP_BACKEND_CLAUDE
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
         client._process = MagicMock()
         client._process.returncode = None
         client._model = "global.anthropic.claude-opus-4-8[1m]"
@@ -536,8 +720,7 @@ class TestSubstitutionWrappersAndRedaction:
         the AcpError text MUST include the "even after adopting substitute
         model {...}" clause.
         """
-        client = AcpClient(work_dir=tmp_path)
-        client._acp_backend = ACP_BACKEND_CLAUDE
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
         client._process = MagicMock()
         client._process.returncode = None
         client._model = "global.anthropic.claude-opus-4-8[1m]"
@@ -571,17 +754,13 @@ class TestSubstitutionWrappersAndRedaction:
         contains a URL-shaped token and asserts the emitted log payload was
         redacted.
         """
-        client = AcpClient(work_dir=tmp_path)
-        client._acp_backend = ACP_BACKEND_CLAUDE
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
         client._model = "global.anthropic.claude-opus-4-8[1m]"
         client._write_claude_local_settings = MagicMock()  # type: ignore[assignment]
 
-        # Inject a substitute that embeds an AWS access-key-shaped substring
-        # so the dual redactor heuristic actually fires (redact_exfiltration_urls
-        # matches the URL because the query carries an AKIA token, and
-        # redact_credentials matches the standalone AKIA pattern). A bare
-        # arbitrary URL is too tame for the heuristic and would leave the test
-        # asserting on a no-op pass-through.
+        # Inject a substitute whose URL carries a ``token=`` value, which the
+        # credential plan masks. A bare arbitrary URL holds no credential and
+        # would leave the test asserting on a no-op pass-through.
         url_shaped = "http://attacker.example.com/exfil?token=AKIAIOSFODNN7EXAMPLE"
 
         sent: list[str] = []
@@ -614,19 +793,14 @@ class TestSubstitutionWrappersAndRedaction:
         assert adopt_calls, "expected an 'adopting gateway-served model' warning"
         # The redacted payload is the second positional argument.
         emitted = adopt_calls[0].args[1]
-        # The credential MUST be gone. The URL MUST be replaced with the
-        # redactor diagnostic marker. The redactor preserves the host name
-        # inside "[REDACTED: suspicious URL to <host>]" so operators can
-        # investigate the leak source -- that is BY DESIGN, not a bypass.
+        # The token value MUST be gone. A URL is never replaced whole: the scheme,
+        # host and path stay, so operators can investigate the leak source.
         assert (
             "AKIAIOSFODNN7EXAMPLE" not in emitted
-        ), "AWS access-key substring MUST be redacted before logging"
+        ), "the token value MUST be redacted before logging"
         assert (
-            "REDACTED" in emitted
-        ), "the redactor marker MUST appear, proving the URL was rewritten"
-        assert (
-            "http://attacker.example.com/exfil?token=" not in emitted
-        ), "the bare exfil URL MUST NOT be emitted verbatim"
+            "http://attacker.example.com/exfil?token=[REDACTED: credential]" in emitted
+        ), "only the token value is rewritten"
 
     @pytest.mark.asyncio
     async def test_initialize_session_redacts_model_in_info_log(self, tmp_path):
@@ -635,12 +809,10 @@ class TestSubstitutionWrappersAndRedaction:
         the happy path with a URL-shaped self._model and confirm the emitted
         info log does not leak it.
         """
-        client = AcpClient(work_dir=tmp_path)
-        client._acp_backend = ACP_BACKEND_CLAUDE
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
         client._process = MagicMock()
         client._process.returncode = None
-        # AWS access-key-shaped substring guarantees both redactors fire (URL
-        # query matches _EXFIL_PATTERNS; standalone key matches _CREDENTIAL_PATTERNS).
+        # A ``token=`` value in the URL, which the credential plan masks.
         client._model = "http://attacker.example.com/m?token=AKIAIOSFODNN7EXAMPLE"
 
         async def _send(method, params):
@@ -659,7 +831,7 @@ class TestSubstitutionWrappersAndRedaction:
         client._capture_available_models = MagicMock()  # type: ignore[assignment]
         client._store_session_config = MagicMock()  # type: ignore[assignment]
 
-        async def _drain():
+        async def _drain(**_kwargs):
             return None
 
         client._drain_notifications = _drain  # type: ignore[assignment]
@@ -676,17 +848,13 @@ class TestSubstitutionWrappersAndRedaction:
         # Format: logger.info("ACP session created: %s (model=%s)", sid, model_log)
         # The third positional arg is the redacted model.
         emitted_model = info_calls[0].args[2]
-        # See sibling test for the design note: redactor keeps the host as a
-        # diagnostic label inside "[REDACTED: suspicious URL to <host>]".
+        # See sibling test: only the token value is replaced, the URL stays.
         assert (
             "AKIAIOSFODNN7EXAMPLE" not in emitted_model
-        ), "AWS access-key substring MUST be redacted before logging"
+        ), "the token value MUST be redacted before logging"
         assert (
-            "REDACTED" in emitted_model
-        ), "the redactor marker MUST appear, proving the URL was rewritten"
-        assert (
-            "http://attacker.example.com/m?token=" not in emitted_model
-        ), "the bare exfil URL MUST NOT be emitted verbatim"
+            "http://attacker.example.com/m?token=[REDACTED: credential]" in emitted_model
+        ), "only the token value is rewritten"
 
     @pytest.mark.asyncio
     async def test_initialize_session_acperror_redacts_substitute_model(self, tmp_path):
@@ -696,8 +864,7 @@ class TestSubstitutionWrappersAndRedaction:
         via the same path as the logger sinks, so the redaction discipline
         applies to exception messages too -- not just logger.* calls.
         """
-        client = AcpClient(work_dir=tmp_path)
-        client._acp_backend = ACP_BACKEND_CLAUDE
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
         client._process = MagicMock()
         client._process.returncode = None
         client._model = "global.anthropic.claude-opus-4-8[1m]"
@@ -715,9 +882,10 @@ class TestSubstitutionWrappersAndRedaction:
             # Helper adopted a credential-shaped substitute then gave up without
             # producing a sessionId. Drives the "even after adopting substitute
             # model X" branch where X is credential-shaped.
-            client._model = "AKIAIOSFODNN7EXAMPLE"
+            client._model = token
             return {}
 
+        token = github_classic(seed=71)
         client._new_session_following_substitution = _no_session_with_credshaped  # type: ignore[assignment]
 
         with pytest.raises(AcpError) as excinfo:
@@ -725,8 +893,8 @@ class TestSubstitutionWrappersAndRedaction:
 
         msg = str(excinfo.value)
         assert (
-            "AKIAIOSFODNN7EXAMPLE" not in msg
-        ), "AWS access-key-shaped substitute MUST be redacted before reaching the AcpError message"
+            token not in msg
+        ), "a credential-shaped substitute MUST be redacted before reaching the AcpError message"
         assert "even after adopting substitute model" in msg
 
     @pytest.mark.asyncio
@@ -736,10 +904,11 @@ class TestSubstitutionWrappersAndRedaction:
         into the exception message.
         """
         client = AcpClient(work_dir=tmp_path)
+        token = github_classic(seed=72)
         real_err = {
             "code": -32603,
             "message": "Internal error",
-            "data": "request_id: AKIAIOSFODNN7EXAMPLE backend trace failed",
+            "data": f"request_id: {token} backend trace failed",
         }
         msg = MagicMock()
         msg.is_response_for.return_value = True
@@ -757,8 +926,8 @@ class TestSubstitutionWrappersAndRedaction:
             await client._wait_for_response(13, timeout=1.0)
 
         emitted = str(excinfo.value)
-        assert "AKIAIOSFODNN7EXAMPLE" not in emitted, (
-            "AWS access-key-shaped substring in msg.error MUST be redacted "
+        assert token not in emitted, (
+            "a credential-shaped substring in msg.error MUST be redacted "
             "before reaching the catch-all AcpError message"
         )
         assert "JSON-RPC error" in emitted, "the catch-all AcpError prefix MUST still be present"

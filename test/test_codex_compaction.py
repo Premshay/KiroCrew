@@ -33,9 +33,11 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from session_handle_helpers import bare_session_handle
 
 from kiro_crew.acp import _dispatch
 from kiro_crew.acp.client import AcpClient
+from kiro_crew.acp.compaction_summary import CompactionSummaries
 from kiro_crew.acp.runtime import AcpRuntime
 from kiro_crew.acp.session_handle import AcpSessionHandle
 from kiro_crew.acp.session_provider import AcpSessionProvider
@@ -72,6 +74,7 @@ from kiro_crew.messaging.commands import compact_unsupported_backend
 from kiro_crew.providers.acp import AcpProvider
 from kiro_crew.session import SessionManager
 from kiro_crew.session_compaction import CompactionCoordinator, _compact_unsupported_backend
+from kiro_crew.testing.synthetic_credentials import github_classic
 from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS, await_until
 
 
@@ -284,6 +287,8 @@ def _bare_client(backend: str = ACP_BACKEND_CODEX) -> AcpClient:
     client._acp_backend = backend
     client._codex_compaction_pending = False
     client._native_compaction_states = _dispatch.NativeCompactionStates()
+    client._compaction_summaries = CompactionSummaries()
+    client._session_id = None
     client._compaction_failed_at = None
     client.last_prompt_stats = AcpPromptStats()
     return client
@@ -574,7 +579,7 @@ def _bare_handle(backend: str = ACP_BACKEND_CODEX) -> Any:
     one needs a runtime with a live process. The backend is read off the RUNTIME
     (``self._runtime.acp_backend``), which is the seam the method actually uses.
     """
-    handle = AcpSessionHandle.__new__(AcpSessionHandle)
+    handle = bare_session_handle()
     handle._runtime = SimpleNamespace(acp_backend=backend)
     handle._session_id = "s-1"
     handle._codex_compaction_pending = False
@@ -1016,7 +1021,7 @@ class TestTheUnmarked222Pair:
     [
         ("too_few_groups", "too_few_groups"),
         (
-            "too_few_groups: key AKIAIOSFODNN7EXAMPLE rejected",
+            f"too_few_groups: key {github_classic(seed=111)} rejected",
             "too_few_groups: key [REDACTED: credential] rejected",
         ),
     ],

@@ -3,7 +3,7 @@
  * answer: a browser whose first-run state read failed and that holds no flags
  * of its own must not replay first run from an empty localStorage.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
 
@@ -14,15 +14,13 @@ const themeState = {
   // A new browser: no flag of its own says first run is done.
   onboarded: false,
   importOnboarded: false,
-  privacyAcked: false,
-  privacyAckVersion: null as number | null,
   themeBootReady: true,
   themeBootRead: false,
   themes: [],
   allThemes: [],
   markOnboarded: vi.fn(),
   markImportOnboarded: vi.fn(),
-  markPrivacyAcked: vi.fn(),
+
   setColorTheme: vi.fn(),
   setMode: vi.fn(),
 }
@@ -40,6 +38,7 @@ vi.mock('../pages/KiroCrewAgentsPage', () => ({ default: () => null }))
 
 import { renderWithProviders } from './helpers'
 import App from '../App'
+import { api } from '../api/client'
 
 const importChapterOpen = () => screen.queryByText(/bring your crew with you/i) !== null
 
@@ -47,9 +46,11 @@ beforeEach(() => {
   localStorage.clear()
   themeState.themeBootRead = false
   themeState.importOnboarded = false
-  themeState.privacyAcked = false
   themeState.markOnboarded.mockClear()
+  // The owner's tab, so only the boot read decides (`useViewerIsNotOwner`).
+  vi.spyOn(api, 'viewerOwnerOk').mockResolvedValue(true)
 })
+afterEach(() => { vi.restoreAllMocks() })
 
 describe('first run and the first-run state read', () => {
   it('stays closed when the read failed and this browser has no flags', async () => {
@@ -60,9 +61,7 @@ describe('first run and the first-run state read', () => {
 
   it('closes the tour seeded from this browser\'s flags when the read failed', async () => {
     localStorage.setItem('mc-import-onboarded', '1')
-    localStorage.setItem('mc-privacy-acked', '1')
     themeState.importOnboarded = true
-    themeState.privacyAcked = true
     renderWithProviders(<App />, { route: '/chat' })
     await screen.findByTestId('chat-page')
     await waitFor(() => expect(screen.queryByText(/choose a mode, a color theme/i)).toBeNull())

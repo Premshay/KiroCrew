@@ -3,6 +3,7 @@
 import ast
 import asyncio
 import inspect
+import os
 import subprocess
 import sys
 import threading
@@ -11,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from spawn_test_helpers import plain_sleeper_argv
 
 from kiro_crew import platform_compat
 from kiro_crew.acp import runtime as rt
@@ -99,10 +101,12 @@ class TestKillEscapedChildren:
             _kill_escaped_children({42: 100})
 
         # The same sweep, unpatched, on a child this test spawned and recorded.
-        child = subprocess.Popen(["sleep", "30"])
+        argv = plain_sleeper_argv(30)
+        name = os.path.basename(argv[0]).encode()
+        child = subprocess.Popen(argv)
         try:
-            wait_until(lambda: _read_basename(child.pid) == b"sleep")
-            record = (platform_compat.get_process_start_id(child.pid), b"sleep")
+            wait_until(lambda: _read_basename(child.pid) == name)
+            record = (platform_compat.get_process_start_id(child.pid), name)
             _kill_escaped_children({child.pid: record})
             assert child.wait(timeout=10) == -signal.SIGKILL
         finally:
@@ -1175,35 +1179,34 @@ class TestEverySessionPathSnapshots:
     """A fresh session and a resumed one fork the same processes.
 
     Read off the source because driving either funnel needs a live backend: the
-    point is that neither path can lose the call or its teardown guard.
+    point is that neither path can lose the call, and no kill can outrun it.
     """
 
-    @pytest.mark.parametrize(
-        "method,session_var",
-        [("_finish_create_session", "session_id"), ("load_session", "resume_sid")],
-    )
-    def test_the_scan_runs_under_a_terminate_guard(self, method, session_var):
+    @pytest.mark.parametrize("method", ["_finish_create_session", "load_session"])
+    def test_the_scan_runs_beside_the_session(self, method):
         src = inspect.getsource(getattr(rt.AcpRuntime, method))
-        assert "await self._snapshot_descendants()" in src, f"{method} does not snapshot"
-        # Whitespace-normalized so an indentation change cannot pass or fail it.
-        flat = " ".join(src.split())
-        expected = (
-            "try: await self._snapshot_descendants() "
-            "except BaseException: "
-            f"await self.terminate_session({session_var}) raise"
-        )
-        guard = expected in flat
-        assert guard, f"{method} does not terminate its session when the scan is cancelled"
+        assert "self._record_tree_in_background()" in src, f"{method} does not snapshot"
+        # The first prompt does not wait for the pass; the kill does.
+        assert "await self._snapshot_descendants(" not in src
 
-    def test_spawn_snapshots_inside_its_cleanup_guard(self):
-        """A cancelled scan after `_initialized` would leave an unowned process."""
+    def test_every_kill_path_waits_for_a_session_start_pass(self):
+        """Nothing signals by, or takes a handle from, a record not yet written."""
+        flat = " ".join(inspect.getsource(rt.AcpRuntime._kill_inner).split())
+        assert flat.index(
+            "await self.wait_tree_recorded(timeout=self._KILL_TREE_WAIT_SECS)"
+        ) < flat.index("self._signal_tree(")
+        refresh = " ".join(inspect.getsource(rt.AcpRuntime.refresh_process_tree).split())
+        assert refresh.index("await self.wait_tree_recorded()") < refresh.index(
+            "await self._snapshot_descendants()"
+        )
+
+    def test_spawn_snapshots_beside_its_start(self):
+        """The spawn hands its pass to a task, and the kill waits for that task."""
         src = inspect.getsource(rt.AcpRuntime._spawn_admitted)
-        after = " ".join(src[src.index("await self._snapshot_descendants(") :].split())
-        assert after.startswith(
-            "await self._snapshot_descendants(retry_when_empty=True) except BaseException:"
-        ), "the spawn snapshot sits outside the cleanup guard"
-        # The guard waits on one shielded cleanup task, and that task kills.
-        assert "self._failed_start_cleanup()" in after, "the guard does not tear the runtime down"
+        assert "self._record_tree_in_background(retry_when_empty=True)" in src
+        assert "await self._snapshot_descendants(" not in src
+        # A failed start still tears the runtime down through one shielded task.
+        assert "self._failed_start_cleanup()" in src, "the guard does not tear the runtime down"
         cleanup = inspect.getsource(rt.AcpRuntime._failed_start_cleanup)
         assert "await self.kill(" in cleanup, "the guard does not tear the runtime down"
 

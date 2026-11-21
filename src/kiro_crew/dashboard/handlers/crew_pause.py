@@ -1,4 +1,4 @@
-"""Ultra Mode "Pause all" / "Resume all" for one root and its whole crew.
+"""Conductor mode "Pause all" / "Resume all" for one root and its whole crew.
 
 ``POST /api/chat/slots/{slot}/crew-workers/pause`` stops the root's turn and every
 running crew member's turn at every depth with the Stop button's own mechanism
@@ -58,10 +58,10 @@ def _is_running(row: Mapping[str, Any]) -> bool:
 
 
 #: ``stop_slot_turn`` answers that mean the turn did NOT stop: nothing ran, or the
-#: session's automatic compaction declined the cooperative cancel. "no active
-#: turn" is not among them: a turn still being prepared answers it, and the
-#: Stop it recorded aborts that turn before dispatch, so Resume all owes it its
-#: Continue.
+#: session's automatic compaction declined the cooperative cancel. A turn still
+#: being prepared answers ``{"ok": true}``: the press ends that runner before it
+#: reaches the provider, so Resume all owes it its Continue. "no active turn" is
+#: not among them: the slot still read running when the press came.
 _NOT_STOPPED = frozenset({"not running", "compacting"})
 
 
@@ -108,7 +108,7 @@ async def api_crew_pause(request: web.Request) -> web.Response:
 async def _pause(request: web.Request) -> web.Response:
     state = request.app["state"]
     root = request.match_info.get("slot", "")
-    rows = _stamped_rows(state)
+    rows = await _stamped_rows(state)
     kind, root_row = _live_root(rows, root)
     if kind != "crew" or root_row is None:
         return _not_root()
@@ -132,7 +132,7 @@ async def _pause(request: web.Request) -> web.Response:
     asked = [*own, *targets]
     # Read again now the hold is published: a turn that started during the write
     # (a patrol wake, a send) is stopped too, and a member created meanwhile is held.
-    rows = _stamped_rows(state)
+    rows = await _stamped_rows(state)
     late_members = _tree_workers(rows, root)
     _kind, late_root = _live_root(rows, root)
     late = [
@@ -362,7 +362,7 @@ async def _resume(request: web.Request) -> web.Response:
     state = request.app["state"]
     root = request.match_info.get("slot", "")
     await crew_pause.ensure_loaded()
-    kind, _root_row = _live_root(_stamped_rows(state), root)
+    kind, _root_row = _live_root(await _stamped_rows(state), root)
     held = crew_pause.record(root)
     if kind != "crew" and held is None:
         return _not_root()

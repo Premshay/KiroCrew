@@ -100,6 +100,7 @@ from kiro_crew.cron_service.fields import (  # noqa: F401 -- re-exported
     _validate_cron_string_fields,
     apply_job_update,
     build_job,
+    resolve_project_path,
     validate_managed_by,
 )
 from kiro_crew.cron_service.folders import (  # noqa: F401 -- re-exported
@@ -570,6 +571,12 @@ class CronService:
         self.quarantined_store: Path | None = None
         self._on_job = on_job
         self._jobs: list[CronJob] = []
+        #: ``auto_paused`` per job id as the DISK last held it (set by _load
+        #: without announcing, advanced by every _save): the auto-pause notice
+        #: fires on this snapshot's rising edge, at the save, so it never
+        #: outruns the disk, never doubles across the flush/merge race, and
+        #: never fires for a pause another process landed and announced.
+        self._announced_pauses: dict[str, bool] = {}
         self._timer_task: asyncio.Task[None] | None = None
         # True during an _on_timer() dispatch pass, so _arm_timer() does not
         # cancel self._timer_task before the sweep has spawned its due jobs.
@@ -663,6 +670,11 @@ class CronService:
         # and the notices in flight, which stop() waits for before it returns.
         self._interrupt_alert: Callable[[CronJob, str], Coroutine[Any, Any, None]] | None = None
         self._interrupt_alerts: set[asyncio.Task[None]] = set()
+        # The gateway's auto-pause notice (set_auto_pause_alert): a SYNC
+        # callback, because the save that detects the rising edge runs on a
+        # worker thread under the store lock and must not block; the callback
+        # hands delivery to the gateway loop itself.
+        self._auto_pause_alert: Callable[[CronJob, int, str], None] | None = None
         _cfg = KiroCrewConfig.load().cron_history
         _history_dir = base_dir if base_dir is not None else _default_dir()
         # History is BEST-EFFORT: a raise here would take down the whole cron
@@ -769,6 +781,7 @@ class CronService:
     attach_run_task = _run_registry.attach_run_task
     discard_finished_run = _run_registry.discard_finished_run
     running_since = _run_registry.running_since
+    run_trigger = _run_registry.run_trigger
     set_refresh_callback = _run_registry.set_refresh_callback
     set_timeout_alert = _run_registry.set_timeout_alert
     set_interrupt_alert = _run_registry.set_interrupt_alert
@@ -823,6 +836,8 @@ class CronService:
     raise_if_store_unreadable = _store_sync.raise_if_store_unreadable
     _sync_for_write = _store_sync._sync_for_write
     _save = _store_sync._save
+    _announce_saved_pause_edges = _store_sync._announce_saved_pause_edges
+    set_auto_pause_alert = _store_sync.set_auto_pause_alert
 
     def _update_job_locked(self, job_id: str, **kwargs: Any) -> CronJob | None:
         """Lock/reload/mutate/save core of :meth:`update_job` (no timer work).
@@ -857,6 +872,13 @@ class CronService:
         # Not a field: the session making this write, recorded on the
         # auto-pause-limit audit row (see CronJob.audit_auto_pause_limit_change).
         audit_actor = kwargs.pop("audit_actor", "") or ""
+        # Resolved before the lock, as build_job does on create: the check probes
+        # the filesystem, and a slow drive must not hold every other cron write
+        # behind it.
+        resolved_project_path = None
+        if "project_path" in kwargs:
+            _validate_cron_string_fields({"project_path": kwargs["project_path"]})
+            resolved_project_path = resolve_project_path(kwargs["project_path"] or "")
         with self._file_lock():
             self._sync_for_write()
             for job in self._jobs:
@@ -884,7 +906,7 @@ class CronService:
                 previous_limit = job.auto_pause_after_failures
                 staged = copy.copy(job)
                 prior = dict(staged.__dict__)
-                apply_job_update(staged, kwargs, chat_folder_out)
+                apply_job_update(staged, kwargs, chat_folder_out, resolved_project_path)
                 edits = {
                     name: value
                     for name, value in staged.__dict__.items()
@@ -982,20 +1004,22 @@ class CronService:
                 "SEL audit for one-shot cron removal failed (job %s)", job_id, exc_info=True
             )
 
-    def _remove_job_locked(self, job_id: str) -> bool:
+    def _remove_job_locked(self, job_id: str) -> CronJob | None:
         """Lock/reload/mutate/save core of :meth:`remove_job` (no timer work).
 
         Removing a job also releases every job that job OWNS, in the same locked
-        write — see :meth:`_release_children_of_removed`.
+        write — see :meth:`_release_children_of_removed`. Returns the removed
+        row as the reloaded store held it, or ``None`` when no job had the id.
         """
         with self._file_lock():
             self._sync_for_write()
             # Bump UNCONDITIONALLY: grant_epoch_ids() raises on corrupt epoch
             # state, so removing even a missing id surfaces that corruption
-            # instead of answering a quiet False. The bump reads live rows, so
+            # instead of answering a quiet None. The bump reads live rows, so
             # it must precede the filter inside _remove_job_rows.
             self._bump_grant_epochs_for({job_id})
-            if any(j.id == job_id for j in self._jobs):
+            row = next((j for j in self._jobs if j.id == job_id), None)
+            if row is not None:
                 restore = self._remove_job_rows({job_id})
                 try:
                     self._save()
@@ -1008,28 +1032,30 @@ class CronService:
                     self._reset_fingerprint()
                     raise
                 logger.info("Removed cron job %s", job_id)
-                return True
-        return False
+                return row
+        return None
 
     def _remove_job_if_locked(
         self,
         job_id: str,
         expected_revision: str,
         revision_of: Callable[["CronJob"], str],
-    ) -> str:
+    ) -> tuple[str, CronJob | None]:
         """Lock/reload/compare/mutate/save core of :meth:`remove_job_if_async`.
 
         An exact ``revision_of``/``expected_revision`` match proceeds to the same
         remove-rows + cascade + save the unconditional path uses; a live job that
         differs is left untouched (``"changed"``), a missing one ``"not_found"``.
+        Returns the outcome and, on ``"removed"``, the removed row as the
+        reloaded store held it.
         """
         with self._file_lock():
             self._sync_for_write()
             job = next((j for j in self._jobs if j.id == job_id), None)
             if job is None:
-                return "not_found"
+                return "not_found", None
             if revision_of(job) != expected_revision:
-                return "changed"
+                return "changed", None
             # Same ordering as _remove_job_locked: the grant-epoch bump reads
             # live rows and must precede the row filter.
             self._bump_grant_epochs_for({job_id})
@@ -1042,7 +1068,7 @@ class CronService:
                 self._reset_fingerprint()
                 raise
             logger.info("Removed cron job %s", job_id)
-            return "removed"
+            return "removed", job
 
     def _enable_job_locked(
         self, job_id: str, enabled: bool = True, *, expected_owner: str | None = None

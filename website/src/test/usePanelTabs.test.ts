@@ -136,6 +136,17 @@ describe('usePanelTabs', () => {
     expect(result.current.activeId).toBe('changes')
   })
 
+  it('a file opened held in another slot keeps the focus against that slot\'s discovery open', () => {
+    // The file twin of the held folder: a split pane's file chip or diff Open.
+    const { result, rerender } = renderHook(({ slot }: { slot: string | null }) => usePanelTabs(slot, mock.descriptors), {
+      initialProps: { slot: 'pane-a' as string | null },
+    })
+    act(() => result.current.openFile('/x/held.md', 'body', 'pane-b', { hold: true }))
+    rerender({ slot: 'pane-b' })
+    act(() => result.current.openView('changes', { automatic: true }))
+    expect(result.current.activeId).toBe('file:/x/held.md')
+  })
+
   it('evictDocumentBodies drops clean file bodies and diff tabs, keeps dirty buffers, in every slot', () => {
     const a = renderHook(() => usePanelTabs('slot-a', mock.descriptors))
     const b = renderHook(() => usePanelTabs('slot-b', mock.descriptors))
@@ -833,7 +844,7 @@ describe('usePanelTabs — per-slot isolation', () => {
   })
 
   it('a held view keeps the focus against a discovery open until the next tab choice', () => {
-    // The Ultra Mode board opens a worker with Workers held in front; the
+    // The conductor mode board opens a worker with Workers held in front; the
     // worker's history then loads and its PR link opens Changes for discovery.
     act(() => openPanelView('worker-slot', 'workers', { hold: true }))
     const { result } = renderHook(() => usePanelTabs('worker-slot', mock.descriptors))

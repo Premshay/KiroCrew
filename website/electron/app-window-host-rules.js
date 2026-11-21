@@ -31,8 +31,12 @@ const WINDOW_KEYS = new Set([
 ]);
 const PANEL_ONLY_KEYS = ["width", "height", "position", "transparent", "gutter"];
 const OVERLAY_ONLY_KEYS = ["displays"];
-const SHORTCUT_KEYS = new Set(["id", "accelerator", "window"]);
+const SHORTCUT_KEYS = new Set(["id", "accelerator", "platformAccelerators", "window"]);
 const BLOCK_KEYS = new Set(["windows", "shortcuts"]);
+/** A shortcut's per-platform default overrides `accelerator`; keyed by these names. */
+const PLATFORMS = Object.freeze(["macos", "windows", "linux"]);
+/** What a hosted window may ask the shell for; mirrors `apps/desktop_capabilities.py`. */
+const CAPABILITIES = Object.freeze(["screenCapture", "localFiles", "gatewayChoice"]);
 
 const MODIFIERS = {
   commandorcontrol: "CommandOrControl",
@@ -87,6 +91,46 @@ function canonicalAccelerator(accelerator) {
   return [...mods.sort(), key].join("+");
 }
 
+/**
+ * The keys *accelerator* presses on *platform* ("darwin", or anything else): each
+ * modifier as the physical key it is there, then the key. "" for a chord the rule
+ * above refuses.
+ */
+function pressedChord(accelerator, platform) {
+  const chord = canonicalAccelerator(accelerator);
+  if (!chord) return "";
+  const parts = chord.split("+");
+  const key = parts.pop();
+  const table = SAME_KEY[platform === "darwin" ? 0 : 1];
+  return [...new Set(parts.map((m) => table[m] || m))].sort().concat(key).join("+");
+}
+
+/**
+ * Every chord, in `pressedChord` form, that one native key press spells: Electron's
+ * `before-input-event` input, which page script cannot synthesize. The key is read
+ * from both the physical position (`code`) and the character (`key`), so a page
+ * recording either spelling of the press finds it. Empty for anything but a fresh
+ * key-down of a letter, digit, function, arrow or Space key.
+ */
+function keyPressChords(input, platform) {
+  if (!isPlainObject(input) || input.type !== "keyDown" || input.isAutoRepeat) return [];
+  const mods = [];
+  if (input.control) mods.push("Ctrl");
+  if (input.meta) mods.push(platform === "darwin" ? "Cmd" : "Super");
+  if (input.alt) mods.push("Alt");
+  if (input.shift) mods.push("Shift");
+  const keys = new Set();
+  const code = typeof input.code === "string" ? input.code : "";
+  const spelled = /^(?:Key([A-Z])|Digit([0-9])|Arrow(Up|Down|Left|Right))$/.exec(code);
+  if (spelled) keys.add(spelled[1] || spelled[2] || spelled[3]);
+  else if (FUNCTION_KEY_RE.test(code.toLowerCase())) keys.add(code.toUpperCase());
+  else if (code === "Space") keys.add("Space");
+  const key = typeof input.key === "string" ? input.key : "";
+  if (/^[A-Za-z0-9]$/.test(key)) keys.add(key.toUpperCase());
+  mods.sort();
+  return [...keys].map((k) => [...mods, k].join("+"));
+}
+
 function isPlainObject(value) {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
@@ -128,24 +172,48 @@ function parseWindow(raw) {
   return { ...win, width, height, position, transparent, gutter };
 }
 
-function parseShortcut(raw, windowIds, chords) {
+/** The manifest's platform name for a Node `process.platform`. */
+function platformName(platform) {
+  if (platform === "darwin") return "macos";
+  return platform === "win32" ? "windows" : "linux";
+}
+
+/**
+ * One declared shortcut with its default resolved for *platform*, or null.
+ *
+ * `platformAccelerators` overrides `accelerator` on the platforms it names. Every
+ * platform's default is checked, and no two shortcuts of the app may share one on
+ * any platform (`chords` holds a Set per platform name).
+ */
+function parseShortcut(raw, windowIds, chords, platform) {
   if (!isPlainObject(raw) || !ownKeysWithin(raw, SHORTCUT_KEYS)) return null;
   const { id, accelerator, window } = raw;
   if (typeof id !== "string" || !ID_RE.test(id)) return null;
   if (typeof window !== "string" || !windowIds.has(window)) return null;
-  const chord = canonicalAccelerator(accelerator);
-  if (!chord || chords.has(chord)) return null;
-  chords.add(chord);
-  return { id, accelerator, chord, window };
+  const perPlatform = raw.platformAccelerators === undefined ? {} : raw.platformAccelerators;
+  if (!isPlainObject(perPlatform) || !ownKeysWithin(perPlatform, new Set(PLATFORMS))) return null;
+  const defaults = {};
+  for (const name of PLATFORMS) {
+    const accel = Object.prototype.hasOwnProperty.call(perPlatform, name) ? perPlatform[name] : accelerator;
+    const chord = canonicalAccelerator(accel);
+    if (!chord || chords[name].has(chord)) return null;
+    chords[name].add(chord);
+    defaults[name] = { accelerator: accel, chord };
+  }
+  // `accelerator` itself must be valid even where every platform overrides it.
+  if (!canonicalAccelerator(accelerator)) return null;
+  const here = defaults[platformName(platform)];
+  return { id, accelerator: here.accelerator, chord: here.chord, window };
 }
 
 /**
  * Parse one app's `manifest.desktop`, or null when anything in it is refused.
  *
  * @param {unknown} raw the `desktop` value from the app's manifest.
+ * @param {string} [platform] the Node platform each shortcut's default is resolved for.
  * @returns {{windows: object[], shortcuts: object[]} | null}
  */
-function parseDesktopDeclaration(raw) {
+function parseDesktopDeclaration(raw, platform = process.platform) {
   if (!isPlainObject(raw) || !ownKeysWithin(raw, BLOCK_KEYS)) return null;
   const rawWindows = raw.windows;
   if (!Array.isArray(rawWindows) || rawWindows.length < 1 || rawWindows.length > MAX_WINDOWS) {
@@ -166,9 +234,9 @@ function parseDesktopDeclaration(raw) {
   if (!Array.isArray(rawShortcuts) || rawShortcuts.length > MAX_SHORTCUTS) return null;
   const shortcuts = [];
   const shortcutIds = new Set();
-  const chords = new Set();
+  const chords = Object.fromEntries(PLATFORMS.map((name) => [name, new Set()]));
   for (const item of rawShortcuts) {
-    const shortcut = parseShortcut(item, ids, chords);
+    const shortcut = parseShortcut(item, ids, chords, platform);
     if (!shortcut || shortcutIds.has(shortcut.id)) return null;
     shortcutIds.add(shortcut.id);
     shortcuts.push(shortcut);
@@ -176,30 +244,88 @@ function parseDesktopDeclaration(raw) {
   return { windows, shortcuts };
 }
 
+/** The known capabilities in a list, in `CAPABILITIES` order; anything else names none. */
+function knownCapabilities(value) {
+  return Array.isArray(value) ? CAPABILITIES.filter((cap) => value.includes(cap)) : [];
+}
+
+/**
+ * The capabilities a row both declares and has approved.
+ *
+ * Both halves are required: `manifest.permissions.desktopCapabilities` says what the
+ * app asks for, `desktopCapabilitiesGrant.approved` what the owner approved. A
+ * gateway that predates the grant publishes no `desktopCapabilitiesGrant`, so it
+ * grants nothing.
+ */
+function approvedCapabilities(row, manifest) {
+  const permissions = isPlainObject(manifest.permissions) ? manifest.permissions : {};
+  const declared = knownCapabilities(permissions.desktopCapabilities);
+  const grant = isPlainObject(row.desktopCapabilitiesGrant) ? row.desktopCapabilitiesGrant : {};
+  const approved = knownCapabilities(grant.approved);
+  return declared.filter((cap) => approved.includes(cap));
+}
+
+function appRows(rows) {
+  return Array.isArray(rows) ? rows : isPlainObject(rows) && Array.isArray(rows.apps) ? rows.apps : [];
+}
+
 /**
  * The declarations the host should serve, keyed by app name, from `/api/apps`.
  *
- * Only an enabled app the gateway did not skip at boot is served. An app with no
- * `desktop` block, or one the rules above refuse, is absent from the map.
+ * Only an app the gateway did not skip at boot is listed, and only an enabled one
+ * unless *disabledToo*: the host lists an app switched off on this computer's
+ * gateway too, because it still serves that app's windows from a crew the operator
+ * chose for it (`gatewayChoice`, app-window-gateways.js) while the app is on there.
+ * Each declaration says which with `enabledHere`. An app with no `desktop` block, or
+ * one the rules above refuse, is absent from the map. Each declaration carries
+ * `capabilities`: the ones the app declares AND has approved.
  *
  * @param {unknown} rows the parsed `/api/apps` body.
  * @param {(line: string) => void} [log] told once per refused declaration.
- * @returns {Map<string, {windows: object[], shortcuts: object[]}>}
+ * @param {{platform?: string, disabledToo?: boolean}} [options] `platform`: the Node
+ *   platform shortcut defaults are resolved for.
+ * @returns {Map<string, {windows: object[], shortcuts: object[], capabilities: string[], enabledHere: boolean}>}
  */
-function desktopDeclarations(rows, log = () => {}) {
+function desktopDeclarations(rows, log = () => {}, { platform = process.platform, disabledToo = false } = {}) {
   const out = new Map();
-  const list = Array.isArray(rows) ? rows : isPlainObject(rows) && Array.isArray(rows.apps) ? rows.apps : [];
-  for (const row of list) {
-    if (!isPlainObject(row) || row.enabled !== true || row.unavailable) continue;
+  for (const row of appRows(rows)) {
+    if (!isPlainObject(row) || row.unavailable) continue;
+    const enabledHere = row.enabled === true;
+    if (!enabledHere && !disabledToo) continue;
     const name = row.name;
     if (typeof name !== "string" || !APP_NAME_RE.test(name) || out.has(name)) continue;
     const manifest = isPlainObject(row.manifest) ? row.manifest : null;
     if (!manifest || manifest.desktop === undefined) continue;
-    const parsed = parseDesktopDeclaration(manifest.desktop);
-    if (parsed) out.set(name, parsed);
+    const parsed = parseDesktopDeclaration(manifest.desktop, platform);
+    if (parsed) out.set(name, { ...parsed, capabilities: approvedCapabilities(row, manifest), enabledHere });
     else log(`app-window-host: ${name}: desktop declaration refused`);
   }
   return out;
+}
+
+/**
+ * Whether the window host, not built-in shell code, owns *name*'s windows on the
+ * gateway that answered *rows*: `true`, `false`, or `null` when the body cannot be read.
+ *
+ * Built-in shell code that predates the host (a directory of its own under
+ * `website/electron/`) asks this before it opens anything for its app, and stands
+ * down on `true`. The answer is keyed on the gateway's record, never on a name the
+ * host knows: `true` when that record's manifest carries a `desktop` block, on or
+ * off, whether or not this shell's rules accept it. A block the rules refuse still
+ * counts, so a shell older than the grammar of the record it reads shows nothing for
+ * that app rather than its built-in windows over a record that no longer ships
+ * them. A gateway that predates the block, or a built-in record without one,
+ * answers `false`, and the built-in code serves its app as before.
+ *
+ * @param {unknown} rows the parsed `/api/apps` body.
+ * @param {string} name the app's installed name.
+ * @returns {boolean | null}
+ */
+function hostOwnsAppWindows(rows, name) {
+  if (!isAppListBody(rows)) return null;
+  const row = appRows(rows).find((r) => isPlainObject(r) && r.name === name);
+  const manifest = row && isPlainObject(row.manifest) ? row.manifest : null;
+  return !!manifest && manifest.desktop !== undefined && manifest.desktop !== null;
 }
 
 /** Whether the list body is one the host can read at all (vs. an unexpected shape). */
@@ -209,11 +335,19 @@ function isAppListBody(body) {
 
 module.exports = {
   APP_NAME_RE,
+  CAPABILITIES,
   ID_RE,
   MAX_WINDOWS,
   MAX_SHORTCUTS,
+  approvedCapabilities,
+  PLATFORMS,
   canonicalAccelerator,
+  knownCapabilities,
   parseDesktopDeclaration,
+  platformName,
   desktopDeclarations,
+  hostOwnsAppWindows,
   isAppListBody,
+  keyPressChords,
+  pressedChord,
 };

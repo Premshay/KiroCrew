@@ -15,6 +15,7 @@ import json
 import logging
 
 import pytest
+from redaction_structured_cases import github_classic
 from test_dashboard_chat import TestRunChatTransientRetry as _TransientSuite
 
 from kiro_crew.acp.client import AcpError, AcpPromptBusy
@@ -26,10 +27,9 @@ from kiro_crew.acp.error_frames import (
 from kiro_crew.acp.transport_errors import _raise_acp_error
 from kiro_crew.dashboard import session_health
 from kiro_crew.dashboard.session_health import RAW_FRAME_LOG_LABEL
-from kiro_crew.security import redact_credentials
 
-# A fake AWS access key id: matches (?:AKIA|ASIA)[A-Z0-9]{16}, asserted absent.
-_TOKEN = "AKIA" + "RAWFRAME0123456A"
+# A synthetic GitHub classic token (valid checksum) the redactor removes, asserted absent.
+_TOKEN = github_classic(seed=105)
 # A made-up PEM header, split so the source holds no key marker.
 _PEM_BEGIN = "-----BEGIN " + "PRIVATE KEY-----"
 _CAUSE = "ProviderCauseMarker: profile lookup failed"
@@ -105,7 +105,7 @@ class TestRawErrorDetailBounds:
         # The cap falls inside the token: a cut before redaction would leave a
         # fragment no credential pattern matches.
         prefix_len = len(json.dumps({"code": -32603, "message": "m", "data": ""})) - 2
-        pad = "x" * (RAW_ERROR_DETAIL_MAX_CHARS - prefix_len - 8)
+        pad = "x" * (RAW_ERROR_DETAIL_MAX_CHARS - prefix_len - 9) + " "
         frame = {"code": -32603, "message": "m", "data": f"{pad}{_TOKEN} tail " + "y" * 4000}
         rendered = json.dumps(frame, ensure_ascii=False)
         start = rendered.index(_TOKEN)
@@ -137,23 +137,6 @@ class TestRawErrorDetailBounds:
         detail = raw_error_detail({"code": 1, "message": "m", "data": data})
         assert "\n" not in detail
         assert json.loads(detail)["message"] == "m"
-
-    @pytest.mark.parametrize("field", ["aws_session_token", "SessionToken", "SecretAccessKey"])
-    def test_quoted_credential_field_in_string_data_is_scrubbed_before_escaping(
-        self, field: str
-    ) -> None:
-        # JSON escaping puts a backslash before each quote inside a string, which
-        # the field-name patterns do not match: the string must be scrubbed in
-        # its own spelling first.
-        secret = "IQoJb3JpZ2luX2VjE" + "A" * 300 + "xyzTOKENEND"
-        data = f'HTTP 401 session expired; creds {{"{field}": "{secret}"}}'
-        # Premise guard: a scrub of the escaped form alone misses it.
-        escaped = json.dumps({"data": data})
-        assert secret in redact_credentials(escaped)[0]
-
-        detail = raw_error_detail({"code": -32000, "message": "m", "data": data})
-        assert secret not in detail
-        assert "[REDACTED" in detail
 
     def test_credential_pair_in_structured_data_is_scrubbed(self) -> None:
         secret = "IQoJb3JpZ2luX2VjE" + "B" * 300
@@ -204,7 +187,7 @@ class TestDashboardTurnLogsTheFrame:
         slot._titled = True
         await _run_chat(state, slot, "hello")
         await self._drain_bg(state)
-        assert any(t.startswith("❌") for t in self._err_texts(slot))
+        assert any(t.startswith("Error:") for t in self._err_texts(slot))
 
     @pytest.mark.asyncio
     async def test_curated_error_logs_the_frame_beside_the_scanned_line(

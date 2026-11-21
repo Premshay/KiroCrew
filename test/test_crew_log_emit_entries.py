@@ -469,7 +469,7 @@ def test_chat_runner_records_the_input_and_refusal_on_a_blocked_expansion():
         ]
         if turn_file.name != "__init__.py"
     )
-    assert "🔒 Prompt blocked" in src
+    assert "Prompt blocked" in src
 
     def _emit_attr(node, name):
         # A crew_log_emit.<name>(...) call, however the module is aliased.
@@ -498,12 +498,12 @@ def test_chat_runner_records_the_input_and_refusal_on_a_blocked_expansion():
             for stmt in body:
                 if (
                     isinstance(stmt, ast.Expr)
-                    and _string_in(stmt.value, "🔒 Prompt blocked")
+                    and _string_in(stmt.value, "Prompt blocked")
                     and body not in blocks
                 ):
                     blocks.append(body)
 
-    assert blocks, "no block appends the '🔒 Prompt blocked' notice"
+    assert blocks, "no block appends the 'Prompt blocked' notice"
 
     def _co_located(block):
         received_at = None
@@ -716,7 +716,7 @@ def test_oversize_attachment_metadata_keeps_the_received_message():
 
 
 def test_every_body_family_produces_one_body_representation():
-    # FR-7 is amended in this change to include bodies, so the redacted body is
+    # FR-7 includes bodies, so the redacted body is
     # what goes in the log. The invariant is the SHAPE every body-bearing entry
     # has, asserted on the entries rather than on the source that produces them:
     # exactly one of `text` or `chunks`, never both and never neither. That holds

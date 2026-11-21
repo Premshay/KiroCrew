@@ -82,6 +82,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _DEFAULT_ON_BACKFILL,
         _DEFAULT_ON_BUILTINS,
         _REQUIRED_BUILTIN_FIELDS,
+        RETIRED_RECORD_SUFFIX,
         _adoption_pin_names,
         _app_declares_backend,
         _audit_default_on_backfill,
@@ -120,8 +121,6 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         update_app,
     )
     from kiro_crew.apps.manager_lookup import (  # noqa: F401
-        TASK_RUNNER_APP,
-        TASK_RUNNER_DISABLED_MESSAGE,
         AgentOwner,
         _absence_is_genuine,
         _add_adoption_row,
@@ -130,12 +129,12 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _app_agent_registration,
         _app_display_name,
         _app_registered_agent,
+        _declared_agents,
         _owner_json,
         _screened_spec_path,
         app_agent_backend_refusal,
         app_agent_launch_refusal,
         app_command_agent_refusal,
-        app_disabled,
         app_enabled_state,
         get_app,
         is_app_enabled,
@@ -154,8 +153,12 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _EXPLICIT_ONLY_FAMILIES,
         _GRANT_AND_SCOPE_WIDENING,
         _GRANT_WIDENING,
+        _MISSING_RECORD_ERRNOS,
+        _OWNER_APPROVED_FAMILIES,
         _RECORD_READ_CAP,
+        _RECORDED_NAMES_SETTLE_NS,
         _SCOPE_WIDENING,
+        _STALE_SIGNATURE,
         _TREE_SWAP_LAST_CAP,
         _VALID_LIFECYCLE,
         _VALID_ORIGIN,
@@ -177,6 +180,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _approved_grants_stored,
         _approved_grants_text,
         _config_keys_refresh_lock,
+        _consented_grant_entries,
         _credential_free_source_metadata,
         _declared_grant_entries,
         _disabled_before_upgrade,
@@ -199,6 +203,8 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _read_schema_version,
         _record_lock_path,
         _record_lock_state,
+        _recorded_app_names,
+        _recorded_names_cache,
         _restore_approved_grants,
         _scan_installed_app_config_keys,
         _session_approval_consent_unrecorded,
@@ -251,6 +257,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         preserved_data_awaits,
     )
     from kiro_crew.apps.manager_uninstall import (  # noqa: F401
+        _count_uninstall,
         _drop_trust_grant,
         _has_trust_grant,
         _holds_base_grant,
@@ -258,6 +265,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _rmtree_app_dir,
         _trust_grant_local,
         _trust_grant_repository,
+        _uninstall_labels,
         trust_grant_removal_blocked,
         uninstall_app,
     )
@@ -265,6 +273,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
 if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     import asyncio  # noqa: F401
     import contextlib  # noqa: F401
+    import errno  # noqa: F401
     import functools  # noqa: F401
     import ipaddress  # noqa: F401
     import json  # noqa: F401
@@ -325,6 +334,9 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew.apps.composer_action_grants import (  # noqa: F401
         composer_action_grant_row,
     )
+    from kiro_crew.apps.desktop_capabilities import (  # noqa: F401
+        desktop_capabilities_grant_row,
+    )
     from kiro_crew.apps.discovery import (  # noqa: F401
         discover_builtin_apps,
     )
@@ -353,6 +365,9 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         contain_command_agents,
         cron_permission_error,
         is_reserved_app_name,
+    )
+    from kiro_crew.apps.manifest_sections import (  # noqa: F401
+        BOT_GRANT_FAMILY,
     )
     from kiro_crew.apps.message_action_grants import (  # noqa: F401
         message_action_grant_row,

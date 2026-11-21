@@ -20,13 +20,16 @@ import AppSource, { type SourceName } from './AppSource'
 import { appDisplayName, appDescription } from './appManifest'
 import { needsDesktopApp } from '../../lib/electron'
 import { fmtCompact } from '../../i18n/format'
+import { offlineProps } from '../../utils/offline'
 
 import { i18nT } from '../../i18n/t'
 import { guidePick } from '../../uiLocations/targetRegistry'
-export default function AppListRow({ app, sources, busy, onOpen, onGet, onUpdate, onEnable }: {
+export default function AppListRow({ app, sources, busy, connected, onOpen, onGet, onUpdate, onEnable }: {
   app: RegistryApp
   sources?: SourceName[]
   busy?: boolean
+  /** The gateway connection flag: offline, Enable is refused. */
+  connected: boolean
   onOpen: (e?: React.MouseEvent | React.KeyboardEvent) => void
   onGet: () => void
   onUpdate: () => void
@@ -100,9 +103,10 @@ export default function AppListRow({ app, sources, busy, onOpen, onGet, onUpdate
                say the word printed on the button. */
             <span className="inline-flex items-center gap-2">
               <Btn
-                disabled={busy}
+                disabled={busy || !connected}
                 onClick={onEnable}
                 aria-describedby={needsDesktopApp(app) ? desktopHintId : undefined}
+                {...offlineProps(connected, i18nT('utils.offline.manage_apps'), i18nT('components.appstore.appListRow.enable'))}
               ><Power size={14} /> {i18nT('components.appstore.appListRow.enable')}</Btn>
               {needsDesktopApp(app) && (
                 <span className="inline-flex items-center gap-1 text-[12px] text-muted" title={i18nT('components.appstore.appListRow.desktop_app_hint')}>
@@ -112,10 +116,14 @@ export default function AppListRow({ app, sources, busy, onOpen, onGet, onUpdate
               )}
             </span>
           )
-        ) : app.installed && app.updateAvailable ? (
+        ) : app.installed && app.updateAvailable && app.installedFrom !== 'market' ? (
           <Btn disabled={busy} className="border-[var(--info)] text-[var(--info)] hover:text-[var(--info)] hover:border-[var(--info)]" onClick={onUpdate}>
             <ArrowUp size={14} /> {i18nT('components.appstore.appListRow.update')}
           </Btn>
+        ) : app.installed && app.installedFrom === 'market' ? (
+          /* Installed from a Kiro Space store under this name: this git row
+             neither updates nor reinstalls it. */
+          <span className="inline-flex items-center gap-1 text-[12px] text-muted" data-testid="installed-from-market"><Check size={12} /> {i18nT('components.appstore.marketStore.installed_from_market')}</span>
         ) : app.installed ? (
           <span className="inline-flex items-center gap-1 text-[12px] text-muted"><Check size={12} /> {i18nT('components.appstore.appListRow.installed')}</span>
         ) : (

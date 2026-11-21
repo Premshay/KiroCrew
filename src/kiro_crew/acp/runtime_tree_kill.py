@@ -10,12 +10,12 @@ of the method on the class or on an instance reaches every caller.
 
 Instance fields written: ``_bound_workspace_fd``, ``_child_pids``, ``_descendant_rescan_task``,
 ``_process``, ``_process_instance``, ``_process_tree_confirmed_dead``, ``_scope_unit``,
-``_spawn_work_dir``.
+``_start_tree_scans``, ``_spawn_work_dir``.
 
-Instance fields read: ``_close_remote_workspace``, ``_descendant_scan_lock``,
+Instance fields read: ``_KILL_TREE_WAIT_SECS``, ``_close_remote_workspace``, ``_descendant_scan_lock``,
 ``_exit_watch_task``, ``_native_skill_projection``, ``_pid``, ``_reader_task``,
 ``_rescan_descendants_later``, ``_spawn_skill_projection``, ``_spawn_start_token``,
-``_start_time``, ``_stderr_task``, ``_work_dir``.
+``_start_time``, ``_stderr_task``, ``_work_dir``, ``wait_tree_recorded``.
 """
 
 from __future__ import annotations
@@ -125,6 +125,40 @@ def _prune_dead_descendants(saved: dict[int, ChildRecord]) -> list[int]:
     return [pid for pid in saved if pid not in dead]
 
 
+#: How often a kill re-reads whether the group a root left behind has emptied.
+_GROUP_EXIT_POLL_SECS = 0.05
+
+
+async def _wait_for_group_exit(pgid: int, deadline: float) -> None:
+    """Wait until process group *pgid* has no member left, or until *deadline* (loop time).
+
+    The group of a root whose identity held at the SIGTERM and that exited inside
+    the kill's grace. The SIGTERM went to every member through the live root, so a
+    member still there is still stopping, or has exited and is not yet reaped by
+    the init it was reparented to. ``pgroup_exists`` counts both, which is the
+    reading the checks after the kill take, so the wait ends only once they would
+    agree that the group is gone. A root that exits between the identity read and
+    the signal leaves a group no SIGTERM reached; that costs the rest of the grace.
+
+    The root's number cannot be reissued while its group has a member. A number
+    the kernel reissues to a new group leader after the group emptied reads as
+    still there, which costs the rest of the grace and never a signal. Nothing is
+    signalled here either: a member still standing at *deadline* is left to the
+    survivor tracking that follows.
+
+    The probe runs on the loop, not on the subprocess executor: it is a signal-0
+    probe of the group (on macOS also the kernel's group listing) that cannot
+    block, and a hung tree walk holding that executor would otherwise hold the
+    probe, and the kill, past *deadline*.
+    """
+    loop = asyncio.get_running_loop()
+    while platform_compat.pgroup_exists(pgid):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(_GROUP_EXIT_POLL_SECS, remaining))
+
+
 def _untrack_killed_root(pid: int, start_token: str | None) -> None:
     """Retire the killed root's PID-registry entry, by identity when it has one.
 
@@ -219,9 +253,54 @@ async def refresh_process_tree(self: AcpRuntime) -> None:
     The snapshot otherwise runs only at spawn, create and resume, so a child
     a turn started is missing from the handle, and only a recorded member may
     vouch for a leaderless group (``process_identity._group_member_vouches``).
-    Same guarded pass as every other snapshot (:meth:`_snapshot_descendants`).
+    Same guarded pass as every other snapshot (:meth:`_snapshot_descendants`),
+    taken after any background pass still running has written its record.
     """
+    await self.wait_tree_recorded()
     await self._snapshot_descendants()
+
+
+def _record_tree_in_background(self: AcpRuntime, *, retry_when_empty: bool = False) -> None:
+    """Run a descendant pass beside a start or a turn's end, not in front of it.
+
+    A runtime's spawn, every session start on it (fresh or resumed), and every
+    turn on it fork processes the last pass could not see, so the tree is
+    walked again once the ``initialize`` handshake, ``session/new`` or
+    ``session/load`` has succeeded, and when a turn ends
+    (``process_identity.record_live_children_after_turn``).
+    The pass is the same guarded :meth:`_snapshot_descendants`, and its caller
+    does not wait for it, because a person's first prompt has no use for the
+    record. What does use it is a kill, so every path that signals by the
+    record or takes a kill handle from it waits for this pass first
+    (:meth:`wait_tree_recorded`): the runtime's own kill and the pre-teardown
+    refresh. The record is therefore the same identity data, written before
+    anything kills by it; a pass the kill's bound (``_KILL_TREE_WAIT_SECS``)
+    cuts short is cancelled, and the kill acts on the earlier record.
+
+    The pass swallows its own failures, so the task never ends in an
+    exception; a cancellation (loop shutdown) leaves the earlier record.
+    """
+    scans = getattr(self, "_start_tree_scans", None)
+    if scans is None:
+        scans = self._start_tree_scans = set()
+    task = asyncio.ensure_future(self._snapshot_descendants(retry_when_empty=retry_when_empty))
+    scans.add(task)
+    task.add_done_callback(scans.discard)
+
+
+async def wait_tree_recorded(self: AcpRuntime, timeout: float | None = None) -> bool:
+    """Return once every background descendant pass has finished.
+
+    Waits without cancelling: a caller cancelled while it waits leaves the
+    pass running, so the record still lands for the orphan sweep. With a
+    *timeout*, returns ``False`` when a pass is still running at its expiry,
+    and leaves that pass running; ``True`` otherwise.
+    """
+    pending = [t for t in getattr(self, "_start_tree_scans", ()) if not t.done()]
+    if not pending:
+        return True
+    _done, still = await asyncio.wait(pending, timeout=timeout)
+    return not still
 
 
 async def _snapshot_descendants(self: AcpRuntime, *, retry_when_empty: bool = False) -> None:
@@ -270,8 +349,8 @@ async def _snapshot_descendants(self: AcpRuntime, *, retry_when_empty: bool = Fa
     session start that called it -- the cost is a leak the sweep still
     reports, not a broken session -- but it logs at WARNING, because that
     report is then the only signal left. A CANCELLATION is not a failure and
-    is deliberately NOT swallowed: it reaches the caller's cleanup guard,
-    which owns the half-built runtime or session it must tear down.
+    is deliberately NOT swallowed: it reaches the awaiting caller (a refresh,
+    or the failed-start record before its kill), or ends a background pass.
 
     Never waits for a tree to appear. *retry_when_empty* asks for one more
     look when this pass sees no descendant, and that look runs as a task of
@@ -551,6 +630,26 @@ async def kill(self: AcpRuntime, *, expected: bool = False, reason: str = "") ->
         self._discard_sandbox_cleanup()
         await self._discard_bound_workspace()
         await self._close_remote_workspace()
+        await _end_remaining_session_states(self)
+
+
+async def _end_remaining_session_states(runtime: AcpRuntime) -> None:
+    """Release what each session still registered had prepared (its settings seed).
+
+    The process is gone, so its sessions are too; a session no teardown reached
+    would otherwise leave its prepared state behind. ``end_session`` runs once per
+    state and sends nothing. Never raises.
+    """
+    states = getattr(runtime, "_session_harness_states", None)
+    if not states:
+        return
+    held = list(states.values())
+    states.clear()
+    for state in held:
+        try:
+            await asyncio.shield(runtime._harness.end_session(state))
+        except BaseException:  # noqa: BLE001 - a kill's cleanup must finish
+            logger.debug("releasing a session's harness state at kill failed", exc_info=True)
 
 
 async def _kill_inner(self: AcpRuntime, *, expected: bool = False, reason: str = "") -> None:
@@ -592,6 +691,23 @@ async def _kill_inner(self: AcpRuntime, *, expected: bool = False, reason: str =
         except (asyncio.CancelledError, Exception):
             pass
 
+    # A background pass still running is waited for: its record is what the
+    # signals below and the survivor retention after them act on, and the root
+    # is not signalled until it is written. Waited for first, because a pass
+    # that sees no descendant schedules the deferred rescan cancelled next.
+    # Bounded: a pass still running at the bound (a hung walk) is cancelled,
+    # and the kill acts on the record the earlier passes wrote, the same as a
+    # kill that ran before the pass started.
+    if not await self.wait_tree_recorded(timeout=self._KILL_TREE_WAIT_SECS):
+        logger.warning(
+            "AcpRuntime: a descendant pass was still running after %.1fs "
+            "-- killing on the earlier record",
+            self._KILL_TREE_WAIT_SECS,
+        )
+        stuck = [t for t in getattr(self, "_start_tree_scans", ()) if not t.done()]
+        for task in stuck:
+            task.cancel()
+        await asyncio.gather(*stuck, return_exceptions=True)
     # A deferred descendant scan must not change this runtime's record under the
     # kill. A file write it already handed to the executor still lands, as one
     # from a cancelled session-start scan does: those lines stay for the orphan
@@ -673,6 +789,11 @@ async def _kill_inner(self: AcpRuntime, *, expected: bool = False, reason: str =
         # Read before the kill clears it: the group fallback needs the
         # incarnation this process was spawned as, not the empty successor.
         instance = self._process_instance
+        # Read before the signal too: while the root's identity holds, the
+        # SIGTERM goes through it to its whole group, and only that group is
+        # waited out below.
+        root_held = self._root_identity() == "holds"
+        grace_ends = asyncio.get_running_loop().time() + self._KILL_TERM_TIMEOUT
         orphaned_group = await self._signal_tree(pid, platform_compat.SIGTERM, instance=instance)
         escalated = False
         try:
@@ -716,6 +837,14 @@ async def _kill_inner(self: AcpRuntime, *, expected: bool = False, reason: str =
                 await asyncio.shield(escalate())
                 raise
             await escalate()
+        elif root_held and not escalated:
+            # The root went down inside the grace, but its group need not have:
+            # the sandbox launcher dies on the SIGTERM at once, and the agent it
+            # forked into the same group closes the root's pipes as it exits, so
+            # wait() returns while that agent is still exiting or not yet
+            # reaped. Pruning now would retain it as a survivor, and a reset's
+            # survivor check would force-kill a process the SIGTERM already ended.
+            await _wait_for_group_exit(pid, grace_ends)
         # Before the handle is dropped, whatever the ladder reached: see
         # _release_stdin for the tree this is the whole teardown of.
         _release_stdin(self._process)

@@ -1,6 +1,5 @@
 import React from 'react'
 import { ChevronRight } from 'lucide-react'
-import Clickable from './Clickable'
 import InfoTip from './InfoTip'
 import SearchableSelect, { type SearchableSelectOption } from './SearchableSelect'
 import SimpleSelect from './SimpleSelect'
@@ -13,19 +12,20 @@ import { RadioChipGroup, radioChip } from './RadioChipGroup'
  *
  * These match the pencil design system components:
  *   - SettingsToggle   → flat row: label+description left, toggle right
- *   - SettingsSelect   → vertical: label, description, dropdown
- *   - SettingsCombobox → vertical: label, description, searchable dropdown
- *   - SettingsInput    → vertical: label, description, text/number input
- *   - SettingsSection  → standalone section header above cards
+ *   - SettingsSelect   → one row: label left, dropdown right
+ *   - SettingsCombobox → one row: label left, searchable dropdown right
+ *   - SettingsInput    → stacked (text, typed in order) or one row (number)
+ *   - SettingsSection  → group heading + description above one group box
  *
- * Layout rule: all settings within a card stack vertically (gap-3).
- * Section headers sit outside the card.
+ * Layout rule: website/docs/page-layout.md, "Settings groups".
  */
 
 /* ── Toggle ── */
 
 interface SettingsToggleProps {
   label: string
+  /** Status beside the label, kept separate from its searchable and accessible name. */
+  labelBadge?: React.ReactNode
   // ReactNode (not just string) so callers can pass rich copy — e.g. the
   // Telegram forum toggle describes setup with inline <span className="font-mono">
   // fragments. The render path already wraps it in a <div>, so any node is safe.
@@ -73,49 +73,45 @@ interface SettingsToggleProps {
   anchor?: boolean
 }
 
-export function SettingsToggle({ label, description, descriptionBadge, hint, checked, onChange, disabled, busy, configKey, settingId, describedBy, anchor = true }: SettingsToggleProps) {
-  // Busy refuses the row click. The row is disabled for assistive tech while it
-  // runs -- `aria-disabled` plus `aria-busy`, out of the tab order -- so a screen
-  // reader does not announce an active button that does nothing. Focus is not
-  // lost: the inner switch carries its own `busy` and keeps its tab stop, so the
-  // user stays on the control they pressed. The dimmed look stays either way.
+/** A link or a button inside a row's description stays above the label's
+ *  stretched click layer, so it is pressed itself instead of the switch. */
+const PRESSABLE_ABOVE_ROW_CLS = '[&_a]:relative [&_button]:relative'
+
+export function SettingsToggle({ label, labelBadge, description, descriptionBadge, hint, checked, onChange, disabled, busy, configKey, settingId, describedBy, anchor = true }: SettingsToggleProps) {
   const inert = disabled || busy
-  /**
-   * Did this activation come from the "?" tip rather than the row?
-   *
-   * Checked on the ROW's own handler rather than by stopping propagation on a
-   * wrapper around the tip. The row is keyboard-activatable -- `Clickable` turns
-   * Enter/Space into the same `onClick` -- so a click-only `stopPropagation` left
-   * Enter on the tip flipping the setting it was there to explain. One guard here
-   * covers both input paths.
-   */
-  const fromHint = (e?: React.MouseEvent | React.KeyboardEvent) =>
-    e?.target instanceof HTMLElement && e.target.closest('[data-settings-hint]') !== null
+  // The row's own text first, then the caller's note about a consequence: the
+  // order they are read on screen. A screen reader hears both, with the name and
+  // the on/off state, at the one stop the row has.
+  const switchId = React.useId()
+  const descriptionId = React.useId()
+  const hasDescription = Boolean(descriptionBadge || description)
+  const switchDescribedBy = [hasDescription ? descriptionId : null, describedBy].filter(Boolean).join(' ') || undefined
   return (
-    <Clickable {...(anchor ? { 'data-setting-label': label, ...(configKey ? { 'data-setting-key': configKey } : {}), ...(settingId ? { 'data-setting-id': settingId } : {}) } : {})} aria-busy={busy || undefined} className={`flex items-center justify-between py-1.5 group ${inert ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'}`} onClick={e => { if (!inert && !fromHint(e)) onChange(!checked) }} disabled={inert}>
+    // The row itself is not a control and handles nothing. A row that was also
+    // a button gave every setting two Tab stops, and the first one read out as a
+    // button that never said on or off. The switch is the one control; the name
+    // beside it is its <label>, stretched over the row (`after:inset-0`) so a
+    // click anywhere on the row still presses the switch, the way a click on any
+    // label does. The tip, the switch and anything a description can press sit
+    // above that layer.
+    <div {...(anchor ? { 'data-setting-label': label, ...(configKey ? { 'data-setting-key': configKey } : {}), ...(settingId ? { 'data-setting-id': settingId } : {}) } : {})} className={`relative flex items-center justify-between py-1.5 group ${inert ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'}`}>
       <div className="flex-1 min-w-0 mr-4">
         <div className="flex items-center gap-1.5">
-          <div className="text-[13px] font-semibold text-text group-hover:text-text-strong transition-colors">{label}</div>
-          {/* Marked, not handled: `fromHint` above reads this attribute off the
-              event target, so the tip needs no handler of its own. */}
-          {hint && <span data-settings-hint><InfoTip text={hint} placement="top" /></span>}
+          <label htmlFor={switchId} className="min-w-0 text-[13px] font-semibold text-text group-hover:text-text-strong transition-colors after:absolute after:inset-0 after:content-['']">{label}</label>
+          {labelBadge && <span className="shrink-0">{labelBadge}</span>}
+          {hint && <span data-settings-hint className="relative"><InfoTip text={hint} placement="top" /></span>}
         </div>
         {descriptionBadge ? (
           // Badge and description each in their own block: two separate UI
           // units side by side, not one sentence built from two catalog keys.
-          <div className="flex flex-wrap items-center gap-1.5 text-[12px] text-muted mt-0.5">
+          <div id={descriptionId} className={`flex flex-wrap items-center gap-1.5 text-[12px] text-muted mt-0.5 ${PRESSABLE_ABOVE_ROW_CLS}`}>
             <div className="shrink-0">{descriptionBadge}</div>
             {description && <div>{description}</div>}
           </div>
-        ) : description && <div className="text-[12px] text-muted mt-0.5">{description}</div>}
+        ) : description && <div id={descriptionId} className={`text-[12px] text-muted mt-0.5 ${PRESSABLE_ABOVE_ROW_CLS}`}>{description}</div>}
       </div>
-      {/* stopPropagation prevents the row's mouse-click convenience from double-
-          toggling; the inner Toggle carries all keyboard/AT semantics. */}
-      {/* eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-static-element-interactions */}
-      <div onClick={e => e.stopPropagation()}>
-        <Toggle checked={checked} onChange={onChange} disabled={disabled} busy={busy} label={label} describedBy={describedBy} />
-      </div>
-    </Clickable>
+      <Toggle id={switchId} checked={checked} onChange={onChange} disabled={disabled} busy={busy} label={label} describedBy={switchDescribedBy} />
+    </div>
   )
 }
 
@@ -131,17 +127,62 @@ export function SettingsToggle({ label, description, descriptionBadge, hint, che
  * `<span>` — a `<label>` with a dangling `htmlFor`, or one wrapping a group of
  * buttons (SettingsStepper / SettingsButtonGroup), would be wrong. Optional so
  * the wrappers without a single labelable control keep compiling unchanged. */
-export function SettingsField({ label, description, hint, configKey, settingId, controlId, children }: { label: string; description?: string; hint?: string; configKey?: string; settingId?: string; controlId?: string; children: React.ReactNode }) {
-  return (
-    <div data-setting-label={label} {...(configKey ? { 'data-setting-key': configKey } : {})} {...(settingId ? { 'data-setting-id': settingId } : {})} className="flex flex-col gap-1.5 py-1.5">
-      <div className="flex items-center gap-1.5">
-        {controlId
-          ? <label htmlFor={controlId} className="text-[13px] font-semibold text-text">{label}</label>
-          : <span className="text-[13px] font-semibold text-text">{label}</span>}
-        {hint && <InfoTip text={hint} placement="top" />}
+/** How a field row lays out its caption and control.
+ *  - `stacked`: caption above, control below at full width. For text a person
+ *    types in order (a form), where a half-width box and its error would cramp.
+ *  - `inline-fixed` / `inline-auto`: caption left, control right, one row per
+ *    setting, inside a Settings group box only. The control sizes to its own
+ *    content, so a long selected label shows whole; `fixed` adds a 12rem floor so
+ *    short dropdowns still read as one column, `auto` lets a segmented control or
+ *    stepper keep its own width. The row wraps on the space it actually has (the
+ *    box, not the viewport): a control too wide to sit beside its caption drops
+ *    under it at full width instead of being clipped. Outside a box both render
+ *    as `stacked`. */
+export type SettingsFieldLayout = 'stacked' | 'inline-fixed' | 'inline-auto'
+
+/** One content width for every Settings group, so a caption on the left and
+ *  its control on the right stay close enough to read as one row on a wide
+ *  window, and every group's right edge lines up with the next. */
+export const SETTINGS_CONTENT_MAX_W = 'max-w-[720px]'
+
+export function SettingsField({ label, description, hint, configKey, settingId, controlId, layout = 'stacked', children }: { label: string; description?: string; hint?: string; configKey?: string; settingId?: string; controlId?: string; layout?: SettingsFieldLayout; children: React.ReactNode }) {
+  const caption = (
+    <div className="flex items-center gap-1.5">
+      {controlId
+        ? <label htmlFor={controlId} className="text-[13px] font-semibold text-text">{label}</label>
+        : <span className="text-[13px] font-semibold text-text">{label}</span>}
+      {hint && <InfoTip text={hint} placement="top" />}
+    </div>
+  )
+  const anchors = { 'data-setting-label': label, ...(configKey ? { 'data-setting-key': configKey } : {}), ...(settingId ? { 'data-setting-id': settingId } : {}) }
+  if (layout === 'stacked') {
+    return (
+      <div {...anchors} className="flex flex-col gap-1.5 py-1.5">
+        {caption}
+        {description && <div className="text-[12px] text-muted">{description}</div>}
+        {children}
       </div>
-      {description && <div className="text-[12px] text-muted">{description}</div>}
-      {children}
+    )
+  }
+  // Inline only inside a group box (`in-[[data-settings-box]]:`), which covers
+  // both SettingsCard's box and a grouped Card's. There the row wraps on its own
+  // width: the caption takes nearly all spare space (grow 999, 12rem basis) and
+  // the control keeps its content width (grow 1 adds a fraction of a pixel), so
+  // the two share a line when they fit. When they do not, the control wraps under
+  // the caption, where the grow fills the line, and `max-w-full` keeps it inside
+  // the box's overflow-hidden frame. No viewport breakpoint: a narrow Settings
+  // pane in a wide window gets the wrapped form too.
+  return (
+    <div {...anchors} className="flex flex-col gap-1.5 py-1.5 in-[[data-settings-box]]:flex-row in-[[data-settings-box]]:flex-wrap in-[[data-settings-box]]:items-center in-[[data-settings-box]]:gap-x-6">
+      <div className="min-w-0 in-[[data-settings-box]]:grow-[999] in-[[data-settings-box]]:basis-48">
+        {caption}
+        {description && <div className="text-[12px] text-muted mt-0.5">{description}</div>}
+      </div>
+      <div className={layout === 'inline-fixed'
+        ? 'min-w-0 max-w-full in-[[data-settings-box]]:shrink-0 in-[[data-settings-box]]:grow in-[[data-settings-box]]:min-w-[min(12rem,100%)]'
+        : 'min-w-0 max-w-full in-[[data-settings-box]]:shrink-0 in-[[data-settings-box]]:grow'}>
+        {children}
+      </div>
     </div>
   )
 }
@@ -175,8 +216,11 @@ export function SettingsSelect({ label, description, hint, value, options, optio
   // below stays as a fallback: it wins the accessible-name computation and
   // carries the same string, so nothing double-announces.
   const controlId = React.useId()
+  // The trigger can still cut a label that is wider than the whole box, so it
+  // carries the full text as its hover title.
+  const selectedLabel = optionLabels?.[options.indexOf(value)] ?? (value || '—')
   return (
-    <SettingsField label={label} description={description} hint={hint} configKey={configKey} settingId={settingId} controlId={controlId}>
+    <SettingsField label={label} description={description} hint={hint} configKey={configKey} settingId={settingId} controlId={controlId} layout="inline-fixed">
       <SimpleSelect
         id={controlId}
         options={options}
@@ -187,7 +231,8 @@ export function SettingsSelect({ label, description, hint, value, options, optio
         disabled={disabled}
         busy={busy}
         aria-label={label}
-        triggerFallback={optionLabels?.[options.indexOf(value)] ?? (value || '—')}
+        title={selectedLabel}
+        triggerFallback={selectedLabel}
       />
     </SettingsField>
   )
@@ -222,20 +267,28 @@ interface SettingsComboboxProps {
  */
 export function SettingsCombobox({ label, description, hint, value, options, onChange, triggerFallback, searchPlaceholder, customValueOption, action, actionStatus, configKey }: SettingsComboboxProps) {
   const controlId = React.useId()
+  // SearchableSelect takes no `title`, so the full trigger text (built the way
+  // its trigger builds it) hangs on a wrapper: hovering the trigger shows it.
+  const selected = options.find(o => o.value === value)
+  const triggerText = selected
+    ? (selected.sublabel ? `${selected.label} (${selected.sublabel})` : selected.label)
+    : (triggerFallback ?? value ?? '—')
   return (
-    <SettingsField label={label} description={description} hint={hint} configKey={configKey} controlId={controlId}>
-      <SearchableSelect
-        id={controlId}
-        options={options}
-        value={value}
-        onChange={onChange}
-        triggerFallback={triggerFallback}
-        searchPlaceholder={searchPlaceholder}
-        customValueOption={customValueOption}
-        action={action}
-        actionStatus={actionStatus}
-        aria-label={label}
-      />
+    <SettingsField label={label} description={description} hint={hint} configKey={configKey} controlId={controlId} layout="inline-fixed">
+      <div title={triggerText}>
+        <SearchableSelect
+          id={controlId}
+          options={options}
+          value={value}
+          onChange={onChange}
+          triggerFallback={triggerFallback}
+          searchPlaceholder={searchPlaceholder}
+          customValueOption={customValueOption}
+          action={action}
+          actionStatus={actionStatus}
+          aria-label={label}
+        />
+      </div>
     </SettingsField>
   )
 }
@@ -260,20 +313,24 @@ interface SettingsMultiSelectProps {
 export function SettingsMultiSelect({ label, description, hint, options, selected, onToggle, bulkActions, summary, searchPlaceholder, disabled, configKey, settingId, onOpenChange, notice }: SettingsMultiSelectProps) {
   const controlId = React.useId()
   return (
-    <SettingsField label={label} description={description} hint={hint} configKey={configKey} settingId={settingId} controlId={controlId}>
-      <MultiSelect
-        id={controlId}
-        label={label}
-        options={options}
-        selected={selected}
-        onToggle={onToggle}
-        bulkActions={bulkActions}
-        summary={summary}
-        searchPlaceholder={searchPlaceholder}
-        disabled={disabled}
-        onOpenChange={onOpenChange}
-        notice={notice}
-      />
+    <SettingsField label={label} description={description} hint={hint} configKey={configKey} settingId={settingId} controlId={controlId} layout="inline-fixed">
+      {/* MultiSelect takes no `title`; the wrapper carries the summary its
+          trigger may cut. */}
+      <div title={summary}>
+        <MultiSelect
+          id={controlId}
+          label={label}
+          options={options}
+          selected={selected}
+          onToggle={onToggle}
+          bulkActions={bulkActions}
+          summary={summary}
+          searchPlaceholder={searchPlaceholder}
+          disabled={disabled}
+          onOpenChange={onOpenChange}
+          notice={notice}
+        />
+      </div>
     </SettingsField>
   )
 }
@@ -298,7 +355,7 @@ interface SettingsInputProps {
   onCompositionStart?: React.CompositionEventHandler<HTMLInputElement | HTMLTextAreaElement>
   onCompositionEnd?: React.CompositionEventHandler<HTMLInputElement | HTMLTextAreaElement>
   placeholder?: string
-  type?: 'text' | 'number'
+  type?: 'text' | 'number' | 'time'
   min?: number
   max?: number
   step?: number
@@ -325,7 +382,7 @@ export function SettingsInput({ label, description, hint, value, onChange, onBlu
   const controlId = React.useId()
   const errorProps = invalidMessageId ? { 'aria-invalid': true, 'aria-describedby': invalidMessageId } : {}
   return (
-    <SettingsField label={label} description={description} hint={hint} configKey={configKey} controlId={controlId}>
+    <SettingsField label={label} description={description} hint={hint} configKey={configKey} controlId={controlId} layout={!multiline && type === 'number' ? 'inline-fixed' : 'stacked'}>
       {multiline ? (
         <textarea
           id={controlId}
@@ -388,6 +445,9 @@ interface SettingsSectionProps {
    * `hint`; a sentence the reader needs to make a choice stays visible instead.
    */
   hint?: string
+  /** One line under the heading, at the heading's indent. For a sentence the
+   *  reader needs before the rows; anything else belongs in `hint`. */
+  description?: React.ReactNode
   /**
    * Render the header as a disclosure that hides its own rows until clicked.
    *
@@ -452,7 +512,7 @@ export function useSettingsDeepLinkTarget(): string | null {
   return React.useSyncExternalStore(subscribeDeepLinkTarget, readDeepLinkTarget, readDeepLinkOnServer)
 }
 
-export function SettingsSection({ title, badge, hint, collapsible, children }: SettingsSectionProps) {
+export function SettingsSection({ title, badge, hint, description, collapsible, children }: SettingsSectionProps) {
   const [open, setOpen] = React.useState(false)
   const bodyId = React.useId()
   const bodyRef = React.useRef<HTMLDivElement>(null)
@@ -525,7 +585,7 @@ export function SettingsSection({ title, badge, hint, collapsible, children }: S
         * only the leading one matches. When a tab renders something of its own
         * above the first section, the header is no longer first and keeps the
         * margin — which is what it should do, because now something IS above it. */}
-      <div className="flex items-center gap-2 mt-6 mb-1 first:mt-0">
+      <div className={`flex items-center gap-2 mt-6 mb-2 px-4 first:mt-0 ${SETTINGS_CONTENT_MAX_W}`}>
         {collapsible ? (
           /* The whole header is the control, not a chevron beside it: a 14px
              target next to a clickable-looking title is the classic near-miss.
@@ -550,11 +610,33 @@ export function SettingsSection({ title, badge, hint, collapsible, children }: S
         {hint && <InfoTip text={hint} placement="top" />}
         {badge}
       </div>
+      {description && <div className={`-mt-1 mb-2 px-4 text-[12px] text-muted ${SETTINGS_CONTENT_MAX_W}`}>{description}</div>}
       {/* Unmounted rather than hidden when closed. A collapsed group exists to
           stop costing the reader attention, and an `aria-hidden` subtree still
           costs a screen-reader user their place in the tab order. */}
-      {collapsible ? open && <div id={bodyId} ref={bodyRef}>{children}</div> : children}
+      {/* The body. Loose text a panel puts between the heading and its box (a
+          note, an intro line) takes the heading's indent, so it lines up with
+          the heading and the row text without each panel padding it. A child
+          that is or holds a box keeps the full width. */}
+      {collapsible
+        ? open && <div id={bodyId} ref={bodyRef} className={`${SETTINGS_CONTENT_MAX_W} [&>:not([data-settings-card]):not(:has([data-settings-box]))]:px-4`}>{children}</div>
+        : <div className={`${SETTINGS_CONTENT_MAX_W} [&>:not([data-settings-card]):not(:has([data-settings-box]))]:px-4`}>{children}</div>}
     </>
+  )
+}
+
+/** The heading of one Settings group, and the line under it. Every group
+ *  heading on a Settings page draws through this, so all of them sit at the
+ *  same indent as the row text in the box below. `SettingsSection` uses it; a
+ *  panel that lays its own group out uses it directly instead of a bare h4. */
+export function SettingsGroupHeader({ title, description, size = 'md' }: { title: React.ReactNode; description?: React.ReactNode; size?: 'md' | 'sm' }) {
+  return (
+    <div className={`px-4 mb-2 ${SETTINGS_CONTENT_MAX_W}`}>
+      {size === 'md'
+        ? <h4 className="text-base font-semibold text-text-strong">{title}</h4>
+        : <h5 className="text-sm font-semibold text-text-strong">{title}</h5>}
+      {description && <div className="text-[12px] text-muted mt-0.5">{description}</div>}
+    </div>
   )
 }
 
@@ -569,25 +651,24 @@ export function SettingsSection({ title, badge, hint, collapsible, children }: S
 export const SETTINGS_CARD_STAGGER_MS = 60
 
 /**
- * The opt-in boxed look (`SettingsCard boxed`): one rounded, bordered card whose
+ * The group box every `SettingsCard` draws: one rounded, bordered card whose
  * DIRECT children are its rows, each padded, with a hairline between rows. A row
  * that renders nothing leaves no DOM node, so it draws no padding and no
  * hairline. A card nested inside a row loses its own bottom gap, so a card-shaped
  * row (an edition row, the KAS card) sits flush like the others.
  * `data-settings-box` lets a caller test for an empty box with `:empty`.
+ *
+ * The hairline selects "every row but the first" as `:not(:first-child)`, never
+ * as `* + *`: a sibling combinator between two bare `*` gives the browser no
+ * class to key on, so any node inserted anywhere restyles the whole subtree of
+ * the elements after it (frontend-conventions.md, Styling). `:where()` keeps the
+ * specificity of a single class.
  */
 const SETTINGS_BOX_CLASS =
   'rounded-xl overflow-hidden border border-[var(--border)] bg-[var(--card)] empty:hidden '
-  + '[&>*]:px-4 [&>*]:py-3 [&>*+*]:border-t [&>*+*]:border-[var(--border)] [&_[data-settings-card]]:mb-0'
+  + '[&>*]:px-4 [&>*]:py-3 [&>:where(:not(:first-child))]:border-t [&>:where(:not(:first-child))]:border-[var(--border)] [&_[data-settings-card]]:mb-0'
 
-export function SettingsCard({ index, boxed, children }: {
-  /**
-   * Draw the card as one bordered box with a hairline between its direct
-   * children. Off by default: most panels keep the borderless group, and only a
-   * page that lists many rows of one kind (Settings > Developer > Feature
-   * Previews) opts in.
-   */
-  boxed?: boolean
+export function SettingsCard({ index, children }: {
   /**
    * Ordinal of this card within its panel (0-based). Maps onto the shared
    * entrance-stagger ladder: the card's `animate-rise` entrance is delayed by
@@ -603,24 +684,17 @@ export function SettingsCard({ index, boxed, children }: {
   children: React.ReactNode
 }) {
   return (
-    // Borderless: the section heading and spacing mark the group, so a box
-    // around it would only add a second frame inside the settings pane.
-    // `data-settings-card` is a stable, nonvisual crop anchor for the capture
-    // scripts (the visual `.card-glow` frame is gone).
+    // One group box under the section heading, rows split by hairlines
+    // (page-layout.md, "Settings groups"). `data-settings-card` is a stable,
+    // nonvisual crop anchor for the capture scripts.
     <div
       data-settings-card=""
-      className="mb-2 animate-rise"
+      className={`mb-2 animate-rise ${SETTINGS_CONTENT_MAX_W}`}
       style={index ? { animationDelay: `${index * SETTINGS_CARD_STAGGER_MS}ms` } : undefined}
     >
-      {boxed ? (
-        <div data-settings-box="" className={SETTINGS_BOX_CLASS}>
-          {children}
-        </div>
-      ) : (
-        <div className="flex flex-col gap-2.5">
-          {children}
-        </div>
-      )}
+      <div data-settings-box="" className={SETTINGS_BOX_CLASS}>
+        {children}
+      </div>
     </div>
   )
 }
@@ -736,7 +810,7 @@ function StepperValueInput({ label, value, onSet, min, max, suffix, disabled }: 
 
 export function SettingsStepper({ label, description, hint, value, onIncrement, onDecrement, onReset, onSet, min, max, suffix = '', disabled, decrementDisabled = false, reserveWidthFor, configKey }: SettingsStepperProps) {
   return (
-    <SettingsField label={label} description={description} hint={hint} configKey={configKey}>
+    <SettingsField label={label} description={description} hint={hint} configKey={configKey} layout="inline-auto">
       <div className="flex items-center gap-2">
         <button
           type="button"
@@ -803,11 +877,14 @@ interface SettingsButtonGroupProps {
   disabled?: boolean
   /** Backend config key this button group writes. */
   configKey?: string
+  /** Stable highlight anchor (`data-setting-id`), as on `SettingsField`. Lets a
+   *  deep link wait for a group that mounts late. */
+  settingId?: string
 }
 
-export function SettingsButtonGroup({ label, description, hint, value, options, onChange, disabled, configKey }: SettingsButtonGroupProps) {
+export function SettingsButtonGroup({ label, description, hint, value, options, onChange, disabled, configKey, settingId }: SettingsButtonGroupProps) {
   return (
-    <SettingsField label={label} description={description} hint={hint} configKey={configKey}>
+    <SettingsField label={label} description={description} hint={hint} configKey={configKey} settingId={settingId} layout="inline-auto">
       {/* Segmented control: a RECESSED track (`bg-accent`) holding a RAISED
           selected thumb (`bg-elevated` + border + shadow).
 

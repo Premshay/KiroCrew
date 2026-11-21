@@ -324,8 +324,9 @@ attached you get a **path**, not an image:
 
 ```
 Screenshot: /var/folders/.../kirocrew-computer-shots/shot-1769472013411.jpeg
-  (1280x604 jpeg, 24.2 KB) — read it with the fs_read tool only if the tree is
-  insufficient.
+  (1280x604 jpeg, 24.2 KB) — DOWNSCALED from the window size printed above, so
+  image pixels are not window coordinates. Take coordinates from an element's
+  own frame. Read the file with the fs_read tool only if the tree is insufficient.
 ```
 
 Read the file only when the outline cannot answer the question: a chart, rendered
@@ -357,6 +358,7 @@ These are **answers**, not failures. Relay them and adapt; do not loop.
 | `dragging on Windows moves the operator's real cursor …` | a drag with the default `click_method` (the macOS app-scoped route) | pass `click_method: "global"` explicitly — Windows has no pointer-free drag, so the opt-in is the whole point. There is no element form of a drag |
 | `a right-button click cannot be delivered to element N …` | a non-left button on the element path, where UIA has no context-menu pattern | name `click_method: "global"` with coordinates, or address the menu command directly if `computer_get_state` already lists it |
 | `moving the real mouse pointer is switched off for this caller` | you asked for `click_method: "global"` on a leg that refuses it | use an element index — it moves no pointer on either platform. (`app_post` also avoids the pointer, but only on macOS; it is refused on Windows) |
+| `sent cmd+..., but 'X' is not the frontmost app and macOS may ignore ...` | the Cmd shortcut was sent, but macOS often drops a Cmd shortcut sent to a background app | read the refreshed tree: if nothing changed, the key was ignored, so do the same thing through an element (`computer_click` a menu or toolbar control, `computer_set_value`, `computer_perform_action`), or ask the user to bring the app to the front. Do not retry the key |
 | `give either element_index or both x and y, not both forms` | you supplied two different targets in one call | pick one — the element index if the outline has the control |
 | `no installed application matches 'X'` | `computer_launch_app` resolves names against the OS's own list of installed apps | try the name as it appears in the Start menu / Applications folder. Do NOT retry with a path — a path is never accepted |
 | `'X' already has a window on screen` | the app you asked to launch is already running | call `computer_get_state` on it; launching again would open a second copy |

@@ -12,13 +12,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew import name_grant, permission_floor
 from kiro_crew.agent_sdk.drivers.acp_turn_vocab import LLMEvent, LLMProvider
 from kiro_crew.constants import (
+    DENY_CAUSE_APPROVAL_TIMEOUT,
     DENY_CAUSE_INVALID_NAME,
     DENY_CAUSE_POLICY,
     DENY_CAUSE_SURFACE_POLICY,
@@ -34,6 +37,7 @@ from kiro_crew.hooks import (
     untruncated_shell_title,
 )
 from kiro_crew.llm_helpers_parts.tool_input_denials import (
+    _MAX_SCANNABLE_TOOL_INPUT_CHARS,
     _edit_target_denial,
     _extract_tool_input_strings,
     _first_tool_input_denial,
@@ -54,8 +58,18 @@ from kiro_crew.security import (
     redact_credentials,
     redact_exfiltration_urls,
 )
+from kiro_crew.security.mcp_body_fields import (
+    body_field_keys,
+    is_kirocrew_server,
+    named_size_refusal,
+    warn_body_field_matches,
+)
 from kiro_crew.security.paths_resolver import bounded_judgment
-from kiro_crew.security.readonly_bash import command_invokes_git, is_read_only_bash
+from kiro_crew.security.readonly_bash import (
+    command_invokes_git,
+    is_read_only_bash,
+    may_write_through_git_flag,
+)
 from kiro_crew.tool_gate_busy import hook_gate_busy
 
 if TYPE_CHECKING:
@@ -109,6 +123,42 @@ class ToolApprovalPolicy(Enum):
 #: Rejects scheduled while a deny site was being CANCELLED mid-steer. Strongly
 #: referenced so the event loop cannot drop them before they answer the wire.
 _orphan_rejects: set[asyncio.Task[Any]] = set()
+
+#: Open while an interactive approver is awaited (``approval_expiry_watch``). The
+#: approver answers a bare ``bool``, so its ``False`` cannot say whether a person
+#: refused or the prompt's window closed with nobody answering; the code where a
+#: window closes says so here, through ``note_approval_expired``. A list rather
+#: than a flag, so a wait the approver runs in a task of its own (which holds a
+#: copy of this context) still marks the same holder.
+_approval_expired: ContextVar[list[bool] | None] = ContextVar("tool_approval_expired", default=None)
+
+
+@contextmanager
+def approval_expiry_watch() -> Iterator[list[bool]]:
+    """Watch one approver wait: the list it yields is non-empty once the wait expired.
+
+    Opened by the permission resolvers (``_resolve_permission``, and
+    ``tool_permission.CallbackResponder``) around the approver they await.
+    """
+    holder: list[bool] = []
+    token = _approval_expired.set(holder)
+    try:
+        yield holder
+    finally:
+        _approval_expired.reset(token)
+
+
+def note_approval_expired() -> None:
+    """Mark the approval being waited on as expired: nobody answered its prompt.
+
+    Called where an approval window closes unanswered. Inside an
+    ``approval_expiry_watch``, the refusal is then recorded as the host's and the
+    model is told nobody answered, instead of both reading a person's no.
+    Anywhere else it does nothing.
+    """
+    holder = _approval_expired.get()
+    if holder is not None:
+        holder.append(True)
 
 
 async def _steer_host_deny(
@@ -209,6 +259,26 @@ def _orphan_reject_done(task: asyncio.Task[Any]) -> None:
         )
 
 
+def _body_field_link_origin() -> str:
+    """The dashboard origin a size refusal links to, or ``""``. Blocking; never raises.
+
+    Same origin choice as the Slack->dashboard links
+    (``dashboard.urls.dashboard_link_origin``). No click token: the refusal reaches
+    the model and may be relayed to a shared channel.
+    """
+    try:
+        from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.dashboard.urls import dashboard_link_origin, tunnel_origin_if_opted_in
+
+        cfg = KiroCrewConfig.load()
+        return dashboard_link_origin(
+            cfg.dashboard.url, tunnel_origin_if_opted_in(cfg.slack.use_tunnel_url)
+        )
+    except Exception:
+        logger.debug("body-field refusal: dashboard origin unavailable", exc_info=True)
+        return ""
+
+
 async def _resolve_permission(
     provider: LLMProvider,
     event: LLMEvent,
@@ -218,6 +288,7 @@ async def _resolve_permission(
     session_key: str = "",
     agent: str = "",
     app: str = "",
+    app_run: tuple[str, str] = ("", ""),
     on_decision: Callable[[str, str, str], None] | None = None,
     spec_floor: Callable[[LLMEvent], Awaitable[str | None]] | None = None,
 ) -> bool:
@@ -237,7 +308,10 @@ async def _resolve_permission(
     unconditional checks), ``"always_deny_hook"`` (a HookManager security deny),
     ``"policy_deny"`` (the governance ceiling, whether reached through the hook
     gate or through a regex-tier rule that only a governance PIN put back into
-    the effective set), or ``""`` for an approval or an interactive rejection.
+    the effective set), ``"always_deny_transport"`` (the transport's security
+    floor refused an approval), ``"batch_write_guard"`` (the batch write guard
+    deferred an approval to the next step), or ``""`` for an approval, an
+    interactive rejection or an approval prompt that expired unanswered.
     The ``always_deny`` prefix is therefore what marks a refusal as "the attempt
     itself was the problem"; everything else describes policy state or an absent
     approver. Note that the same regex match can land under either label — what
@@ -265,6 +339,18 @@ async def _resolve_permission(
             request_id=event.request_id,
             **extra,
         )
+
+    def _log_send_refused() -> None:
+        # ``approve_tool`` answers both the batch write guard and the security
+        # floor with False; only the floor is a security block.
+        from kiro_crew.agent_sdk import batch_guard_refusal_outcome, take_batch_guard_refusal
+
+        reason = take_batch_guard_refusal(provider, event.request_id)
+        if reason is None:
+            _log(OUTCOME_REJECTED_TRANSPORT_FLOOR, metadata={"mechanism": "always_deny_transport"})
+            return
+        outcome, metadata = batch_guard_refusal_outcome(reason)
+        _log(outcome, metadata=metadata)
 
     # Audit FIRST, before any wire I/O for this decision, at every deny below:
     # the steer and the rejection both await the ACP pipe, and a backend that
@@ -488,10 +574,21 @@ async def _resolve_permission(
     # frame carries no ``kind`` (only its later updates do), so the shell cache
     # is empty for a real kiro-cli MCP call. A frame that does report a shell
     # kind still sets ``is_shell`` and is refused the exemption.
+    _body_field_server = getattr(event, "mcp_server_name", "") or ""
+    _body_field_tool = getattr(event, "tool_name", "") or ""
+    _trusted_mcp_params: dict | None = None
+    if (
+        getattr(event, "raw_params_trusted", False)
+        and getattr(event, "mcp_identity_trusted", False)
+        and isinstance(getattr(event, "raw_tool_params", None), dict)
+    ):
+        from kiro_crew.agent_sdk import mcp_call_arguments
+
+        _trusted_mcp_params = mcp_call_arguments(event, _body_field_server, _body_field_tool)
     _mcp_body_keys = (
         mcp_document_body_keys(
-            getattr(event, "tool_name", ""),
-            getattr(event, "mcp_server_name", ""),
+            _body_field_tool,
+            _body_field_server,
             event.raw_tool_params,
         )
         if (
@@ -503,6 +600,29 @@ async def _resolve_permission(
             and isinstance(getattr(event, "raw_tool_params", None), dict)
         )
         else frozenset()
+    )
+    # A third-party MCP tool's message-body fields (``security.mcp_body_fields``:
+    # the reviewed defaults plus the rows the dashboard owner allowed). Same
+    # identity and params bar as the Kiro Crew rows above, and only for a call no
+    # Kiro Crew row covers and no Kiro Crew server makes: a ``kirocrew-*`` tool's
+    # unlisted field (a cron script job's ``message``) keeps the full scan and is
+    # never offered as a row. The rows are resolved in ``_scan_off_loop`` because the
+    # owner's are read from disk. A body field joins the Kiro Crew bodies in the one
+    # ``command_rules=False`` scan (256 KiB ceiling and the path tier), so it never
+    # reaches the shell matcher or the deny-rule list.
+    _body_field_params: dict | None = (
+        _trusted_mcp_params
+        if (
+            _edit_params is None
+            and _scoped_params is None
+            and not _mcp_body_keys
+            and _body_field_server
+            and not is_kirocrew_server(_body_field_server)
+            and _body_field_tool
+            and not getattr(event, "is_shell", False)
+            and _trusted_mcp_params is not None
+        )
+        else None
     )
     _scoped_truncated = False
     _body_strings: list[str] = []
@@ -578,7 +698,28 @@ async def _resolve_permission(
             edit_hit = _edit_target_denial(_gated_params, event.diff_path, event.tool_kind)
             if edit_hit is not None:
                 return (*edit_hit, "always_deny_input")
-        if _scoped_truncated:
+        input_strings, scoped_truncated = _input_strings, _scoped_truncated
+        body_strings = _body_strings
+        field_bodies: dict[str, str] = {}
+        # What a size refusal names a field from: the params left after the listed
+        # body fields are split out, so it never names a field already allowed.
+        size_params: dict | None = _body_field_params
+        if _body_field_params is not None:
+            field_keys = body_field_keys(_body_field_tool, _body_field_server)
+            if field_keys:
+                # A field is a top-level name; only a string there is a body.
+                field_bodies = {
+                    k: v
+                    for k, v in _body_field_params.items()
+                    if k in field_keys and isinstance(v, str)
+                }
+                rest = {k: v for k, v in _body_field_params.items() if k not in field_bodies}
+                body_strings = list(field_bodies.values())
+                size_params = rest
+                field_rest = command_shaped_strings(rest, body_keys=frozenset())
+                scoped_truncated = field_rest.truncated
+                input_strings = list(field_rest)
+        if scoped_truncated:
             # The field-scoped walk could not finish, so the strings it did
             # collect are not the whole payload: refuse rather than scan a part.
             return (
@@ -587,17 +728,36 @@ async def _resolve_permission(
                 "",
                 "always_deny_input",
             )
-        if _input_strings:
+        if input_strings:
             input_hit = _first_tool_input_denial(
-                _input_strings, _denied_regexes, exempt_command=_path_tier_exempt(event)
+                input_strings, _denied_regexes, exempt_command=_path_tier_exempt(event)
             )
             if input_hit is not None:
+                if input_hit[0] == "oversize" and size_params is not None:
+                    input_hit = _named_size_refusal(input_hit, size_params)
                 return (*input_hit, "always_deny_input")
-        if _body_strings:
-            body_hit = _first_tool_input_denial(_body_strings, _denied_regexes, command_rules=False)
+        if body_strings:
+            # Every MCP document or message body, Kiro Crew's and a listed
+            # third-party field alike: the size ceiling and the path tier only.
+            body_hit = _first_tool_input_denial(body_strings, _denied_regexes, command_rules=False)
             if body_hit is not None:
                 return (*body_hit, "always_deny_input")
+        if field_bodies:
+            warn_body_field_matches(field_bodies, _body_field_server, _body_field_tool)
         return None
+
+    def _named_size_refusal(hit: tuple[str, str, str], params: dict) -> tuple[str, str, str]:
+        # A trusted MCP call refused for one top-level field's size: name the tool
+        # and field, and remember the refusal so the dashboard owner can allow that
+        # exact row (``security.mcp_body_fields.named_size_refusal``).
+        reason = named_size_refusal(
+            params,
+            _body_field_server,
+            _body_field_tool,
+            _MAX_SCANNABLE_TOOL_INPUT_CHARS,
+            dashboard_origin=_body_field_link_origin(),
+        )
+        return hit if reason is None else (hit[0], reason, hit[2])
 
     def _bounded_scan_off_loop() -> tuple[str, str, str, str] | None:
         # Every path check of this one call shares one resolver wait budget. An
@@ -684,6 +844,29 @@ async def _resolve_permission(
             await provider.reject_tool(event.request_id)
             return False
 
+    # A moved Bot's limit its worker could not carry exactly (``mate_held_rules``):
+    # no rung below approves a call it covers on its own; the caller's approver
+    # is asked as a person's (``held_call``), and with none the call is refused.
+    # A READ_ONLY turn has no approver, so a held read is refused there.
+    # An organisation's ``ask`` on a KAS web call (``web_ask_rule``) is held the same
+    # way under every policy: KAS asks so a person answers.
+    from kiro_crew import mate_held_rules, web_ask_rule
+
+    _bot_held = (
+        await asyncio.to_thread(
+            mate_held_rules.held_for, event, session_key=session_key, agent=agent
+        )
+        if policy
+        in (
+            ToolApprovalPolicy.AUTO_APPROVE,
+            ToolApprovalPolicy.HOOK_BASED,
+            ToolApprovalPolicy.READ_ONLY,
+        )
+        else []
+    )
+    _web_held = web_ask_rule.held_phrases(event)
+    _held = list(_bot_held) + _web_held
+
     if policy in (ToolApprovalPolicy.HOOK_BASED, ToolApprovalPolicy.READ_ONLY) and hooks:
         tool_result = await run_in_tool_gate_pool(
             hooks.on_tool_call,
@@ -692,6 +875,7 @@ async def _resolve_permission(
             session_key=session_key,
             agent=agent,
             app=app,
+            app_run=app_run,
             **hook_gate_kwargs(event),
             # READ_ONLY asks for the classifier's verdict alone: the gate skips
             # its grant tiers (`auto_approve_tools`, app-own-server), which vouch
@@ -720,7 +904,7 @@ async def _resolve_permission(
             await _steer_host_deny(provider, event, tool_result.reason, cause=DENY_CAUSE_POLICY)
             await provider.reject_tool(event.request_id)
             return False
-        if tool_result.action == TOOL_AUTO_APPROVE:
+        if tool_result.action == TOOL_AUTO_APPROVE and not _held:
             if policy == ToolApprovalPolicy.READ_ONLY and not tool_result.read_only:
                 # READ_ONLY honours the classifier's verdict alone, and the
                 # result says which route produced it: ``read_only`` is set only
@@ -756,10 +940,7 @@ async def _resolve_permission(
                 if approval_sent is not False:
                     _log("auto_approved", metadata={"reason": "hook_auto_approve"})
                 else:
-                    _log(
-                        OUTCOME_REJECTED_TRANSPORT_FLOOR,
-                        metadata={"mechanism": "always_deny_transport"},
-                    )
+                    _log_send_refused()
                 return approval_sent is not False
             if name_grant.should_log_decline(session_key, _ng_refusal):
                 logger.warning(
@@ -818,7 +999,13 @@ async def _resolve_permission(
     # name-grant check the read-only approve ran -- so it is refused instead.
     if policy == ToolApprovalPolicy.HOOK_BASED and hooks and on_tool_approval is None:
         _git_command = name_grant.shell_command_for_event(event)
-        if _git_command and command_invokes_git(_git_command) and is_read_only_bash(_git_command):
+        # A git command that may write a file through a flag
+        # (`git blame --output=F`) is refused here too, not auto-approved.
+        if (
+            _git_command
+            and command_invokes_git(_git_command)
+            and (is_read_only_bash(_git_command) or may_write_through_git_flag(_git_command))
+        ):
             _log("rejected", metadata={"reason": "git_read_headless_reject"})
             await _steer_host_deny(
                 provider,
@@ -830,9 +1017,45 @@ async def _resolve_permission(
             await provider.reject_tool(event.request_id)
             return False
 
+    if _held and on_tool_approval is None:
+        if _bot_held:
+            _log("rejected", metadata={"reason": "bot_limit_held_headless"})
+            _why = (
+                "this call falls under a Bot limit that could not be applied as written ("
+                + "; ".join(_bot_held)
+                + "), so a person must approve it, and this surface has no approver"
+            )
+        else:
+            _log("rejected", metadata={"reason": "web_ask_rule_headless"})
+            _why = (
+                "; ".join(_web_held)
+                + ", so a person must approve it, and this surface has no approver"
+            )
+        await _steer_host_deny(provider, event, _why, cause=DENY_CAUSE_SURFACE_POLICY)
+        await provider.reject_tool(event.request_id)
+        return False
+
     # Interactive approval if callback provided
     if on_tool_approval:
-        approved = await on_tool_approval(event)
+        with approval_expiry_watch() as _expired:
+            if _held:
+                with mate_held_rules.held_call(_held):
+                    approved = await on_tool_approval(event)
+            else:
+                approved = await on_tool_approval(event)
+        if not approved and _expired:
+            # Nobody answered before the prompt's window closed: the host
+            # declined, so the model is told nobody refused it.
+            _log("rejected", metadata={"reason": "approval_expired"})
+            await _steer_host_deny(
+                provider,
+                event,
+                "the approval prompt went unanswered",
+                cause=DENY_CAUSE_APPROVAL_TIMEOUT,
+            )
+            await provider.reject_tool(event.request_id)
+            return False
+
         if not approved:
             # The person said no: no notice (kiro-cli's wording is the truth
             # here), but the audit still precedes the wire like every other deny.
@@ -845,5 +1068,5 @@ async def _resolve_permission(
     if approval_sent is not False:
         _log("auto_approved")
     else:
-        _log(OUTCOME_REJECTED_TRANSPORT_FLOOR, metadata={"mechanism": "always_deny_transport"})
+        _log_send_refused()
     return approval_sent is not False

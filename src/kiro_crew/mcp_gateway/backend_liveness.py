@@ -109,11 +109,19 @@ def _is_heartbeat_id(msg_id: Any) -> bool:
     return msg_id == HEARTBEAT_PING_ID or str(msg_id) == str(HEARTBEAT_PING_ID)
 
 
+#: The newer MCP protocol's change stream: a client keeps this one request open
+#: for its whole session, so neither its age nor its abandonment is tool work.
+_LISTEN_METHOD = "subscriptions/listen"
+
 #: Requests a departing stub may abandon without the backend being recycled:
 #: a ping and the read-only listings run no tool work, so there is nothing a
-#: best-effort cancel could fail to stop. ``initialize`` is not listed because
-#: it is never pending under a stub's own uuid: the upstream handshake is
-#: forwarded under the ``__init__`` sentinel. See ``has_recyclable_in_flight``.
+#: best-effort cancel could fail to stop. The newer MCP protocol's
+#: ``server/discover`` handshake and ``subscriptions/listen`` stream are the
+#: same kind: a client and backend that negotiate that protocol keep a listen
+#: open for the whole session, so every disconnect leaves one in flight.
+#: ``initialize`` is not listed because it is never pending under a stub's own
+#: uuid: the upstream handshake is forwarded under the ``__init__`` sentinel.
+#: See ``has_recyclable_in_flight``.
 _RECYCLE_EXEMPT_METHODS = frozenset(
     {
         "ping",
@@ -121,6 +129,8 @@ _RECYCLE_EXEMPT_METHODS = frozenset(
         "prompts/list",
         "resources/list",
         "resources/templates/list",
+        "server/discover",
+        _LISTEN_METHOD,
     }
 )
 
@@ -388,9 +398,11 @@ async def _heartbeat_once(self: Backend, now: float) -> str:
         # healthy backend, but it still says a request is outstanding, so
         # with pings also stopped the two-condition rule recycles as it
         # would for any other old request. It stays in the table for
-        # attribution and the last-stub recycle (Scope B).
+        # attribution and the last-stub recycle (Scope B). An open listen is
+        # skipped the same way: it is the stream a client keeps for its
+        # whole session, not work that can get stuck.
         oldest_any_age = max(oldest_any_age, age)
-        if pending.cancelled:
+        if pending.cancelled or pending.method == _LISTEN_METHOD:
             continue
         if age > oldest_age:
             oldest_age = age
@@ -440,8 +452,13 @@ async def _heartbeat_once(self: Backend, now: float) -> str:
             return "wedged"
 
         # Old request + fresh pings: backend responsive but tool slow.
-        # Log once per request id, don't recycle.
-        if oldest_fid and oldest_fid not in self._warned_slow_ids:
+        # Log once per request id, don't recycle. The skipped entries can be
+        # the only old ones, so the warned request must be old itself.
+        if (
+            oldest_fid
+            and oldest_age >= HEARTBEAT_TIMEOUT_SECS
+            and oldest_fid not in self._warned_slow_ids
+        ):
             self._warned_slow_ids.add(oldest_fid)
             logger.warning(
                 "slow in-flight request %.1fs (method=%s, stub=%s, fid=%s) "
@@ -632,8 +649,9 @@ async def shutdown(self: Backend, timeout: float = 5.0) -> None:
             # neither name exists on Windows, and the except clause below
             # does not catch AttributeError — so on Windows this raised out
             # of shutdown() and the process.kill() fallback never ran,
-            # leaving the backend alive. The _async variant is required per
-            # test_kill_process_awaits_async_variant_not_sync (Windows
+            # leaving the backend alive. The _async variant is required
+            # (test_mcp_gateway_backend_coverage_process_lifecycle.py::
+            # test_timeout_escalates_to_tree_kill awaits it; Windows
             # taskkill would otherwise block this loop).
             try:
                 await platform_compat.kill_process_tree_async(

@@ -9,10 +9,11 @@ fail") from state readable on this host, and returns one finding::
 ``fix`` is ``{"card": {"kind", "params"}}`` when a change card can make the
 change, or ``{"steps": [...]}`` for something only a person can do.
 
-Every probe is strictly read-only: it never calls a ``_doctor_*`` function or
-anything with a repair or atomic-write path, opens SQLite read-only (reading a
-live write-ahead log when one exists), and never returns a secret value, a
-token or a whole MCP spec. Each
+Every probe leaves settings and data as they were: it never calls a
+``_doctor_*`` function or anything with a repair path, opens SQLite read-only
+(reading a live write-ahead log when one exists), and never returns a secret
+value, a token or a whole MCP spec. The one write is in the crew-log probe: the
+first listing of a unit writes its ``status`` savepoint beside the log. Each
 runs under its own deadline on a worker thread, and a probe that raises or
 overruns reports ``unknown`` instead of failing the diagnosis.
 """
@@ -161,7 +162,8 @@ def _crew_log_units(now_ms: int) -> list[dict[str, Any]]:
     """``[{unit, slot, open, entries: [{type, time, data}]}]`` for recent units.
 
     Reads through the same reader the crew-log routes serve from
-    (:mod:`kiro_crew.crew_log.read`), which opens logs for reading only.
+    (:mod:`kiro_crew.crew_log.read`), which opens logs for reading only; the first
+    listing of a unit writes its ``status`` savepoint beside the log.
     """
     from kiro_crew.crew_log import read as crew_read
 
@@ -394,10 +396,10 @@ def probe_deprecated_agent_spec(ctx: ProbeContext) -> dict[str, Any]:
     pid = "deprecated_agent_spec"
     from kiro_crew.agent import DEPRECATED_AGENT_SPECS
     from kiro_crew.cron import job_agent_names_from_disk
-    from kiro_crew.doctor_checks.agents import _open_slot_agent_names
+    from kiro_crew.doctor_checks.agents import _open_slot_agent_names, is_shipped_alias_entry
 
     cfg = ctx.cfg
-    crews = set(cfg.agents)
+    crews = {n for n, c in cfg.agents.items() if not is_shipped_alias_entry(n, c)}
     found: list[dict[str, str]] = []
 
     def _add(holder: str, name: object, *, skip_crews: bool = True) -> None:
@@ -408,6 +410,8 @@ def probe_deprecated_agent_spec(ctx: ProbeContext) -> dict[str, Any]:
             found.append({"holder": holder, "name": name, "replacement": replacement})
 
     for crew_name, crew in cfg.agents.items():
+        if is_shipped_alias_entry(crew_name, crew):
+            continue
         _add(f"crew {crew_name}", crew.kiro_agent, skip_crews=False)
     _add("agent.default_agent", cfg.agent.default_agent)
     _add("session.pool_agent", cfg.session.pool_agent)
@@ -654,12 +658,15 @@ def probe_embedding_coverage(ctx: ProbeContext) -> dict[str, Any]:
 
 def probe_remote_crew_unreachable(ctx: ProbeContext) -> dict[str, Any]:
     pid = "remote_crew_unreachable"
+    from kiro_crew.atomic_write import read_bytes_with_retry
     from kiro_crew.config.loader import config_dir
 
     path = config_dir() / "instances.json"
     if not path.is_file():
         return finding(pid, OK, "No Remote Crew is configured.")
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    # Bytes, as InstancesRegistry._read reads it: json.loads then accepts a BOM,
+    # UTF-16 and UTF-32, and a Windows sharing violation is retried.
+    raw = json.loads(read_bytes_with_retry(path))
     items = raw.get("instances") if isinstance(raw, dict) else None
     instances = [i for i in items or [] if isinstance(i, dict) and i.get("id")]
     if not instances:

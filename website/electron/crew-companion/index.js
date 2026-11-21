@@ -15,7 +15,9 @@
 
 const { ipcMain } = require("electron");
 const http = require("http");
+const { hostOwnsAppWindows } = require("../app-window-host-rules");
 const { sessionCookieHeader } = require("../mochi-session-token");
+const { linkTokenIsStale } = require("../link-token-age");
 const {
   hostsDashboard: sharedHostsDashboard,
   openDashboardSession: sharedOpenDashboardSession,
@@ -50,6 +52,7 @@ const {
   registerOverlayIpc,
   stopHitboxPoll,
 } = require("./petOverlay");
+const { seedHostDisplayMemory } = require("./displayHandOff");
 
 const APP_NAME = "crew-companion";
 
@@ -92,13 +95,15 @@ let suspended = false;
  * live, full-privilege sign-in links existed at any moment purely as a
  * side-effect of asking whether an app is enabled.
  *
- * Reuse is the normal path and a re-resolve the exception: only an actual auth
- * refusal invalidates the cache. A link token (local mint or ssh fetch) is
- * refused once its short first-load expiry passes, which costs one re-resolve
- * every few minutes; a borrowed session cookie lasts until the session expires.
+ * Reuse is the normal path and a re-resolve the exception. A link token (local
+ * mint or ssh fetch) is re-resolved before the gateway's 300 s window would
+ * refuse it (../link-token-age.js), which costs one mint every few minutes; a
+ * borrowed session cookie lasts until the session expires. An auth refusal
+ * still invalidates the cache.
  */
 const NO_AUTH = Object.freeze({ value: "", viaCookie: false });
 let cachedAuth = NO_AUTH;
+let cachedAuthAt = 0;
 
 /**
  * How long an EMPTY answer from the credential chain is trusted before asking again.
@@ -120,10 +125,13 @@ let emptyAuthAt = 0;
  * @returns {Promise<{value: string, viaCookie: boolean}>}
  */
 async function authForProbe(forceMint) {
-  if (!forceMint && cachedAuth.value) return cachedAuth;
+  if (!forceMint && cachedAuth.value && !linkTokenIsStale(cachedAuth, cachedAuthAt, Date.now())) {
+    return cachedAuth;
+  }
   if (!forceMint && emptyAuthAt && Date.now() - emptyAuthAt < EMPTY_AUTH_RETRY_MS) {
     return NO_AUTH;
   }
+  cachedAuthAt = Date.now();
   try {
     const auth = fetchGatewayAuth && (await fetchGatewayAuth());
     cachedAuth = auth && typeof auth.value === "string" && auth.value
@@ -176,6 +184,8 @@ function noteCredential(present) {
  * it, in which case the CTA reports that it could not act rather than pretending.
  */
 let getDashboardWindow = null;
+// The macOS app show/focus hooks main.js passes for a user-intent show.
+let surfaceApp = {};
 
 /**
  * Ask the gateway whether the app is enabled.
@@ -184,7 +194,10 @@ let getDashboardWindow = null;
  * gateway has stopped accepting can be re-minted exactly once, instead of
  * either wedging the poll forever or going back to minting every tick.
  *
- * @returns {Promise<"enabled"|"disabled"|"unauthorized"|"unknown">}
+ * ``released`` means the row is no longer this built-in's (see below): the windows
+ * close as for ``disabled``, whatever the row's enabled flag says.
+ *
+ * @returns {Promise<"enabled"|"disabled"|"released"|"unauthorized"|"unknown">}
  */
 function probeEnabled(auth) {
   const { value, viaCookie } = auth || NO_AUTH;
@@ -220,6 +233,18 @@ function probeEnabled(auth) {
           // builtin, or a response shape we did not expect, must not be read as
           // an instruction to tear the windows down.
           if (!row) return resolve("unknown");
+          // A row the gateway no longer runs as this built-in (an adopted copy is a
+          // registry app) is drawn by the desktop window host from that app's own
+          // manifest, so these windows would be a second avatar and a second
+          // notification owner. A row without `origin` predates the field and is
+          // the built-in's, as before.
+          if (typeof row.origin === "string" && row.origin !== "builtin") {
+            return resolve("released");
+          }
+          // A record the desktop window host serves (its manifest declares a
+          // `desktop` block) is drawn by the host, on or off: these windows
+          // stand down so the two never show at once.
+          if (hostOwnsAppWindows(rows, APP_NAME) === true) return resolve("released");
           resolve(row.enabled ? "enabled" : "disabled");
         } catch {
           resolve("unknown");
@@ -250,7 +275,9 @@ function hostsDashboard(wc, base = backendUrl) {
  * @returns {boolean} true when the dashboard was surfaced and can show it.
  */
 function openDashboardSession(slotKey) {
-  return sharedOpenDashboardSession(getDashboardWindow && getDashboardWindow(), backendUrl, slotKey);
+  return sharedOpenDashboardSession(
+    getDashboardWindow && getDashboardWindow(), backendUrl, slotKey, surfaceApp,
+  );
 }
 
 async function reconcileOnce() {
@@ -289,12 +316,14 @@ async function reconcileOnce() {
     // resume here and reopen the overlay we just closed for the update quit.
     if (suspended) return;
     if (state === "unknown") return; // leave every window exactly as it is
-    if (state === "disabled") {
+    if (state === "disabled" || state === "released") {
       if (petWindowCount() > 0) {
         closePanelWindow();
         closeGalleryWindow();
         closePetWindow();
-        log("crew-companion: disabled — overlays closed");
+        log(state === "released"
+          ? "crew-companion: the app's own copy is installed; built-in overlays closed"
+          : "crew-companion: disabled, overlays closed");
       }
       return;
     }
@@ -338,6 +367,14 @@ function initCrewCompanion(deps) {
   reportedNoCredential = false;
   log = (deps && deps.glog) || (() => {});
   getDashboardWindow = (deps && deps.getDashboardWindow) || null;
+  surfaceApp = (deps && deps.surfaceApp) || {};
+  // Before main.js starts the window host, which reads its display memory once, on
+  // first use: the built-in avatar's display carries over to the app's own copy.
+  try {
+    seedHostDisplayMemory(deps && deps.userDataDir, deps && deps.displayMemoryPath);
+  } catch (error) {
+    log("crew-companion: display hand-off failed: " + (error && error.message));
+  }
   setOverlayLogger(log);
   setPanelLogger(log);
   setGalleryLogger(log);

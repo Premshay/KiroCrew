@@ -55,6 +55,7 @@ from typing import Any
 from kiro_crew import crewmate_prompts
 from kiro_crew import members as members_mod
 from kiro_crew.agent_files import ASSISTANT_DEFAULT_DISPLAY_NAME, ASSISTANT_MEMBER_NAME
+from kiro_crew.member_folder import open_member_folder
 
 logger = logging.getLogger(__name__)
 
@@ -256,12 +257,18 @@ def claim_greeting_marker(slug: str, slot_key: str) -> bool:
     processes, so exactly one caller ever sees True. Blocking IO; call it off
     the event loop.
     """
-    path = greeting_marker_path(slug)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return False
+    with open_member_folder(slug) as folder:
+        try:
+            fd = os.open(
+                folder.leaf(GREETING_MARKER_FILENAME),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=folder.fd,
+            )
+        except FileExistsError:
+            # A link at the marker is refused, not read as "already claimed".
+            folder.refuse_link(GREETING_MARKER_FILENAME)
+            return False
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump({"slot_key": slot_key, "ts": time.time()}, fh)
     return True
@@ -362,11 +369,15 @@ def app_is_stopping(state: Any) -> bool:
     return process_shutdown_requested(getattr(state, "sessions", None))
 
 
-def dispatch_hidden_turn(state: Any, slot: Any, prompt: str, *, human_seen: bool) -> bool:
+def dispatch_hidden_turn(
+    state: Any, slot: Any, prompt: str, *, human_seen: bool, actor: str = "gateway"
+) -> bool:
     """Run *prompt* as one gateway-authored turn in *slot*, with no user row for it.
 
-    Shared by the first welcome and the goal check-ins
-    (:mod:`kiro_crew.dashboard.goal_reminder`). The turn is not one the user
+    Shared by the first welcome, the goal check-ins
+    (:mod:`kiro_crew.dashboard.goal_reminder`) and an app's wake
+    (:mod:`kiro_crew.dashboard.app_bot_wake`, *actor* ``"app"``, the crew log's
+    name for a turn an app caused; every other caller is ``"gateway"``). The turn is not one the user
     sent (``_turn_user_sent`` stays false), so the operations only a user's turn
     may run (a guide, ``update_self``, most cards) refuse inside it; in a
     crewmate's own thread its goal, milestones and check-ins cards are still
@@ -402,7 +413,7 @@ def dispatch_hidden_turn(state: Any, slot: Any, prompt: str, *, human_seen: bool
                 slot,
                 prompt,
                 _synthetic_payload=True,
-                _turn_actor="gateway",
+                _turn_actor=actor,
             ),
         ),
     )

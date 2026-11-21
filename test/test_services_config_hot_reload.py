@@ -506,6 +506,32 @@ class TestHookManagerWatchConfig:
         assert "subagent_spawn" in kw["resources"]
         assert "execute_bash" not in kw["resources"]
 
+    def test_a_new_tool_identity_grant_is_sel_audited_by_count(self) -> None:
+        """An "Always allow" grant widens what runs too, so it is counted the same way."""
+        from kiro_crew import hooks as hooks_mod
+
+        manager = hooks_mod.HookManager(
+            hooks_mod.HooksConfig.from_dict({"auto_approve_tools": ["fs_read"]})
+        )
+        manager.watch_config()
+        cfg = KiroCrewConfig()
+        cfg.hooks = {  # type: ignore[assignment]
+            "auto_approve_tools": ["fs_read"],
+            "auto_approve_tool_identities": ["@notes/lookup"],
+        }
+        sel_obj = MagicMock()
+        with (
+            patch.object(hooks_mod, "sel", return_value=sel_obj),
+            patch.object(hooks_mod, "load_denied_commands_state", return_value=_keystone_state()),
+        ):
+            manager._on_config_change(_change(cfg, "hooks.auto_approve_tool_identities"))
+        assert manager._config.auto_approve_tool_identities == ["@notes/lookup"]
+        sel_obj.log_api_access.assert_called_once()
+        kw = sel_obj.log_api_access.call_args.kwargs
+        # size counts the same set as added/removed: one tool plus one identity.
+        assert "added=1 removed=0 size=2" in kw["resources"]
+        assert "notes" not in kw["resources"]
+
     def test_an_unchanged_auto_approve_set_leaves_no_audit_row(self) -> None:
         from kiro_crew import hooks as hooks_mod
 
@@ -637,16 +663,21 @@ class TestTelemetryRecorderRebuild:
 
     @pytest.mark.asyncio
     async def test_the_rebuild_runs_off_the_event_loop(self) -> None:
-        """``shutdown`` flushes on the calling thread, so it must not run on the loop."""
+        """A flush waits on every export, so it runs on a background thread, never the loop."""
         from kiro_crew.metrics import provider as provider_mod
 
         provider_mod.watch_config()
+        doomed = object()
         with (
+            patch.object(provider_mod, "_detach", return_value=doomed),
+            patch.object(
+                provider_mod._provider_flush, "flush_in_background", return_value=True
+            ) as background,
             patch.object(provider_mod, "shutdown") as shutdown,
-            patch("asyncio.to_thread", new=AsyncMock()) as to_thread,
         ):
             await _dispatch(KiroCrewConfig(), "telemetry.enabled")
-        to_thread.assert_awaited_once_with(shutdown)
+        background.assert_called_once_with(doomed, provider_mod._flush_detached_provider)
+        shutdown.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_an_unrelated_write_does_not_rebuild(self) -> None:

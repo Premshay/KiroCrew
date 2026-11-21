@@ -1,6 +1,6 @@
 """Where the MCP config files are, and reading, refusing and writing them.
 
-The server-name check, the Kiro-global ``mcp.json`` path and the Kiro Crew one, the extra
+The server-name check and the toggle routes' typed body fields, the Kiro-global ``mcp.json`` path and the Kiro Crew one, the extra
 provider scopes an edition adds, the files the servers list skips for their encoding, the
 refusal of a commented (JSONC) file, the retrying read of the Kiro-global file, the atomic
 write and its off-loop form, resolving which key of a file names a server, the synchronous
@@ -245,6 +245,26 @@ def _string_identifier(body: dict, field: str) -> tuple[str, web.Response | None
     )
 
 
+def _enabled_field(body: dict) -> tuple[bool, web.Response | None]:
+    """The ``enabled`` toggle field as a bool, or a 400 to return.
+
+    ``(value, None)`` for a real boolean, ``(True, response)`` for anything else.
+    An absent field means ``True``, the on default these routes already assumed.
+    The toggle writes the value into ``mcp.json`` as given, so a non-boolean handed
+    through raw -- the string ``"false"`` is the one that bites, since it is truthy
+    -- would turn the server ON while the route answered ok. Only a real boolean is
+    accepted, the same ``invalid_enabled`` refusal the cron, updates and webhook
+    toggle routes already make, so every toggle route answers a bad ``enabled`` the
+    same way.
+    """
+    enabled = body.get("enabled", True)
+    if not isinstance(enabled, bool):
+        return True, web.json_response(
+            {"error": "enabled must be a boolean", "code": "invalid_enabled"}, status=400
+        )
+    return enabled, None
+
+
 # ─── The Kiro Crew mcp.json, provider scopes, reads and writes ──────────
 
 # Resolved per call, never captured at import: an import-time binding freezes
@@ -324,15 +344,17 @@ def _load_config_for_update(path: Path) -> dict[str, Any] | None:
     return None if isinstance(loaded, web.Response) else loaded
 
 
-def _mcp_write_failed(route: str) -> web.Response:
-    """A failed global mcp.json write, answered with a code and a fixed sentence.
+def _mcp_write_failed(route: str, name: str = "global mcp.json") -> web.Response:
+    """A failed MCP config write (the global mcp.json unless *name* says), answered
+    with a code and a fixed sentence.
 
     The exception's own text is for the server log; the client switches on the
     code. Call this inside the ``except`` block, where ``exc_info`` still sees it.
     """
-    logger.warning("%s: global mcp.json write failed", route, exc_info=True)
+    logger.warning("%s: %s write failed", route, name, exc_info=True)
+    file_name = name.split()[-1]
     return web.json_response(
-        {"error": "failed to write mcp.json", "code": "config_write_failed"}, status=500
+        {"error": f"failed to write {file_name}", "code": "config_write_failed"}, status=500
     )
 
 

@@ -35,6 +35,7 @@ from kiro_crew.cron_service.model import (
     CronSchedule,
     parked_by_its_run,
 )
+from kiro_crew.cron_service.schedule import pin_random_cron_fields
 from kiro_crew.cron_service.zone_default_migration import (
     _LEGACY_DEFAULT_ZONE,
     LOCAL_DEFAULT_STORE_VERSION,
@@ -327,10 +328,18 @@ def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> Cro
             kind=sched_kind,
             every_secs=sched.get("every_secs"),
             at_ts=sched.get("at_ts"),
-            cron_expr=_cron_expr,
+            # A stored random (``R``) field reads as the same pick for this job on
+            # every load, so every reader agrees on when it runs.
+            cron_expr=(
+                pin_random_cron_fields(_cron_expr, _required_str(j, "id"))
+                if _cron_expr
+                else _cron_expr
+            ),
         ),
         channel=_guard_opt_str("channel"),
         thread_ts=_guard_opt_str("thread_ts"),
+        channel_type=_guard_str("channel_type"),
+        target_id=_guard_str("target_id"),
         # Derived from user_paused/auto_paused, not the stored `enabled`, so
         # an auto-pause survives a restart (a recurring job's `enabled` is
         # not persisted on failure).
@@ -382,6 +391,7 @@ def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> Cro
         minimal_context=j.get("minimal_context", False),
         hide_in_chat=j.get("hide_in_chat", False),
         new_chat_per_run=j.get("new_chat_per_run") is True,
+        on_tab_close="fresh" if j.get("on_tab_close") == "fresh" else "resume",
         folder_id=_guard_str("folder_id"),
         chat_folder_id=_guard_str("chat_folder_id"),
         project_path=_guard_str("project_path"),
@@ -615,6 +625,12 @@ def job_record(j: CronJob) -> dict[str, Any]:
         record["new_chat_per_run"] = True
     if j.secret_env_resurfaced_pin:
         record["secret_env_resurfaced_pin"] = j.secret_env_resurfaced_pin
+    if j.on_tab_close == "fresh":
+        record["on_tab_close"] = "fresh"
+    # The pinned channel destination, as a pair, by the same rule.
+    if j.channel_type or j.target_id:
+        record["channel_type"] = j.channel_type
+        record["target_id"] = j.target_id
     return record
 
 
@@ -622,11 +638,12 @@ def job_record(j: CronJob) -> dict[str, Any]:
 #: cannot drift: a job that sets each conditionally written key
 #: (``user_pause_generation``, ``user_pause_requested``, ``managed_by``, ``app_manifest_digest``,
 #: ``person_owner_key``, ``acked_item_ids`` with ``acked_item_ids_digest``,
-#: ``project_path``, ``new_chat_per_run``, ``secret_env_resurfaced_pin``, and a
-#: non-default ``auto_pause_after_failures`` and ``alert_after_failures``, which
-#: are omitted at the default). A record key outside this set came from a newer
-#: build. A key inside it is this build's to write or to omit, so a value this
-#: build cleared stays cleared.
+#: ``project_path``, ``new_chat_per_run``, ``secret_env_resurfaced_pin``,
+#: ``on_tab_close``, ``channel_type`` with ``target_id``, and a non-default
+#: ``auto_pause_after_failures`` and ``alert_after_failures``, which are omitted
+#: at the default). A record key outside this set came from a newer build. A key
+#: inside it is this build's to write or to omit, so a value this build cleared
+#: stays cleared.
 _KNOWN_JOB_KEYS = frozenset(
     job_record(
         CronJob(
@@ -642,6 +659,9 @@ _KNOWN_JOB_KEYS = frozenset(
             project_path="-",
             new_chat_per_run=True,
             secret_env_resurfaced_pin="-",
+            on_tab_close="fresh",
+            channel_type="-",
+            target_id="-",
             auto_pause_after_failures=0,
             alert_after_failures=2,
             acked_item_ids=["-"],

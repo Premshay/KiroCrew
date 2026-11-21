@@ -15,9 +15,16 @@ import pytest
 from kiro_crew import ui_index
 
 
-@pytest.fixture(autouse=True)
-def _fresh_cache(_floor_monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+@pytest.fixture(autouse=True, scope="module")
+def _fresh_cache() -> None:
+    # Once per module: the cache is keyed on the index file's path, mtime and size,
+    # so a stale entry from another file is re-read anyway, and nothing here writes
+    # to a loaded index. Clearing it per test re-parsed the index for every case.
     ui_index._cache.update(key=None, index=None)
+
+
+@pytest.fixture(autouse=True)
+def _no_auto_tier(_floor_monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # The committed tiers only, whatever dashboard build this checkout has:
     # the build-time auto tier is pinned in test_find_ui_auto.py.
     _floor_monkeypatch.setattr(ui_index, "AUTO_INDEX_PATH", tmp_path / "no-auto-tier.json")
@@ -92,7 +99,13 @@ _EXPECTED: dict[str, tuple[list[str], list[str], str, list[str], str | None]] = 
         ["job_open", "job_details_tab", "job_secret_request_pending"],
         None,
     ),
-    "artifacts.starred": (["Artifacts", "Starred"], ["产物", "已加星"], "/artifacts", [], None),
+    "artifacts.starred": (
+        ["Artifacts", "Starred"],
+        ["产物", "已加星"],
+        "/artifacts?scope=all",
+        [],
+        None,
+    ),
     "artifacts.deploy": (
         ["Artifacts", "Artifact Deploy"],
         ["产物", "产物部署"],
@@ -101,8 +114,8 @@ _EXPECTED: dict[str, tuple[list[str], list[str], str, list[str], str | None]] = 
         "desktop",
     ),
     "artifacts.new-folder": (
-        ["Artifacts", "New folder"],
-        ["产物", "新建文件夹"],
+        ["Artifacts", "More ways to add an artifact", "New folder"],
+        ["产物", "添加产物的更多方式", "新建文件夹"],
         "/artifacts",
         [],
         "desktop",

@@ -25,6 +25,9 @@ async function mount(initial?: UpdateState) {
   const rendered = renderWithProviders(<UpdateModal />)
   const push = async (next: UpdateState) => {
     await act(async () => { rendered.queryClient.setQueryData(['update-state'], next) })
+    // One more macrotask: the notification can land after the microtask above
+    // (seen when the file runs a single test, or after a test that polled).
+    await act(async () => { await new Promise(r => setTimeout(r, 0)) })
   }
   if (initial) await push(initial)
   return { ...rendered, push }
@@ -427,6 +430,35 @@ describe('armed update', () => {
     await mount(armedState)
     expect(await screen.findByTestId('update-modal-armed')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: i18nT('components.updateModal.restart_now') })).toBeNull()
+  })
+
+  it('offers no Restart now on a window whose relaunch the shell would refuse', async () => {
+    const canRelaunch = vi.fn().mockResolvedValue(false)
+    ;(window as unknown as { updateAPI?: unknown }).updateAPI = { armsOnQuit: true, install, relaunch, canRelaunch }
+    await mount(armedState)
+    expect(await screen.findByTestId('update-modal-armed')).toBeInTheDocument()
+    await waitFor(() => expect(canRelaunch).toHaveBeenCalled())
+    await act(async () => {})
+    expect(screen.queryByRole('button', { name: i18nT('components.updateModal.restart_now') })).toBeNull()
+  })
+
+  it('offers Restart now once the shell confirms this window may relaunch', async () => {
+    const canRelaunch = vi.fn().mockResolvedValue(true)
+    ;(window as unknown as { updateAPI?: unknown }).updateAPI = { armsOnQuit: true, install, relaunch, canRelaunch }
+    await mount(armedState)
+    expect(await screen.findByRole('button', { name: i18nT('components.updateModal.restart_now') })).toBeEnabled()
+  })
+
+  it('asks again when the window regains focus, so one refused answer does not hide Restart now for good', async () => {
+    const canRelaunch = vi.fn().mockResolvedValueOnce(false).mockResolvedValue(true)
+    ;(window as unknown as { updateAPI?: unknown }).updateAPI = { armsOnQuit: true, install, relaunch, canRelaunch }
+    await mount(armedState)
+    await waitFor(() => expect(canRelaunch).toHaveBeenCalledTimes(1))
+    await act(async () => {})
+    expect(screen.queryByRole('button', { name: i18nT('components.updateModal.restart_now') })).toBeNull()
+    await act(async () => { window.dispatchEvent(new Event('focus')) })
+    expect(await screen.findByRole('button', { name: i18nT('components.updateModal.restart_now') })).toBeEnabled()
+    expect(canRelaunch).toHaveBeenCalledTimes(2)
   })
 })
 

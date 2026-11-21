@@ -18,7 +18,6 @@ import pytest
 from kiro_crew.doctor_checks import mcp
 from kiro_crew.mcp_gateway import launch_approval
 from kiro_crew.security import CREDENTIAL_REDACTION_TAGS
-from kiro_crew.security.exfil import EXFILTRATION_REDACTION_TAG_PREFIX
 
 
 def _cfg(*, enabled: bool = True, stub: tuple[str, ...] = ("alpha-mcp", "beta-mcp")):
@@ -61,6 +60,15 @@ def test_refused_share_is_reported_as_an_issue_with_the_approve_path(refused, ca
     assert issues == ["2 MCP server(s) set to share are not shared: launch not approved"]
 
 
+def test_a_share_over_the_launch_cap_is_named_with_its_remedy(refused, capsys):
+    refused["alpha-mcp"] = {"reason": launch_approval.REFUSED_TOO_MANY}
+
+    mcp._doctor_mcp_share_refused(_cfg(stub=("alpha-mcp",)), [])
+
+    out = " ".join(capsys.readouterr().out.split())
+    assert f"alpha-mcp ({mcp._SHARE_REFUSAL_LABELS.get(launch_approval.REFUSED_TOO_MANY)})" in out
+
+
 def _changed(**over):
     """A complete changed-launch refusal whose approved launch is ``/opt/a --one``."""
     record = {
@@ -95,11 +103,11 @@ def test_a_launch_added_beside_the_approved_one_is_named_as_new(refused, capsys)
 
 #: Display tags that read the same for two different values.
 _TAG = "--token=[REDACTED: credential]"
-_URL_TAG = "API_URL=[REDACTED: suspicious URL to example.invalid]"
+_URL_TAG = "API_URL=https://example.invalid/x?token=[REDACTED: credential]"
 
 
 def test_every_display_redaction_tag_starts_with_the_head_the_rule_reads():
-    tags = (*CREDENTIAL_REDACTION_TAGS, EXFILTRATION_REDACTION_TAG_PREFIX)
+    tags = tuple(CREDENTIAL_REDACTION_TAGS)
     assert tags and all(tag.startswith(mcp._REDACTION_TAG_HEAD) for tag in tags)
 
 
@@ -160,7 +168,7 @@ def test_a_launch_added_beside_two_approved_ones_is_named_as_new(refused, capsys
         ),
         pytest.param(
             {**_ADDED, "envs": [[_URL_TAG], []], "approved_envs": [[_URL_TAG]]},
-            id="approved-env-shows-a-redacted-url",
+            id="approved-env-shows-a-url-with-a-redacted-credential",
         ),
     ],
 )
@@ -218,9 +226,10 @@ def test_refused_shares_keys_by_configured_name():
         "playwright-mcp": {"reason": launch_approval.REFUSED_UNAPPROVED},
         "alpha-mcp": {"reason": launch_approval.REFUSED_CHANGED},
         "gone-mcp": {"reason": launch_approval.REFUSED_UNAPPROVED},
+        "capped-mcp": {"reason": launch_approval.REFUSED_TOO_MANY},
     }
     assert launch_approval.refused_shares(
-        ["npm:@playwright/mcp", "alpha-mcp", "beta-mcp"], refused
+        ["npm:@playwright/mcp", "alpha-mcp", "beta-mcp", "capped-mcp"], refused
     ) == {
         "npm:@playwright/mcp": launch_approval.REFUSED_UNAPPROVED,
         "alpha-mcp": launch_approval.REFUSED_CHANGED,

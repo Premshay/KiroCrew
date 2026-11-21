@@ -15,6 +15,7 @@ from aiohttp import web
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_handlers import (
         _TEARDOWN_INCOMPLETE_WARNING,
+        BOT_IDENTITY_DENIED,
         SESSION_SWITCH_KIND,
         DashboardState,
         KiroCrewConfig,
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
         _subagents_attached_response,
         _switch_target_busy,
         _workspace_name_for_dir,
+        audit_app_slot_denial,
         cached_project_agent_names,
         default_project_dir,
         default_template,
@@ -53,6 +55,7 @@ if TYPE_CHECKING:
         restore_agent_selection,
         schedule_eager_spawn,
         sel,
+        selects_bot_identity,
         session_agent_selection_name,
         session_switch_notice,
         slot_history_key,
@@ -332,11 +335,11 @@ def _crew_mode_lock_refusal(
         outcome="denied",
         source=CREW_MODE_LOCKED,
         resources=f"slot={slot.key}",
-        error="an Ultra Mode chat stays on its own agent",
+        error="a conductor mode chat stays on its own agent",
     )
     return web.json_response(
         {
-            "error": "this chat is in Ultra Mode, which stays on its own agent",
+            "error": "this chat is in conductor mode, which stays on its own agent",
             "code": CREW_MODE_LOCKED,
         },
         status=409,
@@ -574,6 +577,11 @@ async def switch_slot_agent(
                 from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
 
                 return _store_unavailable_response(slot.memory_store, exc)
+            if caller.app and selects_bot_identity(choice):
+                # Owning a session is not being given a Bot (``app_names_bot``): an
+                # app's session switches among the app's own agents.
+                audit_app_slot_denial(caller.app, "chat.slot_agent", slot.key, BOT_IDENTITY_DENIED)
+                return slot_not_found()
             choice_store = choice_cfg.memory_stores.get(choice.memory_store_name)
             if choice_store is not None and choice_store.memory_version == 2:
                 denied = await caller.require_owner("chat.slot_agent")

@@ -62,7 +62,8 @@ name                                       value      attributes      source
 ``kirocrew.inventory.knowledge.documents`` count      —               ``knowledge.db``
 ``kirocrew.inventory.lessons``             count      —               ``lessons.jsonl``
 ``kirocrew.inventory.mcp.servers``         count      ``class``       MCP roster
-``kirocrew.inventory.config.toggle``       0/1        ``key``         config flags
+``kirocrew.inventory.config.toggle``       0/1        ``key``         config flags and
+                                                                      feature previews
 ``kirocrew.inventory.webhooks.registered`` count      —               ``hooks.json``
 ``kirocrew.inventory.members``             count      —               crew roster config
 ``kirocrew.inventory.voice.provider``      1          ``kind``,       ``stt`` /
@@ -177,6 +178,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Optional
 # probe on a second SQLite library would drop that store's locks when it closes.
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.metrics.schema import validate_name
+from kiro_crew.sqlite_uri import read_only_uri
 
 if TYPE_CHECKING:  # annotation-only; never imported at runtime
     from opentelemetry.metrics import CallbackOptions, Meter, Observation
@@ -289,6 +291,11 @@ CONFIG_TOGGLES: tuple[tuple[str, str, str], ...] = (
     ("instances", "instances", "enabled"),
     ("stt", "stt", "enabled"),
 )
+
+#: The ``key`` the ``chat_runtime_sharing`` feature preview reports under. Read
+#: through ``agent_sdk.chat_runtime_sharing.chat_runtime_sharing_enabled``, the one
+#: reader of that preview, so an LTS build reports 0 and an absent preview is a real 0.
+PREVIEW_CHAT_RUNTIME_SHARING_KEY = "preview_chat_runtime_sharing"
 
 #: TTL for the two probes that cannot be made cheap (a recursive skills walk and
 #: a SQLite connect). Five minutes rather than the 60s export interval: these
@@ -580,7 +587,7 @@ def _read_knowledge_documents_uncached() -> Optional[int]:
     # Read-only URI so this cannot create, migrate, or lock the database, and a
     # short timeout so a busy writer degrades to a gap instead of stalling the
     # export cycle.
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+    conn = sqlite3.connect(read_only_uri(db_path), uri=True, timeout=2.0)
     try:
         # Table name from a module constant, not inlined: see KNOWLEDGE_SOURCES_TABLE.
         # It is a constant of ours, never user input, so it cannot carry injection.
@@ -754,6 +761,9 @@ def read_config_toggles() -> Optional[dict[str, int]]:
         if not isinstance(value, bool):
             continue
         out[key] = int(value)
+    from kiro_crew.agent_sdk.chat_runtime_sharing import chat_runtime_sharing_enabled
+
+    out[PREVIEW_CHAT_RUNTIME_SHARING_KEY] = int(chat_runtime_sharing_enabled(cfg))
     return out or None
 
 

@@ -25,6 +25,7 @@ from kiro_crew.mate_worker import (
     base_server_selections,
     collapse_selectors,
     covered_by,
+    resource_entries,
     server_selectors,
 )
 from kiro_crew.user_json import copy_json_document
@@ -75,9 +76,11 @@ def _kit_of(spec: dict[str, Any]) -> dict[str, Any]:
             else {}
         ),
     }
-    for key in ("resources", "skills", "allowedTools"):
+    for key in ("skills", "allowedTools"):
         value = spec.get(key)
         kit[key] = [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+    # A knowledge base is an object entry; it is carried as written.
+    kit["resources"] = list(resource_entries(spec.get("resources")).values())
     kit["tools"] = _kit_tools(spec, kit["mcpServers"])
     return kit
 
@@ -131,10 +134,10 @@ def _present_servers(spec: dict[str, Any], base: dict[str, Any] | None) -> set[s
 
 
 def _present_items(spec: dict[str, Any], base: dict[str, Any] | None, key: str) -> set[str]:
-    """``resources``/``skills``/``allowedTools`` the crewmate already has."""
-    present = set(_kit_of(spec)[key])
+    """``resources``/``skills``/``allowedTools`` the crewmate already has, by row key."""
+    present = set(resource_entries(_kit_of(spec)[key]))
     if base is not None:
-        present |= set(_kit_of(base)[key])
+        present |= set(resource_entries(_kit_of(base)[key]))
     return present
 
 
@@ -148,7 +151,7 @@ def _skipped(
         rows.append({"section": "mcpServers", "id": name, "change": "skipped"})
     for key in ("resources", "skills"):
         have = _present_items(spec, base, key)
-        for item in sorted(set(tkit[key]) & have):
+        for item in sorted(set(resource_entries(tkit[key])) & have):
             rows.append({"section": key, "id": item, "change": "skipped"})
     # A grant-only tool setting the worker already grants (``_without_held_grants``).
     for path in sorted(tkit.get("held_grants") or []):
@@ -180,7 +183,7 @@ def _added(
                 rows.append({"section": "tools", "id": ref, "change": "added"})
     for key in ("resources", "skills"):
         have = _present_items(spec, base, key)
-        for item in sorted(set(tkit[key]) - have):
+        for item in sorted(set(resource_entries(tkit[key])) - have):
             rows.append({"section": key, "id": item, "change": "added"})
     return rows
 
@@ -369,10 +372,18 @@ def view(member: str) -> dict[str, Any]:
     Purely additive: there is no recorded template and no "additions since" to
     report — a crewmate's file is the sum of everything added to it.
     """
+    from kiro_crew.mate_spec_policy import conditional_denies, unjudged_denies
+
     _, spec = _owned_file(member)
     return {
         "member": member,
         "revision": _digest(spec),
+        # The file's blocked commands nobody can check, as written: the worker
+        # refuses its shell commands that are not read-only while any is left.
+        "unenforced_denies": unjudged_denies(spec),
+        # Those only the gate checks, in a simple command or chain: the worker
+        # refuses any other command that is not read-only while one is left.
+        "conditional_denies": conditional_denies(spec),
     }
 
 
@@ -435,6 +446,7 @@ def _plan(member: str, body: Any) -> tuple[Path, dict[str, Any], dict[str, Any],
     """
     from kiro_crew.mate_config import MateConfigError, _carried_restrictions, _resolved_source_spec
     from kiro_crew.mate_config_migration import uncarried_restrictions
+    from kiro_crew.mate_held_rules import _bundle_beside_rules
     from kiro_crew.platform.governance import sanitize_agent_config_governance
 
     template, _revision = _request(body)
@@ -444,6 +456,11 @@ def _plan(member: str, body: Any) -> tuple[Path, dict[str, Any], dict[str, Any],
         source = _resolved_source_spec(template)
     except MateConfigError as exc:
         raise WorkerKitError("template_unreadable") from exc
+    if _bundle_beside_rules(source.get("permissions")):
+        # A named bundle only expands into allow rules on KAS's side, and KAS
+        # refuses a block that names one. Leaving it behind narrows; the rules
+        # beside it are carried, as the upgrade path does (``mate_held_rules``).
+        source = {**source, "permissions": {"rules": source["permissions"]["rules"]}}
     source, tkit["held_grants"] = _without_held_grants(source, spec, path.stem)
     lost = uncarried_restrictions(source)
     if lost:
@@ -471,10 +488,12 @@ def _plan(member: str, body: Any) -> tuple[Path, dict[str, Any], dict[str, Any],
     # resources / skills / allowedTools: union, skipping what is already present.
     for key in ("resources", "skills"):
         have = _present_items(spec, base, key)
-        existing = [v for v in (new_spec.get(key) or []) if isinstance(v, str)]
-        added = [v for v in tkit[key] if v not in have]
+        existing = resource_entries(new_spec.get(key))
+        if key == "skills":
+            existing = {k: v for k, v in existing.items() if isinstance(v, str)}
+        added = {k: v for k, v in resource_entries(tkit[key]).items() if k not in have}
         if existing or added:
-            new_spec[key] = list(dict.fromkeys([*existing, *added]))
+            new_spec[key] = list({**existing, **added}.values())
 
     # Approvals ride with servers the add writes, and with the template's selectors
     # on a server the base declares; retained servers keep theirs.
@@ -802,6 +821,8 @@ def preview(member: str, body: Any) -> dict[str, Any]:
     ``changes`` lists each net-new item (``added``) and each item left out
     because the crewmate already has it (``skipped``).
     """
+    from kiro_crew.mate_spec_policy import conditional_denies, unjudged_denies
+
     path, spec, new_spec, template, tkit = _plan(member, body)
     base = _worker_base_or_none()
     current = slot_directions(spec, base, path.stem)
@@ -810,6 +831,9 @@ def preview(member: str, body: Any) -> dict[str, Any]:
         "template": template,
         "revision": _plan_revision(spec, new_spec),
         "runs_unasked": _runs_unasked(spec, new_spec, base),
+        # The blocked commands nobody can check once the add lands, as written.
+        "unenforced_denies": unjudged_denies(new_spec),
+        "conditional_denies": conditional_denies(new_spec),
         # The behaviour directions the add writes ("" when the agent has none),
         # so the preview can show the text it fills the slot with.
         "directions": tkit.get("prompt") or "",

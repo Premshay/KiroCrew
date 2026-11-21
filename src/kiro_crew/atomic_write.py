@@ -355,7 +355,13 @@ def append_line(
     """
     target = Path(path)
     data = _encode(line + "\n", newline=None)
-    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_APPEND
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)  # 0 where os.O_NOFOLLOW does not exist
+    )
     if opener is not None:
         fd = opener(os.fspath(target), flags)
     else:
@@ -1156,7 +1162,11 @@ def _refuse_linked_parent(path: Path) -> None:
             "the write cannot be shown to land where it was named."
         )
     expected = anchor_resolved.joinpath(*names)
-    if resolved_parent != expected:
+    # ntpath.realpath keeps the \\?\ prefix on a missing directory when its
+    # re-probe fails with a different winerror, which a concurrent mkdir of the
+    # same chain causes; the prefixed and plain spellings name one directory.
+    strip = platform_compat.strip_extended_length_prefix
+    if strip(resolved_parent) != strip(expected):
         raise OSError(
             f"refusing to write {path}: its parent resolves to {resolved_parent} "
             f"rather than {expected}, so the write would land somewhere it was "
@@ -1708,7 +1718,7 @@ def discard_replacement(staged: str) -> None:
 def atomic_write_at(
     dir_fd: int,
     name: str,
-    content: str,
+    content: str | bytes,
     *,
     fsync: bool = False,
     mode: int | None = None,

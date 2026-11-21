@@ -55,6 +55,7 @@ from governance_distribution_helpers import (
     _write_policy,
     pd_format_exc,
 )
+from redaction_structured_cases import aws_secret
 
 from kiro_crew import security
 from kiro_crew.platform import governance
@@ -62,6 +63,10 @@ from kiro_crew.platform import governance_health as health
 from kiro_crew.platform import governance_profiles as gp
 from kiro_crew.platform import policy_distribution as pd
 from kiro_crew.platform.context import PlatformCompositionError, current_context
+
+# A synthetic AWS secret key, which the plan redacts. An AWS key ID stays
+# visible as an identifier, so it cannot show that a value is redacted.
+_AWS_SECRET = aws_secret(seed=39)
 
 # ──────────────────────────────────────────────────────────────────────────
 # The parsed declaration
@@ -1102,6 +1107,34 @@ class TestLiveRefresh:
         incident = health.last_incident()
         assert incident is not None and incident["kind"] == "degraded"
 
+    @pytest.mark.parametrize(
+        "error,why",
+        [
+            (
+                urllib.error.URLError(ConnectionRefusedError(111, "Connection refused")),
+                "connection refused",
+            ),
+            (urllib.error.URLError("tls handshake failed"), "<urlopen error tls handshake failed>"),
+        ],
+        ids=["refused", "other-keeps-its-text"],
+    )
+    def test_an_unreachable_source_is_reported_with_the_cause(
+        self, transport, install_ceiling, error, why
+    ):
+        source = transport(_failing_fetcher(error))
+        install_ceiling(governance.parse_policy(_doc("running", distribution={"source": source})))
+        outcome = pd.refresh_now()
+        assert outcome.status == pd.REFRESH_UNREACHABLE
+        assert outcome.detail == f"could not fetch {pd._redact_source(source, source)}: {why}"
+        # The boot fetch says the same, ahead of its own remedy.
+        with pytest.raises(PlatformCompositionError) as info:
+            pd.load_distributed_policy(governance.PolicyDistribution(source=source))
+        assert (
+            f"(could not fetch the ceiling from {pd._redact_source(source, source)}: {why})"
+            in str(info.value)
+        )
+        assert pd.POLICY_UNAVAILABLE_ENV in str(info.value)
+
     def test_a_misconfigured_source_is_rejected_rather_than_raised(
         self, monkeypatch, install_ceiling
     ):
@@ -1257,7 +1290,7 @@ class TestTheDetailNeverNamesTheEndpoint:
     @pytest.mark.parametrize(
         "fetcher",
         [
-            _failing_fetcher(TimeoutError("connect to https://secret.corp.example/p.json failed")),
+            _failing_fetcher(OSError("connect to https://secret.invalid/p.json failed")),
             _static_fetcher(pd.FetchedPolicy(body=b"{ not a policy")),
             _static_fetcher(pd.FetchedPolicy(body=b"")),
         ],
@@ -1299,9 +1332,9 @@ class TestTheDetailNeverNamesTheEndpoint:
         """The exception text is the ENDPOINT's, not ours: an error page, or a proxy echoing
         the request back, can carry the credential. ``_redact_source`` only knows the
         configured source, so the reason has to go through the full sanitiser."""
-        leaked = "AKIAIOSFODNN7EXAMPLE"
+        leaked = _AWS_SECRET
         source = transport(
-            _failing_fetcher(TimeoutError(f"upstream said: aws_access_key_id={leaked}"))
+            _failing_fetcher(OSError(f"upstream said: aws_secret_access_key={leaked}"))
         )
         # The per-window cooldown would otherwise divert the second call to a different
         # reason ("already attempted"), which never carries the endpoint's text at all.
@@ -1339,7 +1372,7 @@ class TestTheDetailNeverNamesTheEndpoint:
         ), "the premise: pattern matching alone cannot reach this value"
 
         source = transport(
-            _failing_fetcher(TimeoutError(f"proxy echoed the request: X-Fleet-Key: {opaque}"))
+            _failing_fetcher(OSError(f"proxy echoed the request: X-Fleet-Key: {opaque}"))
         )
         monkeypatch.setattr(pd, "_claim_fetch_slot", lambda window: True)
 

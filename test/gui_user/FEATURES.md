@@ -348,7 +348,7 @@ Priorities: P0 10 · P1 37 · P2 162 · P3 63. Deduped from 387 raw records.
 
 | Priority | Id | User story | Start URL | Seed | Runnable | Steps |
 |---|---|---|---|---|---|---|
-| P0 | `kas-auth-sign-in-card-signed-out` | As an operator, I want to see whether Kiro Crew holds a Kiro identity and how to sign in, so that I can fix a session that cannot start. | `/settings/agent` | minimal | smoke | 2 |
+| P0 | `kas-auth-sign-in-card-signed-out` | As an operator, I want to see whether Kiro Crew holds a Kiro identity and how to sign in, so that I can fix a session that cannot start. | `/settings/kiro-account` | minimal | smoke | 2 |
 | P1 | `dashboard-token-login-gate` | As an operator, I want the dashboard to refuse unauthenticated visitors and accept my one-time token link, so that only I can drive the gateway. | `/` | minimal | smoke | 3 |
 
 ## Onboarding (`onboarding`)
@@ -356,7 +356,7 @@ Priorities: P0 10 · P1 37 · P2 162 · P3 63. Deduped from 387 raw records.
 | Priority | Id | User story | Start URL | Seed | Runnable | Steps |
 |---|---|---|---|---|---|---|
 | P2 | `onboarding-changelog-modal-after-update` | As a user, I want to see what's new after an update, so that I learn about new features. | `/chat` | minimal | nightly | 3 |
-| P2 | `onboarding-first-run-wizard` | As a first-time user, I want a guided setup covering import review, privacy, and customization, so that the dashboard is set up and I understand the product before my first chat. | `/` | onboarding-fresh | nightly | 6 |
+| P2 | `onboarding-first-run-wizard` | As a first-time user, I want a guided setup covering import review and customization, so that the dashboard is set up and I understand the product before my first chat. | `/` | onboarding-fresh | nightly | 6 |
 | P2 | `standalone-mobile-connect` | As a user, I want to pair my phone to this gateway via governed methods and a QR code, so that I can chat on the go. | `/chat` | minimal | nightly | 3 |
 | P2 | `standalone-startup-feature-video` | As a returning user, I want one short clip introducing a new feature on the first launch after it ships, so that I discover what changed. | `/chat` | minimal | nightly | 2 |
 
@@ -396,7 +396,7 @@ Priorities: P0 10 · P1 37 · P2 162 · P3 63. Deduped from 387 raw records.
 | P2 | `settings-notifications-play-sound-toggle` | As a dashboard user, I want to toggle notification sounds and adjust Volume, so that alerts are audible at my preferred level. | `/settings/notifications` | minimal | nightly | 4 |
 | P2 | `settings-notifications-sources-mute` | As a dashboard user, I want to mute a noisy notification source in Settings > Notifications > Sources, so that it stops badging and sounding. | `/settings/notifications` | crons-active | nightly | 4 |
 | P2 | `settings-privacy-usage-heartbeat-toggle` | As a user, I want to opt in or out of the anonymous usage heartbeat, so that I decide whether a beacon is sent on launch. | `/settings/privacy` | minimal | nightly | 3 |
-| P2 | `settings-releases` | As a user, I want a release channel, update check and changelog, so that I stay current on my terms. | `/settings/releases` | minimal | nightly | 3 |
+| P2 | `settings-releases` | As a user, I want a release channel, update check and the release notes in one place, so that I stay current on my terms. | `/settings/about` | minimal | nightly | 3 |
 | P2 | `settings-shortcuts-ctrl-for-chat-tabs` | As a Mac user, I want chat-tab switching bound to Ctrl+digit instead of Option+digit, so that it does not conflict with typing special characters. | `/settings/shortcuts` | sessions-a-few | nightly | 4 |
 | P2 | `settings-shortcuts-search-everywhere-preset` | As a keyboard user, I want to pick double-Shift, Cmd/Ctrl+K or record a custom chord for Search Everywhere, so that the palette opens with my preferred keys. | `/settings/shortcuts` | minimal | nightly | 5 |
 | P2 | `settings-voice-auto-speak-toggle` | As a dashboard user, I want to enable Auto-speak Responses, so that every assistant reply is read aloud. | `/settings/voice` | minimal | nightly | 3 |

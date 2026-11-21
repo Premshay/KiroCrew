@@ -75,6 +75,7 @@ from kiro_crew.history_consolidation_span import (
     _PersistenceDisabledMidRun,
     _RunCommitState,
 )
+from kiro_crew.history_files import transcript_stems
 from kiro_crew.history_projection import DISPLAY_ONLY_ROLES
 from kiro_crew.image_refs import strip_image_refs
 from kiro_crew.lesson_validation import (
@@ -135,6 +136,12 @@ _CONSOLIDATION_STALE_RETRY_SECS = 300.0
 # Seeded sessions (restored from disk after a restart) examined per idle sweep:
 # a large backlog drains a few per heartbeat instead of all at once.
 _SEEDED_PER_SWEEP = 3
+# Idle keys one sweep examines (a stat and a metadata read each, on the event loop).
+# The rest wait their turn: each examined key moves to the back of the queue.
+_IDLE_EXAMINED_PER_SWEEP = 64
+# Passes and off-loop counts in flight at which a sweep starts nothing more, so a
+# backlog of idle sessions drains a few at a time instead of all at once.
+_IDLE_MAX_IN_FLIGHT = 8
 # Oldest transcript the restart seed backfills: older stranded work is left to a
 # manual ``kirocrew consolidate``, so one boot cannot bill a long-idle backlog.
 _SEED_MAX_AGE_SECS = 7 * 86400
@@ -280,6 +287,12 @@ class HistoryConsolidator:
         self._last_lifecycle: float = 0.0
         self._running: set[str] = set()
         self._tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+        # True while a session may still carry an environment-failure backoff
+        # from a host that could not run turns. Starts True: the backoff is on
+        # disk and survives the restart (or upgrade) that fixed the host. The
+        # first turn that reaches a provider releases it, once, through
+        # :meth:`_release_environment_backoff`.
+        self._env_backoff_pending = True
         # Transcript files whose rows are being counted off the loop, keyed by
         # file name like _busy so alias spellings of one transcript share one
         # claim. See _claim_count and _release_count.
@@ -648,6 +661,7 @@ class HistoryConsolidator:
             return
         if failures < 1:
             return
+        self._env_backoff_pending = True
         self._logger.warning(
             "Consolidation for %s could not reach the LLM (%s; environment "
             "failure #%d, nothing billed); retrying in %.0fs without consuming "
@@ -658,10 +672,65 @@ class HistoryConsolidator:
             max(0.0, retry_at - _time.time()),
         )
 
+    def _release_environment_backoff(self) -> None:
+        """Release the environment backoff of every tracked session, once per recovery.
+
+        Called when a consolidation turn has reached a provider, which proves the
+        host can run turns again. Sessions refused while it could not (a missing
+        kiro-cli, a background session refused before it started) would
+        otherwise keep their widened deadline, up to a day, after the fix.
+
+        Runs off the event loop as a tracked task and never raises into the pass
+        that reached the provider. The keys are the sessions the idle sweep
+        already tracks (live activity plus the startup seed), so the cost is one
+        metadata read each. :meth:`ConversationLog.clear_consolidation_environment_backoff`
+        leaves a session with a billed attempt alone.
+        """
+        if not self._env_backoff_pending:
+            return
+        self._env_backoff_pending = False
+        keys = list(self._last_activity)
+
+        def _release() -> int:
+            released = 0
+            for key in keys:
+                try:
+                    if self._log.clear_consolidation_environment_backoff(key):
+                        released += 1
+                except Exception:
+                    self._logger.debug(
+                        "Could not release the environment backoff for %s", key, exc_info=True
+                    )
+            return released
+
+        async def _run() -> None:
+            try:
+                released = await asyncio.to_thread(_release)
+            except Exception:
+                self._env_backoff_pending = True
+                self._logger.warning("Releasing the environment backoff failed", exc_info=True)
+                return
+            if released:
+                self._logger.info(
+                    "Consolidation reached the LLM again; released the environment "
+                    "backoff of %d session(s)",
+                    released,
+                )
+
+        t = asyncio.ensure_future(_run())
+        self._tasks.add(t)
+        t.add_done_callback(self._tasks.discard)
+
     def _busy(self, key: str) -> bool:
-        """True when *key*, or any other key naming the same transcript file, is running."""
-        target = self._log._path(key).name
-        return any(self._log._path(running).name == target for running in self._running)
+        """True when *key*, or any other key that can name the same transcript file, is running.
+
+        Decided from the key strings alone, never the disk: it runs on the event loop,
+        once per running key, from every entry point. Two keys whose possible
+        filenames (:func:`transcript_stems`) overlap count as one, so a pass is
+        deferred, never doubled.
+        """
+        stems = set(transcript_stems(key))
+        return any(not stems.isdisjoint(transcript_stems(running)) for running in self._running)
 
     def _transcript_stamp(self, key: str) -> tuple[CacheIdentity, int] | None:
         """Return *key*'s transcript stamp from a stat with no read, or ``None``.
@@ -746,6 +815,9 @@ class HistoryConsolidator:
             if _safe_key(key) not in tracked:
                 self._last_activity[key] = mtime
                 self._seeded_keys.add(key)
+                # A turn may have reached a provider before this scan finished
+                # and spent the startup release on the live keys alone.
+                self._env_backoff_pending = True
 
     def maybe_consolidate(self, key: str) -> None:
         """Fire preferences/projects consolidation if message threshold exceeded.
@@ -1016,16 +1088,25 @@ class HistoryConsolidator:
                 self._activity_seeded = True
         now = _time.time()
         seeded_budget = _SEEDED_PER_SWEEP
+        # Both bounds keep one sweep's loop-thread work flat however many sessions
+        # are tracked: each key examined costs a stat and a metadata read here.
+        examine_budget = _IDLE_EXAMINED_PER_SWEEP
         for key, last in list(self._last_activity.items()):
             if now - last < self._history_idle_secs:
                 continue
+            if (
+                examine_budget < 1
+                or len(self._running) + len(self._counting) >= _IDLE_MAX_IN_FLIGHT
+            ):
+                break
             seeded = key in self._seeded_keys
             if seeded:
                 if seeded_budget < 1:
                     continue
                 seeded_budget -= 1
-                # Re-queue at the end so a seed that keeps being skipped cannot starve the rest.
-                self._last_activity[key] = self._last_activity.pop(key)
+            examine_budget -= 1
+            # Re-queue at the end, so the next sweep starts with the keys this one did not reach.
+            self._last_activity[key] = self._last_activity.pop(key)
             # A key whose last count found nothing left is skipped while its transcript's
             # stamp is unchanged, so a finished session costs a stat, not a read, per
             # sweep. The stamp is taken here, before the off-loop count, so a row that

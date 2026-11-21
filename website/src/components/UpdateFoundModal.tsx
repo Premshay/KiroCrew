@@ -1,10 +1,10 @@
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { Trans } from 'react-i18next'
 import MarkdownRenderer from './MarkdownRenderer'
 import ErrorNotice from './ErrorNotice'
-import { InAppUpdateFlow } from '../pages/settings/AboutPanel'
+import { InAppUpdateFlow } from '../pages/settings/AboutPanelUpdateFlow'
 import { updateInfoQuery } from '../api/updateInfoQuery'
 import { failedWithNoData } from '../api/queryState'
 import { useIsPolicyGoverned } from '../utils/updateSwitches'
@@ -21,6 +21,7 @@ import { shouldNudge, snoozeRecord, skipRecord, type UpdateNudgeRecord, type Upd
 import { foldStableStamp } from '../utils/displayVersion'
 import { editionOwnsUpdatePrompts, type UpdateState } from '../hooks/useUpdateSubscription'
 import { useDialogFocusTrap } from '../hooks/useDialogFocusTrap'
+import { reportForError } from '../utils/errorReport'
 
 /**
  * Proactive "update found" modal — the one interruption between an update
@@ -236,7 +237,14 @@ export default function UpdateFoundModal({ held = false }: { held?: boolean } = 
   // The agent hand-off is one more dismissal, so it is confined to the
   // voluntary branch: a mandatory prompt that a failed apply could wave away
   // would enforce nothing.
-  const open = !!candidate && !held
+  // Settings > About shows voluntary updates with their notes and controls,
+  // so the popup stands down there. The desktop About page draws a gateway
+  // update only when a policy provider governs the install; an attached
+  // gateway it does not bundle (adopted or remote) keeps the popup.
+  // Mandatory updates still enforce their non-dismissible prompt.
+  const onAboutPage = useLocation().pathname.replace(/\/+$/, '') === '/settings/about'
+  const aboutShowsCandidate = candidate?.source === 'desktop' || !getUpdateApi() || gwPolicyManaged
+  const open = !!candidate && !held && (required || !onAboutPage || !aboutShowsCandidate)
     && (required || (
       !handedOff
       && recordLoaded
@@ -637,6 +645,7 @@ export default function UpdateFoundModal({ held = false }: { held?: boolean } = 
             variant="inline"
             className="mt-2"
             message={gwCancelArm.isError ? i18nT('components.updateFoundModal.cancel_update_failed') : null}
+            report={gwCancelArm.isError ? reportForError(gwCancelArm.error) : undefined}
             askAgent={!required}
             onHandoff={required ? undefined : () => setHandedOffVersion(candidate.version)}
             testId="update-cancel-armed-error"

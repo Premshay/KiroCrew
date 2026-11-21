@@ -44,6 +44,7 @@ if TYPE_CHECKING:
         persistence_lost_exit_code,
         platform_compat,
         registry,
+        run_pre_exec_stops,
         shutdown_event,
         shutdown_exit_code,
         subprocess_executor,
@@ -313,7 +314,27 @@ async def _stop_services_and_sessions(
         await asyncio.gather(*self._handler_tasks, return_exceptions=True)
 
     if self.cron_svc:
-        await self.cron_svc.stop()
+        from kiro_crew import cron as _cron_facade
+
+        try:
+            await self.cron_svc.stop()
+        finally:
+            # A pause landed by stop()'s own held-record flush scheduled a
+            # notice on this loop; drain it bounded before the loop ends, as
+            # the interrupt notices are, so a schedule's last word is not
+            # cancelled with the process — in a finally, because a raising
+            # stop() is exactly the exit that would otherwise destroy it. One
+            # slower than the bound is cancelled, not left to die as "Task
+            # was destroyed but it is pending" at loop close. The callback
+            # itself is per-service (set_auto_pause_alert) and dies with it.
+            pending = [f for f in getattr(self, "_auto_pause_alerts", ()) if not f.done()]
+            if pending:
+                await asyncio.wait(
+                    [asyncio.wrap_future(f) for f in pending],
+                    timeout=_cron_facade._INTERRUPT_ALERT_WAIT_SECS,
+                )
+                for fut in pending:
+                    fut.cancel()
     if self.heartbeat_svc:
         self.heartbeat_svc.stop()
         await self.heartbeat_svc.wait_closed()
@@ -460,6 +481,7 @@ def _install_shutdown_signal_handlers(self: GatewayOrchestrator) -> None:
     # same event used by the authenticated owner shutdown route.
     loop = asyncio.get_running_loop()
     _shutting_down = False
+    _repeat_term_logged = False
     # Set once, by the second signal, the moment it takes over the exit. From
     # then on the force-exit thread below is the ONLY thing that ends the
     # process: ``_shutdown_and_exit`` reads this before each of its own drains
@@ -522,8 +544,8 @@ def _install_shutdown_signal_handlers(self: GatewayOrchestrator) -> None:
             pass  # force exit must never be blocked by logging
         platform_compat.hard_exit(0)
 
-    def _on_signal(*_args: object) -> None:
-        nonlocal _shutting_down
+    def _on_signal(sig: object = None) -> None:
+        nonlocal _shutting_down, _repeat_term_logged
         # Before anything else, on every signal: a stop owns any apply in
         # flight (cancelled here), so its build child dies here, ahead of
         # any exit path.
@@ -532,6 +554,18 @@ def _install_shutdown_signal_handlers(self: GatewayOrchestrator) -> None:
             if force_exit_claimed.is_set():
                 # Single shot: a repeat signal while the force exit drains must
                 # neither start a second drain nor exit over the unwritten tail.
+                return
+            if sig == signal.SIGTERM:
+                # A repeat SIGTERM is a stop request for a stop already under
+                # way, not an operator's "force it": a service manager can
+                # deliver two in one stop (an older unit's control-group kill
+                # plus a forwarded one). Force-exiting on it would cut the
+                # graceful shutdown short. The shutdown is bounded on its own,
+                # the manager's stop timeout SIGKILLs past that, and Ctrl-C
+                # (SIGINT) stays the escape.
+                if not _repeat_term_logged:
+                    _repeat_term_logged = True
+                    logger.warning("Repeat SIGTERM ignored: graceful shutdown already running")
                 return
             force_exit_claimed.set()
             # The backstop for a step that overruns its own bound (the orphan
@@ -572,7 +606,7 @@ def _install_shutdown_signal_handlers(self: GatewayOrchestrator) -> None:
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, _on_signal)
+            loop.add_signal_handler(sig, _on_signal, sig)
         except NotImplementedError:
             # Windows ProactorEventLoop does not support add_signal_handler.
             # Fall back to signal.signal for SIGINT so shutdown_event still
@@ -731,6 +765,15 @@ async def _shutdown_and_exit(
         await asyncio.wait_for(shutdown_cleanup(), timeout=6.0)
     except Exception:  # noqa: BLE001 - shutdown must not raise
         logger.debug("shared crew slice release at exit failed", exc_info=True)
+    # The supervised children a dashboard cleanup hook stops: the browser harness
+    # daemon with its browser and worker, the instance tunnels, the sleep
+    # inhibitor. A graceful shutdown that ran out of time never reached those
+    # hooks, and os._exit below would leave each child running under PID 1. Each
+    # owner registers the same stop with the pre-exec seam at startup and
+    # unregisters it once its cleanup hook has stopped the child, so after a
+    # shutdown that did reach the hooks only stops that are safe to repeat are
+    # left. Bounded inside the seam, which never raises.
+    await run_pre_exec_stops(occasion="exit")
     # The skill-usage ledgers debounce their writes to one per 60 s, and their
     # flush thread is a daemon: a hit accepted inside that window lives only in
     # memory, and os._exit below kills it. Flush them here, off-loop and

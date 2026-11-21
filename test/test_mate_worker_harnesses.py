@@ -22,6 +22,7 @@ from kiro_crew.acp_backends import (
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_PI,
     ACP_BACKENDS_MATE_WORKER_MCP_TOOL_LIMITS,
     ACP_BACKENDS_MATE_WORKER_NATIVE_TOOL_LIMITS,
     ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS,
@@ -238,7 +239,10 @@ def test_with_kas_unservable_an_unpinned_refusal_offers_no_kas_and_names_its_fix
 
     refusal = _refusal(config, "floorbot")
 
-    able = f"({harness_label(ACP_BACKEND_CLAUDE)}, {harness_label(ACP_BACKEND_CODEX)})"
+    able = (
+        f"({harness_label(ACP_BACKEND_CLAUDE)}, {harness_label(ACP_BACKEND_CODEX)}, "
+        f"{harness_label(ACP_BACKEND_PI)})"
+    )
     assert refusal is not None
     assert f"pick a harness that can {able} or change Settings → Agent Harness." in refusal
     assert f"because {KAS_GAP}" in refusal
@@ -254,7 +258,10 @@ def test_clearing_a_pin_is_offered_only_where_the_member_route_carries_the_worke
     refusal = _refusal(_pin_config("kiro"), "pinbot")
 
     assert refusal is not None and "clear the pin" not in refusal
-    able = f"({harness_label(ACP_BACKEND_CLAUDE)}, {harness_label(ACP_BACKEND_CODEX)})"
+    able = (
+        f"({harness_label(ACP_BACKEND_CLAUDE)}, {harness_label(ACP_BACKEND_CODEX)}, "
+        f"{harness_label(ACP_BACKEND_PI)})"
+    )
     assert f"pick a harness that can {able}" in refusal
     assert "kiro-cli update" in refusal
 
@@ -396,13 +403,105 @@ def test_codex_gets_the_crewmates_prompt_in_the_context_block(pixel_worker):
     """The codex mirror projects no spec prompt, so the block carries the worker's
     principles and the crewmate's prompt, as on claude."""
     from kiro_crew.context_assembly.agent_spec import _crewmate_worker_prompt
-    from kiro_crew.mate_worker import MATE_WORKER_PROMPT
+    from kiro_crew.mate_worker import mate_worker_prompt
 
     with_prompt = {**PIXEL, "prompt": "Follow the release SOP."}
     (pixel_worker / "pixel.json").write_text(json.dumps(with_prompt), encoding="utf-8")
     _served_by(ACP_BACKEND_CODEX, "dashboard:chat-9")
     block = _crewmate_worker_prompt(MATE_WORKER_AGENT, BASE["prompt"], "dashboard:chat-9")
-    assert block == f"You are the worker.\n\n{MATE_WORKER_PROMPT}\n\nFollow the release SOP."
+    assert block == f"You are the worker.\n\n{mate_worker_prompt()}\n\nFollow the release SOP."
+
+
+def _pi_worker_array(work_dir, key, monkeypatch, *, worker=True):
+    """The ``session/new`` array Crew's own resolver composes for a pi session on the
+    worker template under *key*, recorded as a crewmate's worker when *worker*."""
+    from kiro_crew.acp.client import AcpClient
+    from kiro_crew.members_parts import member_sessions
+
+    monkeypatch.setattr(member_sessions, "_CREWMATE_WORKER_SLOTS", {"chat-9"} if worker else set())
+    client = AcpClient(
+        work_dir=work_dir, agent=MATE_WORKER_AGENT, acp_backend=ACP_BACKEND_PI, session_key=key
+    )
+    # The worker's execution record names its crewmate, so allocation marks it a member.
+    client.member_context = bool(key)
+    return client._resolve_session_mcp_servers()
+
+
+def test_pi_carries_the_worker_kit(pixel_worker, tmp_path, monkeypatch):
+    """pi is in the kit set (pi/worker-kit-live.jsonl): its own resolver mounts the
+    crewmate's server on the worker's session, and nowhere else."""
+    from kiro_crew.acp.session_provider import AcpSessionProvider
+    from kiro_crew.acp_backends import ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT
+    from kiro_crew.providers.acp import AcpProvider
+
+    assert mate_worker.worker_kit_backend_refusal(ACP_BACKEND_PI) is None
+    session = SimpleNamespace(_runtime=SimpleNamespace(acp_backend=ACP_BACKEND_PI))
+    assert AcpSessionProvider.mate_worker_kit_supported.fget(session) is True
+    assert AcpSessionProvider.mate_worker_prompt_in_context.fget(session) is True
+    assert AcpSessionProvider.mate_worker_tool_limits_supported.fget(session) is False
+    provider = SimpleNamespace(_client=SimpleNamespace(backend=ACP_BACKEND_PI))
+    assert AcpProvider.mate_worker_kit_supported.fget(provider) is True
+    assert AcpProvider.mate_worker_prompt_in_context.fget(provider) is True
+    assert AcpProvider.mate_worker_tool_limits_supported.fget(provider) is False
+    assert ACP_BACKEND_PI in ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT
+    assert ACP_BACKEND_PI not in ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS
+
+    def names(*args, **kw):
+        return {e.get("name") for e in _pi_worker_array(tmp_path, *args, monkeypatch, **kw)}
+
+    assert "jira" in names("dashboard:chat-9")
+    # With no session, or a session not recorded as the worker, it is the bare base.
+    assert "jira" not in names("")
+    assert "jira" not in names("dashboard:chat-9", worker=False)
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [
+        {"mcpServers": {"jira": {"command": "jira-mcp", "disabledTools": ["x"]}}},
+        {"excludedTools": ["@jira/delete_issue"]},
+        {"excludedTools": ["@jira"]},
+        {"excludedTools": ["fs_write"]},
+    ],
+    ids=["disabledTools", "excluded-server-tool", "excluded-server", "excluded-native-tool"],
+)
+def test_pi_refuses_a_tool_limited_worker_in_its_array(pixel_worker, tmp_path, monkeypatch, limits):
+    """pi has no per-tool deny for a worker, so the read its array is built from
+    refuses a worker whose crewmate's file sets single-tool limits, as codex's does,
+    instead of mounting nothing and running the worker without its kit."""
+    from kiro_crew.session_capabilities import CapabilityStartupError
+
+    (pixel_worker / "pixel.json").write_text(json.dumps({**PIXEL, **limits}), encoding="utf-8")
+    with pytest.raises(CapabilityStartupError) as refused:
+        _pi_worker_array(tmp_path, "dashboard:chat-9", monkeypatch)
+    assert str(refused.value) == "capability_tool_limits_unsupported"
+
+
+def test_pi_refuses_a_worker_whose_file_sets_a_policy(pixel_worker, tmp_path, monkeypatch):
+    """pi applies no ``hooks``, ``permissions`` or ``toolsSettings``, so the same read
+    refuses a worker whose crewmate's file sets one, naming it, rather than running
+    the worker without it."""
+    from kiro_crew.mate_spec_policy import SpecPolicyUncarried
+
+    hooks = {"preToolUse": [{"matcher": "execute_bash", "command": "audit-shell.sh"}]}
+    with_hooks = {**PIXEL, "hooks": hooks}
+    (pixel_worker / "pixel.json").write_text(json.dumps(with_hooks), encoding="utf-8")
+    with pytest.raises(SpecPolicyUncarried) as refused:
+        _pi_worker_array(tmp_path, "dashboard:chat-9", monkeypatch)
+    assert refused.value.fields == ["hooks"]
+
+
+def test_pi_gets_the_crewmates_prompt_in_the_context_block(pixel_worker):
+    """pi reads no Crew spec prompt, so the block carries the worker's principles and
+    the crewmate's prompt, as on claude and codex."""
+    from kiro_crew.context_assembly.agent_spec import _crewmate_worker_prompt
+    from kiro_crew.mate_worker import mate_worker_prompt
+
+    with_prompt = {**PIXEL, "prompt": "Follow the release SOP."}
+    (pixel_worker / "pixel.json").write_text(json.dumps(with_prompt), encoding="utf-8")
+    _served_by(ACP_BACKEND_PI, "dashboard:chat-9")
+    block = _crewmate_worker_prompt(MATE_WORKER_AGENT, BASE["prompt"], "dashboard:chat-9")
+    assert block == f"You are the worker.\n\n{mate_worker_prompt()}\n\nFollow the release SOP."
 
 
 def test_a_crewmate_turning_off_single_tools_names_the_server(pixel_worker):
@@ -461,9 +560,9 @@ def test_a_default_template_crewmate_adds_no_stub_to_the_block(pixel_worker, mon
     so claude's block gains nothing either: no stub text inside the block."""
     from kiro_crew.agent_parts.spec_build import _NATIVE_PROMPT_STUB
     from kiro_crew.context_assembly.agent_spec import _crewmate_worker_prompt
-    from kiro_crew.mate_worker import MATE_WORKER_PROMPT
+    from kiro_crew.mate_worker import mate_worker_prompt
 
-    disk_base = {**BASE, "prompt": f"{_NATIVE_PROMPT_STUB}\n\n{MATE_WORKER_PROMPT}"}
+    disk_base = {**BASE, "prompt": f"{_NATIVE_PROMPT_STUB}\n\n{mate_worker_prompt()}"}
     (pixel_worker / f"{MATE_WORKER_AGENT}.json").write_text(json.dumps(disk_base), encoding="utf-8")
     stub_file = {**PIXEL, "prompt": _NATIVE_PROMPT_STUB}
     (pixel_worker / "pixel.json").write_text(json.dumps(stub_file), encoding="utf-8")
@@ -473,7 +572,7 @@ def test_a_default_template_crewmate_adds_no_stub_to_the_block(pixel_worker, mon
     # claude: the block is the contract plus the principles, and nothing more.
     _served_by(ACP_BACKEND_CLAUDE, "dashboard:chat-9")
     block = _crewmate_worker_prompt(MATE_WORKER_AGENT, "The full contract.", "dashboard:chat-9")
-    assert block == f"The full contract.\n\n{MATE_WORKER_PROMPT}"
+    assert block == f"The full contract.\n\n{mate_worker_prompt()}"
     assert _NATIVE_PROMPT_STUB not in block
 
 
@@ -482,13 +581,13 @@ def test_the_agent_system_prompt_block_carries_the_crewmates_prompt(pixel_worker
     ``[AGENT SYSTEM PROMPT]`` block, so it carries the worker's own principles and
     the crewmate's prompt too, in the order the on-disk worker base has them."""
     from kiro_crew.context_assembly.agent_spec import _crewmate_worker_prompt
-    from kiro_crew.mate_worker import MATE_WORKER_PROMPT
+    from kiro_crew.mate_worker import mate_worker_prompt
 
     with_prompt = {**PIXEL, "prompt": "Follow the release SOP."}
     (pixel_worker / "pixel.json").write_text(json.dumps(with_prompt), encoding="utf-8")
     _served_by(ACP_BACKEND_CLAUDE, "dashboard:chat-9")
     block = _crewmate_worker_prompt(MATE_WORKER_AGENT, BASE["prompt"], "dashboard:chat-9")
-    assert block == f"You are the worker.\n\n{MATE_WORKER_PROMPT}\n\nFollow the release SOP."
+    assert block == f"You are the worker.\n\n{mate_worker_prompt()}\n\nFollow the release SOP."
     # KAS's wire spec already carries both, so its block keeps the base.
     _served_by(ACP_BACKEND_KAS, "dashboard:chat-9")
     assert _crewmate_worker_prompt(MATE_WORKER_AGENT, BASE["prompt"], "dashboard:chat-9") == (
@@ -531,14 +630,14 @@ def test_the_resolved_contract_block_carries_the_crewmates_prompt(
             session_start=True,
         )
 
-    from kiro_crew.mate_worker import MATE_WORKER_PROMPT
+    from kiro_crew.mate_worker import mate_worker_prompt
 
     _served_by(ACP_BACKEND_CLAUDE, "dashboard:chat-9", "dashboard:other")
     block = resolve("dashboard:chat-9")
-    assert block.endswith(f"\n\n{MATE_WORKER_PROMPT}\n\nFollow the release SOP.")
+    assert block.endswith(f"\n\n{mate_worker_prompt()}\n\nFollow the release SOP.")
     # A session with no crewmate record still runs the worker's own principles.
     other = resolve("dashboard:other")
-    assert MATE_WORKER_PROMPT in other and "Follow the release SOP." not in other
+    assert mate_worker_prompt() in other and "Follow the release SOP." not in other
     # On KAS the wire spec carries the worker's prompt; the block is the base alone.
     _served_by(ACP_BACKEND_KAS, "dashboard:chat-9")
     assert resolve("dashboard:chat-9") == "You are the worker."
@@ -614,15 +713,15 @@ def _claude_worker_provider(key, backend=ACP_BACKEND_CLAUDE, **_kwargs):
     ],
     ids=["disabledTools", "excluded-server-tool", "excluded-native-tool", "excluded-unmapped-tool"],
 )
-@pytest.mark.parametrize("backend", [ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX])
+@pytest.mark.parametrize("backend", [ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_PI])
 async def test_the_allocation_refuses_a_tool_limited_worker_on_a_mirror(
     pixel_worker, tmp_path, monkeypatch, limits, backend
 ):
     """The allocation itself, not only its source: a worker whose crewmate's file
-    turns off single tools is refused on codex before anything starts, and on
+    turns off single tools is refused on codex and pi before anything starts, and on
     claude when a limit is a native tool its built-in table does not cover; claude
     starts a worker whose limits are MCP tools or mapped native tools, and the same
-    worker with no limits starts on both."""
+    worker with no limits starts on each."""
     from kiro_crew.config.loader import KiroCrewConfig
     from kiro_crew.members_parts import member_sessions
     from kiro_crew.session import SessionManager
@@ -680,7 +779,7 @@ def test_the_prompt_channel_follows_the_live_provider_not_the_config(
     ``agent.member_acp_backend`` changes: the re-injected block after a compaction is
     the one the start built (claude: both prompts; KAS: the base alone)."""
     from kiro_crew.context_assembly.agent_spec import _crewmate_worker_prompt
-    from kiro_crew.mate_worker import MATE_WORKER_PROMPT
+    from kiro_crew.mate_worker import mate_worker_prompt
 
     with_prompt = {**PIXEL, "prompt": "Follow the release SOP."}
     (pixel_worker / "pixel.json").write_text(json.dumps(with_prompt), encoding="utf-8")
@@ -697,7 +796,7 @@ def test_the_prompt_channel_follows_the_live_provider_not_the_config(
     after_compaction = _crewmate_worker_prompt(MATE_WORKER_AGENT, BASE["prompt"], key)
     assert after_compaction == at_start
     if started_on == ACP_BACKEND_CLAUDE:
-        assert MATE_WORKER_PROMPT in at_start and "Follow the release SOP." in at_start
+        assert mate_worker_prompt() in at_start and "Follow the release SOP." in at_start
     else:
         assert at_start == BASE["prompt"]
 

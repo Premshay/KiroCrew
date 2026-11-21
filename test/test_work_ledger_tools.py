@@ -12,6 +12,7 @@ in the dispatch table resolves as tabulated against both tool halves.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 import sys
@@ -404,6 +405,7 @@ async def test_every_store_code_maps_to_the_status_the_rfc_tabulates():
         "item_closed": 409,
         "item_cap_exceeded": 409,
         "goal_concurrency_cap_reached": 409,
+        "host_memory_critical": 409,
         "depth_exceeded": 409,
         "crew_log_incomplete": 409,
         "cache_dirty": 409,
@@ -866,7 +868,7 @@ async def test_accept_is_a_route_action_not_a_store_action():
     assert "accept" not in wl.CONDUCTOR_ACTIONS
     assert "ask" not in wl.CONDUCTOR_ACTIONS
     assert "accept" in routes.RECORD_ACTIONS
-    assert routes.RECORD_ACTIONS == wl.CONDUCTOR_ACTIONS | {"accept", "ask"}
+    assert routes.RECORD_ACTIONS == wl.CONDUCTOR_ACTIONS | {"accept", "ask", "retire"}
     assert routes.RECORD_ACTIONS == validation._WORK_RECORD_ACTIONS
 
 
@@ -1053,7 +1055,7 @@ def test_the_schema_caps_restate_the_stores_own():
 def test_the_worker_schema_has_no_conductor_field():
     """The absence IS the guarantee — stronger than an allowlist kept correct by hand."""
     names = {f.name for f in validation.WORK_REPORT_SCHEMA.fields}
-    assert names == {"status", "summary", "artifacts", "pr", "reason", "wake_at"}
+    assert names == {"status", "summary", "artifacts", "pr", "reason", "wake_at", "discussion"}
     for forbidden in (
         "item_id",
         "session",
@@ -1567,6 +1569,45 @@ async def test_read_default_tail_is_the_ceiling_and_events_narrows_or_drops_it(m
     _, body = await _read_with(CONDUCTOR_A, f"events={routes._MAX_EVENT_TAIL}")
     row = next(r for r in body["items"] if r["item_id"] == ids[2])
     assert len(row["events"]) == 13
+
+
+@pytest.mark.asyncio
+async def test_read_takes_every_event_tail_in_one_executor_hop(monkeypatch):
+    """The read holds the board lock the Crew board's build waits on, so its executor
+    hops must not grow with the board: five items cost the hops one does."""
+    hops: list[object] = []
+    real = asyncio.to_thread
+
+    async def counting(func, /, *args, **kwargs):
+        hops.append(func)
+        return await real(func, *args, **kwargs)
+
+    def create(title: str) -> None:
+        wl.ensure_conductor(CONDUCTOR_A, goal="drive the fleet")
+        wl.apply_conductor_action(
+            CONDUCTOR_A, "create", title=title, acceptance={"kind": "human_approval"}
+        )
+
+    async def hops_of_a_read() -> tuple[int, dict[str, Any]]:
+        # Counted on a second read of the same board, so a once-only load on a
+        # first read (the code-channel store) is never taken for a per-item cost.
+        assert (await _read(CONDUCTOR_A))[0] == 200
+        hops.clear()
+        status, body = await _read(CONDUCTOR_A)
+        assert status == 200
+        return len(hops), body
+
+    monkeypatch.setattr(asyncio, "to_thread", counting)
+    create("item 0")
+    one_item, _ = await hops_of_a_read()
+    for n in range(1, 5):
+        create(f"item {n}")
+    five_items, body = await hops_of_a_read()
+    assert len(body["items"]) == 5
+    assert five_items == one_item
+    for row in body["items"]:
+        tail = wl.read_events(CONDUCTOR_A, row["item_id"], limit=routes._MAX_EVENT_TAIL)
+        assert row["events"] == [event.to_dict() for event in tail]
 
 
 @pytest.mark.asyncio

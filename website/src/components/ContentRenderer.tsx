@@ -207,7 +207,7 @@ export const ContentRenderer = memo(function ContentRenderer({
         />
       )}
       {!isRichType && !editing && isMarkdown && (
-        <div ref={previewRef as React.RefObject<HTMLDivElement>} className={markdownClassName ?? 'msg-content text-sm leading-relaxed'}>
+        <div ref={previewRef as React.RefObject<HTMLDivElement>} data-hl-scope="" className={markdownClassName ?? 'msg-content text-sm leading-relaxed'}>
           <BasePathCtx.Provider value={filePath || null}>
             <MarkdownRenderer content={displayContent} sourcePos onFileOpen={onFileOpen} onFolderOpen={onFolderOpen} />
           </BasePathCtx.Provider>
@@ -216,6 +216,7 @@ export const ContentRenderer = memo(function ContentRenderer({
       {!isRichType && !editing && !isMarkdown && (
         <div
           ref={previewRef as React.RefObject<HTMLDivElement>}
+          data-hl-scope=""
           className={`relative w-full h-full overflow-hidden ${flush ? '' : 'border border-border rounded-md'}`}
         >
           {/* previewRef is a QUERY root only (TreeWalker / selection
@@ -232,5 +233,7 @@ export const ContentRenderer = memo(function ContentRenderer({
       )}
     </>
   )
-  return previewStyle ? <div className="h-full" style={previewStyle}>{inner}</div> : inner
+  // `data-chat-scope`: every previewStyle names `--mc-content-width`, and
+  // cli-mode.css anchors its chat rules on this attribute (see its header).
+  return previewStyle ? <div className="h-full" style={previewStyle} data-chat-scope="">{inner}</div> : inner
 })

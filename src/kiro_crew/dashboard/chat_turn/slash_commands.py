@@ -62,6 +62,7 @@ if TYPE_CHECKING:
         logger,
         sel,
         select_provider_backend,
+        subagents_attached_async,
     )
     from kiro_crew.dashboard.chat_turn.eager_spawn import schedule_eager_spawn
     from kiro_crew.dashboard.chat_turn.prompt_assembly import _expand_prompt_mention_off_loop
@@ -76,7 +77,10 @@ if TYPE_CHECKING:
         _append_command_reply,
         _cleared_segment_text,
     )
-    from kiro_crew.dashboard.chat_turn.session_reset import _consume_pending_reset
+    from kiro_crew.dashboard.chat_turn.session_reset import (
+        _a_completion_is_queued,
+        _consume_pending_reset,
+    )
     from kiro_crew.dashboard.chat_turn.turn_admission import (
         _channels_judging_turn,
         _refuse_channel_turn,
@@ -209,18 +213,27 @@ async def _answer_slash_for_harness(
             if slot.set_todo(None):
                 state.broadcast_ws("todo_update", {"slot": slot.key, "todo": None})
             text = (
-                "🗑 Conversation cleared. Earlier messages stay visible, but the agent "
+                "Conversation cleared. Earlier messages stay visible, but the agent "
                 "no longer remembers them."
             )
         else:
+            discard_key = slot._pending_discard_conversation_key
+            if (
+                discard_key is not None
+                and _a_completion_is_queued(slot)
+                and not await subagents_attached_async(state, slot, discard_key, "clear_drop_plan")
+            ):
+                # Waiting only on a queued completion, which runs in the old conversation
+                # with its plan: the plan goes where the discard lands.
+                slot._pending_discard_drops_plan = True
             text = (
-                "🗑 Clear queued. The agent is busy right now, so your next reply "
+                "Clear queued. The agent is busy right now, so your next reply "
                 "may still remember this conversation."
             )
     else:
         outcome = "unsupported_backend"
         harness = "KAS" if backend == ACP_BACKEND_KAS else label_for(backend)
-        text = f"⚠ `{command}` doesn't work with {harness}. It was not sent to the agent."
+        text = f"Warning: `{command}` doesn't work with {harness}. It was not sent to the agent."
     sel().log_tool_invocation(
         session_key=session_key,
         agent=slot.agent or "kirocrew",
@@ -332,7 +345,7 @@ async def _handle_agent_command(
         text = switch_announcement(str(body.get("agent") or agent), str(body.get("warning") or ""))
     else:
         reason = str(body.get("error") or "the switch was refused")
-        text = f"⚠️ Could not switch to agent `{agent}`: {reason}"
+        text = f"Warning: Could not switch to agent `{agent}`: {reason}"
     _append_command_reply(slot, text)
     sel().log_tool_invocation(
         session_key=session_key,
@@ -363,7 +376,10 @@ async def _handle_goal_command(state: "DashboardState", slot: "_ChatSlot", messa
     changed = False
     if _rest in ("", "status"):
         if _goal_svc is None:
-            body = "No active goal loop (AutoNudge is disabled)."
+            body = (
+                "Goal loops are unavailable (AutoNudge is disabled). "
+                "Set `KIROCREW_AUTONUDGE=1` and restart the gateway."
+            )
         else:
             _loop = _goal_svc.get_by_slot(slot.key)
             if _loop is not None and getattr(_loop, "active", True):
@@ -390,7 +406,7 @@ async def _handle_goal_command(state: "DashboardState", slot: "_ChatSlot", messa
         _loop = _goal_svc.get_by_slot(slot.key) if _goal_svc is not None else None
         if _goal_svc is not None and _loop is not None:
             await _goal_svc.remove(_loop.id, stop_reason="goal_cleared")
-        body = "🎯 Goal cleared." if changed or _loop is not None else "No active goal to clear."
+        body = "Goal cleared." if changed or _loop is not None else "No active goal to clear."
     else:
         _max_cycles = 50
         _objective = _rest
@@ -482,7 +498,7 @@ def _refuse_blocked_slash(turn) -> None:
         slot,
         slot.append(
             "assistant",
-            f"⚠️ `{first_word}` is not available in the dashboard.",
+            f"Warning: `{first_word}` is not available in the dashboard.",
             "msg msg-a",
         ),
     )
@@ -645,6 +661,11 @@ async def _turn_slash_gate(turn: _ChatTurn) -> _Flow | None:
                 # The nested call is a whole turn with its own exit guard, so the
                 # tail is its to run, however it ends.
                 turn_exit.handed_off = True
+                # The caller's trace id (tracing/inbound.py) goes to the nested turn,
+                # the one that produces the reply.
+                from kiro_crew.tracing import inbound as trace_inbound
+
+                trace_inbound.hand_back(turn._recovery_turn_id)
                 await _run_chat(
                     state,
                     slot,
@@ -670,7 +691,7 @@ async def _turn_slash_gate(turn: _ChatTurn) -> _Flow | None:
                     outcome="blocked",
                     metadata={"mention": f"@{name}", "slot": slot.key, "via": "/prompts get"},
                 )
-                _append_command_reply(slot, f"🔒 Prompt `{name}` blocked — sensitive path.")
+                _append_command_reply(slot, f"Prompt `{name}` blocked — sensitive path.")
                 state.push_slots_update()
             elif status == "too_large":
                 sel().log_tool_invocation(
@@ -683,7 +704,8 @@ async def _turn_slash_gate(turn: _ChatTurn) -> _Flow | None:
                     metadata={"mention": f"@{name}", "slot": slot.key, "via": "/prompts get"},
                 )
                 _append_command_reply(
-                    slot, f"⚠️ Prompt `{name}` exceeds size limit ({MAX_PROMPT_BYTES // 1000}KB)."
+                    slot,
+                    f"Warning: Prompt `{name}` exceeds size limit ({MAX_PROMPT_BYTES // 1000}KB).",
                 )
                 state.push_slots_update()
             else:
@@ -696,7 +718,7 @@ async def _turn_slash_gate(turn: _ChatTurn) -> _Flow | None:
                     outcome="not_found",
                     metadata={"mention": f"@{name}", "slot": slot.key, "via": "/prompts get"},
                 )
-                _append_command_reply(slot, f"❌ Prompt `{name}` not found.")
+                _append_command_reply(slot, f"Error: Prompt `{name}` not found.")
                 state.push_slots_update()
             return _Flow.END
 
@@ -870,10 +892,10 @@ async def _turn_slash_gate(turn: _ChatTurn) -> _Flow | None:
     # that got past its own gate is on a harness that runs it natively.
     # The other harnesses in ACP_BACKENDS_LOCAL_CLEAR have no /clear of their own
     # either, or (claude) run one Crew cannot observe, so /clear alone is answered
-    # here for them too; their other commands keep the prompt path, where those
-    # harnesses serve the ones they know. A harness with a row in
-    # ACP_BACKEND_PROMPT_HANDLER_COMMANDS (codex) keeps the prompt path only for the
-    # commands in its row; its other commands get the notice, as on KAS.
+    # here for them too. A harness with a row in ACP_BACKEND_PROMPT_HANDLER_COMMANDS
+    # (codex, opencode, mimocode, pi, deepseek, goose, copilot, antigravity) keeps
+    # the prompt path only for the commands in its row; its other commands get the
+    # notice, as on KAS.
     # A kiro-cli command that is not a Crew harness command (/knowledge, /effort,
     # /plan, /rewind) is answered here on KAS alone; anywhere else it stays text.
     # The user's own quick prompt of that name is a macro and keeps the text path.
@@ -1046,7 +1068,7 @@ async def _turn_compact_command(turn: _ChatTurn) -> None:
             _append_compaction_notice(state, slot, empty_notice)
         elif capabilities_of(client).compacts_inline:
             _restore_skills_context_after_compaction(turn)
-            msg = "✅ Conversation compacted."
+            msg = "Conversation compacted."
             _append_compaction_notice(state, slot, msg)
             state.broadcast_context_usage(slot.key, _context_usage_payload(slot.key, client))
         else:
@@ -1065,16 +1087,12 @@ async def _turn_compact_command(turn: _ChatTurn) -> None:
             if compaction_result["type"] == "completed":
                 _restore_skills_context_after_compaction(turn)
                 summary = redact(compaction_result.get("summary", ""))
-                msg = (
-                    f"✅ Conversation compacted: {summary}"
-                    if summary
-                    else "✅ Conversation compacted."
-                )
+                msg = f"Conversation compacted: {summary}" if summary else "Conversation compacted."
             elif compaction_result["type"] == "failed":
                 # The provider ships the reason on `failed` too, and every
                 # other surface already tells the user what it was — Slack,
                 # Telegram, Discord, and this dashboard's own AUTO-compact
-                # notice (see chat_utils._compaction_notice_text). Dropping
+                # notice (see chat_utils._append_compaction_notice). Dropping
                 # it here left the one path a user takes deliberately as the
                 # only one that says nothing, so a `/compact` that fails
                 # because the conversation is too large is indistinguishable
@@ -1093,9 +1111,9 @@ async def _turn_compact_command(turn: _ChatTurn) -> None:
                     # payload) would otherwise push the whole transcript out
                     # of the reader's view.
                     error = error[:_COMPACT_FAIL_REASON_MAX_CHARS].rstrip() + "…"
-                msg = f"❌ Compaction failed: {error}" if error else "❌ Compaction failed."
+                msg = f"Error: Compaction failed: {error}" if error else "Error: Compaction failed."
             else:
-                msg = "⚠️ Compaction timed out."
+                msg = "Warning: Compaction timed out."
             _append_compaction_notice(state, slot, msg)
             # Update the context meter from the provider's post-compaction
             # state. On success the provider has dropped its stale counts by

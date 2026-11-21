@@ -22,7 +22,6 @@ const themeState = {
   // First run NOT finished: outside the frame this opens the Customize tour.
   onboarded: false,
   importOnboarded: true,
-  privacyAcked: true,
   themeBootReady: true,
   themeBootRead: true,
   themes: [],
@@ -32,7 +31,7 @@ const themeState = {
   setTheme: vi.fn(),
   markOnboarded: vi.fn(),
   markImportOnboarded: vi.fn(),
-  markPrivacyAcked: vi.fn(),
+
   setColorTheme: vi.fn(),
   setMode: vi.fn(),
 }
@@ -58,14 +57,16 @@ vi.mock('../pages/KiroCrewAgentsPage', () => ({ default: () => null }))
 
 import { renderWithProviders } from './helpers'
 import App from '../App'
+import { api } from '../api/client'
 
 beforeEach(() => {
   localStorage.clear()
   localStorage.setItem('mc-import-onboarded', '1')
-  localStorage.setItem('mc-privacy-acked', '1')
+  // The owner's tab: first run is owed to it (`useViewerIsNotOwner`).
+  vi.spyOn(api, 'viewerOwnerOk').mockResolvedValue(true)
 })
 
-afterEach(() => { frame.on = false })
+afterEach(() => { frame.on = false; vi.restoreAllMocks() })
 
 describe('App inside the look-preview frame', () => {
   it('mounts no launch dialog, even with first run still owed', async () => {

@@ -180,12 +180,12 @@ the frame classes, the section names what the `used` series shows.
   compaction status frame means, and what pi's source predicts. Skip this and
   `wait_for_compaction` waits out its whole timeout on a compaction that already
   happened;
-- rewrite the pi paragraph on `ACP_BACKENDS_COMPACT`. It is the record of WHY the set
-  asks for a capture, so replace the waiting-for-a-drive part with what the drive found —
-  the `used` series, the harness version, the fixture path;
-- the same comment's closing paragraph explains that pi takes the
-  `COMPACT_ARM_UNCLASSIFIED` refusal. Remove it: no known harness takes that arm once pi
-  is a member.
+- add a paragraph for the harness on `ACP_BACKENDS_COMPACT`. The comment is the record
+  of WHY each member is in, so write what the drive found -- the `used` series, the
+  harness version, the fixture path -- the way the pi paragraph there reads;
+- if the comment says the harness takes the `COMPACT_ARM_UNCLASSIFIED` refusal
+  (`src/kiro_crew/messaging/commands.py`), remove that sentence: a member never takes
+  that arm.
 
 **4. The backend card's unmeasured cell.** The Settings > Agent Harness card renders
 three marks per line — available, not available, and NOT MEASURED — and the third one
@@ -234,8 +234,8 @@ the design:
   and `test_pi_finishes_inside_the_prompt_turn`: one asserts the manual membership, the
   other the inline membership and `capabilities_for(...).compacts_inline`, if step 3 added
   it. If the harness was listed in `TestEveryKnownBackendIsClassified.UNCLASSIFIED`,
-  remove it there; that set is empty on main, and the refusal arm stays covered by the
-  unknown-id case in `TestTheRefusalTextSaysWhatHappens`;
+  remove it there (it holds `strands` and `antigravity`); the refusal arm stays
+  covered by the unknown-id case in `TestTheRefusalTextSaysWhatHappens`;
 - the harness's own backend test, when it has one — `test/test_acp_goose_backend.py`'s
   `test_goose_compacts_inline_on_a_driven_capture` is the shape: it asserts both
   memberships and names the capture in its docstring;

@@ -115,7 +115,12 @@ _CRON_CONFIG_FIELDS = (
 
 
 def _cron_job_revision(job: Any) -> str:
-    return _revision_digest({k: getattr(job, k, None) for k in _CRON_CONFIG_FIELDS})
+    fields = {k: getattr(job, k, None) for k in _CRON_CONFIG_FIELDS}
+    # The pin joins only when set, so an unpinned job keeps the digest a card stored before it.
+    for key in ("channel_type", "target_id"):
+        if getattr(job, key, None):
+            fields[key] = getattr(job, key)
+    return _revision_digest(fields)
 
 
 def cron_job_revision(job: Any) -> str:
@@ -129,15 +134,16 @@ def cron_job_revision(job: Any) -> str:
     return _cron_job_revision(job)
 
 
-def next_run_at(cron_expr: str, timezone: str | None) -> float | None:
+def next_run_at(cron_expr: str, timezone: str | None, job_id: str = "card-preview") -> float | None:
     from kiro_crew.cron_service.model import CronJob, CronSchedule
-    from kiro_crew.cron_service.schedule import compute_next_run_ts
+    from kiro_crew.cron_service.schedule import compute_next_run_ts, pin_random_cron_fields
 
+    # A random (``R``) field is pinned per job id, as the job it previews is.
     job = CronJob(
-        id="card-preview",
+        id=job_id,
         name="preview",
         message="",
-        schedule=CronSchedule(kind="cron", cron_expr=cron_expr),
+        schedule=CronSchedule(kind="cron", cron_expr=pin_random_cron_fields(cron_expr, job_id)),
     )
     job.timezone = timezone or ""
     try:
@@ -957,14 +963,21 @@ async def resumed_undo_is_stale(rec: dict[str, Any], index: int, *, state: Any, 
         current = await read_state(kind, params, rec["evidence"][:1], state=state, app=app)
         keys: tuple[str, ...] = ("exists", "member_id", "revision")
         undo = (rec.get("plan") or {}).get("undo") or []
-        rules_at = next(
-            (i for i, s in enumerate(undo) if str(s.get("path", "")).endswith("/rules")), -1
-        )
-        if kind == catalog.KIND_CREWMATE_IMPORT and "rules" in after and index <= rules_at:
-            # Until the Undo's own rules step runs, rules saved since are the
-            # owner's; after it, the Undo cleared them itself.
+
+        def at(suffix: str) -> int:
+            return next(
+                (i for i, s in enumerate(undo) if str(s.get("path", "")).endswith(suffix)), -1
+            )
+
+        # Until the Undo's own step for a part runs, a change saved since is the
+        # owner's; after it, the Undo removed or cleared that part itself. A card stored
+        # before the dashboard step has no ``dashboard`` in its after-state: not compared.
+        guarded = (("rules", at("/rules")), ("dashboard", at("/dashboard/template")))
+        is_import = kind == catalog.KIND_CREWMATE_IMPORT
+        parts = tuple(k for k, at_ in guarded if is_import and k in after and index <= at_)
+        if parts:
             current = await read_state(kind, params, rec["evidence"], state=state, app=app)
-            keys += ("rules",)
+            keys += parts
         return canonical({k: current.get(k) for k in keys}) != canonical(
             {k: after.get(k) for k in keys}
         )
@@ -1074,7 +1087,8 @@ async def _import_state(
     """An applied import's crewmate, plus each cron it made and its rules, as fingerprints.
 
     The Undo deletes a cron only while it still reads as the import left it, and
-    clears the rules only while they are still the imported text: an edit the
+    clears the rules only while they are still the imported text, and removes the
+    dashboard only at the template and version the card adopted: an edit the
     owner saved since makes the snapshot differ, so the Undo is refused. The
     carried files are checked file by file by their own route's Undo.
     """
@@ -1091,7 +1105,27 @@ async def _import_state(
     out = {**base, "crons": crons}
     if catalog.IMPORT_STEP_RULES in roles[: len(evidence)]:
         out["rules"] = await asyncio.to_thread(_import_rules_digest, evidence[0])
+    if catalog.IMPORT_STEP_DASHBOARD in roles[: len(evidence)]:
+        adopted = evidence[roles.index(catalog.IMPORT_STEP_DASHBOARD)].get("instance_version")
+        # No recorded version: the slug already held a page and the step adopted nothing,
+        # so there is no page of the import's to fingerprint.
+        if isinstance(adopted, int):
+            out["dashboard"] = await asyncio.to_thread(_import_dashboard_state, evidence[0])
     return out
+
+
+def _import_dashboard_state(ev0: dict[str, Any]) -> dict[str, Any] | None:
+    """The page now set on the imported Bot: which template, at which instance version."""
+    from kiro_crew.dashboard_templates import instance
+
+    slug = ev0.get("member_id")
+    if not isinstance(slug, str) or not slug:
+        return None
+    try:
+        now = instance.read(slug)
+    except instance.InstanceError:
+        return None
+    return {"template_id": now.template_id, "instance_version": now.instance_version}
 
 
 def _import_after_is_written(
@@ -1115,6 +1149,18 @@ def _import_after_is_written(
         elif role == catalog.IMPORT_STEP_RULES:
             text = str(params.get("rules") or "").strip()
             if after.get("rules") != hashlib.sha256(text.encode("utf-8")).hexdigest():
+                return False
+        elif role == catalog.IMPORT_STEP_DASHBOARD:
+            page = after.get("dashboard")
+            written = evidence[index].get("instance_version")
+            if written is None:
+                # The step kept a page the slug already held: nothing of the import's here.
+                if page is not None:
+                    return False
+                continue
+            if not isinstance(page, dict) or not isinstance(written, int):
+                return False
+            if page.get("instance_version") != written:
                 return False
     return True
 
@@ -1175,18 +1221,17 @@ async def _mcp_detail(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def _crewmate_label(key: str) -> str:
-    """The name the user knows a crewmate by: its display name, else its key.
+    """The name the user knows a crewmate by: its display name, else its default.
 
     A card raised in the crewmate's own chat is read under that display name, so
     a title or scope line naming the key would name a crewmate the user has never
     seen. Display-only, so it rides in the context rather than the compared
     snapshot: a rename between propose and apply is not a conflict.
     """
+    from kiro_crew.agent_files import member_label
     from kiro_crew.config.loader import KiroCrewConfig
 
-    agent = KiroCrewConfig.load().agents.get(key)
-    label = getattr(agent, "display_name", "") if agent is not None else ""
-    return label.strip() if isinstance(label, str) and label.strip() else key
+    return member_label(key, KiroCrewConfig.load().agents.get(key))
 
 
 async def read_context(
@@ -1238,19 +1283,25 @@ async def read_context(
         from kiro_crew.cron_service.schedule import (
             get_local_tz,
             is_valid_timezone,
+            pin_random_cron_fields,
             resolve_timezone_name,
         )
 
         tz = source.get("timezone") or ""
         if tz and not is_valid_timezone(tz):
             raise catalog.CardCatalogError("invalid_timezone", f"unknown timezone '{tz[:64]}'")
-        when = next_run_at(expr, tz)
+        target_id = str(p.get("id") or "") if kind == catalog.KIND_SCHEDULE_UPDATE else ""
+        when = next_run_at(expr, tz, target_id or "card-preview")
         if when is None:
             raise catalog.CardCatalogError("invalid_cron", "that cron expression never runs")
         # The IANA zone the scheduler runs it in now: a card with no zone takes
         # the default one, and "local" is the host's. The browser formats the
         # next run in this zone, and it cannot read "local".
         zone = (resolve_timezone_name(tz) or "UTC") if tz else get_local_tz()[0]
+        if not target_id and pin_random_cron_fields(expr, "card-preview") != expr:
+            # A new job's random pick depends on the id it is created with, which
+            # does not exist yet, so no next run is shown rather than a wrong one.
+            return {"timezone": zone}
         return {"next_run_at": when, "timezone": zone}
     if kind == catalog.KIND_CREWMATE_CAPABILITIES:
         from kiro_crew.agent_capabilities import CapabilityError

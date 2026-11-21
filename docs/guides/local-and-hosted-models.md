@@ -61,16 +61,20 @@ Use `"pi"` for Pi or `"goose"` for goose. The switch takes effect on the
 **next** session; an existing chat keeps the backend it started on. The Agent
 Harness tab reports a harness whose binary is missing, with the install
 command to run. (`kirocrew doctor` shows each selected harness's sign-in state,
-but it checks the installed binary only for kiro-cli and Claude, so use the
+but it checks the installed binary only for kiro-cli, Claude, and Codex, so use the
 Agent Harness tab to confirm an OpenCode, Pi, or goose binary is present.) A
 chat started on a `pi` too old for the adapter fails with a message that names
 the update command.
 
-New chats start on the selected harness. Crew Member DM threads follow
-`agent.member_acp_backend` (default `"kas"`) instead. OpenCode, Pi, and goose
-are each a harness a member's DM thread can run on with its dispatch tools, so
-set that field to the same value (`"opencode"`, `"pi"`, or `"goose"`) as well if
-members should use these models.
+New chats start on the selected harness. Bot DM threads follow
+`agent.member_acp_backend` when it holds a value; when it is unset they follow
+`agent.acp_backend`, but only onto a harness that can also carry the Bot's
+workers. Pi can (with KAS, Claude, and Codex it carries a Bot's worker kit), so
+with Pi selected, Bots run on Pi too. OpenCode and goose cannot, so with one of
+them selected, Bots run on KAS and the log says why. A stored
+`agent.member_acp_backend` of `"opencode"` or `"goose"` gives the DM thread its
+dispatch tools, but the Bot's workers are refused on that harness, and a Bot
+with a saved agent spec is refused there.
 
 ## 2. LM Studio
 
@@ -366,13 +370,11 @@ pool.
 one session uses one harness and one endpoint, you can split work by pointing
 different parts of Kiro Crew at different Ollama hosts: run more than one
 session or worker, each driving a harness configured for a different Ollama
-host. For **crew-member DM sessions** specifically, the backend is chosen by
-`agent.member_acp_backend` (not `agent.acp_backend`); set it to a local harness
-if members should also run on Ollama:
-
-```bash
-kirocrew config set agent.member_acp_backend opencode   # or goose
-```
+host. For **Bot DM sessions** specifically, the backend is chosen by
+`agent.member_acp_backend` when it is set. A Bot's workers cannot run on
+OpenCode or goose (section 1), so on those two this split works for regular
+sessions and workers you start yourself, not for Bots that dispatch work; on
+Pi it works for Bots as well.
 
 Approach A spreads load per request; Approach B spreads it per session or
 member. Approach A is the cleaner answer for raw throughput across N boxes;
@@ -420,7 +422,7 @@ backend it started on, so start a new chat after switching. An explicit value
 that is unrecognized or unselectable logs a warning and falls back to the Kiro
 CLI (kiro-cli) floor, not KAS; read it back with
 `kirocrew config get agent.acp_backend`, and check **Settings → Agent Harness**
-to confirm the harness is installed. To move crew-member DM sessions too, set
+to confirm the harness is installed. To move Bot DM sessions too, set
 `agent.member_acp_backend` the same way (`kiro` there selects KAS, not
 kiro-cli).
 
@@ -438,7 +440,7 @@ and configure it:
 | Binary override env var | `OPENCODE_BIN` | `PI_ACP_BIN` / `PI_ACP_PI_COMMAND` | `GOOSE_BIN` |
 | Provider config | `provider.<id>` block in `opencode.json`, `@ai-sdk/openai-compatible` for a local/compatible endpoint | `providers.<id>` block in `~/.pi/agent/models.json`, `api: "openai-completions"` for a local/compatible endpoint | `goose configure` / `~/.config/goose/config.yaml` |
 | Hosted-provider sign-in | `opencode auth login` (OpenRouter and others) | `/login <provider>` inside the `pi` TUI | Per-provider, through `goose configure` |
-| Member DM dispatch | Supported (`agent.member_acp_backend`) | Supported | Supported |
+| Bots | DM dispatch tools only; workers and saved specs refused | DM dispatch tools, saved specs, and workers | DM dispatch tools only; workers and saved specs refused |
 
 Reach for **OpenCode** when your gateway host already has Node/npm and you are
 mainly pointing at LM Studio, OpenRouter, or Ollama through one JSON provider
@@ -476,7 +478,7 @@ command that installs it.
 
 | Symptom | Check |
 |---|---|
-| "OpenCode is not signed in" or "Pi is not signed in" when a chat starts | The harness found no usable provider. Run the sign-in step for OpenRouter, or add the LM Studio or Ollama provider entry, then start a new chat. |
+| "OpenCode has no model provider it can use" or "Pi is not signed in" when a chat starts | The harness found no usable provider. Run the sign-in step for OpenRouter, or add the LM Studio or Ollama provider entry, then start a new chat. With no provider of its own, OpenCode would start on its own hosted models, so Kiro Crew refuses the chat before anything is sent. To use those hosted models on purpose, pick one in the model picker or set it as `model` in `opencode.json`. |
 | The model is missing from the Kiro Crew picker | Run `opencode models <provider>` or Pi's `/model` (goose: `/model` inside its TUI). If the harness does not list it, fix the harness config first. If it does, start a new chat so a session reports it. |
 | LM Studio requests fail | `curl http://localhost:1234/v1/models` must answer on the gateway host. Check that the server is started and the port in the config matches. |
 | Harness cannot reach Ollama | `curl http://HOST:11434/api/tags` must answer from the Kiro Crew host. For a remote host, confirm `OLLAMA_HOST=0.0.0.0:11434` on the Ollama side and that the firewall allows port `11434`. |
@@ -484,8 +486,8 @@ command that installs it.
 | `opencode models openrouter` answers "Provider not found" | No OpenRouter key is stored yet. Run `opencode auth login` and choose OpenRouter. |
 | A turn on Ollama stalls or loops without using tools | The chosen Ollama model likely lacks tool/function-calling support. Pick a tool-capable model from [ollama.com/library](https://ollama.com/library). |
 | New chats still hit the cloud after switching to a local harness | The switch applies on the next session - start a new chat. Re-read `agent.acp_backend` with `kirocrew config get agent.acp_backend`; an explicit value that is unrecognized or unselectable falls back to the Kiro CLI (kiro-cli) floor, not KAS. |
-| The selected harness is not installed | **Settings → Agent Harness** reports a missing harness binary and prints the command that installs it (`npm i -g opencode-ai@1`, Pi's install command, or goose's `download_cli.sh`). If the binary lives somewhere unusual, set `OPENCODE_BIN` / `PI_ACP_BIN` / `GOOSE_BIN`. |
-| A Crew Member DM does not use the model | Member threads follow `agent.member_acp_backend`, not `agent.acp_backend`. See section 1 and section 6. |
+| The selected harness is not installed | **Settings → Agent Harness** reports a missing harness binary and prints the command that installs it (`npm i -g opencode-ai@1`, Pi's install command, or goose's `download_cli.sh`). OpenCode's own installer folder (`~/.opencode/bin`) is searched too, so **Check again** finds an install made while the gateway runs. If the binary lives somewhere unusual, set `OPENCODE_BIN` / `PI_ACP_BIN` / `GOOSE_BIN`. |
+| A Bot DM does not use the model | Bot threads follow `agent.member_acp_backend` when it is set; when it is unset they follow `agent.acp_backend` only onto a harness that can carry their workers, which OpenCode and goose cannot, so they run on KAS. See section 1. |
 
 For the authoritative backend reference, see the `agent.acp_backend` section of
 [configuration.md](../../src/kiro_crew/docs/configuration.md).

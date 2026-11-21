@@ -63,6 +63,7 @@ from kiro_crew.apps.manifest_containment import (  # noqa: F401
     _declared_agent_names,
     _has_dotdot_segment,
     _is_rooted_path,
+    _is_shipped_builtin_root,
     app_root_containment,
     contain_command_agents,
     contained_in_screened_root,
@@ -136,6 +137,17 @@ from kiro_crew.apps.manifest_contributes import (  # noqa: F401
     _normalize_status_path,
     _strict_int,
 )
+from kiro_crew.apps.manifest_memory_providers import (  # noqa: F401
+    _MEMORY_PROVIDER_KEYS,
+    MAX_MEMORY_PROVIDERS_PER_APP,
+    MEMORY_PROVIDER_DESCRIPTION_MAX,
+    MEMORY_PROVIDER_ID_RE,
+    MEMORY_PROVIDER_NAME_MAX,
+    MEMORY_PROVIDER_PAGE_RE,
+    MEMORY_PROVIDER_ROUTE_RE,
+    MemoryProviderDecl,
+    MemoryProvidersConfig,
+)
 from kiro_crew.apps.manifest_names import (  # noqa: F401
     APP_NAME_MAX_LENGTH,
     KEBAB_RE,
@@ -153,6 +165,9 @@ from kiro_crew.apps.manifest_sections import (  # noqa: F401
     _L10N_QUOTED_CHARS,
     _L10N_QUOTED_KEYS,
     _OVERLAY_SLUG_RE,
+    BOT_GRANT_FAMILIES,
+    BOT_GRANT_FAMILY,
+    BOT_SCOPE_NAMES,
     L10N_LOCALE_RE,
     L10N_TEXT_CAPS,
     LIFECYCLE_SCRIPT_TIMEOUT_DEFAULT,
@@ -180,9 +195,11 @@ from kiro_crew.apps.manifest_sections import (  # noqa: F401
     UIOverlay,
     UIPage,
     UISidebar,
+    _bot_scopes,
     _granted_list,
     _l10n_quoted,
     _sidebar_order,
+    bot_grant_entries,
     clamp_lifecycle_timeout,
     lifecycle_timeout_error,
     lifecycle_timeout_seconds,
@@ -255,9 +272,12 @@ def cron_permission_error(manifest: AppManifest) -> str:
 #:
 #: * ``apps/routes.py`` ``setup_routes`` -- ``manifest``, ``config``, and the lifecycle
 #:   verbs ``uninstall`` (whose ``uninstall/preview`` child is covered by the segment),
-#:   ``update``, ``enable``, ``disable``, ``open``, ``dev``, ``migrate-cleanup``
+#:   ``update``, ``enable``, ``disable``, ``open``, ``dev``, ``migrate-cleanup``,
+#:   ``bot-grants``
+#: * ``apps/routes_kiro.py`` -- ``kiro``
 #: * ``dashboard/routes/system.py`` -- ``token``
 #: * ``apps/job_routes.py`` -- ``_jobs``
+#: * ``apps/sel_routes.py`` -- ``_sel``
 #:
 #: A NEW core route mounted under ``/api/apps/{name}/`` MUST be added here in the same
 #: commit, or an app can claim it; ``test_file_menu_items.py`` scans those sources and
@@ -267,11 +287,14 @@ def cron_permission_error(manifest: AppManifest) -> str:
 CORE_APP_ROUTE_SEGMENTS = frozenset(
     {
         "_jobs",
+        "_sel",
+        "bot-grants",
         "config",
         "dev",
         "disable",
         "enable",
         "frames",
+        "kiro",
         "manifest",
         "migrate-cleanup",
         "open",
@@ -371,7 +394,8 @@ def app_endpoint_allowed(
     # at install, so those apps could not contribute a row at all.
     #
     # It is a per-caller flag rather than a blanket widening because this is the ONE
-    # shared endpoint check (see ``test_app_endpoint_allowed_is_the_one_shared_check``)
+    # shared endpoint check (its edges are pinned by
+    # ``test_app_endpoint_allowed_is_the_one_shared_check``)
     # and its other caller, the publish-provider registry in ``routes_listing.py``, states
     # ``/api/apps/<app>/`` as its contract in its own refusal message. Widening the
     # helper for everyone would have broadened that surface silently.
@@ -435,6 +459,14 @@ _KNOWN_FIELDS = frozenset(
         "agentReadOnlyDirs",
     }
 )
+
+
+def _optional_text(value: Any) -> str:
+    """An optional display string from app.json: JSON ``null`` is no value.
+
+    ``str(None)`` would show the word "None" as the app's author or licence.
+    """
+    return "" if value is None else str(value)
 
 
 @dataclass
@@ -567,6 +599,9 @@ class AppManifest:
             name_error = app_name_error(self.name)
             if name_error:
                 errors.append(name_error)
+            elif self.backend.webOrigin and len(self.name) > 63:
+                # The name becomes a DNS label in its web origin's host name.
+                errors.append("backend.webOrigin needs an app name of at most 63 characters")
 
         if not self.version:
             errors.append("missing required field: version")
@@ -661,6 +696,8 @@ class AppManifest:
                 report_path(refusal, f"ui page entryPoint {refusal}: {page.entryPoint!r}")
 
         # UI overlay validation
+        errors.extend(self.ui.frame_source_errors())
+        errors.extend(self.permissions.list_errors())
         seen_overlay_ids: set[str] = set()
         for overlay in self.ui.overlays:
             if not overlay.id:
@@ -808,6 +845,7 @@ class AppManifest:
         from kiro_crew.apps.app_frame import process_backed
 
         errors.extend(self.agentTools.validate(self.name, process_backed(self)))
+        errors.extend(self.contributes.memoryProviders.validate(process_backed(self)))
 
         # A contributed command's `agent` is contained to the agents THIS app ships.
         # The prompt is app-authored, so letting it name any host agent would let an
@@ -1264,8 +1302,8 @@ class AppManifest:
             version=str(data.get("version", "")),
             displayName=str(data.get("displayName", "")),  # noqa: N815
             description=str(data.get("description", "")),
-            author=str(data.get("author", "")),
-            license=str(data.get("license", "")),
+            author=_optional_text(data.get("author")),
+            license=_optional_text(data.get("license")),
             minKiroCrewVersion=str(data.get("minKiroCrewVersion", "")),  # noqa: N815
             signer=str(data.get("signer", "")),
             signature=str(data.get("signature", "")),
@@ -1511,13 +1549,10 @@ def requirements_in_tree(app_root: Path, req_file: Path) -> tuple[Path, Path] | 
     """The strictly-resolved ``(app_root, requirements.txt)`` pair when *req_file*
     is one the runtime will read, else ``None``.
 
-    The provisioner's own acceptance rule for the file, spelled once: the entry
-    must strictly resolve (a dangling link is ``None``) to a regular file (a
-    directory is ``None``) inside the strictly-resolved app root (a link that
-    escapes it is ``None``), no larger than :data:`REQUIREMENTS_TXT_MAX_BYTES`
-    (an oversized file is ``None``; the provisioner's bounded read refuses it).
-    ``requirements.txt -> requirements/prod.txt`` is legitimate layout and
-    resolves.
+    The provisioner's acceptance rule for the file, spelled once in :func:`requirements_verdict`
+    with the cause of each refusal: the entry must strictly resolve to a regular file inside the
+    strictly-resolved app root, no larger than :data:`REQUIREMENTS_TXT_MAX_BYTES`. A link such as
+    ``requirements.txt -> requirements/prod.txt`` that stays inside the root resolves.
 
     Three callers, one rule. ``backend_runtime/provisioning.py``'s provisioning read and its
     activation gate use it as the fast refusal before their descriptor-pinned,
@@ -1527,20 +1562,26 @@ def requirements_in_tree(app_root: Path, req_file: Path) -> tuple[Path, Path] | 
     gate uses it to predict what those two will do, so it never waives a file the
     provisioner would refuse. ``None`` on any resolution error, so no caller catches here.
     """
+    return requirements_verdict(app_root, req_file)[0]
+
+
+def requirements_verdict(app_root: Path, req_file: Path) -> tuple[tuple[Path, Path] | None, str]:
+    """The rule itself: ``(pair, "")`` on accept, else ``(None, cause)`` naming no path."""
+    cause = "the app directory could not be resolved"
     try:
         root_resolved = app_root.resolve(strict=True)
+        cause = "it is missing, a dangling symlink or a symlink loop"
         target = req_file.resolve(strict=True)
-        if not target.is_file() or not target.is_relative_to(root_resolved):
-            return None
+        cause = "it could not be read"
+        if not target.is_file():
+            return None, "it is not a regular file"
+        if not target.is_relative_to(root_resolved):
+            return None, "it resolves outside the app directory (only in-tree links are followed)"
         if target.stat().st_size > REQUIREMENTS_TXT_MAX_BYTES:
-            return None
-    except (OSError, RuntimeError):
-        # RuntimeError: a symlink loop, which Path.resolve raises as such before
-        # Python 3.13 (ELOOP, an OSError, from then on). Either way "not a file
-        # the runtime will read", never an exception for a caller to turn into a
-        # 500.
-        return None
-    return root_resolved, target
+            return None, f"it is larger than the {REQUIREMENTS_TXT_MAX_BYTES}-byte size cap"
+    except (OSError, RuntimeError):  # RuntimeError: a symlink loop before Python 3.13
+        return None, cause
+    return (root_resolved, target), ""
 
 
 #: Cron helpers served as attributes of this module on first access, so

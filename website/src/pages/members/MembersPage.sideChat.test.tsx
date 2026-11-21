@@ -15,6 +15,8 @@ import { __resetPanelTabs } from '../../hooks/usePanelTabs'
 vi.mock('../../api/client', () => ({
   api: {
     members: vi.fn(),
+    // The owner check behind Import from file (`useViewerIsNotOwner`): the owner.
+    viewerOwnerOk: vi.fn(() => Promise.resolve(true)),
     // The roster's team grouping reads the team list; "no teams" keeps the
     // list flat, which is the shape every case here was written against.
     teams: { list: vi.fn(() => Promise.resolve({ teams: [] })) },
@@ -204,9 +206,9 @@ describe('MembersPage Side Chat in the side panel (selection Ask)', () => {
     // The collision surfaces as its own notice; no pane, so no Ask …
     await screen.findByTestId('member-thread-collision')
     expect(screen.queryByTestId('chat-pane-stub')).toBeNull()
-    // … and the strip is the slot-free bucket: Dashboard only. Side Chat
+    // … and the strip is the slot-free bucket: Dashboard and Sessions. Side Chat
     // remains dynamic and requires a confirmed member thread.
-    await waitFor(() => expect(tabLabels()).toEqual(['Dashboard']))
+    await waitFor(() => expect(tabLabels()).toEqual(['Dashboard', 'Sessions']))
     expect(screen.queryByTestId('side-chat-stub')).toBeNull()
   })
 })

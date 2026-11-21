@@ -64,6 +64,8 @@ Site = tuple[str, str]
 # (module path under src/kiro_crew, dotted enclosing function) -> gates referenced.
 ADMISSION_SITES: dict[Site, frozenset[str]] = {
     ("acp/client_start.py", "_spawn"): frozenset({FORK, FRESH}),
+    # A claude session's own agent on a process a session tree shares.
+    ("acp/harness/claude.py", "ClaudeHarness.prepare_session"): frozenset({FRESH}),
     ("acp/harness/kas.py", "KasHarness.session_extras._build"): frozenset({FORK, FRESH}),
     ("acp/harness/kiro.py", "KiroHarness.resolve_spawn"): frozenset({FORK}),
     # A KAS session's sub-agent target, registered in the same batch as its agent.
@@ -76,6 +78,12 @@ ADMISSION_SITES: dict[Site, frozenset[str]] = {
 
 # Per admission site: (gates it does not reference, whether something else covers it).
 KNOWN_GAPS: dict[Site, tuple[frozenset[str], str]] = {
+    ("acp/harness/claude.py", "ClaudeHarness.prepare_session"): (
+        frozenset({FORK}),
+        "covered for a joiner by ChatSharePlacement._admit_joiner, which checks fork "
+        "governance for the agent the joining session runs; the founding session's "
+        "agent is the spawn's, whose gap the _resolve_spawn_plan entry names",
+    ),
     ("acp/harness/kiro.py", "KiroHarness.resolve_spawn"): (
         frozenset({FRESH}),
         "covered: AcpRuntime._resolve_spawn_plan runs the freshness gate after this "
@@ -141,6 +149,10 @@ AGENT_ARGV_SITES: dict[Site, tuple[Site, ...] | str] = {
     ("mcp_gateway/rewriter_spec.py", "_refusing_stub_entry"): (
         "not a kiro-cli spawn: the agent name is an argument to the MCP gateway stub, "
         "which runs with --refuse and starts nothing"
+    ),
+    ("mcp_gateway/footprint_probe.py", "_probe_argv"): (
+        "not a kiro-cli spawn: the agent name is an argument to the one idle MCP "
+        "gateway stub the footprint probe measures, which serves no backend"
     ),
     ("testing/workflow_memory_scenario.py", "respond"): (
         "not a kiro-cli spawn: a test scenario reading its own argv"

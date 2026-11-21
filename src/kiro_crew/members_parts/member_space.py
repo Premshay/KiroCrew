@@ -13,14 +13,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import stat
 from collections.abc import Container, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from kiro_crew import platform_compat
 from kiro_crew.artifacts import slugify
-from kiro_crew.atomic_write import atomic_write, read_bytes_with_retry
+from kiro_crew.atomic_write import read_bytes_with_retry
 from kiro_crew.config.paths import data_home
 from kiro_crew.external_text import external_text_requires_redaction
 from kiro_crew.slugs import slug_hash_fallback
@@ -42,12 +44,11 @@ MEMBERS_DIR_NAME = "members"
 ACTIVITY_FILE_NAME = "activity.jsonl"
 
 # LEGACY ONLY. Nothing writes this file: participation events go to the
-# per-member append-only event log, and :func:`read_activity` reads that log
-# rather than this path. It survives as a migration SOURCE, folded in once per
-# member and then retired by rename (see the event-log service). Bounding it by
-# size therefore has nothing to bound, since the writer that grew it is gone;
-# the fold streams it under its own byte budget instead, because the file stays
-# agent-writable whatever its size.
+# per-member append-only event log, which :func:`read_activity` reads. It is
+# kept as a migration SOURCE, folded in once per member and then retired by
+# rename (see the event-log service). No size cap is needed since nothing
+# grows it; the fold streams it under its own byte budget because the file
+# stays agent-writable.
 
 #: Crew-slug -> DM-thread binding inside a member's directory.
 DM_FILE_NAME = "dm.json"
@@ -516,6 +517,10 @@ def member_dir(slug: str) -> Path:
     """Absolute path to one member's directory, containment-checked.
 
     Does NOT create the directory; :func:`record_activity` creates it on demand.
+
+    Read-only site: the link at ``members`` is resolved by name here and nothing is
+    written. Code that writes under ``members`` opens
+    :func:`kiro_crew.member_folder.open_member_folder` and keeps to the held folder.
     """
     validate_slug(slug)
     root = members_root().resolve()
@@ -549,13 +554,24 @@ CREATE_REQUEST_FILENAME = "create_request.json"
 
 def _write_member_record(name: str, config, filename: str, record: dict[str, str]) -> None:
     """Write *record* as *filename* in member *name*'s directory. Blocking IO."""
-    path = member_dir(member_slug(name, config)) / filename
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Mate's welcome is written at boot, before the gateway's own owner-only sweep
-    # runs, so the chain this creates is tightened here (members/ and members/<slug>/).
-    for _dir in (path.parent, path.parent.parent):
-        platform_compat.restrict_dir_to_owner(_dir)
-    atomic_write(path, json.dumps(record) + "\n")
+    from kiro_crew.member_folder import open_member_folder
+
+    with open_member_folder(member_slug(name, config)) as folder:
+        # Mate's welcome is written at boot, before the gateway's own owner-only sweep
+        # runs, so the chain this creates is tightened here (members/ and members/<slug>/).
+        # Both levels are tightened through their descriptors. Without descriptors the
+        # walk has just refused a link by name, and they stay by name. When ``members``
+        # is a link, the folder it names is somewhere else and its mode is left as it is.
+        if folder.fd is None:
+            platform_compat.restrict_dir_to_owner(folder.path)
+        else:
+            os.fchmod(folder.fd, stat.S_IRWXU)
+        if not folder.members_is_link:
+            if folder.parent_fd is not None:
+                os.fchmod(folder.parent_fd, stat.S_IRWXU)
+            else:
+                platform_compat.restrict_dir_to_owner(folder.path.parent)
+        folder.write(filename, json.dumps(record) + "\n")
 
 
 def _read_member_record(slug: str, filename: str, member: str) -> dict | None:

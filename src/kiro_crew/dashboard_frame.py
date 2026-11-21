@@ -74,7 +74,7 @@ import json
 import logging
 import math
 import re
-from typing import Any, Callable, Final, Mapping, cast
+from typing import Any, Final, Mapping, cast
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +167,23 @@ WINDOW_GLOBAL: Final[str] = "kirocrew"
 BINDING_ATTRIBUTE: Final[str] = "data-dashboard-field"
 
 _DATA_ELEMENT_ID = "kirocrew-dashboard-data"
+
+#: The attribute the frame marks its colour scheme with, on ``<body>``: ``data-mode="light"``
+#: or ``data-mode="dark"``. MIRRORED from the browser wrapper's ``FRAME_MODE_ATTRIBUTE``
+#: (``website/src/lib/widgetSrcdoc.ts``), which marks the tab's frame; a test pins the two
+#: equal. An attribute and not a class, because the body shares the page's class namespace:
+#: a page that styles its own ``.light`` or ``.dark`` element would style the body too, in
+#: whichever theme matches the name, and lay the whole page out inside that rule.
+MODE_ATTRIBUTE: Final[str] = "data-mode"
+
+#: The scheme an offline run draws. Every document this module composes whole -- the
+#: save's check and the snapshot -- is drawn in the dashboard's default light look
+#: (:mod:`kiro_crew.dashboard_snapshot_look`); the tab writes the person's own scheme
+#: into the body it builds. Marked here so an offline run meets the same body the tab
+#: shows, and a page that collides with the marker fails where its author can still see.
+OFFLINE_MODE: Final[str] = "light"
+
+_BODY_OPEN = f'<body {MODE_ATTRIBUTE}="{OFFLINE_MODE}">\n'
 
 #: Document-skeleton tags a page must not carry.
 #:
@@ -459,60 +476,6 @@ def code_spans(html: str, limit: int | None = None) -> list[tuple[int, int]]:
             if limit is not None and len(spans) >= limit:
                 break
     return spans
-
-
-#: How many script and style texts :func:`map_page_text` leaves out of the markup function.
-#: Each stretch between them is a separate call, so a page of thousands of tiny elements
-#: would cost far more than one call over the whole page. Past this many, the rest of the
-#: page goes to the markup function, which is the stricter of the two.
-MAX_CODE_PIECES: Final[int] = 256
-
-
-def map_page_text(html: str, markup: Callable[[str], str], code: Callable[[str], str]) -> str:
-    """What *markup* makes of *html*, except that the text of its script and style elements is *code*'s.
-
-    *markup* is the baseline: the answer for the whole page is its answer, and the one change
-    allowed is to put *code*'s result for an element's text where *markup*'s was. So the page
-    differs from the baseline only inside script and style text, and only by what *code* leaves
-    out. A page with no such text, and a page *markup* does not change, never reaches *code*.
-
-    The baseline is cut at the script and style text :func:`code_spans` finds in *html*, and
-    the pieces are scrubbed one by one. A rule that reaches across a cut (a PEM block, a
-    labelled value) makes the pieces differ from the baseline, and then the baseline is the
-    answer. The browser reads the page this returns, so the result is scanned again, and unless
-    the kept text is still exactly its script and style text the baseline is the answer as well.
-    """
-    baseline = markup(html)
-    spans = code_spans(html, MAX_CODE_PIECES)
-    if not spans or baseline == html:
-        return baseline
-    pieces: list[str] = []
-    swapped: list[str] = []
-    kept: list[tuple[int, int]] = []  # where each kept text sits in the joined pieces
-    at = served_len = 0
-    for (start, end), is_text in zip(
-        (*spans, (len(html), len(html))), (*([True] * len(spans)), False)
-    ):
-        outside = html[at:start]
-        if outside:
-            scrubbed = markup(outside)
-            pieces.append(scrubbed)
-            swapped.append(scrubbed)
-            served_len += len(scrubbed)
-        if is_text:
-            text = html[start:end]
-            pieces.append(markup(text))
-            kept_text = code(text)
-            swapped.append(kept_text)
-            kept.append((served_len, served_len + len(kept_text)))
-            served_len += len(kept_text)
-        at = end
-    if "".join(pieces) != baseline:
-        return baseline
-    served = "".join(swapped)
-    if code_spans(served, MAX_CODE_PIECES) != kept:
-        return baseline
-    return served
 
 
 #: Escapes applied inside the data island's JSON string literals.
@@ -1287,7 +1250,8 @@ def compose(html: str, read: Mapping[str, Any], title: str = "") -> str:
     2. the inert data island, then the bootstrap that freezes it onto ``window``
        and binds the fields -- both before the page, so the page's first inline
        script already sees its values;
-    3. the page, verbatim, inside ``<body>``;
+    3. the page, verbatim, inside ``<body>``, which carries the scheme marker the tab's
+       frame puts on its own body (:data:`MODE_ATTRIBUTE`, :data:`OFFLINE_MODE`);
     4. the readiness beacon, which only a page whose own scripts survived reaches.
 
     The host draws no markup of its own above the page. A field that did not resolve
@@ -1325,7 +1289,7 @@ def compose(html: str, read: Mapping[str, Any], title: str = "") -> str:
         f"<title>{_escape_html_text(title or 'Dashboard')}</title>\n"
         f"<style>{_HOST_CSS}</style>\n"
         "</head>\n"
-        "<body>\n"
+        f"{_BODY_OPEN}"
         f"{island}\n"
         # BEFORE the page, so an error in the page's first script is counted.
         f"<script>{_INIT_GUARD_JS}</script>\n"
@@ -1449,9 +1413,10 @@ def _js_json(value: Any) -> str:
 def _as_text(value: Any) -> str:
     """A value as the page would show it, matching the bootstrap's own ``text()``.
 
-    Spelled twice because the two run in different languages on the same contract; a
-    test pins them to the same three rules so a page filled here and a page filled by
-    the script cannot disagree about one value. A number is spelled the way JS spells
+    Spelled twice because the two run in different languages on the same contract, so
+    a page filled here and a page filled by the script must agree about one value. No
+    test runs the script's ``text()`` beside this one; a change to either side must
+    update the other by hand. A number is spelled the way JS spells
     the number the bootstrap parsed, so ``3.0`` reads ``3`` on both pages.
     """
     if value is None:
@@ -1561,7 +1526,7 @@ def compose_body(html: str, read: Mapping[str, Any]) -> str:
     differently.
     """
     document = compose(html, read)
-    start = document.index("<body>\n") + len("<body>\n")
+    start = document.index(_BODY_OPEN) + len(_BODY_OPEN)
     end = document.rindex("</body>")
     # The host builds the HEAD, so everything this module puts there is dropped by the
     # slice -- including its own stylesheet, which is not decoration: it is what dims a

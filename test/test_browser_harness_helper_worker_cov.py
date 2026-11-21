@@ -7,9 +7,14 @@ in-memory stdin/stdout, so each request path is observed by its reply.
 
 from __future__ import annotations
 
+import base64
+import gzip
+import http.server
 import io
 import json
+import socketserver
 import sys
+import threading
 import types
 from typing import Any
 
@@ -179,7 +184,7 @@ def test_main_answers_each_line_in_order_and_exits_cleanly_at_eof(
             "{not json",
             json.dumps([1, 2, 3]),
             json.dumps({"id": 2, "helper": "goto", "kwargs": {"url": "https://a.test"}}),
-            json.dumps({"id": 3, "helper": "http_get", "kwargs": {"url": "x"}}),
+            json.dumps({"id": 3, "helper": "upload_file", "kwargs": {"path": "x"}}),
         ]
     )
     code, replies = _run_main(monkeypatch, lines + "\n", helpers)
@@ -190,7 +195,7 @@ def test_main_answers_each_line_in_order_and_exits_cleanly_at_eof(
     assert replies[2]["id"] is None and replies[2]["ok"] is False
     assert "helper not allowed" in replies[2]["error"]
     assert replies[3] == {"id": 2, "ok": True, "result": {"url": "https://a.test"}}
-    assert replies[4]["id"] == 3 and "not allowed: http_get" in replies[4]["error"]
+    assert replies[4]["id"] == 3 and "not allowed: upload_file" in replies[4]["error"]
     assert len(replies) == 5, "blank lines get no reply"
 
 
@@ -202,3 +207,216 @@ def test_main_reports_a_missing_harness_on_the_pipe_and_exits_1(
     assert len(replies) == 1
     assert replies[0]["id"] is None and replies[0]["ok"] is False
     assert replies[0]["error"].startswith("import failed:")
+
+
+# --- screenshot_clip ---------------------------------------------------------------
+
+
+class _ClipHelpers:
+    """Answers the three CDP calls ``screenshot_clip`` makes."""
+
+    def __init__(self, *, ratio: Any = 2, page_x: float = 0, page_y: float = 100, data: Any = None):
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self._ratio, self._x, self._y = ratio, page_x, page_y
+        self._data = base64.b64encode(b"\x89PNG-clip").decode() if data is None else data
+
+    def cdp(self, method: str, **params: Any) -> dict[str, Any]:
+        self.calls.append((method, params))
+        if method == "Page.getLayoutMetrics":
+            return {"cssVisualViewport": {"pageX": self._x, "pageY": self._y}}
+        if method == "Runtime.evaluate":
+            return {"result": {"value": self._ratio}}
+        return {"data": self._data}
+
+    def clip(self) -> dict[str, Any]:
+        (params,) = [p for m, p in self.calls if m == "Page.captureScreenshot"]
+        return params["clip"]
+
+
+def _clip_request(tmp_path: Any, **kwargs: Any) -> dict[str, Any]:
+    base = {
+        "path": str(tmp_path / "c.png"),
+        "x": 10,
+        "y": 20,
+        "width": 200,
+        "height": 80,
+        "max_dim": 4096,
+        "magnify": 1.0,
+    }
+    return {"id": 9, "helper": "screenshot_clip", "kwargs": {**base, **kwargs}}
+
+
+def test_screenshot_clip_writes_the_decoded_image_and_shifts_the_box_by_the_scroll(
+    tmp_path: Any,
+) -> None:
+    helpers = _ClipHelpers()
+    reply = helper_worker._handle(helpers, _clip_request(tmp_path))
+    assert reply["ok"] is True
+    assert (tmp_path / "c.png").read_bytes() == b"\x89PNG-clip"
+    clip = helpers.clip()
+    assert (clip["x"], clip["y"], clip["width"], clip["height"]) == (10, 120, 200, 80)
+    assert clip["scale"] == 1.0
+
+
+def test_screenshot_clip_fits_the_longest_device_pixel_side_to_max_dim(tmp_path: Any) -> None:
+    helpers = _ClipHelpers(ratio=2)
+    helper_worker._handle(helpers, _clip_request(tmp_path, max_dim=200))
+    assert helpers.clip()["scale"] == pytest.approx(200 / (200 * 2))
+
+
+def test_screenshot_clip_magnifies_a_small_box_but_not_past_the_limit(tmp_path: Any) -> None:
+    helpers = _ClipHelpers(ratio=1)
+    helper_worker._handle(
+        helpers, _clip_request(tmp_path, width=40, height=10, max_dim=1568, magnify=4.0)
+    )
+    assert helpers.clip()["scale"] == 4.0
+    helpers = _ClipHelpers(ratio=1)
+    helper_worker._handle(
+        helpers, _clip_request(tmp_path, width=400, height=10, max_dim=1000, magnify=4.0)
+    )
+    assert helpers.clip()["scale"] == pytest.approx(2.5)
+
+
+def test_screenshot_clip_reads_an_unknown_pixel_ratio_as_one(tmp_path: Any) -> None:
+    helpers = _ClipHelpers(ratio=None)
+    helper_worker._handle(helpers, _clip_request(tmp_path, max_dim=100))
+    assert helpers.clip()["scale"] == pytest.approx(100 / 200)
+
+
+def test_screenshot_clip_with_no_image_is_an_error_reply_and_writes_nothing(
+    tmp_path: Any,
+) -> None:
+    reply = helper_worker._handle(_ClipHelpers(data=""), _clip_request(tmp_path))
+    assert reply["ok"] is False and "no image" in reply["error"]
+    assert not (tmp_path / "c.png").exists()
+
+
+class _DialogHelpers:
+    """A ``helpers`` stand-in whose page has at most one JavaScript dialog open."""
+
+    def __init__(self, dialog: dict[str, Any] | None) -> None:
+        self.dialog = dialog
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def page_info(self) -> dict[str, Any]:
+        if self.dialog:
+            return {"dialog": self.dialog}
+        return {"url": "https://example.com/", "title": "t", "w": 800, "h": 600}
+
+    def cdp(self, method: str, **params: Any) -> dict[str, Any]:
+        self.calls.append((method, params))
+        return {}
+
+
+def _dialog_request(**kwargs: Any) -> dict[str, Any]:
+    return {"id": 9, "helper": "dialog", "kwargs": kwargs}
+
+
+_PROMPT = {"type": "prompt", "message": "Name?", "defaultPrompt": "", "url": "https://x/"}
+
+
+def test_dialog_with_none_open_answers_none_and_sends_nothing() -> None:
+    helpers = _DialogHelpers(None)
+    reply = helper_worker._handle(helpers, _dialog_request(action="accept"))
+    assert reply == {"id": 9, "ok": True, "result": {"dialog": None}}
+    assert helpers.calls == []
+
+
+def test_dialog_without_an_action_reads_the_open_dialog_and_leaves_it() -> None:
+    helpers = _DialogHelpers(_PROMPT)
+    reply = helper_worker._handle(helpers, _dialog_request())
+    assert reply["ok"] is True and reply["result"] == {"dialog": _PROMPT}
+    assert helpers.calls == []
+
+
+def test_dialog_accept_hands_a_prompt_its_text() -> None:
+    helpers = _DialogHelpers(_PROMPT)
+    reply = helper_worker._handle(helpers, _dialog_request(action="accept", text="Ada"))
+    assert reply["result"] == {"dialog": _PROMPT, "answered": "accept"}
+    assert helpers.calls == [("Page.handleJavaScriptDialog", {"accept": True, "promptText": "Ada"})]
+
+
+def test_dialog_accept_without_text_sends_no_prompt_text() -> None:
+    helpers = _DialogHelpers(_PROMPT)
+    helper_worker._handle(helpers, _dialog_request(action="accept"))
+    assert helpers.calls == [("Page.handleJavaScriptDialog", {"accept": True})]
+
+
+def test_dialog_dismiss_never_sends_text() -> None:
+    helpers = _DialogHelpers(_PROMPT)
+    reply = helper_worker._handle(helpers, _dialog_request(action="dismiss", text="Ada"))
+    assert reply["result"]["answered"] == "dismiss"
+    assert helpers.calls == [("Page.handleJavaScriptDialog", {"accept": False})]
+
+
+def test_dialog_refuses_an_action_it_does_not_know() -> None:
+    helpers = _DialogHelpers(_PROMPT)
+    reply = helper_worker._handle(helpers, _dialog_request(action="explode"))
+    assert reply["ok"] is False and "action" in reply["error"]
+    assert helpers.calls == []
+
+
+# --- http_get ----------------------------------------------------------------
+
+
+class _Site(http.server.BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802 - the stdlib's handler name
+        if self.path == "/hop":
+            self.send_response(302)
+            self.send_header("Location", "http://127.0.0.1:1/private")
+            self.end_headers()
+        elif self.path == "/big":
+            body = gzip.compress(b"x" * (helper_worker.HTTP_BODY_CAP_BYTES + 10))
+            self.send_response(200)
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"<title>Example</title>")
+
+    def log_message(self, *_args: Any) -> None:
+        pass
+
+
+class _LoopbackServer(http.server.ThreadingHTTPServer):
+    # The plain bind resolves the host name, which can stall on macOS.
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "127.0.0.1", self.server_address[1]
+
+
+@pytest.fixture
+def site() -> Any:
+    server = _LoopbackServer(("127.0.0.1", 0), _Site)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=5)
+
+
+def _http_get(url: str) -> dict[str, Any]:
+    request = {"id": 1, "helper": "http_get", "kwargs": {"url": url, "timeout": 5.0}}
+    return helper_worker._handle(object(), request)
+
+
+def test_http_get_answers_a_redirect_instead_of_following_it(site: str) -> None:
+    reply = _http_get(f"{site}/hop")
+    assert reply == {
+        "id": 1,
+        "ok": True,
+        "result": {"status": 302, "location": "http://127.0.0.1:1/private"},
+    }
+
+
+def test_http_get_returns_the_page_text(site: str) -> None:
+    assert _http_get(f"{site}/")["result"] == "<title>Example</title>"
+
+
+def test_http_get_reads_at_most_its_cap_of_a_gzip_body(site: str) -> None:
+    result = _http_get(f"{site}/big")["result"]
+    assert result == "x" * helper_worker.HTTP_BODY_CAP_BYTES

@@ -30,6 +30,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import re
 import secrets
 import time
 import urllib.parse
@@ -55,6 +56,8 @@ _GOOGLE: dict[str, Any] = {
     # the account, so two cards share a grant only on the same account.
     "extra_scopes": ("openid",),
     "grant_group": "google",
+    # https://accounts.google.com/.well-known/openid-configuration
+    "issuer": "https://accounts.google.com",
     # Google revokes across every client of one Cloud project, so sharing is
     # judged by the project number that leads each client id.
     "grant_by_project": True,
@@ -67,7 +70,12 @@ DCR_SLUGS = frozenset({"atlassian", "notion", "linear", "stripe", "vercel", "git
 #: token, else the access token); without it the revoke is GitHub's token-scoped
 #: DELETE. ``authorize_params`` are added to the consent URL. Slugs with the same
 #: ``grant_group``, client id and account share one upstream grant.
-#: ``extra_scopes`` are appended to the registry's scopes.
+#: ``extra_scopes`` are appended to the registry's scopes. ``issuer`` is the vendor's
+#: published ``issuer`` (RFC 9207), set only where the vendor's public metadata also says its
+#: authorization response carries ``iss`` (Google: its metadata's
+#: ``authorization_response_iss_parameter_supported``): a callback whose ``iss`` names any
+#: other server, or is missing, is refused. An entry without one (GitHub,
+#: Asana, Slack: no documented ``iss`` in the response) is not checked.
 _ENDPOINTS: dict[str, dict[str, Any]] = {
     "github": {
         "authorize": "https://github.com/login/oauth/authorize",
@@ -81,6 +89,24 @@ _ENDPOINTS: dict[str, dict[str, Any]] = {
         "token": "https://app.asana.com/-/oauth_token",
         "revoke": "https://app.asana.com/-/oauth_revoke",
         "revoke_form": ("token", "client_id", "client_secret"),
+    },
+    # Slack's MCP authorization server (https://mcp.slack.com/.well-known/
+    # oauth-authorization-server): user-token consent and token endpoints,
+    # client_secret_post, PKCE S256. Slack's MCP docs require the app's client
+    # secret (docs.slack.dev/ai/slack-mcp-server); refresh tokens rotate and are
+    # single-use (docs.slack.dev/authentication/using-token-rotation).
+    "slack": {
+        "authorize": "https://slack.com/oauth/v2_user/authorize",
+        "token": "https://slack.com/api/oauth.v2.user.access",
+        # Revokes one token, the access token (docs.slack.dev/reference/methods/
+        # auth.revoke); Slack answers 200 and reports the outcome in the body.
+        # shortcut: no Slack endpoint revokes a refresh token, so the rotating
+        # refresh token stays live upstream until its 30-day expiry; the card's
+        # revoke page ends the whole grant.
+        "revoke": "https://slack.com/api/auth.revoke",
+        "revoke_form": ("token",),
+        "revoke_token": "access",
+        "revoke_ok_field": "revoked",
     },
     **{
         slug: _GOOGLE
@@ -105,7 +131,9 @@ _REFRESH_SKEW_SECS = 120.0
 SIGN_IN_TTL_SECS = 600.0
 _HTTP_TIMEOUT_SECS = 20.0
 #: Refresh errors that mean the stored refresh token is dead (after one re-read).
-_DEAD_GRANT_ERRORS = frozenset({"bad_refresh_token", "invalid_grant", "unauthorized_client"})
+_DEAD_GRANT_ERRORS = frozenset(
+    {"bad_refresh_token", "invalid_grant", "invalid_refresh_token", "unauthorized_client"}
+)
 #: The ``error`` values of an authorization error response (RFC 6749 §4.1.2.1),
 #: each with the code a refused sign-in records. Closed on purpose: the vendor
 #: writes ``error``, so any other value, or none, records :data:`CALLBACK_REFUSED`
@@ -138,6 +166,20 @@ class CrewOAuthError(Exception):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+_NOT_CODE_CHARS = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def safe_error_code(value: Any, default: str) -> str:
+    """The vendor's ``error`` as a coarse code: ``[A-Za-z0-9_.-]``, at most 64 chars.
+
+    The vendor writes ``error``, so control characters, newlines and free text must
+    not reach a log line, an audit field, a mint row or the harness. Anything else
+    is dropped; *default* answers when nothing is left.
+    """
+    code = _NOT_CODE_CHARS.sub("", value)[:64] if isinstance(value, str) else ""
+    return code or default
 
 
 def enabled() -> bool:
@@ -230,36 +272,112 @@ def custody_on(slug: str) -> bool:
     return _held_key(slug) and enabled()
 
 
+def _registry_url_key(url: str) -> str:
+    """The form two MCP urls are compared in to tell whether they name one endpoint.
+
+    The shared fetch canonicalizer (``platform.spec_denied_gate.canonical_url``):
+    scheme and host case, a default port and a trailing host dot do not matter;
+    the path stays case-sensitive (``/mcp`` and ``/mcp/readonly`` differ). A url
+    it refuses keeps the plain string, so it matches nothing new.
+    """
+    from kiro_crew.platform.spec_denied_gate import canonical_url
+
+    return (canonical_url(url) or url).rstrip("/")
+
+
 def _is_registry_url(url: Any) -> bool:
     """Whether *url* is the MCP endpoint of a card Crew signs in to. Blocking.
 
     Such an entry belongs to that card (its client, port and vault key),
     whatever name it was added under: the owner-server path never claims it. A
     registry provider outside :data:`SUPPORTED_SLUGS` has no Crew sign-in on its
-    card, so its url takes the owner-server path like any other.
+    card, so its url takes the owner-server path like any other. A card that
+    leaves its slug and URL to the owner
+    (:func:`kiro_crew.connections.owner_servers.card_yields`) has neither a client
+    nor a grant to share, so its URL is not refused until it has one.
     """
+    from kiro_crew.connections.owner_servers import card_yields
     from kiro_crew.connections.registry import get_all_registry_providers
 
     if not isinstance(url, str):
         return False
-    wanted = url.rstrip("/")
+    wanted = _registry_url_key(url)
     return any(
-        p["slug"] in SUPPORTED_SLUGS and str(p["mcp_url"]).rstrip("/") == wanted
+        p["slug"] in SUPPORTED_SLUGS
+        and _registry_url_key(str(p["mcp_url"])) == wanted
+        and not card_yields(p)
         for p in get_all_registry_providers()
     )
 
 
-def signs_in_custom(entry: Any) -> bool:
+def _card_claims(name: str, entry: Any) -> bool:
+    """Whether a card Crew signs in to keeps *entry* off the owner-server path. Blocking.
+
+    True for an entry at such a card's url (:func:`_is_registry_url`), with one
+    exception: on a card whose source entries hold the user's own client
+    (``oauth_clients.keeps_user_client``, Slack), an entry the sealed owner record
+    names at this exact url, under a name other than the slug itself (a
+    letter-case variant included), stays the owner's. That card routes the exact
+    slug only (:func:`routed_slug`), so refusing the url would leave such an entry
+    on neither path.
+    """
+    from kiro_crew.config.loader import read_config_for_update
+    from kiro_crew.connections.oauth_clients import keeps_user_client
+    from kiro_crew.connections.owner_servers import is_owner_server
+    from kiro_crew.connections.registry import get_all_registry_providers, get_provider
+
+    url = entry.get("url") if isinstance(entry, dict) else None
+    if not _is_registry_url(url):
+        return False
+    # Same key as _is_registry_url: a variant that check claimed must find its
+    # card here too, or all([]) below would read as every card keeping its client.
+    wanted = _registry_url_key(str(url))
+    cards = [
+        str(p["slug"])
+        for p in get_all_registry_providers()
+        if p["slug"] in SUPPORTED_SLUGS and _registry_url_key(str(p["mcp_url"])) == wanted
+    ]
+    if get_provider(name) is not None or not all(keeps_user_client(s) for s in cards):
+        return True
+    try:
+        config = read_config_for_update()
+    except Exception:  # noqa: BLE001 -- an unreadable record proves nothing
+        return True
+    return not is_owner_server(config, name, entry)
+
+
+def _left_to_owner(name: str, entry: Any) -> bool:
+    """Whether *entry*, named for a registry slug, is the owner's own server. Blocking.
+
+    True only while the slug's card yields (``owner_servers.card_yields``) AND the
+    sealed owner record names this exact url, so an entry an agent added or
+    re-pointed still goes to the card's path.
+    """
+    from kiro_crew.config.loader import read_config_for_update
+    from kiro_crew.connections.owner_servers import card_yields, is_owner_server
+    from kiro_crew.connections.registry import get_provider
+
+    provider = get_provider(name)
+    if provider is None or not card_yields(provider):
+        return False
+    try:
+        config = read_config_for_update()
+    except Exception:  # noqa: BLE001 -- an unreadable record proves nothing
+        return False
+    return is_owner_server(config, name, entry)
+
+
+def signs_in_custom(name: str, entry: Any) -> bool:
     """Whether an owner-added server's dashboard sign-in runs through Crew. Blocking.
 
-    The caller has proved *entry* is the owner's recorded remote server. Needs the
-    flag and a bridged chat backend, as a card's Connect does; an entry that sends
-    its own credential header keeps its own path.
+    The caller has proved *entry* is the owner's recorded remote server under
+    *name*. Needs the flag and a bridged chat backend, as a card's Connect does;
+    an entry that sends its own credential header keeps its own path.
     """
     return (
         isinstance(entry, dict)
         and entry.get("type") != "sse"
-        and not _is_registry_url(entry.get("url"))
+        and not _card_claims(name, entry)
         and not has_credential_header(entry.get("headers"))
         and enabled()
         and _chat_backend_bridged()
@@ -281,8 +399,8 @@ def _custom_slug(name: str, entry: Any) -> str:
     if (
         url is None
         or entry.get("type") == "sse"
-        or not is_signable_name(name)
-        or _is_registry_url(url)
+        or not is_signable_name(name, entry)
+        or _card_claims(name, entry)
     ):
         return ""
     key = custom_key(name, url)
@@ -325,11 +443,12 @@ def routed_slug(name: str, entry: Any, provider_for_server: Any, backend: str | 
     remote server whose grant Crew holds (:func:`_custom_slug`), for a session on
     *backend* (:func:`custody_on` and :func:`serves_backend`), or for the chat
     backend (:func:`manages`) when none is given. An entry that sends its own
-    credential header keeps its own path.
+    credential header keeps its own path. An owner-added server named for a slug
+    whose card yields (:func:`_left_to_owner`) is the owner's, not the card's.
     """
     if has_credential_header(entry.get("headers")):
         return ""
-    if name in SUPPORTED_SLUGS:
+    if name in SUPPORTED_SLUGS and not _left_to_owner(name, entry):
         provider = (
             _dcr_provider(name, entry) if name in DCR_SLUGS else provider_for_server(name, entry)
         )
@@ -463,7 +582,7 @@ def tokens_from_response(doc: dict[str, Any], now: float) -> Tokens:
     """A token-endpoint answer as :class:`Tokens`, or ``exchange_failed``."""
     access = doc.get("access_token")
     if not isinstance(access, str) or not access or doc.get("error"):
-        raise CrewOAuthError(str(doc.get("error") or "exchange_failed")[:64])
+        raise CrewOAuthError(safe_error_code(doc.get("error"), "exchange_failed"))
     expires_in = doc.get("expires_in")
     refresh = doc.get("refresh_token")
     return Tokens(
@@ -576,7 +695,7 @@ async def _post_token(slug: str, form: dict[str, str]) -> dict[str, Any]:
                         body = None
                     error = body.get("error") if isinstance(body, dict) else None
                     if isinstance(error, str) and error:
-                        raise CrewOAuthError(error[:64])
+                        raise CrewOAuthError(safe_error_code(error, f"token_http_{resp.status}"))
                     raise CrewOAuthError(f"token_http_{resp.status}")
                 try:
                     doc = await resp.json(content_type=None)
@@ -720,6 +839,26 @@ class SignIn:
             raise CrewOAuthError("callback_port_busy") from None
         self.bound_port = int(self._runner.addresses[0][1])
 
+    def _iss_trusted(self, iss: str | None) -> bool:
+        """RFC 9207: does the callback's ``iss`` fit this sign-in's authorization server?"""
+        if self._dcr is not None:
+            from kiro_crew.connections.crew_oauth_dcr import iss_ok
+
+            return iss_ok(self._dcr.client, iss)
+        issuer = _ENDPOINTS.get(self.slug, {}).get("issuer")
+        if not issuer:
+            return True
+        if not iss:
+            # The vendor says its response carries iss, so an answer without it is refused.
+            return False
+        from kiro_crew.connections.l0_probe import same_issuer
+
+        try:
+            return same_issuer(iss, issuer)
+        except ValueError:
+            # Vendor text that urlsplit refuses is a mismatch, never a logged traceback.
+            return False
+
     async def _callback(self, request: Any) -> Any:
         from aiohttp import web
 
@@ -728,13 +867,10 @@ class SignIn:
         # Bytes: compare_digest raises on a non-ASCII str, which would answer 500.
         if self._done.done() or not secrets.compare_digest(state.encode(), self._state.encode()):
             return web.Response(status=400, text="This sign-in link is not the current one.")
-        if self._dcr is not None:
-            from kiro_crew.connections.crew_oauth_dcr import iss_ok
-
-            if not iss_ok(self._dcr.client, request.query.get("iss")):
-                # RFC 9207 mix-up defence: the answer came from another server.
-                self._done.set_exception(CrewOAuthError("issuer_mismatch"))
-                return web.Response(status=400, text="This sign-in answer is not trusted.")
+        if not self._iss_trusted(request.query.get("iss")):
+            # RFC 9207 mix-up defence: the answer came from another server.
+            self._done.set_exception(CrewOAuthError("issuer_mismatch"))
+            return web.Response(status=400, text="This sign-in answer is not trusted.")
         if not code or "error" in request.query:
             # An error response is a refusal even beside a code. access_denied
             # is either the user declining or an organization policy blocking the
@@ -983,16 +1119,26 @@ async def _revoke(slug: str, tokens: Tokens) -> bool:
             else None
         )
         if form_fields:
-            values = {"token": tokens.refresh or tokens.access}
+            endpoint = _ENDPOINTS[slug]
+            token = tokens.access if endpoint.get("revoke_token") == "access" else None
+            values = {"token": token or tokens.refresh or tokens.access}
             if client is not None:
                 values.update(client_id=client.client_id, client_secret=client.client_secret)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
-                    _ENDPOINTS[slug]["revoke"],
+                    endpoint["revoke"],
                     data={k: values[k] for k in form_fields},
                     allow_redirects=False,
                 ) as resp:
-                    return resp.status == 200
+                    ok_field = endpoint.get("revoke_ok_field")
+                    if resp.status != 200 or not ok_field:
+                        return resp.status == 200
+                    # A 200 that still says no (Slack's ``{"ok": false}``) is no revoke.
+                    try:
+                        body = await resp.json(content_type=None)
+                    except ValueError:
+                        return False
+                    return isinstance(body, dict) and body.get(ok_field) is True
         auth = aiohttp.BasicAuth(client.client_id, client.client_secret)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.delete(
@@ -1057,8 +1203,35 @@ async def disconnect(slug: str, store: TokenStore | None = None) -> dict[str, bo
     return {"removed": removed, "revoked": revoked}
 
 
+async def forget_owner_grants(servers: dict[str, str]) -> None:
+    """Revoke and delete what Crew holds for owner-added servers left without a use for it.
+
+    *servers* maps each name to the url its grant is keyed on (:func:`custom_key`):
+    a server the owner removed, re-pointed or turned local, or one a card took
+    over. Its pair goes as a Disconnect does (:func:`disconnect`), then its
+    client. Never raises: the config change that ended the entry has landed.
+    """
+    from kiro_crew.config.paths import data_home
+    from kiro_crew.connections.crew_oauth_dcr import ClientStore, client_entry_name
+    from kiro_crew.secrets import SecretVault
+
+    for name, url in servers.items():
+        key = custom_key(name, url)
+        try:
+            vault = SecretVault(data_home())
+            held = await asyncio.to_thread(vault.list_names)
+            # The revoke reads the client, so the client goes last.
+            if token_entry_name(key) in held:
+                await disconnect(key, TokenStore(vault))
+            if client_entry_name(key) in held:
+                await asyncio.to_thread(ClientStore(vault).delete, key)
+        except Exception:  # noqa: BLE001 -- the config change already landed
+            logger.warning("could not forget the grant of owner MCP server %r", name, exc_info=True)
+
+
 def _audit(operation: str, outcome: str, slug: str, detail: str = "") -> None:
     """One SEL record and one gateway.log line; a provider and a coarse code, never a value."""
+    detail = safe_error_code(detail, "")
     logger.info(
         "Crew OAuth %s for %s: %s%s", operation, slug, outcome, f" ({detail})" if detail else ""
     )
@@ -1163,8 +1336,11 @@ async def _start_mint_row(
             parts.path,
             # The query-free url discovery used, never the configured one.
             mcp_url=sign_in._dcr.client.resource,
+            server_name=row,
         )
-    if await asyncio.to_thread(oauth_url_contains_credential, _vetted_link(vetted, sign_in._dcr)):
+    if await asyncio.to_thread(
+        oauth_url_contains_credential, _vetted_link(vetted, sign_in._dcr), row
+    ):
         await sign_in.shutdown()
         await _set_row(row, token, {"state": "failed", "reason": "mint_url_rejected"})
         return token

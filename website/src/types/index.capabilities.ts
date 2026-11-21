@@ -450,6 +450,17 @@ export interface McpServer {
    *  table may offer the in-place sign-in on it. Absent or false for a server
    *  an agent, a session or a hand edit added. */
   ownerSignIn?: boolean
+  /** This row is a Connections provider's server whose client the user may hold
+   *  themselves (Slack), and no OAuth Apps record exists for it yet. The card
+   *  leaves the row alone and the row keeps its own chat sign-in guidance. */
+  connectionUnconfigured?: boolean
+  /** On a `connectionUnconfigured` row whose chat sign-in cannot start: the entry
+   *  names no client of its own, or Crew's sign-in serves it and has no OAuth app.
+   *  The row names the missing OAuth app instead of sending the user to chat. */
+  connectionNeedsApp?: boolean
+  /** The provider's OAuth app is saved, but Crew's sign-in is unavailable.
+   *  The row links to setup instead of offering a sign-in that cannot work. */
+  connectionNeedsCrewSignIn?: boolean
   /** Set by the gateway only while chats run on KAS, on a row that asked for
    *  OAuth whose sign-in a KAS chat would not use (see `McpKasChatSignIn`).
    *  Absent: no caveat. */
@@ -463,6 +474,10 @@ export interface McpServer {
   /** True when the entry lives in Kiro Crew's own mcp.json — the scope the
    *  Edit JSON action reads and writes (consent-disabled rows included). */
   kirocrewManaged?: boolean
+  /** One of Kiro Crew's own servers (`kirocrew-core`, `kirocrew-cron`, ...).
+   *  The table locks its Kiro Crew switch on and offers no Uninstall, and the
+   *  backend refuses turning it off or removing it. */
+  builtin?: boolean
   /** Which config switched the row off, from the backend — never inferred from
    *  `enabled` + `kirocrewManaged`. `kirocrew`: a disable in Kiro Crew's own
    *  store, which the Kiro Crew scope badge + Apply lifts (the consent step).

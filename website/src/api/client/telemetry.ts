@@ -38,6 +38,14 @@ export type WakaTimeStats = {
   }
 }
 
+/** WakaTime OAuth connection state (GET /api/wakatime/oauth/status). `connected`
+ *  gates the Disconnect control; `client_configured` tells the UI whether an
+ *  OAuth app client id is set so it can prompt for setup before offering Connect. */
+export type WakaTimeOauthStatus = {
+  connected: boolean
+  client_configured: boolean
+}
+
 /** Stacking dimensions `GET /api/usage/series` accepts. */
 export type UsageSeriesDimension = 'channel' | 'agent' | 'model' | 'cohort'
 
@@ -85,11 +93,29 @@ export type UiControl =
   | 'followup_add_session'
   | 'followup_skip'
 
+/** One app view the dashboard reports (POST /api/telemetry/app-view). The server
+ *  resolves the app's public id and version from `app` itself and counts any
+ *  other `surface` as `other`; mirrors `APP_OPENED_SURFACE_VALUES` and
+ *  `APP_FOREGROUND_SURFACE_VALUES` in `src/kiro_crew/metrics/feature_usage.py`. */
+export type AppViewReport =
+  | { app: string; surface: 'page' | 'popout' | 'desktop'; event: 'opened' }
+  | { app: string; surface: 'page' | 'popout'; event: 'foreground'; seconds: number }
+
 export function createTelemetryEndpoints({ get, post, j, jfetch: fetch }: ClientTransport) {
   const usageReadouts = {
     /** Count one click on an agent-rendered control (POST
      *  /api/telemetry/ui-control, 204). Only the control's kind is sent. */
     reportUiControlClick: (control: UiControl) => post('/api/telemetry/ui-control', { control }),
+    /** Count one app open or one foreground span (POST /api/telemetry/app-view,
+     *  owner only, 204). `keepalive`, so a span sent from `pagehide` outlives the
+     *  page; the body is well under the browser's keepalive cap. */
+    reportAppView: (report: AppViewReport) =>
+      fetch('/api/telemetry/app-view', {
+        method: 'POST',
+        keepalive: true,
+        headers: { 'Content-Type': 'application/json', 'X-Session-Key': 'dashboard:ui' },
+        body: JSON.stringify(report),
+      }),
     /** The five session folds of a crew log, keyed by name, in ONE request.
      *
      *  The batch route is what makes the answer coherent: it resolves the session
@@ -155,6 +181,12 @@ export function createTelemetryEndpoints({ get, post, j, jfetch: fetch }: Client
      *  left the 30 kept turns. */
     telemetryContextTurn: (slot: string, turn: number) =>
       fetch('/api/telemetry/context-trace?slot=' + encodeURIComponent(slot) + '&turn=' + encodeURIComponent(String(turn))).then(j),
+    /** The text one turn sent the agent, secrets masked; the dashboard owner only.
+     *  403 `owner_only` for anyone else, 404 `not_kept` once the gateway no longer
+     *  holds it (newest turns only, in memory, none for a restricted chat), 404
+     *  `too_long` when the prompt was over the gateway's size cap and never kept. */
+    telemetryPromptAsSent: (slot: string, turn: number): Promise<{ text: string }> =>
+      fetch('/api/telemetry/prompt-as-sent?slot=' + encodeURIComponent(slot) + '&turn=' + encodeURIComponent(String(turn))).then(j),
     /** Per-turn usage rows for one session — the Spend table's drill-down.
      *  Same always-written row store as the context trace; the dashboard reads
      *  every row (the endpoint's app-ownership filter applies to app callers).
@@ -174,6 +206,16 @@ export function createTelemetryEndpoints({ get, post, j, jfetch: fetch }: Client
      *  the CSV/JSON arrives via the endpoint's own Content-Disposition. */
     wakatimeExportUrl: (start: string, end: string, format: 'csv' | 'json') =>
       `/api/wakatime/export?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&format=${format}`,
+    /** OAuth connection state for the settings Connect/Disconnect control. */
+    wakatimeOauthStatus: () =>
+      fetch('/api/wakatime/oauth/status').then(j) as Promise<WakaTimeOauthStatus>,
+    /** Start the OAuth read-auth flow. Returns the WakaTime authorize URL the
+     *  browser navigates to; the backend sets the CSRF state cookie on this call. */
+    wakatimeOauthAuthorize: () =>
+      post('/api/wakatime/oauth/authorize').then(j) as Promise<{ authorize_url: string }>,
+    /** Revoke and clear the stored tokens, returning the integration to API-key auth. */
+    wakatimeOauthDisconnect: () =>
+      post('/api/wakatime/oauth/disconnect').then(j) as Promise<{ disconnected: boolean }>,
   }
 
   const privacyPosture = {
@@ -184,7 +226,8 @@ export function createTelemetryEndpoints({ get, post, j, jfetch: fetch }: Client
   }
 
   const creditUsage = {
-    sessionsUsage: () => fetch('/api/sessions/usage').then(j) as Promise<{ usage?: KiroUsagePayload }>,
+    /** `account` is an opaque tag of the signed-in account (absent when unknown). */
+    sessionsUsage: () => fetch('/api/sessions/usage').then(j) as Promise<{ usage?: KiroUsagePayload; account?: string }>,
     /**
      * Refresh the credit reading now (the account modal's Refresh button). Same
      * `{usage}` envelope as `sessionsUsage`, so `parseKiroUsagePayload` reads

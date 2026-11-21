@@ -381,7 +381,7 @@ def native_subagent_snapshots(
         output = slot._native_subagent_output
         for info in list(slot._native_subagent_tracker.values()):
             card_id = str(info.get("id") or "")
-            if not card_id:
+            if not card_id or info.get("dismissed"):
                 continue
             base: dict[str, object] = {
                 "id": card_id,
@@ -390,6 +390,8 @@ def native_subagent_snapshots(
                 "agent": str(info.get("agent") or ""),
                 **({"controllable": False} if info.get("controllable") is False else {}),
             }
+            # The label and model a card's frames carry, when it has them.
+            base.update({key: str(info[key]) for key in ("label", "model") if info.get(key)})
             if info.get("done"):
                 done_at = float(info.get("done_at") or 0.0)
                 if done_at and (now - done_at) > ttl_secs:
@@ -434,6 +436,25 @@ def native_subagent_snapshots(
         done.sort(key=snapshot_done_at, reverse=True)
         done = done[:terminal_limit]
     return running + done
+
+
+def dismiss_native_subagent(self: DashboardState, card_id: str) -> bool:
+    """Mark a finished native card dismissed, so reconnect replay stops drawing it.
+
+    Every completion path unregisters a native card from ``_native_cards``, but
+    the slot that ran it keeps the terminal record :func:`native_subagent_snapshots`
+    replays. The record is marked, not removed: while the parent turn runs, the
+    tracker is the roster reconciler's own dict, and a removed record would read
+    as a new sub-agent if a later ``list_update`` still lists it.
+
+    False when no slot holds a finished card with this id.
+    """
+    for slot in list(self._slots.values()):
+        for info in list(slot._native_subagent_tracker.values()):
+            if info.get("id") == card_id and info.get("done"):
+                info["dismissed"] = True
+                return True
+    return False
 
 
 def has_slot(self: DashboardState, name: str) -> bool:
@@ -804,6 +825,7 @@ def get_or_create_slot(
                 if _ts and not slot.linked_session_key and not _self_ref:
                     self._slack_to_slot[_ts] = name
     except Exception:
+        # Slack-link hydration is optional; the slot is still created and registered.
         pass
     _registry_for(self).put_slot(self, name, slot)
     # Publish the updated key set to SessionManager and the surface

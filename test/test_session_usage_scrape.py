@@ -26,6 +26,8 @@ import kiro_crew.dashboard.handlers.sessions as sessions_mod
 from kiro_crew.testing.clock import ManualClock
 from kiro_crew.testing.wait import finished
 
+pytestmark = pytest.mark.usefixtures("no_ambient_kiro_api_key")
+
 
 def _park_scrape_for_an_hour(monkeypatch) -> None:
     """Park the usage scrape an hour ahead of the product's monotonic clock.
@@ -304,7 +306,13 @@ class TestUnavailableReasonNamesTheRealRemedy:
         self._api(monkeypatch, None, sessions_mod.kiro_usage_api.AUTH_REJECTED)
         with self._scrape():
             await sessions_mod._fetch_usage_bg()
-        assert sessions_mod._usage_cache.get("reason") == "signin_required"
+        # A refused credential is marked, so the dashboard can show it as a
+        # failure; a missing one (the test above) carries no such mark.
+        assert sessions_mod._usage_cache == {
+            "available": False,
+            "reason": "signin_required",
+            "credential_rejected": True,
+        }
 
     @pytest.mark.asyncio
     async def test_no_plan_for_the_account_reports_no_reason(self, monkeypatch):
@@ -759,6 +767,18 @@ class TestRefreshWithV2Retired:
         assert sessions_mod._usage_scrape_failures == 0
         assert not sessions_mod._scrape_in_backoff()
         assert sessions_mod._usage_cache.get("available") is False
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_credential_is_marked_without_a_scrape(self, monkeypatch):
+        monkeypatch.setattr(
+            sessions_mod.kiro_usage_api,
+            "fetch_usage_limits",
+            lambda **k: _api_result(None, sessions_mod.kiro_usage_api.AUTH_REJECTED),
+        )
+        with patch("asyncio.create_subprocess_exec", AsyncMock()):
+            assert await sessions_mod._fetch_usage_bg() is None
+        assert sessions_mod._usage_cache.get("reason") == "signin_required"
+        assert sessions_mod._usage_cache.get("credential_rejected") is True
 
     @pytest.mark.asyncio
     async def test_no_plan_keeps_a_same_account_reading_stale(self, monkeypatch):

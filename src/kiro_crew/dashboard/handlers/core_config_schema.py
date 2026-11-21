@@ -10,7 +10,11 @@ import and patch; this module never imports it."""
 from __future__ import annotations
 
 import kiro_crew.config.session_environments as _session_environments
-from kiro_crew.acp_backends import selectable_backend_values, selectable_stored_backend_values
+from kiro_crew.acp_backends import (
+    CHAT_RUNTIME_SHARING_HARNESSES,
+    selectable_backend_values,
+    selectable_stored_backend_values,
+)
 from kiro_crew.apps.manifest import KEBAB_RE
 from kiro_crew.computer_use.types import MAX_SCREENSHOT_MAX_PX as _CU_MAX_SCREENSHOT_MAX_PX
 from kiro_crew.computer_use.types import MAX_TREE_NODES_LIMIT as _CU_MAX_TREE_NODES_LIMIT
@@ -42,6 +46,7 @@ from kiro_crew.config.loader import (
 )
 from kiro_crew.config.sections import (
     BROWSER_CHOICES,
+    BROWSER_ISOLATIONS,
     BROWSER_LOCAL_ORIGIN_PATTERN,
     BROWSER_LOCAL_ORIGINS_MAX,
     COMPACT_WAIT_SECS_MAX,
@@ -150,9 +155,14 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # schema; the card says so after a save. No install is implied by turning it on:
     # a true value with nothing installed refuses the next KAS spawn by name.
     "agent.kas_bundle": {"type": "bool"},
+    # Remember remote MCP sign-ins across KAS sessions (Settings → Connections).
+    # Read when a KAS process starts, so the schema marks it boot-only.
+    "agent.kas_persist_mcp_sign_in": {"type": "bool"},
     # The remote-dispatch preview switch (Settings → Developer → Feature previews,
     # rfc-conductor-remote-dispatch.md). Read on every call, so no restart.
     "work_ledger.remote_dispatch": {"type": "bool"},
+    # Task Runner's switch (Settings > Display > View). Every start reads it, so no restart.
+    "taskrunner.enabled": {"type": "bool"},
     # Default model for new sessions. Membership can NOT be validated against a
     # fixed list: the real vocabulary is whatever the live kiro-cli advertises
     # (/api/models spawns it to find out), and it spans both canonical registry
@@ -175,6 +185,12 @@ _EDITABLE_CONFIG: dict[str, dict] = {
         "validate_fn": _validate_role_model,
     },
     "agent.role_models.subagent": {
+        "type": "str",
+        "max_len": 64,
+        "pattern": _MODEL_PIN_PATTERN,
+        "validate_fn": _validate_role_model,
+    },
+    "agent.role_models.subagent_light": {
         "type": "str",
         "max_len": 64,
         "pattern": _MODEL_PIN_PATTERN,
@@ -207,6 +223,7 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # default; "" = inherit. Applies only on reasoning-capable models.
     "agent.role_efforts.background": {"type": "enum", "values": ["", *EFFORT_LEVELS]},
     "agent.role_efforts.subagent": {"type": "enum", "values": ["", *EFFORT_LEVELS]},
+    "agent.role_efforts.subagent_light": {"type": "enum", "values": ["", *EFFORT_LEVELS]},
     "agent.approval_mode": {"type": "enum", "values": ["auto", "interactive"]},
     # How long an AD-HOC auto-approve grant lasts. Editable from Settings because
     # every value here still ends: the timed ones are capped at the SafetyOverride
@@ -223,6 +240,12 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.sandbox": {"type": "enum", "values": ["auto", "strict", "off"]},
     "agent.sandbox_allow_no_isolation": {"type": "bool"},
     "agent.tool_search": {"type": "bool"},
+    # Opt-in KAS memory recall for the owner's own new dashboard chats. Read at
+    # session creation, so no restart; see ``acp/kas_memory.py``.
+    "agent.orchestrator_memory": {"type": "bool"},
+    # Settings > Developer > Feature Previews > Session control. Read on every
+    # session-control call, so no restart.
+    "agent.session_control": {"type": "bool"},
     "agent.completion_keep": {"type": "enum", "values": ["head", "tail", "both"]},
     "agent.completion_keep_chars": {
         "type": "int",
@@ -312,6 +335,10 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # The sidebar's session sort key, written by the sort menu; the enum is the
     # loader's own list, spelled once.
     "dashboard.session_sort": {"type": "enum", "values": list(SESSION_SORT_MODES)},
+    # Whether the sidebar draws unfiled sessions above the folder list. A view
+    # preference the sort-and-filter menu writes. Nothing outside the dashboard
+    # reads it.
+    "dashboard.unfiled_sessions_above_folders": {"type": "bool"},
     # Per-version snooze/skip verdict for the proactive update popup, written
     # as ONE atomic record: the three fields only mean anything together, so
     # per-field writes would open both a crash window (old verdict paired
@@ -367,6 +394,9 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # Display -> View). Default on; only a literal `false` opens the search
     # palette instead.
     "dashboard.command_bar_enabled": {"type": "bool"},
+    # Channels' sidebar row and Search Everywhere result (the former `channels`
+    # app's enabled state). Default off; only a literal `true` shows them.
+    "dashboard.channels_enabled": {"type": "bool"},
     # The terminal app "Open in external terminal" starts (Settings → Display →
     # Terminal). "" = unset, the default, which withholds the action. Limited
     # to the desktop shell's launch allowlist; the launch gate in
@@ -510,6 +540,18 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # path expansion, sensitive-path exclusion and existence, so a path it declines is
     # skipped there rather than refused here.
     "skills.extra_paths": {"type": "str_list", "max_items": 64, "max_item_len": 4096},
+    # Memory → Repeated failures: the opt-in weekly bell note
+    # (dashboard/repeated_failures_notice.py). Default OFF in MemoryConfig.
+    "memory.repeated_failures_notice": {"type": "bool"},
+    # Seconds, or "auto" (600 on a machine with 16 GiB or less, 3600 elsewhere). The
+    # field is ``int | str``, which the schema-derived rule cannot edit, so the row
+    # keeps its number box here and also takes the one word.
+    "memory.embedding_idle_evict_secs": {
+        "type": "int",
+        "min": 0,
+        "max": 365 * 24 * 3600,
+        "allow_auto": True,
+    },
     # Knowledge Library ingestion. Chunk budget max mirrors the point past which
     # a single sweep stops being a trickle; dedup cadence max is ~a day of sweeps.
     "knowledge.auto_add_documents": {"type": "bool"},
@@ -591,6 +633,7 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # Values come from the config section itself, so this gate and the loader's
     # own normalization cannot drift.
     "browser.choice": {"type": "enum", "values": list(BROWSER_CHOICES)},
+    "browser.isolation": {"type": "enum", "values": list(BROWSER_ISOLATIONS)},
     "browser.live.enabled": {"type": "bool"},
     "browser.live.quality": {"type": "enum", "values": list(LIVE_QUALITIES)},
     "browser.live.max_fps": {"type": "enum", "values": list(LIVE_MAX_FPS_CHOICES)},
@@ -693,6 +736,16 @@ for _tier in DECISION_MODEL_ROUTE_TIERS:
 for _preview in FEATURE_PREVIEW_FLAGS:
     _EDITABLE_CONFIG[f"dashboard.feature_previews.{_preview}"] = {"type": "bool"}
 
+# The per-harness switches under the ACP runtime sharing preview, one boolean per
+# harness in ``CHAT_RUNTIME_SHARING_HARNESSES``. Only those names are writable, so
+# the route cannot switch on a harness that is not safe to share.
+_EDITABLE_CONFIG.update(
+    {
+        f"agent.chat_runtime_sharing_harnesses.{name}": {"type": "bool"}
+        for name in CHAT_RUNTIME_SHARING_HARNESSES
+    }
+)
+
 
 # The wake judge's two per-point settings. In the editable set where
 # ``provider.*`` is not, and the difference is what each one decides: the endpoint
@@ -745,7 +798,9 @@ _APP_MUTE_SESSIONS_SPEC: dict = {"type": "bool"}
 
 
 def _editable_config_spec(path_key: object) -> dict | None:
-    """The PATCH spec for *path_key*: a listed field, or a per-app setting path."""
+    """The PATCH spec for *path_key*: a listed field, a per-app setting path, or the
+    schema-derived rule ``config_all_settings.generic_spec`` gives a key with
+    no listed one."""
     if not isinstance(path_key, str):
         return None
     spec = _EDITABLE_CONFIG.get(path_key)
@@ -757,4 +812,8 @@ def _editable_config_spec(path_key: object) -> dict | None:
                 return _APP_MODEL_SPEC
             if parts[2] == "mute_sessions":
                 return _APP_MUTE_SESSIONS_SPEC
+        # The Advanced page's schema-derived rule, for a key with no curated one.
+        from kiro_crew.dashboard.handlers.config_all_settings import generic_spec
+
+        return generic_spec(path_key)
     return spec

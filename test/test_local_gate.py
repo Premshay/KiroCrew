@@ -18,8 +18,10 @@ from __future__ import annotations
 import argparse
 import importlib
 import importlib.util
+import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -40,6 +42,15 @@ def _load_gate():
 @pytest.fixture(scope="module")
 def gate():
     return _load_gate()
+
+
+@pytest.fixture(autouse=True)
+def _frontend_toolchain_present(gate, _floor_monkeypatch):
+    """A plan under test must not depend on whether this host has Node or ran ``npm ci``."""
+    _floor_monkeypatch.setattr(gate, "frontend_dependencies_installed", lambda: True, raising=False)
+    _floor_monkeypatch.setattr(
+        importlib.import_module("run_scoped_tests"), "_node_launcher", lambda name: f"/usr/bin/{name}"
+    )
 
 
 def _args(**overrides):
@@ -86,25 +97,28 @@ def test_classify_evidence_does_not_flip_frontend_only(gate) -> None:
     assert frontend and not meta and not backend
 
 
+class _GitProc:
+    def __init__(self, stdout: str = "", returncode: int = 0) -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = ""
+
+
+_BASE_LOOKUPS = (["git", "merge-base"], ["git", "rev-parse"])
+
+
 def test_changed_files_keeps_both_rename_endpoints(gate, monkeypatch) -> None:
     """Renaming a real file INTO temp-screenshots/ must not hide the old
     path's bucket: ``--no-renames`` splits a rename into delete + add (the
-    same contract run_scoped_tests.py and CI's dorny/paths-filter apply), and
-    the porcelain parser keeps BOTH sides of a defensive ``old -> new`` arrow.
+    same contract run_scoped_tests.py and CI's dorny/paths-filter apply).
     """
-    class _Proc:
-        def __init__(self, stdout: str = "") -> None:
-            self.returncode = 0
-            self.stdout = stdout
-
     def fake_run(argv, **_kwargs):
-        if argv[:2] == ["git", "merge-base"]:
-            return _Proc("abc123\n")
+        if argv[:2] in _BASE_LOOKUPS:
+            return _GitProc("abc123\n")
+        assert "--no-renames" in argv, "neither git read may fold renames"
         if argv[:2] == ["git", "diff"]:
-            assert "--no-renames" in argv, "committed diff must not fold renames"
-            return _Proc("src/kiro_crew/gateway.py\n")
-        assert "--no-renames" in argv, "porcelain status must not fold renames"
-        return _Proc('R  src/kiro_crew/moved.py -> temp-screenshots/f/moved.png\n')
+            return _GitProc("src/kiro_crew/gateway.py\0")
+        return _GitProc("D  src/kiro_crew/moved.py\0A  temp-screenshots/f/moved.png\0")
 
     monkeypatch.setattr(gate.subprocess, "run", fake_run)
     paths = gate.changed_files("main")
@@ -113,6 +127,54 @@ def test_changed_files_keeps_both_rename_endpoints(gate, monkeypatch) -> None:
     assert "temp-screenshots/f/moved.png" in paths
     # And the classification consequence: the old backend path still counts.
     assert gate.classify(paths) == (False, False, True)
+
+
+def test_changed_files_reads_non_ascii_frontend_paths_verbatim(gate, monkeypatch) -> None:
+    """Git C-quotes a non-ASCII path in line output (``"website/src/f\\303\\251e.tsx"``)
+    and prints it verbatim only under ``-z``. A quoted name misses the
+    ``website/`` prefix, so a frontend-only diff would classify as backend.
+    The fake answers each read the way git does, with or without ``-z``.
+    """
+    committed, untracked = "website/src/fée.tsx", "website/src/née.test.tsx"
+
+    def c_quoted(path: str) -> str:
+        escaped = "".join(
+            ch if ch.isascii() else "".join(f"\\{byte:03o}" for byte in ch.encode())
+            for ch in path
+        )
+        return f'"{escaped}"'
+
+    def fake_run(argv, **_kwargs):
+        nul = "-z" in argv
+        if argv[:2] in _BASE_LOOKUPS:
+            return _GitProc("abc123\n")
+        if argv[:2] == ["git", "diff"]:
+            return _GitProc(f"{committed}\0" if nul else f"{c_quoted(committed)}\n")
+        return _GitProc(f"?? {untracked}\0" if nul else f"?? {c_quoted(untracked)}\n")
+
+    monkeypatch.setattr(gate.subprocess, "run", fake_run)
+    paths = gate.changed_files("main")
+    assert paths is not None
+    assert sorted(paths) == sorted([committed, untracked])
+    assert gate.classify(paths) == (True, False, False)
+
+
+@pytest.mark.parametrize("base", ["", "   ", "--output=evil", "no-such-ref"])
+def test_changed_files_refuses_a_base_that_is_not_a_commit(gate, monkeypatch, base: str) -> None:
+    """An empty base would diff ``...HEAD`` (HEAD against itself) and report
+    nothing changed; an option-shaped one would reach ``git diff`` as a flag.
+    Either must be "cannot tell" (exit 2), and no diff may run."""
+    diffs: list[list[str]] = []
+
+    def fake_run(argv, **_kwargs):
+        if argv[:2] in _BASE_LOOKUPS:
+            return _GitProc("", returncode=1)
+        diffs.append(argv)
+        return _GitProc("")
+
+    monkeypatch.setattr(gate.subprocess, "run", fake_run)
+    assert gate.changed_files(base) is None
+    assert not [argv for argv in diffs if argv[:2] == ["git", "diff"]]
 
 
 def test_classify_mixed_diff_sets_both_flags(gate) -> None:
@@ -525,6 +587,99 @@ def test_a_missing_runner_is_a_selection_error_everywhere_else(gate) -> None:
     assert issubclass(gate.LauncherMissing, gate.SelectionUntrustworthy)
 
 
+def test_installed_website_packages_keep_the_cross_surface_set_without_fetching(
+    gate, monkeypatch
+) -> None:
+    """With ``npm ci`` done, a backend diff still runs CI's cross-surface specs,
+    through node and the vitest entry point the lockfile installed, from website/."""
+    monkeypatch.setattr(gate, "changed_files", lambda base: ["src/kiro_crew/gateway.py"])
+    _related(monkeypatch, gate, {
+        "backend": ["test/test_gatewayd_diag.py"],
+        "frontend": ["src/test/AcpAdapter.defaults.test.ts"],
+    })
+    plan = gate.build_plan(_args())
+    assert _plan_labels(plan) == ["backend (related)", "frontend (related)"]
+    _label, fe_cmd, cwd = plan.commands[1]
+    assert fe_cmd[:3] == ["/usr/bin/node", "./node_modules/vitest/vitest.mjs", "run"]
+    assert cwd == gate._REPO_ROOT / "website"
+
+
+def test_only_websites_own_vitest_counts_as_installed(gate, tmp_path, monkeypatch) -> None:
+    """A ``node_modules`` without vitest is not an install, whatever else is on PATH.
+
+    ``npx --no-install vitest`` runs a globally installed vitest when the local
+    tree lacks one, so a guard that only saw the directory would let a partial
+    install run a vitest the lockfile never pinned. The guard reads the one file
+    the runner starts.
+    """
+    real_gate = _load_gate()
+    website = tmp_path / "website"
+    (website / "node_modules").mkdir(parents=True)
+    global_bin = tmp_path / "global" / "bin"
+    global_bin.mkdir(parents=True)
+    (global_bin / "vitest").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (global_bin / "vitest").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{global_bin}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setattr(real_gate, "_REPO_ROOT", tmp_path)
+    assert real_gate.frontend_dependencies_installed() is False
+
+    entry = website / real_gate.VITEST_ENTRY
+    entry.parent.mkdir(parents=True)
+    entry.write_text("", encoding="utf-8")
+    assert real_gate.frontend_dependencies_installed() is True
+
+
+def test_missing_website_packages_skip_the_cross_surface_set_on_a_backend_diff(
+    gate, monkeypatch, capsys
+) -> None:
+    """A fresh worktree has Node but no ``website/node_modules``. A diff that
+    touched no frontend file keeps its backend run and exits 0, naming the fix."""
+    monkeypatch.setattr(gate, "frontend_dependencies_installed", lambda: False)
+    monkeypatch.setattr(gate, "changed_files", lambda base: ["src/kiro_crew/gateway.py"])
+    _related(monkeypatch, gate, {
+        "backend": ["test/test_gatewayd_diag.py"],
+        "frontend": ["src/test/AcpAdapter.defaults.test.ts"],
+    })
+    plan = gate.build_plan(_args())
+    assert _plan_labels(plan) == ["backend (related)"]
+    assert plan.skipped == ["frontend"]
+    assert any(
+        "NOT RUN HERE" in note and "npm ci" in note and "CI runs them" in note
+        for note in plan.notes
+    )
+
+    monkeypatch.setattr(gate, "build_plan", lambda _args: plan)
+    monkeypatch.setattr(
+        gate.subprocess, "run",
+        lambda *_a, **_k: subprocess.CompletedProcess([], 0),
+    )
+    assert gate.main([]) == 0
+    assert "frontend related set NOT run here" in capsys.readouterr().err
+
+
+def test_missing_website_packages_fail_closed_on_a_frontend_diff(
+    gate, monkeypatch, capsys
+) -> None:
+    """A frontend change with nothing installed to test it runs nothing and
+    exits 2: a skip here would pass a frontend diff no spec ever ran on."""
+    monkeypatch.setattr(gate, "frontend_dependencies_installed", lambda: False)
+    monkeypatch.setattr(gate, "changed_files", lambda base: ["website/src/App.tsx"])
+    _related(monkeypatch, gate, {
+        "backend": ["test/test_gatewayd_diag.py"],
+        "frontend": ["src/test/App.deployRoute.test.tsx"],
+    })
+    ran: list[list[str]] = []
+
+    def record_run(cmd, *_a, **_k):
+        ran.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(gate.subprocess, "run", record_run)
+    assert gate.main([]) == 2
+    assert not [cmd for cmd in ran if cmd and cmd[0] != "git"]
+    assert "npm ci" in capsys.readouterr().err
+
+
 def test_backend_only_diff_runs_related_not_full(gate, monkeypatch) -> None:
     monkeypatch.setattr(gate, "changed_files", lambda base: ["src/kiro_crew/gateway.py"])
     _related(monkeypatch, gate, {
@@ -715,3 +870,141 @@ def test_the_reference_scan_reads_each_test_file_once_and_drops_it(gate) -> None
         "run_scoped_tests._read_text is memoised again; the reference scan must "
         "read each file once and drop it, not retain the test tree's text"
     )
+
+
+# ---------------------------------------------------------------------------
+# selection: a platform's collect-ignore list reaches the related set
+# ---------------------------------------------------------------------------
+
+_LISTED = "test_posix_only_suite.py"
+
+
+def _mini_repo(tmp_path: Path) -> Path:
+    """A checkout with the listed name at every reach the hook distinguishes.
+
+    ``test/<name>`` is what the hook ignores; the same name under a subdirectory
+    and under the apps-builtins root is collected on every platform, so the
+    selector must keep both. The module under ``src/`` gives the name-matched
+    and referencing sources something to find.
+    """
+    root = tmp_path / "repo"
+    (root / "src" / "kiro_crew").mkdir(parents=True)
+    (root / "src" / "kiro_crew" / "posix_only_suite.py").write_text("X = 1\n", encoding="utf-8")
+    for rel in (
+        f"test/{_LISTED}",
+        "test/test_other.py",
+        f"test/fixtures/{_LISTED}",
+        f"src/kiro_crew/apps/builtins/demo/{_LISTED}",
+    ):
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("from kiro_crew import posix_only_suite\n", encoding="utf-8")
+    return root
+
+
+@pytest.fixture
+def collect_ignore_helpers():
+    return importlib.import_module("platform_collect_ignore_helpers")
+
+
+def test_a_listed_suite_is_dropped_only_at_the_hooks_reach(
+    gate, tmp_path, monkeypatch, collect_ignore_helpers
+) -> None:
+    """Named on the pytest command line, a file bypasses ``pytest_ignore_collect``;
+    the selector therefore applies the hook's list itself, and no wider.
+
+    The list is installed the way ``test_platform_collect_ignore.py`` installs
+    it, so the Windows branch is proven on every host.
+    """
+    selector = importlib.import_module("run_scoped_tests")
+    root = _mini_repo(tmp_path)
+    monkeypatch.setattr(collect_ignore_helpers, "PLATFORM_IGNORED", frozenset({_LISTED}))
+    diff = [f"test/{_LISTED}", "src/kiro_crew/posix_only_suite.py"]
+    targets, verdict = selector.related_targets("backend", diff, root=root)
+    assert f"test/{_LISTED}" not in targets
+    assert f"test/fixtures/{_LISTED}" in targets
+    assert f"src/kiro_crew/apps/builtins/demo/{_LISTED}" in targets
+    assert "test/test_other.py" in targets
+    assert "1 not collected on this platform" in verdict
+
+
+def test_an_empty_platform_list_drops_nothing(
+    gate, tmp_path, monkeypatch, collect_ignore_helpers
+) -> None:
+    """Linux lists nothing, so the related set is the plain union there."""
+    selector = importlib.import_module("run_scoped_tests")
+    root = _mini_repo(tmp_path)
+    monkeypatch.setattr(collect_ignore_helpers, "PLATFORM_IGNORED", frozenset())
+    targets, verdict = selector.related_targets("backend", [f"test/{_LISTED}"], root=root)
+    assert f"test/{_LISTED}" in targets
+    assert "not collected" not in verdict
+
+
+def test_the_leaf_selector_imports_without_pytest_or_kiro_crew() -> None:
+    """CI's ``changes`` job runs ``leaf_test_scope.py`` with no dependencies
+    installed, and it imports this selector; the collector helper (which needs
+    pytest and kiro_crew) must load on first use, not at import."""
+    probe = (
+        "import sys; sys.path.insert(0, 'scripts'); import leaf_test_scope; "
+        "assert 'platform_collect_ignore_helpers' not in sys.modules"
+    )
+    # -S: no site-packages, so neither pytest nor an installed kiro_crew is importable.
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", probe],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_the_selector_subtracts_exactly_what_the_hook_ignores(
+    gate, request, monkeypatch, collect_ignore_helpers
+) -> None:
+    """One list, one platform rule: the selector's subtraction is the hook's verdict.
+
+    Every path the selector would drop is one the real hook chain ignores at
+    ``test/``, and every listed name is dropped -- asked through the conftest's
+    registered hook rather than by re-reading the file, so the two readers cannot
+    drift apart without this failing.
+    """
+    selector = importlib.import_module("run_scoped_tests")
+    names = collect_ignore_helpers.platform_ignore_names("win32")
+    assert names, "the Windows ignore list parsed to nothing"
+    monkeypatch.setattr(collect_ignore_helpers, "PLATFORM_IGNORED", names)
+    # Under CI's --file-shard-targets every unlisted path is skipped by design,
+    # which would answer for the platform list here; lift it for this question.
+    shards = request.config.pluginmanager.get_plugin("ci-file-shards")
+    if shards is not None:
+        monkeypatch.setattr(shards, "keep", None)
+    test_dir = collect_ignore_helpers.TEST_DIR
+    ihook = request.session.gethookproxy(test_dir)
+    dropped = selector.platform_uncollected_targets()
+    assert dropped == {f"test/{name}" for name in names}
+    for rel in sorted(dropped):
+        path = test_dir / rel[len("test/") :]
+        assert ihook.pytest_ignore_collect(collection_path=path, config=request.config), rel
+    assert not ihook.pytest_ignore_collect(collection_path=Path(__file__), config=request.config)
+
+
+def test_a_windows_excluded_suite_is_not_re_enabled_by_the_related_set(
+    gate, monkeypatch, collect_ignore_helpers
+) -> None:
+    """The reported shape, on the real tree: a suite the Windows list keeps out
+    of every shard reaches pytest anyway when a change names it, matches its
+    name, or references it, because the related set hands pytest explicit paths.
+    Under the Windows list it must be absent; with no list it is selected.
+    """
+    selector = importlib.import_module("run_scoped_tests")
+    names = collect_ignore_helpers.platform_ignore_names("win32")
+    listed = sorted(names)[0]
+    rel = f"test/{listed}"
+    assert (_REPO_ROOT / rel).is_file()
+    monkeypatch.setattr(collect_ignore_helpers, "PLATFORM_IGNORED", names)
+    targets, verdict = selector.related_targets("backend", [rel])
+    assert rel not in targets
+    assert "not collected on this platform" in verdict
+    monkeypatch.setattr(collect_ignore_helpers, "PLATFORM_IGNORED", frozenset())
+    targets, _verdict = selector.related_targets("backend", [rel])
+    assert rel in targets

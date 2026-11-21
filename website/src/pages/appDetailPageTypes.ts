@@ -70,7 +70,7 @@ type AppInfo = Pick<RegistryApp, '_registry' | 'provenance'> & {
   installedVersion?: string
   enabled?: boolean
   sessionApprovalConsentPending?: boolean
-  approvedGrants?: { api?: string[]; events?: string[] }
+  approvedGrants?: { api?: string[]; events?: string[]; bots?: string[] }
   linkPreviewGrant?: LinkPreviewGrantRow
   messageActionGrant?: MessageActionGrantRow
   linkOpenGrant?: LinkOpenGrantRow
@@ -80,6 +80,16 @@ type AppInfo = Pick<RegistryApp, '_registry' | 'provenance'> & {
   workerAutoApproveGrant?: { approved: boolean; staged: boolean }
   /** `permissions.reachableByUserSessions` verbs the owner approved, and the ones an update holds back; absent when undeclared. */
   userSessionReachGrant?: { approved: string[]; staged: string[] }
+  /** `permissions.desktopCapabilities` the owner approved, and the ones an update holds back; absent when undeclared. */
+  desktopCapabilitiesGrant?: { approved: string[]; staged: string[] }
+  /** `ui.frameSources` origins the owner approved, and the ones an update or edit holds back; absent when undeclared. */
+  frameSourcesGrant?: { approved: string[]; staged: string[] }
+  /** `permissions.browserSites` pages the owner approved, and the ones waiting; absent when undeclared. */
+  browserSitesGrant?: { approved: string[]; staged: string[] }
+  /** `permissions.kiroOperations` the owner approved, and the ones waiting; absent when undeclared. */
+  kiroOperationsGrant?: { approved: string[]; staged: string[] }
+  /** `permissions.browser` verbs the owner approved, the ones waiting, and whether the `app_browser_sdk` preview is on; absent when undeclared. */
+  browserGrant?: { approved: string[]; staged: string[]; preview: boolean }
   managed?: string
   source?: string
   installedAt?: string
@@ -119,7 +129,16 @@ interface AppPermissions {
   sessionApproval?: boolean
   memberThreads?: boolean
   workerAutoApprove?: boolean
+  chatSlots?: boolean
+  hiddenSessions?: boolean
+  chatLaunch?: unknown
   reachableByUserSessions?: string[]
+  desktopCapabilities?: string[]
+  /** `permissions.browser` verbs, `"view"`, `"read"` and `"act"`. */
+  browser?: string[]
+  webhookSource?: boolean
+  /** Bot scopes, `"read"` and `"wake"`. */
+  bots?: string[]
   [key: string]: unknown
 }
 
@@ -177,4 +196,4 @@ interface AppManifest {
 }
 
 // `AppDetailPage.tsx` builds and renders these.
-export type { AppInfo, NormalizedRegistryEntry, RegistryEntry }
+export type { AppInfo, McpServerConfig, NormalizedRegistryEntry, RegistryEntry }

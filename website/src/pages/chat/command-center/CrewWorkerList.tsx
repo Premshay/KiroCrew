@@ -8,14 +8,15 @@ import ErrorNotice from '../../../components/ErrorNotice'
 import { SearchFilterBar } from '../../../components/SearchFilterBar'
 import { safeGetSessionItem, safeSetSessionItem } from '../../../utils/safeStorage'
 import { useAppDispatch, useAppSelector, type RootState } from '../../../store'
-import { closeActivityPanel, openActivityPanel, resumeFromHistory, switchSlot } from '../../../store/chatSlice'
+import { closeActivityPanel, openActivityPanel, resumeFromHistory, selectSidebarAutomationRunningKeys, selectSidebarWorkflowActiveKeys, switchSlot } from '../../../store/chatSlice'
+import { normalizeRunSessionKey } from '../../../components/workflows/runModel'
 import { openPanelView } from '../../../hooks/usePanelTabs'
 import { ChevronLeft } from 'lucide-react'
 import { useCrewBack } from '../../../components/crew/useCrewBack'
 import { crewRouteNotServed, liveCrewWorkers, mergeCrewWorkers } from '../../../lib/crewWorkers'
 import { crewWorkersGapMs, readCrewWorkers } from '../../../lib/crewWorkersPoll'
 import { crewModeRoot, crewRootOf, runsCrewMode } from '../../../lib/crewMode'
-import UltraCrewPanel from './UltraCrewPanel'
+import ConductorModeCrewPanel from './ConductorModeCrewPanel'
 
 /** The status labels, keyed by the wire value `GET .../crew-workers` sends. */
 export const CREW_WORKER_STATUS_KEY: Record<CrewWorker['status'], string> = {
@@ -70,16 +71,44 @@ export function crewWorkersPushKey(slots: readonly ChatSlot[], root: string): st
   const parts: string[] = []
   for (const s of slots) {
     if (s.key === root) {
-      parts.push(JSON.stringify(s.crew_work ?? null))
+      parts.push(JSON.stringify([
+        s.crew_work ?? null, s.running ? 1 : 0, s.subagents_running ? 1 : 0,
+        s.subagents_queued || 0, s.preparing ? 1 : 0, s.compacting ? 1 : 0,
+      ]))
     } else if (s.crew_root === root || s.mate_root === root) {
       parts.push([
-        s.key, s.running ? 1 : 0, s.pending_approval ? 1 : 0, s.pending_approval_info?.request_id || '',
+        s.key, s.running ? 1 : 0, s.subagents_running ? 1 : 0, s.subagents_queued || 0,
+        s.preparing ? 1 : 0, s.compacting ? 1 : 0, s.queue_depth || 0, s.queue_held_depth || 0,
+        s.pending_approval ? 1 : 0, s.pending_approval_info?.request_id || '',
         s.needs_input ? 1 : 0, s.title || '', s.last_turn_ts || '', s.parent?.slot || '', s.created_by || '',
         s.crew_work ? JSON.stringify(s.crew_work) : '',
       ].join('|'))
     }
   }
   return parts.join('\n')
+}
+
+/** The full key that wakes the worker and board reads: slot activity plus the
+ * workflow and automation stores, whose events do not change a slot row. */
+export function crewWorkersRuntimePushKey(state: RootState, root: string): string {
+  if (!root) return ''
+  const slots = state.dashboard.slots
+  const crewKeys = new Set([root])
+  for (const slot of slots) {
+    if (slot.crew_root === root || slot.mate_root === root) crewKeys.add(slot.key)
+  }
+  const normalized = new Set([...crewKeys].map(normalizeRunSessionKey))
+  const workflows = selectSidebarWorkflowActiveKeys(state)
+    .filter(key => normalized.has(key))
+    .sort()
+  const automations = selectSidebarAutomationRunningKeys(state)
+    .filter(key => crewKeys.has(key))
+    .sort()
+  return JSON.stringify({
+    slots: crewWorkersPushKey(slots, root),
+    workflows,
+    automations,
+  })
 }
 
 const pendingRefresh = new Map<string, ReturnType<typeof setTimeout>>()
@@ -89,7 +118,7 @@ const pendingRefresh = new Map<string, ReturnType<typeof setTimeout>>()
  *  state. Every hook mounted for one root shares one coalesced re-read. */
 export function useCrewWorkersPush(root: string, enabled: boolean): void {
   const queryClient = useQueryClient()
-  const key = useAppSelector(s => (enabled ? crewWorkersPushKey(s.dashboard.slots, root) : ''))
+  const key = useAppSelector(s => (enabled ? crewWorkersRuntimePushKey(s, root) : ''))
   // `null` until the first enabled run: a list cached by an earlier mount may predate
   // pushes that landed while nothing was mounted (queries never go stale on their own).
   const seen = useRef<string | null>(null)
@@ -270,18 +299,18 @@ export function CrewPanelBack({ root }: { root: string }) {
   </div>
 }
 
-/** The side panel's Crew tab for `slot`: its root's Ultra Mode panel when the slot
- *  is an Ultra Mode root or one of its crew members, and one line saying so otherwise. */
+/** The side panel's Crew tab for `slot`: its root's conductor mode panel when the slot
+ *  is a conductor mode root or one of its crew members, and one line saying so otherwise. */
 export function CrewWorkersTab({ slot, active, onAct }: { slot: string | null; active: boolean; onAct?: (text: string) => void }) {
   const { t } = useTranslation()
   const row = useAppSelector(s => (slot ? s.dashboard.slots.find(item => item.key === slot) : undefined))
   const root = crewModeRoot(row) && row ? row.key : crewRootOf(row)
-  // A brand-new chat whose Ultra Mode switch is landing has no root
-  // stamp yet; show its (empty) Ultra panel instead of "not an Ultra Mode chat".
+  // A brand-new chat whose conductor mode switch is landing has no root
+  // stamp yet; show its (empty) conductor mode panel instead of "not a conductor mode chat".
   // A chat with messages that was just switched on is in the same gap: it already
-  // runs Ultra Mode while the root stamp has not reached the row.
+  // runs conductor mode while the root stamp has not reached the row.
   if (!root && row && !row.crew_root && (!row.messages
-    || (!row.created_by && !row.parent && runsCrewMode(row.agent, row.agent_kind, row.crew_mode_agent)))) return <UltraCrewPanel root={row.key} viewing={slot} active={active} onAct={onAct} />
+    || (!row.created_by && !row.parent && runsCrewMode(row.agent, row.agent_kind, row.crew_mode_agent)))) return <ConductorModeCrewPanel root={row.key} viewing={slot} active={active} onAct={onAct} />
   if (!root) return <p className="p-3 text-sm text-muted" data-testid="crew-workers-none">{t('commandCenter.workers_not_crew')}</p>
-  return <UltraCrewPanel root={root} viewing={slot} active={active} onAct={onAct} />
+  return <ConductorModeCrewPanel root={root} viewing={slot} active={active} onAct={onAct} />
 }

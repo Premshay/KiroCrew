@@ -102,7 +102,8 @@ describe('store/chat owners', () => {
 
 /** Reducers the facade wires inline next to the families: small UI flags and the live frame reducer. */
 const INLINE_REDUCERS = [
-  'setPendingInput', 'stagePendingSend', 'stageToMainComposer', 'setAgentSwitchNotice', 'setVoicePlaying', 'setVoiceBusy', 'setVoicePreparing', 'setVoiceAudio',
+  'setPendingInput', 'stagePendingSend', 'stageToMainComposer', 'setAgentSwitchNotice',
+  'setVoicePlaying', 'setVoiceBusy', 'setVoicePreparing', 'setVoicePaused', 'setVoiceAudio',
   'requestSlotReveal', 'requestSlotFolderOpen', 'clearSlotReveal', 'requestFolderReveal', 'sseChatMessage', 'setCloseRefused',
 ]
 
@@ -176,7 +177,7 @@ const REEXPORTS: Array<[string, Record<string, unknown>, string[]]> = [
   ['selectors', selectors, [
     'selectActiveSlotProject', 'selectComposerBusy', 'selectContinuable', 'selectProjectChipLocked', 'selectSendAccepted', 'selectSendAttempts', 'selectSendConfirmed', 'selectSlotMessages',
     'selectPendingTurn', 'selectSlotPendingApproval', 'selectSlotRunEpoch', 'selectSlotStreamState', 'selectSlotToolLog', 'selectTrailingSendUnconfirmed',
-    'selectSlotTurnFromWake', 'selectTurnInterrupted', 'QUIET_END_SERVER', 'QUIET_END_TOOL',
+    'selectResumeInterrupted', 'selectSlotTurnFromWake', 'selectTurnInterrupted', 'QUIET_END_SERVER', 'QUIET_END_TOOL',
   ]],
   ['slotSwitch', slotSwitch, ['clearSwitchSlotGone', 'setSwitchSlotGone', 'switchSlot', 'switchSlotNoticeCopy']],
   ['slotRefresh', slotRefresh, ['refreshSlot', 'warmSlotCache']],

@@ -608,7 +608,7 @@ class TestDeliverResult:
             ("assistant", "Title\n\nresult")
         ]
         # The heartbeat seeds the slot's title from the task summary.
-        assert slot.title == "💓 task"
+        assert slot.title == "task"
         ds.notify.assert_called_once_with(
             "heartbeat", "Title", "task\n\nresult", meta={"slot": "new-slot"}
         )
@@ -1035,8 +1035,8 @@ class TestShutdown:
         settles, so only this method's own cut lets ``_shutdown`` return, and a
         regression that drops the cut still reaches the bound and fails."""
         monkeypatch.setattr(gw, "GRACEFUL_SHUTDOWN_SECS", FALLBACK_TIMEOUT_SECS)
-        # Absent before the drain had a budget of its own; set so a regression
-        # reaches the graceful bound below instead of failing on the attribute.
+        # A short drain budget, so the run reaches the graceful bound below
+        # quickly. The attribute exists, so raising=False changes nothing.
         monkeypatch.setattr(gw, "PERSISTENCE_DRAIN_GRACE_SECS", 0.05, raising=False)
         orch = _make_orchestrator()
         drain_cut = asyncio.Event()

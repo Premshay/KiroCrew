@@ -160,6 +160,12 @@ def is_connection_server(session_key: str, server: str) -> bool:
         return any(b.session_key == session_key and b.server == server for b in _bridges.values())
 
 
+def serves_connection(server: str) -> bool:
+    """Whether a registered bridge serves *server* for any session."""
+    with _lock:
+        return any(b.server == server for b in _bridges.values())
+
+
 def drop_slug(slug: str) -> None:
     """Forget every bridge of *slug* (a failed Disconnect); their next call is refused."""
     with _lock:
@@ -531,10 +537,13 @@ def _refresh_refusal(code: str) -> Any:
             "set it under Settings → Connections",
             "client_not_configured",
         )
+    from kiro_crew.connections.crew_oauth import safe_error_code
+
+    shown = safe_error_code(code, "rejected")
     # The provider answered and refused: a retry will not help.
     return _refuse(
         502,
-        f"the provider rejected the sign-in refresh ({code[:64]}): check the OAuth app "
+        f"the provider rejected the sign-in refresh ({shown}): check the OAuth app "
         "under Settings → Connections, then reconnect if it persists",
         "refresh_rejected",
     )

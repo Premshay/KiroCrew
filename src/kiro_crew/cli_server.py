@@ -180,6 +180,12 @@ def _status(args: argparse.Namespace) -> None:
     except Exception:
         print("Kiro Crew gateway is running but returned an unexpected response.")
         return
+    if not isinstance(data, dict):
+        # Valid JSON that is not an object (``[]``, ``null``, a string) parses
+        # without raising, so the handler above never sees it; the reads below
+        # would then raise on it. The owner fallback can return one too.
+        print("Kiro Crew gateway is running but returned an unexpected response.")
+        return
 
     print(f"Kiro Crew v{__version__} 👻\n")
     print(f"  Uptime:      {data.get('uptime', '—')}")
@@ -389,6 +395,13 @@ async def _gateway(
         print(f"👻 Created default config: {config_path()}")
 
     cfg = KiroCrewConfig.load()
+    # Local recording is on by default; the start says so in one stderr line,
+    # once per notice version. On a daemon thread, so it neither runs on
+    # the loop nor holds the boot back. Imported here: this module's import list
+    # is a frozen facade inventory.
+    from kiro_crew.metrics import notice as usage_notice
+
+    usage_notice.print_notice_in_background(cfg)
     await run_gateway(
         cfg,
         no_dashboard=no_dashboard,
@@ -417,6 +430,9 @@ async def _run_task(args: argparse.Namespace) -> None:
 
     await asyncio.to_thread(ensure_kiro_cli_kas_verdict)
     cfg = KiroCrewConfig.load()
+    from kiro_crew.metrics import notice as usage_notice
+
+    usage_notice.print_notice_in_background(cfg)
     factory = build_provider_factory(cfg)
     sessions = SessionManager(cfg, provider_factory=factory)  # type: ignore[arg-type]
 
@@ -537,19 +553,31 @@ async def _run_task(args: argparse.Namespace) -> None:
     else:
         print(f"👻 Running spec: {spec_path}")
     task_name = getattr(args, "name", "")
-    result = await runner.run(spec_path, name=task_name)
+    # Local: this module's top-level imports are a frozen facade inventory.
+    from kiro_crew.hooks import FileTooLargeError
 
-    label = result.name or result.task_id
-    if result.status == "completed":
-        print(f"\n✅ Task completed — {label} ({len(result.tasks)} steps)")
-    elif result.status == "failed":
-        print(f"\n❌ Task failed ({label}): {result.error}", file=sys.stderr)
-        sys.exit(1)
-    elif result.status == "cancelled":
-        print("\n⚠️  Task cancelled")
-        sys.exit(1)
+    try:
+        try:
+            result = await runner.run(spec_path, name=task_name)
+        except (ValueError, OSError, FileTooLargeError) as exc:
+            # The runner's own spec checks (an empty spec, one the file gate
+            # refuses, one that is not UTF-8 or too large) and its workspace
+            # writes. Reported like the missing-spec case above, not as a
+            # traceback; the reason names which.
+            print(f"❌ Could not run {spec_path}: {exc}", file=sys.stderr)
+            sys.exit(1)
 
-    await sessions.close_all()
+        label = result.name or result.task_id
+        if result.status == "completed":
+            print(f"\n✅ Task completed — {label} ({len(result.tasks)} steps)")
+        elif result.status == "failed":
+            print(f"\n❌ Task failed ({label}): {result.error}", file=sys.stderr)
+            sys.exit(1)
+        elif result.status == "cancelled":
+            print("\n⚠️  Task cancelled")
+            sys.exit(1)
+    finally:
+        await sessions.close_all()
 
 
 def _service_cmd(args: argparse.Namespace) -> int:
@@ -864,6 +892,8 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _GATEWAY_NOT_LISTENING_HINT,
         _TOKEN_REFUSAL_REMEDIES,
         _TOKEN_REQUEST_TIMEOUT,
+        EMBED_FORWARD_PORT_ENV,
+        _embed_query,
         _emit_session_urls,
         _logout,
         _probe_dashboard_health,
@@ -940,6 +970,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _detached_upstream_branch,
         _gateway_holds_update_lock,
         _refresh_agent_config,
+        _report_already_latest,
         _revalidate_gateway_update_check,
         _snapshot_memory_or_exit,
         _untracked_collisions,
@@ -950,4 +981,5 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.dashboard.tailnet import POLICY_OFF_DETAIL, policy_off  # noqa: F401
     from kiro_crew.env import node_augmented_path, node_bin_dirs  # noqa: F401
     from kiro_crew.gateway_lock import LockHolder  # noqa: F401
+    from kiro_crew.git_tmp_packs import UPDATE_FETCH_TIMEOUT_S, reap_stale_tmp_packs  # noqa: F401
     from kiro_crew.platform import release_apply  # noqa: F401

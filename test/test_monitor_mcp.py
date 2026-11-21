@@ -242,7 +242,8 @@ def test_monitor_inspect_passes_strict_identity_without_fallback():
                     "created_ts": 123.0,
                     "wake_count": 3,
                     "token_usage_known": False,
-                    "wake_instructions": "large prompt omitted from inspect",
+                    "wake_instructions": "Check CI on the new head.",
+                    "wake_on_terminal": True,
                     "last_wake_reason_code": "checks_failed",
                     "user_stop_reason": "operator stopped",
                     "last_observation_status": "pending",
@@ -270,7 +271,9 @@ def test_monitor_inspect_passes_strict_identity_without_fallback():
     assert payload["monitor"]["last_observation_reason_code"] == "checks_pending"
     assert "last_observation_summary" not in payload["monitor"]
     assert payload["monitor"]["observation"]["checks"]["passed_count"] == 20
-    assert "wake_instructions" not in payload["monitor"]
+    # What monitor_update can change is read back, so an update can be confirmed.
+    assert payload["monitor"]["wake_instructions"] == "Check CI on the new head."
+    assert payload["monitor"]["wake_on_terminal"] is True
     assert "check-0" not in result
 
 
@@ -549,3 +552,23 @@ def test_monitor_tools_reject_non_integral_or_boolean_runtime(tool_name, runtime
     assert result.startswith("Error:")
     assert session_directive.decode(result, tool_name) is None
     assert gateway_posts == []
+
+
+def test_autonudge_stop_with_a_null_reason_still_stops(gateway_posts):
+    """A model filling the optional ``reason`` as null must still stop the loop."""
+    with (
+        patch(
+            "kiro_crew.mcp_core._resolve_session_key_strict",
+            return_value="webex:kirocrew:direct:operator@example.com",
+        ),
+        patch("kiro_crew.mcp_core.sel", return_value=MagicMock()),
+    ):
+        try:
+            stop = mcp_core._call_tool("autonudge_stop", {"reason": None})
+        except Exception as exc:  # noqa: BLE001 - a raise loses the stop directive
+            stop = f"raised {exc!r}"
+
+    assert session_directive.decode(stop, "autonudge_stop") == {"reason": ""}, stop
+    assert [(p, b["tool"]) for p, b in gateway_posts] == [
+        ("/api/session-directive", "autonudge_stop")
+    ]

@@ -384,6 +384,20 @@ def valid_scratch_root_override() -> Path | None:
     return _resolve_scratch_root_override()
 
 
+def scratch_root_override_path_hint() -> Path | None:
+    """Read the pinned override, or its unvalidated spelling, without filesystem I/O.
+
+    Path gates must not allocate or validate scratch while checking a file. Before
+    allocation pins the override, the gate resolves this hint through its own bounded
+    resolver; a hint is never authorization to allocate at that path.
+    """
+    raw = os.environ.get(SCRATCH_ROOT_ENV) or ""
+    pin = _scratch_root_override_pin
+    if isinstance(pin, tuple) and pin[0] == raw:
+        return pin[1]
+    return Path(raw) if raw else None
+
+
 def _resolve_scratch_root_override() -> Path | None:
     """Validate the override once and pin ``(raw, resolved)`` for the process.
 
@@ -649,22 +663,29 @@ def _validate_scratch_root_override() -> tuple[Path | None, str | None]:
     # the override's own -- and the redundant nested mask aborts the launcher's mount pin.
     # Refusing an override at, under, or above any of these homes closes that at the source
     # (the module that owns the override) and falls back to the safe default.
+    #
+    # Both sides are compared with the Windows extended-length prefix folded off: on Windows
+    # ``resolve()`` keeps a ``\\?\`` prefix the operator typed while each home and the
+    # workspace base resolve plain, so an unfolded compare would accept the prefixed
+    # spelling of a path whose plain spelling is refused. The fold is lexical and applies to
+    # the comparison only; the returned ``p`` keeps the spelling the operator chose.
+    p_cmp = platform_compat.strip_extended_length_prefix(p)
     crew_homes: list[Path] = []
     for home_fn in (config_dir, _default_home, _legacy_home):
         try:
-            crew_homes.append(home_fn().resolve())
+            crew_homes.append(platform_compat.strip_extended_length_prefix(home_fn().resolve()))
         except Exception:  # pragma: no cover - defensive; never block resolution on this
             continue
-    for home_resolved in crew_homes:
-        if p == home_resolved or p in home_resolved.parents or home_resolved in p.parents:
+    for home_cmp in crew_homes:
+        if p_cmp == home_cmp or p_cmp in home_cmp.parents or home_cmp in p_cmp.parents:
             return None, "a crew home"
     try:
-        workspace_resolved = _default_workspace_base().resolve()
+        workspace_cmp: Path | None = platform_compat.strip_extended_length_prefix(
+            _default_workspace_base().resolve()
+        )
     except Exception:  # pragma: no cover - defensive
-        workspace_resolved = None
-    if workspace_resolved is not None and (
-        p == workspace_resolved or p in workspace_resolved.parents
-    ):
+        workspace_cmp = None
+    if workspace_cmp is not None and (p_cmp == workspace_cmp or p_cmp in workspace_cmp.parents):
         return None, "the workspace"
     # Refuse an EXISTING override root the current user does not own. The relocated root is
     # locked to its owner at allocation (``restrict_dir_to_owner``), but that pins whatever

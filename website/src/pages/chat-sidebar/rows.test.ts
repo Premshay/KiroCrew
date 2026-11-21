@@ -10,6 +10,7 @@
 import v8 from 'node:v8'
 import vm from 'node:vm'
 import { describe, it, expect, vi } from 'vitest'
+import { i18nT } from '../../i18n/t'
 import {
   buildSidebarRows, chipLabel, guideStepOnRowControl, sameRowView,
   type ConductorRowView, type RowPlacement, type RowScene, type RowShell, type SidebarRowInputs, type SidebarRows,
@@ -28,7 +29,7 @@ const peer = (key: string, over: Partial<Slot> = {}): Slot =>
   ({ key, title: `Peer ${key}`, running: false, last_turn_ts: iso(MINUTE), peer_id: 'inst-a', peer_name: 'astro', row_identity: `inst-a:${key}`, ...over }) as Slot
 
 function clears() {
-  return { tags: vi.fn(), search: vi.fn(), status: vi.fn(), folder: vi.fn(), hides: vi.fn(), models: vi.fn() }
+  return { tags: vi.fn(), search: vi.fn(), status: vi.fn(), folder: vi.fn(), hides: vi.fn(), models: vi.fn(), creators: vi.fn() }
 }
 
 /** No crew group shows: a single-machine list, as the facade passes on the board. */
@@ -57,9 +58,10 @@ function inputs(rows: Slot[], over: InputOverrides = {}): SidebarRowInputs {
     filters: {
       tags: { resolved: new Set(), raw: new Set(), ...f.tags },
       search: { text: '', folderMatches: null, ...f.search },
-      status: { active: new Set(), hidden: new Set(), paused: false, recentWindowMs: 60 * MINUTE, ...f.status },
+      status: { active: new Set(), hidden: new Set(), paused: new Set(), recentWindowMs: 60 * MINUTE, ...f.status },
       folders: { hiddenSubtree: new Set(), pinnedSubtree: new Set(), active: false, ...f.folders },
       models: { passes: () => true, active: false, ...f.models },
+      creators: { passes: () => true, active: false, ...f.creators },
     },
     clears: over.clears ?? clears(),
     crewGroups: over.crewGroups ?? NO_GROUPS,
@@ -239,47 +241,59 @@ describe('every filter dimension answers the three consumers together', () => {
   const pinnedSet = new Set(['kept'])
   // Dimension order is the registry's: tags, search, status, folder, status hides, model.
   const cases: Array<[string, InputOverrides, { filtered: string[]; narrowed: boolean; hides: boolean[]; hidesKept?: boolean[] }]> = [
-    ['nothing active', {}, { filtered: ['kept', 'dropped'], narrowed: false, hides: [false, false, false, false, false, false] }],
+    ['nothing active', {}, { filtered: ['kept', 'dropped'], narrowed: false, hides: [false, false, false, false, false, false, false] }],
     ['tags', { filters: { tags: { resolved: new Set(['t1']), raw: new Set(['t1']) } } },
-      { filtered: ['kept'], narrowed: true, hides: [true, false, false, false, false, false] }],
+      { filtered: ['kept'], narrowed: true, hides: [true, false, false, false, false, false, false] }],
     ['search', { filters: { search: { text: 'kept' } } },
-      { filtered: ['kept'], narrowed: true, hides: [false, true, false, false, false, false] }],
+      { filtered: ['kept'], narrowed: true, hides: [false, true, false, false, false, false, false] }],
     ['status', { filters: { status: { active: new Set<SessionFilterKey>(['pinned']) } } },
-      { filtered: ['kept'], narrowed: true, hides: [false, false, true, false, false, false] }],
+      { filtered: ['kept'], narrowed: true, hides: [false, false, true, false, false, false, false] }],
     // The folder dimension narrows nothing and filters no row: it acts through the
     // lanes (`isRowFolderHidden`) and the folder render, and only a reveal asks it.
     ['folder', { filters: { folders: { hiddenSubtree: new Set(['F2']), active: true } } },
-      { filtered: ['kept', 'dropped'], narrowed: false, hides: [false, false, false, true, false, false] }],
-    ['a paused status chip', { filters: { status: { active: new Set<SessionFilterKey>(['pinned']), paused: true } } },
-      { filtered: ['kept', 'dropped'], narrowed: false, hides: [false, false, false, false, false, false] }],
+      { filtered: ['kept', 'dropped'], narrowed: false, hides: [false, false, false, true, false, false, false] }],
+    ['a paused status chip', { filters: { status: { active: new Set<SessionFilterKey>(['pinned']), paused: new Set<SessionFilterKey>(['pinned']) } } },
+      { filtered: ['kept', 'dropped'], narrowed: false, hides: [false, false, false, false, false, false, false] }],
     // A hide answers for the row itself, and exempts no pinned row: `kept` is pinned.
     ['a status hide', { filters: { status: { hidden: new Set<SessionFilterKey>(['pinned']) } } },
-      { filtered: ['dropped'], narrowed: true, hides: [false, false, false, false, false, false], hidesKept: [false, false, false, false, true, false] }],
+      { filtered: ['dropped'], narrowed: true, hides: [false, false, false, false, false, false, false], hidesKept: [false, false, false, false, true, false, false] }],
     // Raw-vs-resolved: a stored tag the vocabulary cannot resolve filters nothing, yet a
     // reveal still clears it (it could be re-hiding the row mid-load). `kept` is pinned,
     // so the tag filter exempts it: a reveal of it must not clear the tag.
     ['an unresolved stored tag', { filters: { tags: { resolved: new Set(), raw: new Set(['ghost']) } } },
-      { filtered: ['kept', 'dropped'], narrowed: false, hides: [true, false, false, false, false, false], hidesKept: [false, false, false, false, false, false] }],
+      { filtered: ['kept', 'dropped'], narrowed: false, hides: [true, false, false, false, false, false, false], hidesKept: [false, false, false, false, false, false, false] }],
     // The model filter exempts no pinned row: in exclude mode a pinned session on the
     // hidden model is the one the person asked to drop. `kept` is pinned.
     ['model', { filters: { models: { passes: slot => slot.key === 'dropped', active: true } } },
-      { filtered: ['dropped'], narrowed: true, hides: [false, false, false, false, false, false], hidesKept: [false, false, false, false, false, true] }],
+      { filtered: ['dropped'], narrowed: true, hides: [false, false, false, false, false, false, false], hidesKept: [false, false, false, false, false, true, false] }],
+    // "Started by" exempts no pinned row either: `kept` is pinned.
+    ['creator', { filters: { creators: { passes: slot => slot.key === 'dropped', active: true } } },
+      { filtered: ['dropped'], narrowed: true, hides: [false, false, false, false, false, false, false], hidesKept: [false, false, false, false, false, false, true] }],
   ]
   it.each(cases)('%s', (_name, over, expected) => {
     const rows = buildSidebarRows(inputs([kept, dropped], { ...over, local: { pinned: pinnedSet, folderOf: { kept: 'F1', dropped: 'F2' } } }))
     expect(keys(rows.filteredSlots)).toEqual(expected.filtered)
     expect(rows.listNarrowed).toBe(expected.narrowed)
     expect(rows.revealBlockingFilters.map(d => d.hides(dropped))).toEqual(expected.hides)
-    expect(rows.revealBlockingFilters.map(d => d.hides(kept))).toEqual(expected.hidesKept ?? [false, false, false, false, false, false])
+    expect(rows.revealBlockingFilters.map(d => d.hides(kept))).toEqual(expected.hidesKept ?? [false, false, false, false, false, false, false])
   })
 
-  it.each([0, 1, 2, 3, 4, 5])('reveal clear %i drops only its own dimension, the folder one along the row\'s own folder', index => {
+  it.each([0, 1, 2, 3, 4, 5, 6])('reveal clear %i drops only its own dimension, the folder one along the row\'s own folder', index => {
     const c = clears()
     const rows = buildSidebarRows(inputs([kept, dropped], { clears: c, local: { folderOf: { dropped: 'F2' } } }))
     rows.revealBlockingFilters[index].clear(dropped)
-    const called = [c.tags, c.search, c.status, c.folder, c.hides, c.models].map(fn => fn.mock.calls.length)
-    expect(called).toEqual([0, 1, 2, 3, 4, 5].map(i => (i === index ? 1 : 0)))
+    const called = [c.tags, c.search, c.status, c.folder, c.hides, c.models, c.creators].map(fn => fn.mock.calls.length)
+    expect(called).toEqual([0, 1, 2, 3, 4, 5, 6].map(i => (i === index ? 1 : 0)))
     if (index === 3) expect(c.folder).toHaveBeenCalledWith('F2')
+  })
+
+  it('counts the "Started by" matches and hides over the rows the other filters keep', () => {
+    const rows = [local('mine-a'), local('mine-b'), local('theirs'), local('off-search', { title: 'zzz' })]
+    const passes = (slot: Slot) => slot.key.startsWith('mine')
+    const on = buildSidebarRows(inputs(rows, { filters: { creators: { passes, active: true }, search: { text: 'title' } } }))
+    expect(keys(on.filteredSlots)).toEqual(['mine-a', 'mine-b'])
+    expect(on.creatorCounts).toEqual({ matching: 2, hidden: 1 })
+    expect(buildSidebarRows(inputs(rows)).creatorCounts).toEqual({ matching: 0, hidden: 0 })
   })
 
   it('clears no folder for a peer row whose key collides with a filed local one', () => {
@@ -332,7 +346,17 @@ describe('every filter dimension answers the three consumers together', () => {
     })).filtersNarrowing).toBe(true)
     expect(buildSidebarRows(inputs(rows, { filters: { status: { hidden: new Set(['running']) } } })).filtersNarrowing).toBe(true)
     // A paused chip set narrows nothing, so there is nothing to clear.
-    expect(buildSidebarRows(inputs(rows, { filters: { status: { active: new Set(['unread']), paused: true } } })).filtersNarrowing).toBe(false)
+    expect(buildSidebarRows(inputs(rows, { filters: { status: { active: new Set(['unread']), paused: new Set<SessionFilterKey>(['unread']) } } })).filtersNarrowing).toBe(false)
+  })
+
+  it('a paused status filter drops out of the OR while an unpaused one still narrows', () => {
+    const rows = [local('u'), local('p', { pinned: true }), local('x')]
+    const built = buildSidebarRows(inputs(rows, {
+      local: { unread: new Set(['u']), pinned: new Set(['p']) },
+      filters: { status: { active: new Set<SessionFilterKey>(['unread', 'pinned']), paused: new Set<SessionFilterKey>(['unread']) } },
+    }))
+    expect(keys(built.filteredSlots)).toEqual(['p'])
+    expect(built.filtersNarrowing).toBe(true)
   })
 
   it('keeps every row filed in a folder whose NAME the query matched', () => {
@@ -367,7 +391,7 @@ describe('the reveal registry and the narrowing flag agree with the filter pass'
   const SEARCH: Array<InputOverrides['filters']> = [{}, { search: { text: 'deploy' } }]
   const STATUS: Array<InputOverrides['filters']> = [
     {}, { status: { active: new Set<SessionFilterKey>(['running', 'unread']) } },
-    { status: { active: new Set<SessionFilterKey>(['recent']), paused: true } },
+    { status: { active: new Set<SessionFilterKey>(['recent']), paused: new Set<SessionFilterKey>(['recent']) } },
   ]
   const FOLDER: Array<InputOverrides['filters']> = [{}, { folders: { hiddenSubtree: new Set(['F1']), active: true } }]
   const grid: Array<[string, InputOverrides['filters']]> = []
@@ -515,7 +539,7 @@ describe('the status hides', () => {
   })
 
   it('keeps hiding while the include chips are paused', () => {
-    const rows = build({ status: { active: new Set<SessionFilterKey>(['pinned']), paused: true, ...hideRunning } })
+    const rows = build({ status: { active: new Set<SessionFilterKey>(['pinned']), paused: new Set<SessionFilterKey>(['pinned']), ...hideRunning } })
     expect(keys(rows.filteredSlots)).toEqual(['stop'])
   })
 
@@ -764,7 +788,7 @@ describe('each output keeps its identity while its own inputs hold still', () =>
     filters: {
       tags: { ...ACTIVE.filters.tags }, search: { ...ACTIVE.filters.search },
       status: { ...ACTIVE.filters.status }, folders: { ...ACTIVE.filters.folders },
-      models: { ...ACTIVE.filters.models },
+      models: { ...ACTIVE.filters.models }, creators: { ...ACTIVE.filters.creators },
     },
     clears: { ...ACTIVE.clears },
   })
@@ -828,7 +852,7 @@ describe('each output keeps its identity while its own inputs hold still', () =>
     ['filters.search.text', withFilter('search', 'text', 'beta')],
     ['filters.search.folderMatches', withFilter('search', 'folderMatches', new Set(['F1']))],
     ['filters.status.active', withFilter('status', 'active', new Set<SessionFilterKey>(['running']))],
-    ['filters.status.paused', withFilter('status', 'paused', true)],
+    ['filters.status.paused', withFilter('status', 'paused', new Set<SessionFilterKey>(['running']))],
     ['filters.status.hidden', withFilter('status', 'hidden', new Set<SessionFilterKey>(['unread']))],
     ['filters.status.recentWindowMs', withFilter('status', 'recentWindowMs', 10 * DAY)],
     ['filters.folders.hiddenSubtree', withFilter('folders', 'hiddenSubtree', new Set(['F1']))],
@@ -966,11 +990,14 @@ describe('the window a row stubs into', () => {
   const rows = buildSidebarRows(inputs([a, b]))
   const mounted = (over: Parameters<typeof scene>[0], slot: Slot = a) => rows.views(scene(over)).windowOf(slot).keepMounted
 
-  it('titles the stub by the session title, falling back to its key', () => {
+  it('titles the stub the way its row is titled, an untitled one by the label', () => {
     const views = rows.views(scene())
+    const untitled = i18nT('pages.artifactDetailPage.untitled_session')
     expect(views.windowOf(a).title).toBe('Title a')
-    expect(views.windowOf(local('k', { title: '' })).title).toBe('k')
-    expect(views.windowOf(local('k', { title: 'k' })).title).toBe('k')
+    expect(views.windowOf(local('k', { title: '' })).title).toBe(untitled)
+    expect(views.windowOf(local('k', { title: 'k' })).title).toBe(untitled)
+    // The backend's English placeholder for an open untitled slot is not a title.
+    expect(views.windowOf(local('k', { title: 'New Session…' })).title).toBe(untitled)
   })
 
   it('stubs a row only when nothing on it would be lost', () => {

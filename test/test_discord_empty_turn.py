@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from redaction_structured_cases import github_classic
 from test_discord import (
     FakeClient,
     FakeCtx,
@@ -43,6 +44,7 @@ from kiro_crew.discord.renderer import DiscordRenderer
 from kiro_crew.discord.transport import DISCORD_CAPABILITIES
 from kiro_crew.discord.transport_dispatch import DiscordDispatcher
 from kiro_crew.history import ConversationLog
+from kiro_crew.testing.synthetic_credentials import SAMPLE_SLACK_BOT_TOKEN
 
 FOOTER_MARK = "\n\n-# "
 
@@ -280,7 +282,7 @@ class TestEmptyTurnIsNeverAFinishedReply:
         """The pipeline hands this adapter the RAW exception (``TurnRecord.error``);
         the error row it writes takes the same redaction as every channel-visible
         failure text, so the transcript never stores a host path or a token."""
-        secret = "ghp_" + "x" * 36
+        secret = github_classic(seed=21)
 
         class _SecretDying(FakeProvider):
             async def stream(self, message: str) -> Any:
@@ -371,8 +373,8 @@ class TestEmptyTurnIsNeverAFinishedReply:
         cli = FakeClient()
         r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
         await r.on_turn_start()
-        # Assembled at runtime so no source line spells a key id.
-        key = "AK" + "IA" + "IOSFODNN7EXAMPLE"
+        # A Slack bot token, built so no source line spells one.
+        key = SAMPLE_SLACK_BOT_TOKEN
         r.note_steer(f"use {key} for the bucket")
         await r.close()
 
@@ -445,7 +447,7 @@ class TestEmptyTurnIsNeverAFinishedReply:
         self, tmp_path: Path
     ) -> None:
         """Flushing the withheld tail must still be a redacted flush."""
-        key = "AK" + "IA" + "IOSFODNN7EXAMPLE"  # assembled so no source line spells a key id
+        key = github_classic(seed=23)  # built at runtime so no source line spells a credential
         d, cli, _sess, log = _dispatcher(_UnclosedAfterTextProvider(f"key {key}"), tmp_path)
 
         await d.handle_message(_inbound("what is the key?"))

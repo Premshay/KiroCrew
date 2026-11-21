@@ -1,7 +1,7 @@
 /** Clean up sessions: the archive window, its dry-run preview and the archive
  *  write (`useSessionCleanup`), and the header menu's panel that drives them. */
 import { useState } from 'react'
-import { BrushCleaning } from 'lucide-react'
+import { BrushCleaning, ChevronRight } from 'lucide-react'
 import ErrorNotice from '../../components/ErrorNotice'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { deleteSlot, fetchHistory } from '../../store/chatSlice'
@@ -15,6 +15,7 @@ import type { QueryClient } from '@tanstack/react-query'
 import type { AppDispatch } from '../../store'
 import type { SidebarScope } from './scope'
 import { RadioChipGroup, radioChip } from '../../components/RadioChipGroup'
+import { sessionDisplayTitle } from '../../utils/sessionDisplayTitle'
 
 /** Inactivity windows offered by the cleanup panel, in days. The backend accepts any
  *  value >= 1, so this list is purely the set of presets the picker renders. */
@@ -101,14 +102,14 @@ export function renderSessionCleanupPanel(shell: SidebarScope): React.ReactNode 
                         <button type="button" aria-expanded={cleanupExpanded} aria-controls={CLEANUP_LIST_ID} className="ml-1 text-accent hover:underline cursor-pointer bg-transparent border-none p-0 text-[12px]" onClick={() => setCleanupExpanded(!cleanupExpanded)}>
                           {cleanupExpanded
                             ? i18nT('pages.chatSidebar.hide_sessions_count', { count: archivable.length, n: fmtNumber(archivable.length) })
-                            : i18nT('pages.chatSidebar.show_sessions_count', { count: archivable.length, n: fmtNumber(archivable.length) })} ▸
+                            : i18nT('pages.chatSidebar.show_sessions_count', { count: archivable.length, n: fmtNumber(archivable.length) })} <ChevronRight className="lucide-inline" />
                         </button>
                       )}
                       {cleanupExpanded && archivable.length > 0 && (
                         <div id={CLEANUP_LIST_ID} className="mt-2 max-h-32 overflow-y-auto rounded-md border border-border bg-bg-elevated p-1.5">
                           {archivable.map(s => (
                             <div key={s.key} className="text-[12px] text-muted truncate py-0.5 px-1">
-                              {s.title && s.title !== s.key ? s.title : s.key}
+                              {sessionDisplayTitle(s)}
                               {slotActivityTs(s) && <span className="ml-1 text-[11px] opacity-60">{fmtRelativeTime(slotActivityTs(s))}</span>}
                             </div>
                           ))}

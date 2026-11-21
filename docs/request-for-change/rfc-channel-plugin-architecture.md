@@ -3,8 +3,8 @@ title: Channel Plugin Architecture — shared runtime, channels as app extension
 status: partial
 author: zezhexu
 created: 2026-07-28
-last-audited: 2026-10-05
-audited-at: f97eeefbe3
+last-audited: 2026-11-20
+audited-at: c157748343
 doc-pr: 689
 implementation-prs: [777, 1019, 1234]
 tracking-issues: []
@@ -29,8 +29,8 @@ superseded-by: []
   incomplete. Section 3 items not on main: the `ChannelHooks` protocol; the
   descriptor's `contract_version`, config schema, capabilities and
   transport/renderer factories (`messaging/registry.py::ChannelDescriptor` carries
-  `channel_type`, `start`, `credentials`, `credential_fallbacks`,
-  `required_config` and `boot_keys`); and the generic channel config route and
+  `channel_type`, `start`, `credentials`, `restart_credentials`,
+  `credential_fallbacks`, `required_config` and `boot_keys`); and the generic channel config route and
   settings form. §9 as shipped: rules 2, 3 and 5 and the parser half of rule 4 ship
   (`messaging/link.py::parse_session_key`, `assert_colon_free`,
   `build_dm_session_key`); rule 1 (a `/api/sessions/{key}` control plane) does not —

@@ -26,10 +26,13 @@ from crew_log_emit_helpers import (  # noqa: F401 -- the autouse fixture registe
     _owned_elsewhere,
     _remove_as_retention_does,
 )
+from redaction_structured_cases import github_classic
 
 from kiro_crew import crew_log as lg
+from kiro_crew import platform_compat
 from kiro_crew.crew_log import emit
 from kiro_crew.crew_log import projection as crew_log_projection
+from kiro_crew.testing.wait import default_timeout
 
 # cache pressure
 
@@ -116,7 +119,7 @@ def test_a_resume_closes_a_child_the_registry_no_longer_lists():
 
 
 def test_a_resume_leaves_a_child_the_registry_still_lists_alone():
-    # The same-process case that made an earlier revision corrupt the file: idle
+    # The same-process case that can corrupt the file: idle
     # teardown, reset, resume -- while the child is still running and will file its
     # own terminal. The registry still lists it, so the repair must not invent one.
     emit.set_child_liveness(lambda agent_id: agent_id == "sub-1")
@@ -197,11 +200,11 @@ def test_a_credential_in_the_task_text_never_reaches_the_log():
     """
     _open_session()
     emit.on_turn_started(SESSION, 1, "user")
-    emit.on_subagent_spawned(
-        SESSION, 1, agent_id="sub-1", task="deploy with AKIAIOSFODNN7EXAMPLE now"
-    )
+    # An AWS key ID is an Identifier with the structured detectors on.
+    secret = github_classic(seed=25)
+    emit.on_subagent_spawned(SESSION, 1, agent_id="sub-1", task=f"deploy with {secret} now")
     assert_drained()
-    assert "AKIAIOSFODNN7EXAMPLE" not in _opener("subagent/spawned")["task"]
+    assert secret not in _opener("subagent/spawned")["task"]
 
 
 def test_a_completed_child_records_the_credits_it_billed():
@@ -734,6 +737,32 @@ def test_call_index_of_a_live_turn_survives_cache_pressure():
     assert steps == [1, 2, 3], "the numbering restarted, so two calls share a step"
 
 
+@pytest.fixture
+def _gateway_descriptor_limit():
+    """Run under the open-file soft limit the gateway sets at boot (10240).
+
+    ``service_boot`` raises it with ``raise_nofile_soft_limit(10240)``. A test that keeps
+    ``_MAX_OPEN_CREW_LOGS`` crew logs open (each with its lock file) beside the eager
+    folder needs more than the macOS default of 256, so without this it reds on a stock
+    Mac with ``EMFILE`` while passing on CI runners that allow 10240. The handles are
+    closed before the inherited limit comes back.
+    """
+    try:
+        import resource
+    except ImportError:  # Windows: no per-process descriptor rlimit
+        yield
+        return
+    inherited = resource.getrlimit(resource.RLIMIT_NOFILE)
+    platform_compat.raise_nofile_soft_limit(10240)
+    try:
+        yield
+    finally:
+        emit.drain_for_shutdown(timeout=default_timeout())
+        emit.reset_caches()
+        resource.setrlimit(resource.RLIMIT_NOFILE, inherited)
+
+
+@pytest.mark.usefixtures("_gateway_descriptor_limit")
 def test_call_index_stays_unique_when_many_turns_are_live_at_once():
     """More live turns than the handle cap, all still running.
 

@@ -1,9 +1,9 @@
 """A code channel's agent: the kickoff picker and ``/kirocrew agent <name>``.
 
 Every code channel runs ONE dashboard session (:mod:`.binding`), started on the
-resolved default agent: the explicit Slack Code default, else the default
-folder's ``default_agent``, else ``kirocrew-conductor`` (the auto "Code channels"
-folder's agent). The people in the channel can move that session to another
+resolved default agent: the conductor mode agent while "Always use conductor mode" is
+on, else the explicit Slack Code default, else the default folder's
+``default_agent``, else the owner's default agent. The people in the channel can move that session to another
 agent two ways:
 
 * the kickoff message carries a Block Kit ``static_select`` listing the agents
@@ -589,8 +589,12 @@ async def switch_channel_agent(
     # shared display sink before it leaves the host for Slack (as _announce).
     raw = str(body.get("error") or "the switch was refused")
     try:
+        from kiro_crew.security.redaction_switch import always_scan
+
         reason = surface.display_text(raw)
-        audited = surface.display_text(raw, mentions=False)  # the SEL row keeps plain text
+        # The SEL row keeps plain text, and stays redacted whatever the owner's setting.
+        with always_scan():
+            audited = surface.display_text(raw, mentions=False)
     except Exception:
         # A host whose redaction could not compose: say nothing of the error.
         logger.warning("code channel agent switch: refusal reason not shown", exc_info=True)

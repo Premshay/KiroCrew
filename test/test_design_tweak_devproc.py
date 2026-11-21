@@ -63,6 +63,27 @@ class FakePopen:
         return self.returncode
 
 
+class _SubprocessWithPopen:
+    """The ``subprocess`` module as ``server`` sees it, with only ``Popen`` replaced."""
+
+    def __init__(self, popen: Any) -> None:
+        self.Popen = popen
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(subprocess, name)
+
+
+def _patch_server_popen(monkeypatch: pytest.MonkeyPatch, popen: Any) -> None:
+    """Replace ``Popen`` for ``server`` alone, through its own ``subprocess`` binding.
+
+    The global ``subprocess.Popen`` is shared by every thread in the worker,
+    including the sensitive-path resolver pool's reaper, which spawns its
+    children through that name; a fake there reaches the reaper instead of
+    only ``_start_dev_proc``.
+    """
+    monkeypatch.setattr(server, "subprocess", _SubprocessWithPopen(popen))
+
+
 def _make_pkg_json(root: Path, scripts: dict | None = None) -> None:
     """Write a minimal package.json with optional scripts."""
     data: dict[str, Any] = {"name": "test-proj", "version": "1.0.0"}
@@ -443,7 +464,7 @@ class TestStartDevProc:
         monkeypatch.setattr(server, "_resolve_bin", lambda n: Path("/usr/bin/npm"))
 
         fake = FakePopen(pid=200, returncode=1)
-        monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: fake)
+        _patch_server_popen(monkeypatch, lambda *a, **kw: fake)
         monkeypatch.setattr(server, "kill_process_tree", lambda *a, **kw: True)
         monkeypatch.setattr(server, "DATA_DIR", tmp_path)
 
@@ -467,7 +488,7 @@ class TestStartDevProc:
             handle.flush()
             return fake
 
-        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        _patch_server_popen(monkeypatch, fake_popen)
 
         result = server._start_dev_proc("proj-tail", tmp_path)
 
@@ -484,10 +505,11 @@ class TestStartDevProc:
         monkeypatch.setattr(server, "_resolve_bin", lambda n: Path("/usr/bin/npm"))
         monkeypatch.setattr(server, "DATA_DIR", tmp_path)
 
-        # Build the AWS-access-key-shaped fixture by concatenation so no
-        # real-looking token literal sits in the source (the content scanner
-        # reads added lines).
-        secret = "AKIA" + "IOSFODNN7" + "EXAMPLE"
+        # Build a synthetic GitHub token at runtime so no real-looking token
+        # literal sits in the source (the content scanner reads added lines).
+        from redaction_structured_cases import github_classic
+
+        secret = github_classic(seed=51)
         payload = f"config error near key {secret} while starting"
         fake = FakePopen(pid=202, returncode=1)
 
@@ -497,7 +519,7 @@ class TestStartDevProc:
             handle.flush()
             return fake
 
-        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        _patch_server_popen(monkeypatch, fake_popen)
 
         result = server._start_dev_proc("proj-secret", tmp_path)
 
@@ -535,7 +557,7 @@ class TestStartDevProc:
             handle.flush()
             return fake
 
-        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        _patch_server_popen(monkeypatch, fake_popen)
 
         result = server._start_dev_proc("proj-pem", tmp_path)
 
@@ -583,7 +605,7 @@ class TestStartDevProc:
             handle.flush()
             return fake
 
-        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        _patch_server_popen(monkeypatch, fake_popen)
 
         result = server._start_dev_proc("proj-seam", tmp_path)
 
@@ -623,7 +645,7 @@ class TestStartDevProc:
             handle.flush()
             return fake
 
-        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        _patch_server_popen(monkeypatch, fake_popen)
 
         result = server._start_dev_proc("proj-cap", tmp_path)
 
@@ -675,7 +697,7 @@ class TestStartDevProc:
             handle.flush()
             return fake
 
-        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        _patch_server_popen(monkeypatch, fake_popen)
 
         result = server._start_dev_proc("proj-orphan", tmp_path)
 
@@ -732,7 +754,7 @@ class TestStartDevProc:
             handle.flush()
             return fake
 
-        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        _patch_server_popen(monkeypatch, fake_popen)
 
         result = server._start_dev_proc("proj-orphan-2", tmp_path)
 
@@ -793,7 +815,7 @@ class TestStartDevProc:
             handle.flush()
             return fake
 
-        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        _patch_server_popen(monkeypatch, fake_popen)
 
         result = server._start_dev_proc("proj-orphan-noend", tmp_path)
 
@@ -852,7 +874,7 @@ class TestStartDevProc:
             handle.flush()
             return fake
 
-        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        _patch_server_popen(monkeypatch, fake_popen)
 
         result = server._start_dev_proc("proj-companion", tmp_path)
 
@@ -871,8 +893,8 @@ class TestStartDevProc:
         (tmp_path / "node_modules").mkdir()
         monkeypatch.setattr(server, "_resolve_bin", lambda n: Path("/usr/bin/npm"))
         monkeypatch.setattr(server, "DATA_DIR", tmp_path)
-        monkeypatch.setattr(
-            subprocess, "Popen",
+        _patch_server_popen(
+            monkeypatch,
             lambda *a, **kw: (_ for _ in ()).throw(OSError("ENOENT")),
         )
         result = server._start_dev_proc("proj6", tmp_path)
@@ -887,7 +909,7 @@ class TestStartDevProc:
         monkeypatch.setattr(server, "DATA_DIR", tmp_path)
 
         fake = FakePopen(pid=300, returncode=None)
-        monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: fake)
+        _patch_server_popen(monkeypatch, lambda *a, **kw: fake)
         monkeypatch.setattr(server, "kill_process_tree", lambda *a, **kw: True)
         # First call: nothing; second call: found
         calls = [0]

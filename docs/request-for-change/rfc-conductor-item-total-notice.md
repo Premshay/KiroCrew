@@ -3,8 +3,8 @@ title: The goal conductor keeps its item total out of round reports and says it 
 status: superseded
 author: kirocrew agent session, directed by adlio
 created: 2026-10-20
-last-audited: 2026-10-27
-audited-at: ab57fba809
+last-audited: 2026-11-20
+audited-at: c157748343
 doc-pr: 22427
 implementation-prs: [22417]
 tracking-issues: [22415]
@@ -39,7 +39,7 @@ in its own document, so that one is not edited here.
 specified how the conductor surfaces it: "The total is a line in every round
 report (`items used: N of <item_cap>`)". The conductor prompt
 (`_CONDUCTOR_SYSTEM_PROMPT` in `src/kiro_crew/agent.py`, its "Rounds are not
-gated, but spend is bounded" paragraph) and the goal-conductor skill
+gated, but they are bounded" paragraph) and the goal-conductor skill
 (`src/kiro_crew/builtin_skills/goal-conductor/SKILL.md`, its "Item cap
 (advisory)" bullet) carry that instruction, and `src/kiro_crew/docs/work-ledger.md`
 documents it.

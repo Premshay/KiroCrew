@@ -30,10 +30,8 @@ from kiro_crew.sandbox_leaves import (
     _CREW_HOME_PREFIXES,
     _CREW_READONLY_LEAVES,
     _CREW_SANDBOX_VISIBLE_LEAVES,
-    _MD_NOTEBOOK_STAGING_LEAF,
     _POLICY_CACHE_LEAF,
     _RELOCATED_CREW_HIDDEN_LEAVES,
-    MD_NOTEBOOK_APP_NAME,
     _crew_home_entries,
 )
 
@@ -223,12 +221,10 @@ _APP_BACKEND_OWNED_LEAVES: dict[str, tuple[str, ...]] = {
     # the SAME namespace — and a worktree's lifecycle script could then pick the code
     # the gateway execs next. The pointer stays masked; Dev Fleet moves the cutover to a
     # gateway-process route instead (``dev_fleet/gateway_routes.py``).
-    MD_NOTEBOOK_APP_NAME: (
-        # The whole state directory, handed back as one unit: the state files, their staged
-        # temps and the migration marker all live inside it, so the publish rename stays on
-        # one mount. The retired bare spellings are NOT here; the backend never reads them.
-        _MD_NOTEBOOK_STAGING_LEAF,
-    ),
+    #
+    # NOT here either: the Notes state. It lives under the app's own data directory, in
+    # the directory its manifest declares in ``credentialMasks`` ("state/"), and its
+    # backend gets it back through :func:`app_declared_mask_targets` like any app's.
 }
 
 
@@ -265,6 +261,94 @@ def app_backend_visible_targets(app_name: str, mode: str = "standard") -> tuple[
     )
 
 
+def app_backend_secret_mask_targets() -> tuple[str, ...]:
+    """Absolute paths of the gateway's internal-API secret files, for an app backend.
+
+    ``.local_secret`` and every ``run/gateway-<port>.secret`` and
+    ``run/gateway-<port>-<addr>.secret`` hold the same value, which is the only
+    credential of the gateway's internal routes. An app backend is third-party code and
+    reads none of them: no spawned backend calls the gateway with it (the Sage app's
+    routes, the one app that does, run inside the gateway). ``apps/backend.py`` passes
+    these paths as ``extra_hidden_dirs``, so the plan masks the files and leaves
+    ``run`` itself readable. Both data-home spellings and a relocated data home are
+    covered; files that exist at spawn time are listed.
+
+    A backend started at gateway boot is spawned BEFORE the gateway writes this
+    generation's files, so the files of the gateway's own listener (named by
+    ``KIROCREW_BOUND_PORT``) and ``.local_secret`` are created empty in the live data
+    home first, on POSIX, and listed like the rest. The gateway writes each one in
+    place, so the backend keeps seeing the empty stand-in after the write.
+
+    shortcut: a file under a data-home spelling other than the live one, or for a
+    listener this gateway does not name, is masked only if it exists at spawn;
+    upgrade by masking ``run`` once the launcher lives outside it.
+    """
+
+    def bound_gateway_secret_paths(run_dir: str) -> tuple[str, ...]:
+        """This gateway's own listener files by name; ``KIROCREW_BOUND_PORT`` names the port.
+
+        The listener files carry the bound address in their name, which the environment
+        keeps only in part, so the four loopback and wildcard spellings and
+        ``KIROCREW_BOUND_HOST`` are all named.
+        """
+        try:
+            port = int(os.environ.get("KIROCREW_BOUND_PORT", "").strip())
+        except ValueError:
+            return ()
+        if not 1 <= port <= 65535:
+            return ()
+        from kiro_crew.instances import run_marker
+
+        bound = os.environ.get("KIROCREW_BOUND_HOST", "").strip()
+        hosts = dict.fromkeys(("127.0.0.1", "::1", "0.0.0.0", "::", bound))
+        names = [run_marker.secret_file_name(port)]
+        names.extend(run_marker.listener_secret_file_name(port, h) for h in hosts if h)
+        return tuple(os.path.join(run_dir, n) for n in names)
+
+    def precreate_empty(path: str) -> None:
+        """Create *path* empty and owner-only if absent; never follow a link."""
+        try:
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+        except FileExistsError:
+            pass
+        except OSError:
+            logger.warning("could not precreate %s for the secret mask", os.path.basename(path))
+
+    home = str(Path.home())
+    roots = [os.path.join(home, prefix) for prefix in _CREW_HOME_PREFIXES]
+    live_root = ""
+    try:
+        live_root = os.path.normpath(str(config_dir()))
+        roots.append(live_root)
+    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+        logger.debug("could not resolve the crew data home for secret masking", exc_info=True)
+    bound_names: tuple[str, ...] = ()
+    if live_root and os.name == "posix":
+        run_dir = os.path.join(live_root, "run")
+        bound_names = bound_gateway_secret_paths(run_dir)
+        if bound_names:
+            try:
+                os.makedirs(run_dir, mode=0o700, exist_ok=True)
+            except OSError:
+                logger.warning("could not create the run directory for the secret mask")
+            else:
+                for path in (os.path.join(live_root, ".local_secret"), *bound_names):
+                    precreate_empty(path)
+    targets: list[str] = []
+    for root in dict.fromkeys(os.path.normpath(r) for r in roots):
+        targets.append(os.path.join(root, ".local_secret"))
+        try:
+            names = os.listdir(os.path.join(root, "run"))
+        except OSError:
+            continue
+        targets.extend(
+            os.path.join(root, "run", n)
+            for n in sorted(names)
+            if n.startswith("gateway-") and n.endswith(".secret")
+        )
+    return tuple(dict.fromkeys(t for t in targets if os.path.lexists(t)))
+
+
 def app_declared_mask_targets(
     app_name: str, *, builtin: bool, mode: str = "standard"
 ) -> tuple[str, ...]:
@@ -287,7 +371,8 @@ def app_declared_mask_targets(
     Only a path that is absent or a regular file with ONE name is handed back
     (:func:`_liftable_declared_file`). A second hard link makes the file's bytes another
     path's bytes too, maybe a core credential's, and a path comparison cannot tell; a
-    directory is not a declared entry at all. Either one stays masked for the backend.
+    directory at a file entry stays masked for the backend too. A directory entry
+    (``"state/"``) is handed back while it is absent or a real directory, never a link.
 
     Returns ``()`` for an app that declares nothing.
     """
@@ -306,15 +391,21 @@ def app_declared_mask_targets(
     )
     if not leaves:
         return ()
+    directories = credential_masks.declared_crew_dir_leaves_for(app_name, builtin=builtin)
     home = str(Path.home())
-    targets = [os.path.join(home, entry) for entry in _crew_home_entries(leaves)]
-    targets.extend(_relocated_crew_targets(leaves))
+    targets: list[tuple[str, bool]] = []
+    for leaf in leaves:
+        directory = leaf in directories
+        targets.extend((os.path.join(home, e), directory) for e in _crew_home_entries((leaf,)))
+        targets.extend((t, directory) for t in _relocated_crew_targets((leaf,)))
     return tuple(
-        target
-        for target in targets
-        if not carveout_shadowed_by_foreign_mask(target, mode=mode)
-        and not carveout_chain_has_planted_link(target)
-        and _liftable_declared_file(target)
+        dict.fromkeys(
+            target
+            for target, directory in targets
+            if not carveout_shadowed_by_foreign_mask(target, mode=mode)
+            and not carveout_chain_has_planted_link(target)
+            and (_liftable_declared_dir(target) if directory else _liftable_declared_file(target))
+        )
     )
 
 
@@ -363,6 +454,27 @@ def app_declared_readonly_targets(
     )
 
 
+def _liftable_declared_dir(target: str) -> bool:
+    """Whether a declared directory *target* may go back to its backend: absent, or a real dir.
+
+    Judged with ``lstat``, so a link at the name is never followed or handed back.
+    """
+    try:
+        info = os.lstat(target)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        info = None
+    if info is not None and stat.S_ISDIR(info.st_mode):
+        return True
+    logger.warning(
+        "sandbox: not handing the declared directory mask %s back to its app's backend: it "
+        "is not a directory, so it stays masked for that backend too.",
+        target,
+    )
+    return False
+
+
 def _liftable_declared_file(target: str) -> bool:
     """Whether a declared *target* may go back to its app's backend: absent, or a one-name file.
 
@@ -389,7 +501,7 @@ def _liftable_declared_file(target: str) -> bool:
 def enterprise_policy_cache_view(
     mode: str = "standard", extra_hidden_dirs: tuple[str, ...] = ()
 ) -> tuple[str, ...]:
-    """The governance cache to lift READ-ONLY for a sandboxed spawn, in an LTS build.
+    """The governance cache to lift READ-ONLY for a sandboxed spawn on a governed host.
 
     An LTS build always enters the central tier (RFC D2), including a Kiro Crew
     MCP server kiro-cli starts inside the agent sandbox. That process reaches neither the
@@ -399,10 +511,15 @@ def enterprise_policy_cache_view(
     fixed source and the fetch validators; no credential. The vault and every other
     credential path stay hidden.
 
+    An oss build whose ceiling came from central distribution
+    (``policy_distribution.central_ceiling_installed``) is in the same position: the ACP
+    launch tail and managed MCP declarations put the harness's Kiro Crew MCP children in
+    cache-only mode, and a KAS runtime starts them inside this sandbox.
+
     Lifted the way ``apps/backend.py`` lifts it for a cache-only backend: one spelling,
     refused when it sits beneath a foreign mask (:func:`carveout_shadowed_by_foreign_mask`),
     and kept read-only by the plan for every spelling (``sandbox_plan.is_policy_cache_dir``).
-    ``()`` in an oss build, so an oss sandbox is unchanged.
+    ``()`` in an oss build with no central ceiling, so such a sandbox is unchanged.
 
     Also ``()``, so the cache stays masked and a cache-only child fails closed, when:
 
@@ -415,8 +532,9 @@ def enterprise_policy_cache_view(
     """
     try:
         from kiro_crew.edition import is_lts
+        from kiro_crew.platform.policy_distribution import central_ceiling_installed
 
-        if not is_lts():
+        if not (is_lts() or central_ceiling_installed()):
             return ()
         target = os.path.join(str(config_dir()), _POLICY_CACHE_LEAF)
     except Exception:

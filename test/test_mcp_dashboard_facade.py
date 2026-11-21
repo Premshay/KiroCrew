@@ -134,8 +134,8 @@ def test_the_owners_are_the_mcp_dashboard_siblings_in_layer_order() -> None:
     """``_OWNERS`` names every ``mcp_dashboard_*.py`` sibling, and each owner imports only
     owners listed before it: the order the facade loads them and a read resolves in."""
     owners = list(_index().owners)
+    assert owners, "the facade composes no owner"
     on_disk = {f"kiro_crew.{p.stem}": p for p in SRC_DIR.glob("mcp_dashboard_*.py")}
-    assert len(on_disk) == 7
     assert sorted(owners) == sorted(on_disk)
     late: dict[str, list[str]] = {}
     for position, owner in enumerate(owners):

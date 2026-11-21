@@ -1,15 +1,41 @@
-"""Read the direction of an ``aws s3 cp|mv|sync`` command, or refuse to read it.
+"""Read the direction of ``aws s3 cp|mv|sync`` commands, or refuse to read them.
 
 The three ``credential-exfil-s3-*`` rows match ``<verb> .* s3://`` on the raw text,
 so a download with a leading flag (``cp --recursive s3://b/p ./d``) reads as an
 upload. A regex cannot split flags from operands the way bash and the aws CLI do:
 a backslash-escaped space and a glued ``$IFS`` each make bash see words the regex
-does not. So this module does not see through shell syntax at all. It
-reads only a command of plain literal words, splits them as bash would, reads the
-words with a fixed table of aws CLI flags, and answers True only when the one
-source is ``s3://`` and the one destination is not. Anything else -- an expansion,
-a glob, an escape, a separator, an unknown flag -- answers False and the row's
-deny stands, so this can only narrow a row on a command it fully read.
+does not. So this module does not see through shell syntax at all. It reads only
+commands built from plain literal words, splits them as bash would, reads the
+words with a fixed table of aws CLI flags, and answers True only when EVERY
+``aws s3`` transfer on the line is a download: its one source is ``s3://`` and its
+one destination is not. Anything else -- an expansion it cannot resolve, a glob,
+an escape, an unclear separator, an unknown flag, a subshell, a pipe into anything
+but ``tail``/``head``/``grep``/``wc``, an input redirect, a command
+substitution -- answers False and the rows' deny stands, so this can only narrow a
+row on a command it fully read. A download may carry ``N>&M`` stream copies
+(``2>&1``) and redirects to ``/dev/null`` (``2>/dev/null``), a leading ``time``,
+and an ``AWS_PROFILE``, ``AWS_REGION`` or ``AWS_DEFAULT_REGION`` prefix. A redirect
+to any other target keeps the deny: that file could be the config a transfer reads.
+
+It reads a SEQUENCE of top-level statements split on ``;``, ``&&``, ``||`` and
+newlines, judging each on its own:
+
+* A plain literal assignment made earlier on the line (``B=b``, then ``s3://$B/…``)
+  is resolved, but only when the value is one plain literal word and the name is
+  assigned exactly once by an assignment that always runs (not after ``&&`` or
+  ``||``). Names are case-sensitive, as in bash. A reassignment, a ``+=`` append,
+  or a name that steers splitting, lookup or ``~`` (``IFS``, ``PATH``, ``HOME``,
+  ``PWD``, …) or that bash sets itself (``_``, ``RANDOM``, ``OPTARG``, ``BASH*``, …)
+  keeps the line denied.
+* Any other statement must run one program from a short inert list (``cat``,
+  ``echo``, ``touch``, ``mkdir``, ``ls``, ``cd``, ``pwd``, ``true``) with no ``$``,
+  backtick, backslash or ``!``, and with no ``>`` or ``<`` (a redirect or
+  here-document could write ``~/.aws/config`` before the download reads it). None of
+  those sets a variable or runs other code, so a
+  resolved value stays what bash will use. ``export``, ``read``, ``printf -v``, a
+  ``${X:=…}``, a loop, ``eval`` or ``bash`` keeps the line denied. Narrowing removes
+  only the s3 rows, so every other deny rule still judges the statement in
+  :mod:`~kiro_crew.security.deny_gate`.
 
 It reads ``aws s3`` and nothing else: ``python -c``, ``curl`` and every other way
 to move a file are out of its reach and stay with the rows and the OS sandbox.
@@ -26,10 +52,15 @@ import shlex
 
 from kiro_crew import platform_compat
 
+from . import shell_commands as _commands
 from . import shell_normalizer as _shell
-from .denied_rules import BUILTIN_DENIED_RULES
+from .denied_rules import BUILTIN_DENIED_RULES, _deny_pattern_matches
+from .paths import MAX_SCANNABLE_COMMAND_CHARS
 
 _VERBS = frozenset({"cp", "mv", "sync"})
+_AWS_WORDS = frozenset({"aws", "aws.exe"})  # not .cmd/.bat: cmd.exe re-parses those lines
+_AWS_CMD_WORDS = frozenset({"aws.cmd", "aws.bat"})  # read only with no cmd.exe metacharacter
+_CMD_META = frozenset('&|<>^%"()')
 _S3_TRANSFER_PATTERNS: frozenset[str] = frozenset(
     rule.pattern
     for rule in BUILTIN_DENIED_RULES
@@ -66,6 +97,96 @@ _FLAGS: dict[str, str] = {
     **dict.fromkeys(("--sse-c", "--request-payer"), _EQ_ONLY),
 }
 
+#: The programs a statement that is neither an ``aws s3`` transfer nor an assignment
+#: may run, with plain words only. None of them sets a shell variable or runs other
+#: code, so they cannot change what a later statement reads. Anything else (a loop
+#: keyword, ``export``, ``printf -v``, ``eval``, ``bash``, a ``${X:=…}``) keeps the
+#: deny. Such a statement may not redirect either: any ``>`` or ``<`` (quoted or
+#: not, here-documents included) keeps the deny, since ``echo … > ~/.aws/config``
+#: could install a ``credential_process`` the next download runs. shortcut: a short
+#: list from real download scripts; add a program only when it can set no variable
+#: and run nothing.
+_INERT = frozenset("cat echo touch mkdir ls cd pwd true".split())
+#: The programs a download's output may be piped into (``aws s3 cp … 2>&1 | tail``).
+#: Each one only reads its stdin and prints, so nothing it does can send a file. A
+#: statement on the RECEIVING end of a pipe must be one of these, with plain words
+#: only; a statement on the SENDING end must be a download or another of these, so
+#: ``cat f | aws s3 cp - s3://x`` keeps the deny. shortcut: the readers agents
+#: really append; add one only when it reads stdin, writes no file and runs nothing.
+#: ``less`` is left out: its lesskey file (which a download on the same line can
+#: write) may set ``LESSOPEN``, which runs a command even on stdin.
+_PIPE_READERS = frozenset("tail head grep wc".split())
+#: Variables that may prefix a download (``AWS_PROFILE=dev aws s3 cp …``). Each one
+#: picks what a ``--profile`` or ``--region`` flag already picks. ``AWS_CONFIG_FILE``
+#: and the like are left out on purpose: they choose which file the CLI reads.
+_ENV_PREFIXES = frozenset(("aws_profile", "aws_region", "aws_default_region"))
+#: Output redirect operators a download or a pipe reader may carry, and only with a
+#: :data:`_NULL_TARGETS` target, written as its own word or glued (``2>/dev/null``).
+#: A redirect to any other target writes a file, which could be the AWS config a
+#: transfer reads, so it keeps the deny. No ``<`` form is read either: an input
+#: redirect or a here-document keeps the deny.
+_NULL_REDIRECT_OPS = ("&>>", "1>>", "2>>", ">>", "&>", "1>", "2>", ">&", ">")  # longest first
+#: ``N>&M`` / ``>&M``: send one stream where another goes. It opens no file.
+_FD_DUPS = frozenset(f"{a}>&{b}" for a in ("", "1", "2") for b in "12")
+#: The only redirect target read: it writes no file.
+_NULL_TARGETS = frozenset(("/dev/null",))
+#: Names whose value changes how bash splits words, finds programs or expands a
+#: ``~``; assigning one keeps the deny.
+_SPECIAL_NAMES = frozenset(("IFS", "PATH", "ENV", "BASH_ENV", "CDPATH", "HOME", "PWD", "OLDPWD"))
+#: Names bash sets or rewrites itself (``$_`` after every command, ``$RANDOM`` on
+#: each read, ``$OPTARG`` from ``getopts``), so a value assigned earlier is not the
+#: value a later ``$NAME`` reads; assigning one keeps the deny. Every ``BASH*`` name
+#: is in this class too.
+_BASH_SET_NAMES = frozenset(
+    "_ RANDOM SRANDOM SECONDS LINENO EPOCHREALTIME EPOCHSECONDS PPID UID EUID GROUPS "
+    "HOSTNAME HOSTTYPE MACHTYPE OSTYPE OPTIND OPTARG OPTERR REPLY PIPESTATUS FUNCNAME "
+    "SHLVL SHELLOPTS HISTCMD COLUMNS LINES DIRSTACK MAPFILE COPROC".split()
+)
+#: The characters a resolved value may hold: a plain word, case kept.
+_VALUE_CHARS = _PLAIN | frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+#: How many characters resolving ``$NAME`` may add across a whole line.
+_SUBSTITUTION_MARGIN = 256
+
+
+def _is_name(text: str) -> bool:
+    """Whether *text* is a shell variable name: ASCII letters, digits, ``_``, no leading digit."""
+    return text.isascii() and text.isidentifier()
+
+
+def _is_assignment_prefix(token: str) -> bool:
+    """Whether *token* starts with ``NAME=`` or ``NAME+=``.
+
+    It steps over inline assignment prefixes (``AWS_PROFILE=p aws …``) and spots a
+    lone-assignment try.
+    """
+    name, eq, _value = token.partition("=")
+    if name.endswith("+"):
+        name = name[:-1]
+    return bool(eq) and _is_name(name)
+
+
+def _lone_assignment(raw: str) -> "tuple[str, str] | None":
+    """``(NAME, value)`` of a standalone ``NAME=value`` statement, else None.
+
+    The one assignment shape resolved: a name, ``=``, and a value of plain
+    characters only (it may be empty). It is read on the case-preserved text:
+    shell names are case-sensitive (``B`` is not ``b``).
+    """
+    name, eq, value = raw.partition("=")
+    if not eq or not _is_name(name) or not all(ch in _VALUE_CHARS for ch in value):
+        return None
+    return name, value
+
+
+def _name_end(text: str, start: int) -> int:
+    """End of the variable name at ``text[start]``, or *start* when none starts there."""
+    end = start
+    while end < len(text) and text[end].isascii() and (text[end].isalnum() or text[end] == "_"):
+        end += 1
+    if end > start and text[start].isdigit():
+        return start
+    return end
+
 
 def _plain_words(command: str) -> "list[str] | None":
     """The argv bash builds from *command*, or None when it is not plain literal words."""
@@ -91,6 +212,11 @@ def _skip_flag(words: "list[str]", i: int) -> "int | None":
     """Index after the flag at ``words[i]`` and its value, or None when it is not read."""
     name, eq, _value = words[i].partition("=")
     arity = _FLAGS.get(name)
+    # ``--request-payer`` takes an optional value whose one choice is ``requester``,
+    # so ``--request-payer requester`` is read as the flag and its value. Any other
+    # next word is refused, since the flag could swallow an operand.
+    if name == "--request-payer" and not eq and words[i + 1 : i + 2] == ["requester"]:
+        return i + 2
     if arity is None or (eq and arity == _BOOL) or (not eq and arity == _EQ_ONLY):
         return None
     if eq or arity == _BOOL:
@@ -100,20 +226,86 @@ def _skip_flag(words: "list[str]", i: int) -> "int | None":
     return i + 2
 
 
-def _s3_download_only(command: str, raw: str = "") -> bool:
+def _shell_words(command: str) -> "list[tuple[str, bool]]":
+    """*command* split on unquoted blanks: each word's raw text, and whether all of it is unquoted."""
+    words: list[tuple[str, bool]] = []
+    text, active = "", True
+    for step in _shell._iter_shell_chars(command):
+        if step.active and step.char in " \t":
+            if text:
+                words.append((text, active))
+            text, active = "", True
+            continue
+        text += step.text
+        active = active and step.active
+    if text:
+        words.append((text, active))
+    return words
+
+
+def _strip_redirects(command: str) -> "str | None":
+    """*command* without its ``N>&M`` stream copies and its redirects to ``/dev/null``.
+
+    Reads the :data:`_NULL_REDIRECT_OPS` forms only with an unquoted
+    :data:`_NULL_TARGETS` target, spaced (``> /dev/null``) or glued (``2>/dev/null``).
+    None when any other unquoted ``>``, ``<`` or ``&`` is left (a redirect to a file,
+    an input redirect, a here-document, a ``>`` glued after a word such as
+    ``./d>log``): the deny stands. A ``>`` inside quotes is data and stays for
+    :func:`_plain_words` to judge.
+    """
+    words = _shell_words(_shell._fold_line_continuations(command))
+    kept: list[str] = []
+    i = 0
+    while i < len(words):
+        word, active = words[i]
+        if not (active and set(word) & set("<>&")):
+            kept.append(word)
+            i += 1
+            continue
+        if word in _FD_DUPS:
+            i += 1
+            continue
+        op = next((o for o in _NULL_REDIRECT_OPS if word.startswith(o)), "")
+        target, step = word[len(op) :], 1
+        if op and not target and i + 1 < len(words) and words[i + 1][1]:
+            target, step = words[i + 1][0], 2
+        if not op or target not in _NULL_TARGETS:
+            return None
+        i += step
+    return " ".join(kept)
+
+
+def _is_pipe_reader(command: str) -> bool:
+    """Whether *command* is one :data:`_PIPE_READERS` program with plain words only."""
+    stripped = _strip_redirects(command)
+    if stripped is None:
+        return False
+    words = _plain_words(stripped)
+    if not words:
+        return False
+    return words[0] in _PIPE_READERS
+
+
+def _one_plain_download(command: str) -> bool:
     """Whether *command* is exactly one plain ``aws s3 cp|mv|sync s3://… <local>``.
 
-    *raw* is the same command before case folding: KELVIN SIGN folds to ASCII ``k``.
+    *command* is already lower-cased and any resolvable variable already resolved.
+    A leading ``running:`` (kiro-cli's title for a shell call) is stepped over.
     """
-    if platform_compat.IS_WINDOWS:  # no POSIX shell reads it there (module docstring)
-        return False
-    if not (command.isascii() and raw.isascii()):
-        return False
-    words = _plain_words(command.lower())
-    if words and words[0] == "running:":  # kiro-cli's title for a shell call
+    words = _plain_words(command)
+    if words and words[0] == "running:":
+        words = words[1:]
+    # ``time`` only times the command; a ``time -p`` or any other word stays unread.
+    if words and words[0] == "time":
+        words = words[1:]
+    while words and _is_assignment_prefix(words[0]) and words[0].partition("=")[0] in _ENV_PREFIXES:
         words = words[1:]
     # A ``file://`` / ``fileb://`` value makes the aws CLI READ a local file and
     # send it (``--sse-c-key fileb://...`` goes out in a request header).
+    if words and (
+        words[0] in _AWS_WORDS or (words[0] in _AWS_CMD_WORDS and not _CMD_META & set(command))
+    ):  # WSL interop, same CLI
+        words[0] = "aws"
     if not words or words[0] != "aws" or any(("file://" in w or "fileb://" in w) for w in words):
         return False
     stage, operands, i = 0, [], 1  # stage 0 wants ``s3``, 1 the verb, 2 operands
@@ -138,3 +330,162 @@ def _s3_download_only(command: str, raw: str = "") -> bool:
         and operands[0].startswith("s3://")
         and not operands[1].startswith("s3://")
     )
+
+
+def _substitute(text: str, assigns: "dict[str, str]", budget: int) -> "str | None":
+    """*text* with each ``$NAME`` / ``${NAME}`` of a resolved *assigns* name replaced.
+
+    Only a name assigned exactly once to a plain literal is in *assigns*, so the
+    replacement is a plain word and cannot itself introduce an expansion. An
+    unresolved reference keeps its ``$`` and leaves the statement unreadable.
+    One left-to-right scan that looks up each reference once: a pattern per name
+    made a line of many assignments and statements cost their product. None when
+    the result would pass *budget* characters: a long value read many times would
+    otherwise grow a short line into megabytes before the tokenizer reads it.
+    """
+    out: list[str] = []
+    size = i = 0
+    while i < len(text):
+        dollar = text.find("$", i)
+        if dollar < 0:
+            dollar = len(text)
+        size += dollar - i
+        if size > budget:
+            return None
+        out.append(text[i:dollar])
+        if dollar == len(text):
+            break
+        braced = text.startswith("{", dollar + 1)
+        start = dollar + 2 if braced else dollar + 1
+        end = _name_end(text, start)
+        if braced and end < len(text) and text[end] == "}" and end > start:
+            stop = end + 1  # ``${NAME}``; any other ``${…}`` form is left as is
+        elif not braced and end > start:
+            stop = end  # ``$NAME`` takes the whole name: ``$AB`` is never ``$A`` + ``B``
+        else:
+            stop = start = end = dollar + 1  # a lone ``$`` stays as it is
+        value = assigns.get(text[start:end]) if end > start else None
+        piece = text[dollar:stop] if value is None else value
+        size += len(piece)
+        if size > budget:
+            return None
+        out.append(piece)
+        i = stop
+    return "".join(out)
+
+
+def _program_after_assigns(tokens: "list[str]") -> "tuple[str, list[str]]":
+    """The program a statement runs and the words after it, inline ``VAR=x`` stepped over."""
+    i = 0
+    while i < len(tokens) and _is_assignment_prefix(tokens[i]):
+        i += 1
+    if i >= len(tokens):
+        return "", []
+    return _shell._program_basename(tokens[i]), tokens[i + 1 :]
+
+
+def _statement_raw(command: str, cmd: "_commands.ShellCommand") -> str:
+    """The raw text of one statement, or "" when it has no steps (an empty segment)."""
+    if not cmd.steps:
+        return ""
+    return command[cmd.steps[0].start : cmd.steps[-1].end].strip(" \t")
+
+
+def _reads_all_downloads(text: str) -> bool:
+    """Whether *text* is a sequence of statements whose every s3 transfer is a download.
+
+    *text* keeps its case: bash matches a here-document tag and a variable name
+    case-sensitively, so the split and the assignments are read on it, and each
+    statement is lower-cased only after its variables are resolved. Returns False
+    on anything the reader cannot split cleanly or cannot read in full, so the
+    rows' deny stands.
+    """
+    stripped = text.lstrip()
+    if stripped.lower().startswith("running: ") or stripped.lower() == "running:":
+        text = stripped[len("running:") :]
+    try:
+        commands = _commands.read_commands(text, heredocs=True)
+    except Exception:
+        return False
+    # Structural gate: refuse anything that makes the split or a statement unclear.
+    for cmd in commands:
+        if cmd.separator not in (";", "&&", "||", "\n", "", "|"):
+            return False  # ``&`` backgrounding, ``|&``, backtick or paren
+        if any(step.char == _commands.SUBST for step in cmd.steps):
+            return False  # command substitution
+    assigns: dict[str, str] = {}
+    saw_transfer = saw_conditional = piped_in = False
+    # Resolving ``$NAME`` may add at most a small margin over the whole line.
+    budget = min(len(text) + _SUBSTITUTION_MARGIN, MAX_SCANNABLE_COMMAND_CHARS)
+    for cmd in commands:
+        raw = _statement_raw(text, cmd)
+        tokens = _shell._shell_tokens(raw) if raw else []
+        # A pipe may only carry a download's (or a reader's) output into a reader.
+        # ``reads_pipe_ok`` is whether this statement may write into a pipe.
+        reads_pipe_ok = False
+        if piped_in:
+            if not _is_pipe_reader(raw.lower()):
+                return False
+            reads_pipe_ok = True
+        elif tokens:
+            # A standalone assignment feeds the variable map; one it cannot
+            # resolve cleanly keeps the line denied. Only an assignment that always
+            # runs is read: after any ``&&`` or ``||`` bash may skip it, and the
+            # name keeps whatever value it already had.
+            if len(tokens) == 1 and _is_assignment_prefix(tokens[0]):
+                lone = _lone_assignment(raw)
+                if lone is None or lone[0] in assigns or saw_conditional:
+                    return False
+                name, value = lone
+                if name in _SPECIAL_NAMES or name in _BASH_SET_NAMES or name.startswith("BASH"):
+                    return False
+                assigns[name] = value
+            else:
+                resolved = _substitute(raw, assigns, budget)
+                if resolved is None:
+                    return False  # resolving would pass the cap: the deny stands
+                budget -= len(resolved)
+                sub_raw = resolved.lower()
+                program, rest = _program_after_assigns(_shell._shell_tokens(sub_raw))
+                # The gate's own linear-time matcher: a raw ``re.search`` on these
+                # rows backtracks exponentially on a run of flags.
+                matches_regex = any(
+                    _deny_pattern_matches(pat, sub_raw, True) for pat in _S3_TRANSFER_PATTERNS
+                )
+                if matches_regex or (program in _AWS_WORDS | _AWS_CMD_WORDS and "s3" in rest):
+                    saw_transfer = True
+                    unredirected = _strip_redirects(sub_raw)
+                    if unredirected is None or not _one_plain_download(unredirected):
+                        return False
+                    reads_pipe_ok = True
+                elif (
+                    (sub_raw.split(None, 1) or [""])[0] not in _INERT
+                    or _NEVER.intersection(sub_raw)
+                    or ">" in sub_raw
+                    or "<" in sub_raw
+                ):
+                    return False  # empty, could run code, change a variable or touch a file
+                else:
+                    reads_pipe_ok = True  # ``ls ./d | head``: an inert program's output
+        if cmd.separator == "|" and not reads_pipe_ok:
+            return False  # only a download or a reader may write into a pipe
+        piped_in = cmd.separator == "|"
+        if cmd.separator in ("&&", "||"):
+            saw_conditional = True
+    return saw_transfer and not piped_in  # a line ending in ``|`` is not read
+
+
+def _s3_download_only(command: str, raw: str = "") -> bool:
+    """Whether every ``aws s3`` transfer in *command* is a plain readable download.
+
+    *raw* is the same command before case folding: KELVIN SIGN folds to ASCII ``k``.
+    The statements are read on *raw*, so a *raw* that is not *command* in another
+    case (a caller that judges a rewritten view) reads nothing.
+    """
+    if platform_compat.IS_WINDOWS:  # no POSIX shell reads it there (module docstring)
+        return False
+    if not (command.isascii() and raw.isascii()):
+        return False
+    if raw and raw.lower() != command:
+        return False
+    return _reads_all_downloads(raw or command)

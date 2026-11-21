@@ -24,6 +24,7 @@ from typing import Any
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from redaction_structured_cases import github_classic
 
 from kiro_crew import platform_compat
 from kiro_crew.artifact_store.dashboard_package import DASHBOARD_KIND, parse_package
@@ -686,14 +687,14 @@ async def test_artifact_update_refuses_a_surrogate_the_same_way(tmp_path):
 async def test_a_credential_shaped_field_name_is_refused_at_save(monkeypatch, store):
     """A name a redactor would mask is refused HERE, and nothing is written.
 
-    ``[a-z][a-z0-9_]{0,63}`` admits ``ghp_`` plus 36 characters, and the page refuses
+    ``[a-z][a-z0-9_]{0,63}`` admits ``npm_`` plus 36 characters, and the page refuses
     the whole read for such a name, so storing it would give a page that never renders.
     The premise is asserted on the real redactor, the rule both sides consult. The
     refusal names a POSITION, not the name, so the name never travels raw in logs.
     """
     from kiro_crew.platform import redact_via_context
 
-    token_name = "ghp_" + "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8"
+    token_name = "npm_" + "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8"
     # The two halves of the premise, each asserted rather than assumed.
     assert redact_via_context(token_name) != token_name, "not credential-shaped here"
     assert redact_via_context("open_prs") == "open_prs", "control name is not redacted"
@@ -739,7 +740,8 @@ async def test_a_credential_shaped_theme_token_is_refused_too(monkeypatch, store
     """
     from kiro_crew.platform import redact_via_context
 
-    token_key = "--xoxb-" + "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8"
+    # An OpenAI project key: a Slack token after the leading ``--`` is glued to a dash.
+    token_key = "--sk-proj-" + "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8"
     # The two halves of the premise, each asserted rather than assumed.
     assert redact_via_context(token_key) != token_key, "not credential-shaped here"
     assert redact_via_context("--accent") == "--accent", "control token is not redacted"
@@ -826,8 +828,9 @@ def test_the_tool_is_on_the_panel_server_and_takes_no_target():
 
     tool = next(t for t in mcp_panel._tool_definitions() if t["name"] == "dashboard_save")
     props = tool["inputSchema"]["properties"]
-    assert set(props) == {"model", "view", "theme"}
-    # Theme is optional: an MCP client can drop an empty object before it arrives.
+    assert set(props) == {"model", "view", "theme", "widgets"}
+    # Theme and widgets are optional: an MCP client can drop an empty object before
+    # it arrives, and a save without widgets keeps the stored ones.
     assert sorted(tool["inputSchema"]["required"]) == ["model", "view"]
     assert not (set(props) & {"bound_to", "session", "session_key", "slot", "target", "kind"})
 
@@ -1146,10 +1149,9 @@ def test_the_page_is_run_over_the_read_the_tab_is_served(glue):
     assert not _STORE_SLUG.match(row["package_slug"])
 
 
-#: Assembled at runtime, like the credential-shaped values in ``test_member_dashboard_routes``:
-#: a literal of this shape in the diff is a finding against the PR whatever the code
-#: around it is for. Do not join these back up.
-_KEY = "AKIA" + "IOSFODNN7" + "EXAMPLE"
+#: Built at runtime, like the credential-shaped values in ``test_member_dashboard_routes``:
+#: a synthetic GitHub classic token with a valid checksum, which the redactor rewrites.
+_KEY = github_classic(seed=141)
 
 
 def _keyed_package() -> dict[str, Any]:

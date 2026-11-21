@@ -175,8 +175,8 @@ def test_the_owners_are_the_work_ledger_siblings_in_layer_order() -> None:
     each owner imports only owners listed before it -- the order the facade loads them and
     a read resolves in."""
     owners = list(_index().owners)
+    assert owners, "the facade composes no owner"
     assert sorted(owners) == sorted(_owner_paths())
-    assert len(owners) == 7
     assert f"{PACKAGE}.{_NOT_AN_OWNER}" not in owners
     late: dict[str, list[str]] = {}
     for position, owner in enumerate(owners):

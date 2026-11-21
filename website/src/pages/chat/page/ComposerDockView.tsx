@@ -30,6 +30,8 @@ import type { SessionRef } from '../../../utils/sessionRefs'
 import type { SlotApprovalMode } from '../../../utils/slotApprovalMode'
 import { SETTINGS_DEFAULT_MODEL_ID } from '../../../hooks/useSettingHighlight'
 import { settingsPath } from '../../../components/settingsPath'
+import { useKiroCliCanRunHere, useKiroCliSignInInTerminal } from '../../../components/KiroCliSignInInTerminal'
+import { useModelsAuthRequired } from '../../../providers/modelListHealth'
 import { agentOrDefaultLabel } from '../../../utils/agentLabel'
 import { isUntitledSession, sessionDisplayTitle } from '../../../utils/sessionDisplayTitle'
 import { sessionMemoryTag } from '../../../lib/agentMemorySource'
@@ -59,6 +61,8 @@ import { useStableCallbackProps } from '../useStableCallbackProps'
 import type { ComposerTypingLock } from '../shared-crew/useComposerTypingLock'
 import SessionControlHost from '../../../components/SessionControlHost'
 import ErrorNotice from '../../../components/ErrorNotice'
+import { GUIDE_KEEP_CLEAR } from '../../../guide/trustRoot'
+import KiroSignInPrompt from '../../../components/KiroSignInPrompt'
 import { pinIsWithheld } from '../../../lib/model'
 import FollowUpCard, { type FollowupStartMode } from '../../../components/FollowUpCard'
 import PendingQuestionCard from '../../../components/PendingQuestionCard'
@@ -76,6 +80,7 @@ import { i18nT } from '../../../i18n/t'
 import { acpBackendName } from '../../../api/acpBackend'
 import { fmtDateFields, fmtNumber } from '../../../i18n/format'
 import { useSlotRunsHere } from '../../../components/sessionEnvironmentHooks'
+import { stagedProjectTurnKey } from '../../../components/chat-input/stagedProject'
 
 /**
  * The main composer, with its callback props held at stable identities. This
@@ -103,8 +108,6 @@ interface ComposerDockViewProps {
   activeSlot: string
   connected: boolean
   dispatch: AppDispatch
-  isMobile: boolean
-  isTouch: boolean
   navigate: NavigateFunction
   provider: ProviderAdapter
   activityOpen: boolean
@@ -214,6 +217,7 @@ interface ComposerDockViewProps {
   refusedPress: ReturnType<typeof useRefusedPress>['refusedPress']
   setRefusedPress: ReturnType<typeof useRefusedPress>['setRefusedPress']
   send: ReturnType<typeof useComposerSend>['send']
+  composerSend: ReturnType<typeof useComposerSend>['composerSend']
   pickModel: (modelName: string) => void
   setProject: (path: string) => Promise<void>
   /** A project pick on this chat is still waiting on its route. */
@@ -255,6 +259,10 @@ interface ComposerDockViewProps {
   effortAutoNote?: boolean
   /** The active slot's ultracode switch, from its selection-capabilities read. */
   ultracode?: boolean
+  /** The active slot's Fast mode switch (the read's `fast` field). */
+  fastMode?: boolean
+  /** Why that switch cannot be turned on (the read's `fast_unavailable` field). */
+  fastUnavailable?: string
   modelMarker: 'auto' | 'default' | null
   pinModelToAgentMut: ReturnType<typeof useComposerChips>['pinModelToAgentMut']
   projectBranch: string
@@ -299,9 +307,9 @@ interface ComposerDockViewProps {
   /** The Crew Mode chip (crewModeSwitch): offered on this chat, and its switch on. */
   crewModeOffered: boolean
   /** A plain chat that already has messages: the same chip sits right of the
-   *  permission button and turns this chat into an Ultra Mode chat, one way. */
+   *  permission button and turns this chat into a conductor mode chat, one way. */
   crewModeMidChatOffered?: boolean
-  turnOnCrewMode: () => void
+  turnOnCrewMode: () => void | Promise<boolean>
   /** Set only while Crew Mode is on and no message is sent yet: the composer's
    *  Crew Mode mark is then a toggle that turns it off. */
   turnOffCrewMode?: () => void
@@ -311,13 +319,13 @@ interface ComposerDockViewProps {
   /** A conductor session (Crew Mode): the composer offers no agent picker, since
    *  the conductor is chosen by Crew Mode itself. Workspace and model stay. */
   agentPickerHidden?: boolean
-  /** Ultra Mode is on and no message is sent yet: the chip row stays
+  /** Conductor mode is on and no message is sent yet: the chip row stays
    *  with the chip pressed (a toggle), the memory chip is held, and the agent
    *  slot shows nothing. */
   crewChipPressed?: boolean
-  /** The gateway refuses any agent switch of this chat (a Crew Mode chat with a
-   *  message, `crew_mode_locked`) while the Crew Mode preview is off on this
-   *  device: no agent picker, and no Crew Mode mark either. */
+  /** The gateway refuses any agent switch of this chat (a conductor mode chat with
+   *  a message, `crew_mode_locked`) in a build without conductor mode (LTS): no
+   *  agent picker, and no conductor mode mark either. */
   agentSwitchLocked?: boolean
   /** The main pane holds a Crew Mode worker: the composer is that worker's steer
    *  composer. It looks like the conductor's normal composer; a running turn
@@ -334,7 +342,7 @@ interface ComposerDockViewProps {
  * Its body is not re-indented: `ChatPage.statusStackLayering.test.tsx` finds the status stack's end by its closing tag's depth (14 spaces).
  */
 export default function ComposerDockView({
-  embedded, forkUnavailable = false, mode, activeSlot, connected, dispatch, isMobile, isTouch, navigate, provider, activityOpen, composerBusy, contextPct, contextTokens, knowledgeFetch, messages, pendingFollowup,
+  embedded, forkUnavailable = false, mode, activeSlot, connected, dispatch, navigate, provider, activityOpen, composerBusy, contextPct, contextTokens, knowledgeFetch, messages, pendingFollowup,
   pendingQuestion, projectLocked, restoredQuestionNotice, sentMessages, slotRunning, slotStopping, composerDraft, historySuggestions, showHistorySuggestions, chatConfig, agentDropdown,
   agentDropdownRef, agentFilter, agentInputRef, defaultAgent, defaultAgentFailed, effectiveAgents, filteredAgents, installedAgents, setAgentDropdown, setAgentFilter, toggleDefaultAgent,
   codexPairModels, filteredModels, hiddenModelsQ, ownModelsFailed, ownModelsFetching, retryOwnModels, modelsBackend, jevRouteOn, modelDropdown, modelDropdownRef, modelFilter, modelInputRef, modelPickerConfigured, modelPickerReturnsFocusRef, setModelDropdown,
@@ -342,11 +350,11 @@ export default function ComposerDockView({
   automationSnapshotFailed, setAutomationOpen, prefillHint, setPrefillHint, pasteSlice, pendingFiles, pendingSessions, resizedInfo, unstageSessionRef, uploading, agentBtnRect, anchorAgentBtn,
   projectPickerOpen, setProjectPickerOpen, anchorProjectBtn, projectBtnRect, pendingDirs, composerRef, composerVoiceOptions, isMac, cancelUpload, composerUploadFiles, dropTargetProps, handleCapture,
   handleFileOpen, handleOptimizeResult, search, tabsCtl, uploadCount, sendHeld, composerBandRef, scrollBottom, handleResumeSession, composerRootChange, composerUserEdit, followUpMulti,
-  followUpOptions, followUpPicked, followUpPickedRef, followUpSourceKey, toggleFollowUpOption, dashCfg, jevAutoConsented, refusedPress, setRefusedPress, send, pickModel, setProject, projectSwitching, switchAgent,
+  followUpOptions, followUpPicked, followUpPickedRef, followUpSourceKey, toggleFollowUpOption, dashCfg, jevAutoConsented, refusedPress, setRefusedPress, send, composerSend, pickModel, setProject, projectSwitching, switchAgent,
   currentSlot, activeFolderName, anchorSessionControl, openSessionControl, refreshSessionControlStatuses, sessionControlKey, sessionControlRect, sessionControls, setOpenSessionControl,
   activeAgentName, attachmentAnnouncement, clampOutOfTokens, handleAddToContext, mentionKeyEdit, optimizerMentionGuard, mentionEditRange, removeDirChip, removeFileChip, selectPickedFile, followupAddToSession,
   followupStartInNewChat, followupStartInWorktree, displayMode, _modelPinActive, _modelPinAgent, _modelPinPinned, _pinShownModel, _slotProject, defaultEffort, effectiveEffort, effortLevelsOverride,
-  effortSupported, effortAutoNote = false, ultracode, modelMarker, pinModelToAgentMut, projectBranch, projectGit, projectGitError, shownModel, cardOwnsRecovery, resumeAfterSignIn, continuable, continuing, handleContinue, interrupted, dockGutter, dockRef,
+  effortSupported, effortAutoNote = false, ultracode, fastMode, fastUnavailable, modelMarker, pinModelToAgentMut, projectBranch, projectGit, projectGitError, shownModel, cardOwnsRecovery, resumeAfterSignIn, continuable, continuing, handleContinue, interrupted, dockGutter, dockRef,
   endQuoteFlight, flyingQuote, inputAreaRef, isAtBottom, answerQuestionCard, handleCancelQueued, handleEditQueued, handleEditOpenQueued, handleInterruptQueued, handleReorderQueued, keepQuestionAnswer, queuedMessages,
   queuePendingIds, steer, stopTurn, systemDeliveryCount, handleEditLastRequest, composerOptimizing, handleOptimizingChange, memorySwitching, showComposerMemoryChip, switchMemoryMode, composerAbove, typingLock, composerPresence,
   composerSessionControls, preferenceAdvice, gitBadge, crewModeOffered, crewModeMidChatOffered = false, turnOnCrewMode, turnOffCrewMode, crewModeSwitching = null, agentPickerHidden = false, crewChipPressed = false, agentSwitchLocked = false, steerWorker, steerWorkerRoot = '',
@@ -360,6 +368,9 @@ export default function ComposerDockView({
   const [followupStartSends] = usePersistedBool(FOLLOWUP_START_SENDS_KEY, false)
   // App composer actions: rows in "+" whose apps insert plain text.
   const composerActions = useComposerActionItems()
+  // A queued turn opens without the composer going idle; the staged-pick badge
+  // re-takes its start project from this (#20350).
+  const projectTurnKey = useMemo(() => stagedProjectTurnKey(messages), [messages])
   // Someone else holds the typing lock: no dictation may start into the draft.
   const voiceOptions = useMemo(
     () => (typingLock ? { ...composerVoiceOptions, startBlocked: true } : composerVoiceOptions),
@@ -378,6 +389,14 @@ export default function ComposerDockView({
   // A worker's steer is refused past the steer route's limit BEFORE the draft is
   // cleared, so an over-long paste stays in the box with the reason beside it.
   const [steerTooLong, setSteerTooLong] = useState(false)
+  // The configured list is short because kiro-cli's own login is missing: the
+  // picker says so and signs kiro-cli in through the Terminal panel. The flag
+  // speaks only for the configured list, never a harness's own (`modelsBackend`).
+  const kiroCliSignedOut = useModelsAuthRequired(provider.id) && modelsBackend === undefined
+  const kiroCliSignIn = useKiroCliSignInInTerminal()
+  // An embedded chat has no dock to run it in, and a chat that is not known to
+  // run here refuses a local run: those copy the command instead.
+  const kiroCliCanRun = useKiroCliCanRunHere(!embedded && currentSlot?.executor !== 'remote' ? runsHere : false)
   const steerFits = (text?: string): boolean => {
     if (steerWorker === undefined) return true
     const fits = (text ?? composerDraft.get()).length <= CREW_STEER_MAX_CHARS
@@ -431,6 +450,11 @@ export default function ComposerDockView({
                   still fuses. Layout-neutral when the queue is empty: the pair
                   cancels. */}
               <div ref={composerBandRef} className="max-h-[50svh] overflow-y-auto overscroll-contain pb-[11px] mb-[-11px] dock-inert" data-testid="composer-status-stack">
+              {/* The Kiro sign-in, before a send fails for the lack of one: the
+                  gateway decides when a new chat needs it, and the flow inside
+                  is the same one Settings renders. In this capped stack so the
+                  Company SSO form stays scrollable on a short phone pane. */}
+              <KiroSignInPrompt />
               {/* Topmost, furthest from the composer: it is about the session's
                   setup, not about the work in hand, and is gone once every MCP
                   server has connected. */}
@@ -472,6 +496,7 @@ export default function ComposerDockView({
                   className="px-4 mb-1.5 mx-auto w-full"
                   style={{ maxWidth: 'var(--mc-content-width, 900px)' }}
                   data-testid="refused-press-error"
+                  {...GUIDE_KEEP_CLEAR}
                 >
                   <ErrorNotice
                     title={i18nT(REFUSED_PRESS_TITLE_KEYS[refusedPress.action])}
@@ -603,7 +628,7 @@ export default function ComposerDockView({
                     <CrewWorkerComposerGate root={steerWorkerRoot} worker={activeSlot} workerTitle={steerWorker ?? ''}
                       waitingForApproval={!!currentSlot?.pending_approval} />
                   ) : (
-                    // Without the gate (the Crew Mode preview off) a send the server
+                    // Without the gate (a build without conductor mode, LTS) a send the server
                     // still took as a steer can come back unrecorded: say so here.
                     <CrewSteerUnrecordedNotice worker={activeSlot}
                       workerTitle={currentSlot ? sessionDisplayTitle(currentSlot) : ''} />
@@ -626,12 +651,14 @@ export default function ComposerDockView({
               // (typing, paste, undo, picker inserts), never for a parent-driven
               // seed -- so it is the signal that arms the prefill hint's expiry.
               onChange={composerUserEdit}
-              onSend={() => { if (!steerRootClosed && steerFits()) send() }}
+              // A refused send leaves the draft in the box, so it reports "not
+              // confirmed" and a restored stash entry is kept.
+              onSend={() => (!steerRootClosed && steerFits() ? composerSend() : Promise.resolve(false))}
               terminalCommands={activeSlot && !currentSlot ? 'pending'
                 : currentSlot?.executor === 'remote' || runsHere === false ? 'remote'
                   : currentSlot && runsHere === undefined ? 'pending' : 'local'}
               canSteer={composerBusy}
-              onSteer={opts => { if (!steerRootClosed && steerFits(opts?.text)) steer(opts) }}
+              onSteer={opts => (!steerRootClosed && steerFits(opts?.text) ? steer(opts) : Promise.resolve(false))}
               // AND a turn actually running. `composerBusy` is also true when only
               // background sub-agents are working, and there is no turn to decide
               // ABOUT in that state: the send starts a fresh turn and the point
@@ -697,6 +724,8 @@ export default function ComposerDockView({
               optimizerMentionGuard={optimizerMentionGuard}
               mentionEditRange={mentionEditRange}
               project={currentSlot?.project || ''}
+              turnProject={currentSlot?.turn_project}
+              turnProjectFallback={currentSlot?.turn_project_fallback}
               projectBranch={projectBranch}
               projectGitDirty={gitBadge?.dirty ?? 0}
               projectGitDirtyTruncated={gitBadge?.dirtyTruncated ?? false}
@@ -731,9 +760,12 @@ export default function ComposerDockView({
               // drawn from, so chip, menu and gate cannot disagree.
               modelIsJevRouted={jevRouteOn && isUnpinnedModel(currentSlot?.model)}
               harnessBackend={modelsBackend}
-              // A crew member's footer is the conductor's: the Crew Mode mark (never
-              // a switch there) in place of the agent picker and its label.
-              agentBadge={crewChipPressed ? undefined : agentPickerHidden || steerWorker !== undefined ? <CrewModeComposerChip /> : undefined}
+              // The conductor mode bolt in place of the agent picker. On a crew
+              // member that is not itself a conductor its tip names the role,
+              // Worker, so it does not read as a conductor.
+              agentBadge={crewChipPressed ? undefined
+                : agentPickerHidden ? <CrewModeComposerChip />
+                : steerWorker !== undefined ? <CrewModeComposerChip worker /> : undefined}
               onAgentClick={provider.capabilities.agentTemplates && !agentPickerHidden && !agentSwitchLocked && steerWorker === undefined ? (rect, trigger) => { anchorAgentBtn(rect, trigger); setAgentDropdown(!agentDropdown) } : undefined}
               onModelClick={(rect, trigger, composerHadFocus) => {
                 modelPickerReturnsFocusRef.current = !!composerHadFocus
@@ -766,10 +798,9 @@ export default function ComposerDockView({
               contextUsedTokens={contextTokens?.used}
               contextWindowTokens={contextTokens?.window || provider.getContextWindow(shownModel)}
               derivePctFromUsed={contextTokens?.used != null && contextTokens.window == null}
-              showContextPct={chatConfig.showContextPct}
-              showContextTokens={chatConfig.showContextTokens}
               environmentSlot={activeSlot}
               isRunning={composerBusy}
+              projectTurnKey={projectTurnKey}
               projectLocked={projectLocked}
               projectSwitching={projectSwitching}
               /* Composed with `interrupted`, matching the ErrorCard gate above.
@@ -834,7 +865,6 @@ export default function ComposerDockView({
               memoryMode={currentSlot?.memory_mode ?? 'persistent'}
               sentMessages={sentMessages}
               onEditLastRequest={handleEditLastRequest}
-              sendOnEnter={isMobile && isTouch ? 'ctrl-enter' : chatConfig.sendOnEnter}
               followUpOptions={followUpOptions}
               followUpPicked={followUpPicked}
               quickSend={dashCfg?.quick_send}
@@ -847,12 +877,11 @@ export default function ComposerDockView({
                 if (tryQuickSend(o, dashCfg?.quick_send, e.shiftKey, slotRunning, followUpPickedRef.current.size, sendNow)) return
                 toggleFollowUpOption(o)
               }}
-              showFullPastes={chatConfig.showFullPastes}
               knowledgeChip={knowledgeFetch.pendingKnowledge ? <div className="flex items-start gap-1"><KnowledgeBubbleChip knowledge={{ items: knowledgeFetch.pendingKnowledge.items.length, tokens: knowledgeFetch.pendingKnowledge.totalTokens, titles: knowledgeFetch.pendingKnowledge.items.map(i => i.title), content: knowledgeFetch.pendingKnowledge.items.map(i => ({ title: i.title, text: i.content.slice(0, 2000) })) }} /><button type="button" onClick={() => knowledgeFetch.clearPending()} className="shrink-0 mt-0.5 p-0.5 text-muted hover:text-danger-text bg-transparent border-none cursor-pointer rounded hover:bg-danger/10 transition-colors" aria-label={i18nT('pages.chatPage.remove_knowledge_context')} title={i18nT('pages.chatPage.remove_knowledge_context')}>&times;</button></div> : undefined}
               connected={connected}
             />
               </Composer>
-              {steerWorker !== undefined && steerTooLong && <p role="alert" className="mt-1 px-4 mx-auto w-full text-[12px] text-danger-text" style={{ maxWidth: 'var(--mc-content-width, 900px)' }} data-testid="crew-steer-too-long">{i18nT('components.crewMode.steer_too_long', { name: steerWorker, max: fmtNumber(CREW_STEER_MAX_CHARS) })}</p>}
+              {steerWorker !== undefined && steerTooLong && <p role="alert" className="mt-1 px-4 mx-auto w-full text-[12px] text-danger-text" style={{ maxWidth: 'var(--mc-content-width, 900px)' }} data-testid="crew-steer-too-long" {...GUIDE_KEEP_CLEAR}>{i18nT('components.crewMode.steer_too_long', { name: steerWorker, max: fmtNumber(CREW_STEER_MAX_CHARS) })}</p>}
               </div>
             </div>
             {/* Agent dropdown portal — triggered from input bar */}
@@ -891,6 +920,7 @@ export default function ComposerDockView({
                 modelsFailedMessage={i18nT('components.modelEffortDropdown.harness_models_failed', { harness: acpBackendName({ id: modelsBackend ?? '' }) })}
                 retryingModels={ownModelsFetching}
                 onRetryModels={retryOwnModels}
+                kiroCliSignIn={kiroCliSignedOut ? { run: () => { setModelDropdown(false); kiroCliSignIn.askToSignIn() }, command: kiroCliSignIn.command, canRun: kiroCliCanRun } : undefined}
                 filter={modelFilter}
                 setFilter={setModelFilter}
                 onClose={() => setModelDropdown(false)}
@@ -907,6 +937,8 @@ export default function ComposerDockView({
                 defaultEffort={defaultEffort}
                 effortLevelsOverride={effortLevelsOverride}
                 ultracode={ultracode}
+                fastMode={fastMode}
+                fastUnavailable={fastUnavailable}
                 onManageModels={modelPickerConfigured ? undefined : () => {
                   setModelDropdown(false)
                   navigate(settingsPath({ tab: 'chat', sub: 'models', highlight: 'key:dashboard.model_picker_hidden_models' }))
@@ -931,6 +963,8 @@ export default function ComposerDockView({
                 }}
               />
             </OverlayPortal>}
+            {/* Outside the model picker's portal: the picker closes before it opens. */}
+            {kiroCliSignIn.dialog}
             {/* Project picker — triggered from input bar */}
             <ProjectPicker
               open={projectPickerOpen}

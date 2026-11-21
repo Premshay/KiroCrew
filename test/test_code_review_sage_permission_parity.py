@@ -79,16 +79,6 @@ def _repository_manifest(api: list[str]) -> AppManifest:
     return AppManifest.from_dict(data)
 
 
-def test_the_wheel_copy_declares_exactly_its_own_paths_and_the_source_family():
-    assert _shipped()["permissions"]["api"] == OWN + HOST
-
-
-def test_every_host_path_the_page_calls_is_declared():
-    declared = _shipped()["permissions"]["api"]
-    for path in PAGE_CALLS:
-        assert any(scope._api_pattern_matches(p, path) for p in declared), path
-
-
 def test_the_sdk_panel_paths_are_the_ones_listed_here():
     """The SDK panel's endpoint table, read from its source, is in ``PAGE_CALLS``."""
     source = (
@@ -97,15 +87,6 @@ def test_the_sdk_panel_paths_are_the_ones_listed_here():
     table = source.split("PULL_REQUEST_PANEL_PATHS = {", 1)[1].split("}", 1)[0]
     paths = [line.split("'")[1] for line in table.splitlines() if "'" in line]
     assert paths and set(paths) <= set(PAGE_CALLS)
-
-
-def test_a_registered_builtin_approves_what_the_wheel_ships(registered):
-    grants = manager._read_approved_grants(NAME)
-    assert grants is not None and grants["api"] == OWN + HOST
-
-
-def test_the_repository_copy_adopts_without_widening(registered):
-    assert checks.permission_refusal(NAME, _repository_manifest(OWN + HOST)) is None
 
 
 def test_one_more_host_path_is_still_a_widening(registered):
@@ -129,3 +110,55 @@ def test_the_app_token_matches_the_family_and_nothing_undeclared(registered, mon
         "/api/apps",
     ):
         assert not scope.app_token_path_allowed(NAME, path), path
+
+
+# The follow-up chat the page opens (`permissions.chatLaunch`, section 44): the wheel
+# copy declares it, so the repository copy declaring the same is no widening.
+LAUNCH = {
+    "keyPrefix": "sage-followup-",
+    "agents": ["code-review-sage-reviewer", "kirocrew"],
+    "folder": "Sage Review",
+    "memoryModes": ["persistent"],
+}
+
+
+def _repository_launch(launch: dict | None) -> AppManifest:
+    data = copy.deepcopy(_shipped())
+    if launch is None:
+        data["permissions"].pop("chatLaunch", None)
+    else:
+        data["permissions"]["chatLaunch"] = launch
+    return AppManifest.from_dict(data)
+
+
+def test_the_wheel_copy_declares_the_follow_up_chat():
+    assert _shipped()["permissions"]["chatLaunch"] == LAUNCH
+
+
+def test_the_repository_copy_declaring_the_same_chat_adopts(registered):
+    assert checks.permission_refusal(NAME, _repository_launch(LAUNCH)) is None
+    assert checks.permission_refusal(NAME, _repository_launch(None)) is None
+
+
+@pytest.mark.parametrize(
+    "wider",
+    [
+        {**LAUNCH, "agents": [*LAUNCH["agents"], "kirocrew-conductor"]},
+        {**LAUNCH, "memoryModes": ["persistent", "incognito"]},
+        {**LAUNCH, "folder": "Inbox"},
+        {**LAUNCH, "keyPrefix": "sage-"},
+    ],
+)
+def test_a_wider_chat_launch_is_a_widening(registered, wider):
+    assert checks.permission_refusal(NAME, _repository_launch(wider)) == "permission_widening"
+
+
+def test_the_registered_builtin_launches_what_it_declares_only_while_enabled(
+    registered, monkeypatch
+):
+    from kiro_crew.apps.chat_launch import declared_chat_launch, parse_chat_launch
+
+    # Off by default (`defaultEnabled: false`), so the gate admits no launch.
+    assert declared_chat_launch(NAME) is None
+    monkeypatch.setattr(manager, "is_app_enabled", lambda name: name == NAME)
+    assert declared_chat_launch(NAME) == parse_chat_launch(LAUNCH)

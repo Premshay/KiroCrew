@@ -11,8 +11,8 @@ import { OPTION_MARKER_PATTERN_SOURCE } from '../app-sdk/protocol/optionMarker'
 
 // Mock MarkdownRenderer to avoid complex markdown parsing in tests
 vi.mock('../components/MarkdownRenderer', () => ({
-  default: ({ content, blockedLinks }: { content: string; blockedLinks?: unknown }) => (
-    <div data-testid="md" data-blocked-links={JSON.stringify(blockedLinks ?? null)}>{content}</div>
+  default: ({ content, redactions, blockedLinks }: { content: string; redactions?: unknown; blockedLinks?: unknown }) => (
+    <div data-testid="md" data-redactions={JSON.stringify(redactions ?? null)} data-blocked-links={JSON.stringify(blockedLinks ?? null)}>{content}</div>
   ),
 }))
 // Mock useSmoothStream to passthrough — its rAF loop conflicts with vi.useFakeTimers()
@@ -266,13 +266,28 @@ describe('AssistantMessage', () => {
     expect(screen.getByTestId('md')).toHaveTextContent('version one text')
   })
 
+  it('local variant browsing takes each variant\'s credential records with its text', () => {
+    // A record describes one text: showing variant one beside the row's records
+    // would pair a lock tag with a value that text never held.
+    const rowRecords = [{ ordinal: 0, rule: 'jwt' }]
+    const v1Records = [{ ordinal: 0, rule: 'private_key' }]
+    const variants = [
+      { content: 'version one text', redactions: v1Records },
+      { content: 'version two text' },
+    ]
+    render(<AssistantMessage content="version two text" isStreaming={false} variants={variants} variantIdx={1} redactions={rowRecords} />)
+    expect(screen.getByTestId('md').dataset.redactions).toBe(JSON.stringify(rowRecords))
+    fireEvent.click(screen.getByTitle('Previous version'))
+    expect(screen.getByTestId('md').dataset.redactions).toBe(JSON.stringify(v1Records))
+  })
+
   it('local variant browsing takes each variant\'s blocked-link records with its text', () => {
     // A record describes one text: showing variant one beside the row's records
-    // would open a panel naming a link that text never held.
+    // would draw a link that text never held as blocked, and leave its own live.
     const rowRecords = [{ domain: 'row.example.com' }]
     const v1Records = [{ domain: 'one.example.com' }]
     const variants = [
-      { content: 'version one text', blocked_links: v1Records },
+      { content: 'version one text', link_blocks: v1Records },
       { content: 'version two text' },
     ]
     render(<AssistantMessage content="version two text" isStreaming={false} variants={variants} variantIdx={1} blockedLinks={rowRecords} />)
@@ -1373,6 +1388,18 @@ describe('turn stats footer (elapsed time + credits)', () => {
     // The marker trails the elapsed time after the footer's own separator, and
     // leaves the billed amount where it was.
     expect(screen.getByTestId('turn-stats').textContent!.replace(/\s+/g, ' ').trim()).toMatch(/^2\.50 credits ·\s*1m 24s\s*·\s*Cache rebuilt$/)
+  })
+
+  it('words an inferred rebuild as likely and says it is an estimate', () => {
+    render(<AssistantMessage content="done" isStreaming={false} slotRunning={false} turnStats={{ elapsed_ms: 84_000, credits: 2.5, cache: 'likely' }} />)
+    const chip = screen.getByTestId('turn-cache-likely')
+    expect(chip).toHaveTextContent('Cache likely rebuilt')
+    expect(screen.queryByTestId('turn-cache-rewrite')).not.toBeInTheDocument()
+    const tip = within(chip).getByRole('button', { name: 'More information' })
+    expect(tip.getAttribute('title')).toMatch(/probably stored again/)
+    expect(tip.getAttribute('title')).toMatch(/estimate/)
+    expect(chip.className).not.toMatch(/\bborder\b|\brounded-full\b/)
+    expect(screen.getByTestId('turn-stats').textContent!.replace(/\s+/g, ' ').trim()).toMatch(/^2\.50 credits ·\s*1m 24s\s*·\s*Cache likely rebuilt$/)
   })
 
   it('draws no cache chip when the key is absent or holds another value', () => {

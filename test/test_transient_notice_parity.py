@@ -21,6 +21,7 @@ patterns against the Python constants.
 
 from __future__ import annotations
 
+import ast
 import importlib
 import inspect
 import json
@@ -62,6 +63,23 @@ _TEXT_RE = re.compile(
     r'^(?P<name>(?!GATEWAY_NOTICE_)(?:TRANSIENT|GATEWAY)_[A-Z_]+_TEXT)\s*=\s*\(?\s*"(?P<text>[^"]+)"',
     re.MULTILINE,
 )
+# Every column-0 assignment of the same names, whatever its right-hand side. The
+# strict patterns above must parse each one; a constant written in a shape they
+# miss (an annotation, single quotes) would otherwise drop out of every check.
+_BACKEND_NAME_RE = re.compile(
+    r"^((?:TRANSIENT|GATEWAY)_NOTICE_(?!META_KEY|ARGS_KEY)[A-Z_]+)\b\s*[:=]", re.MULTILINE
+)
+_TEXT_NAME_RE = re.compile(
+    r"^((?!GATEWAY_NOTICE_)(?:TRANSIENT|GATEWAY)_[A-Z_]+_TEXT)\b\s*[:=]", re.MULTILINE
+)
+
+
+def _assigned_names(pattern: re.Pattern[str]) -> set[str]:
+    return {
+        name
+        for path in (_CHAT_UTILS, _GATEWAY)
+        for name in pattern.findall(path.read_text(encoding="utf-8"))
+    }
 
 
 def _table(name: str) -> str:
@@ -188,7 +206,6 @@ def test_legacy_table_recognises_every_pre_token_wording() -> None:
         "EMPTY_TURN_NOTICE_AFTER_WORK",
     ):
         texts[name] = getattr(empty_turn_copy, name)
-    assert len(texts) == 13
     unmatched = [n for n, t in texts.items() if not any(p.match(t) for p in patterns)]
     assert (
         not unmatched
@@ -199,7 +216,7 @@ def test_fallback_texts_avoid_internal_vocabulary() -> None:
     # A person reading the English fallback is not told about "backends" or
     # "hiccups". Pins the wording class, not the copy.
     texts = _fallback_texts()
-    assert len(texts) == 16
+    assert texts, "no TRANSIENT_*_TEXT / GATEWAY_*_TEXT fallback constants found"
     for name, text in texts.items():
         lowered = text.lower()
         assert "hiccup" not in lowered and "backend" not in lowered, (name, text)
@@ -218,26 +235,61 @@ def _legacy_token(text: str) -> str | None:
     return None
 
 
-def test_token_tables_have_the_pinned_size() -> None:
-    # 6 transient-5xx tokens and 79 gateway tokens; a new row family moves both.
-    assert len(_backend_tokens()) == 85
-    assert len(_frontend_families()) == 85
-    assert len(_legacy_entries()) == 81
+def test_every_constant_and_legacy_row_is_parsed() -> None:
+    # The scans above are what every other check iterates, so a constant or row
+    # they fail to parse would be checked by nothing. Each is compared with a
+    # looser scan of the same source rather than with a stored total: a total is
+    # one line every PR that adds a family edits, and two such PRs merge into a
+    # tree neither tested (testing-conventions.md § Merge-safe ratchets and counts).
+    assert set(_backend_tokens()) == _assigned_names(_BACKEND_NAME_RE)
+    assert set(_fallback_texts()) == _assigned_names(_TEXT_NAME_RE)
+    legacy = _legacy_entries()
+    assert len(legacy) == len(
+        re.findall(r"\bre:\s*/", _table("LEGACY"))
+    ), "a LEGACY row whose pattern or token the parser cannot read"
+    assert {token for _, token in legacy} <= set(_frontend_families())
 
 
-def _tokenized_literal_sites() -> list[tuple[str, int, str, str]]:
-    """``(path, line, token, english)`` for every append whose meta names one token.
+def _content_texts(content: ast.expr, module: str) -> list[str] | None:
+    """Every English text *content* can render, or ``None`` when it is chosen at run time.
 
-    The content must be a literal, an f-string (each interpolation rendered as
-    ``7``, which every captured value pattern accepts) or a module constant;
-    a site that picks its token or its text at run time is pinned below instead.
+    A literal, an f-string (each interpolation rendered as ``7``, which every
+    captured value pattern accepts), a module constant, a ``gn.`` or other
+    module-attribute constant, or a conditional between any of those.
     """
-    import ast
-    import importlib
-
     from kiro_crew.dashboard import gateway_notice as gn
 
-    token_re = re.compile(r"\bgn\.(GATEWAY_NOTICE_[A-Z_]+)")
+    if isinstance(content, ast.Constant) and isinstance(content.value, str):
+        return [content.value]
+    if isinstance(content, ast.JoinedStr):
+        return ["".join(v.value if isinstance(v, ast.Constant) else "7" for v in content.values)]
+    if isinstance(content, ast.Name):
+        text = getattr(importlib.import_module(module), content.id, None)
+        return [text] if isinstance(text, str) else None
+    if isinstance(content, ast.Attribute) and isinstance(content.value, ast.Name):
+        owner = (
+            gn
+            if content.value.id == "gn"
+            else getattr(importlib.import_module(module), content.value.id, None)
+        )
+        text = getattr(owner, content.attr, None)
+        return [text] if isinstance(text, str) else None
+    if isinstance(content, ast.IfExp):
+        body = _content_texts(content.body, module)
+        orelse = _content_texts(content.orelse, module)
+        return body + orelse if body is not None and orelse is not None else None
+    return None
+
+
+def _tokenized_sites() -> list[tuple[str, int, str, list[str] | None]]:
+    """``(path, line, token, texts)`` for every append whose meta names one token.
+
+    ``texts`` is ``None`` for a site whose text is chosen at run time; its wording
+    is pinned by :func:`_run_time_wording` instead.
+    """
+    from kiro_crew.dashboard import gateway_notice as gn
+
+    token_re = re.compile(r"\b(?:gn\.)?(GATEWAY_NOTICE_[A-Z_]+)")
     src_root = _REPO / "src"
     sites = []
     for path in sorted((src_root / "kiro_crew").rglob("*.py")):
@@ -261,61 +313,89 @@ def _tokenized_literal_sites() -> list[tuple[str, int, str, str]]:
             )
             if len(names) != 1:
                 continue
-            content = node.args[1]
-            if isinstance(content, ast.Constant) and isinstance(content.value, str):
-                text = content.value
-            elif isinstance(content, ast.JoinedStr):
-                text = "".join(
-                    v.value if isinstance(v, ast.Constant) else "7" for v in content.values
-                )
-            elif isinstance(content, ast.Name):
-                text = getattr(importlib.import_module(module), content.id, None)
-                if not isinstance(text, str):
-                    continue
-            else:
-                continue
             sites.append(
-                (str(path.relative_to(_REPO)), node.lineno, getattr(gn, names.pop()), text)
+                (
+                    path.relative_to(_REPO).as_posix(),
+                    node.lineno,
+                    getattr(gn, names.pop()),
+                    _content_texts(node.args[1], module),
+                )
             )
     return sites
 
 
-def test_every_tokenized_literal_site_is_recognised_by_its_legacy_pattern() -> None:
+def test_every_tokenized_site_is_recognised_by_its_legacy_pattern() -> None:
     # Rows written before a site carried its token are on disk with only this
     # English, so the frontend's LEGACY table must map each wording to the very
     # token the site writes today.
-    sites = _tokenized_literal_sites()
-    assert len(sites) == 36
+    sites = _tokenized_sites()
+    resolved = [(p, line, tok, texts) for p, line, tok, texts in sites if texts is not None]
+    assert resolved, "the source scan resolved no tokenized append site"
     wrong = [
-        (p, line, tok, _legacy_token(text))
-        for p, line, tok, text in sites
+        (p, line, tok, text, _legacy_token(text))
+        for p, line, tok, texts in resolved
+        for text in texts
         if _legacy_token(text) != tok
     ]
     assert not wrong, f"site(s) whose English no LEGACY pattern maps to their token: {wrong}"
 
 
-def test_run_time_chosen_tokens_match_their_wording() -> None:
+def test_every_unresolved_site_has_its_wording_pinned() -> None:
+    # A site whose text the scan cannot resolve is checked by nothing above, so
+    # its token's wording must be pinned by the run-time check below.
+    pinned = set(_run_time_wording())
+    unchecked = [(p, line, tok) for p, line, tok, texts in _tokenized_sites() if texts is None]
+    assert all(tok in pinned for _p, _line, tok in unchecked), (
+        "tokenized append site(s) whose text the scan cannot resolve and whose token "
+        "_run_time_wording does not pin, so their English is checked against LEGACY "
+        f"by nothing: {[s for s in unchecked if s[2] not in pinned]}"
+    )
+
+
+def _run_time_wording() -> dict[str, list[str]]:
+    """The wording of each token whose site picks its text at run time."""
     from kiro_crew.dashboard.chat_runner import (
         SESSION_NOT_FOUND_GIVE_UP_TEXT,
         SESSION_NOT_FOUND_RETRY_TEXT,
     )
+    from kiro_crew.dashboard.session_control_parts import delivery_containment as dc
     from kiro_crew.llm_helpers import CREDENTIAL_RELOAD_RETRY_NOTICE
 
     # The acp_recovery module reads the give-up text through chat_runner at run
     # time, so the source scan above cannot resolve it.
-    assert _legacy_token(SESSION_NOT_FOUND_GIVE_UP_TEXT) == "session_reconnect_give_up"
-    assert _legacy_token(SESSION_NOT_FOUND_RETRY_TEXT) == "session_reconnecting"
-    assert _legacy_token(CREDENTIAL_RELOAD_RETRY_NOTICE) == "credentials_reloading"
-    assert (
-        _legacy_token("ℹ The capacity retry was cancelled — your message takes over.")
-        == "capacity_retry_cancelled_superseded"
-    )
-    assert (
-        _legacy_token(
+    return {
+        "session_reconnect_give_up": [SESSION_NOT_FOUND_GIVE_UP_TEXT],
+        "session_reconnecting": [SESSION_NOT_FOUND_RETRY_TEXT],
+        "credentials_reloading": [CREDENTIAL_RELOAD_RETRY_NOTICE],
+        # The sender's discard notice joins its target and reason at run time; only
+        # a cause with a framed reason carries the token.
+        "send_discarded": [
+            "⚠ Message you sent to crew:x " + dc._SEND_DISCARD_REASONS[cause]
+            for cause in dc._SEND_DISCARD_FRAMED_REASONS
+        ],
+        "capacity_retry_cancelled_superseded": [
+            "ℹ The capacity retry was cancelled — your message takes over."
+        ],
+        "capacity_retry_cancelled_stopped": [
             "ℹ The capacity retry was cancelled — the turn was stopped, the call was not retried."
-        )
-        == "capacity_retry_cancelled_stopped"
-    )
+        ],
+        # The resource-wake budget row composes its sentence at run time.
+        "resource_wake_budget_paused": [
+            "Resource subscription rsub_0000000000000007 on crux (fake) reached its 48 "
+            "wakes for 2026-11-01 (UTC) and is paused until the next UTC day. Updates "
+            "meanwhile are folded into one wake after the pause."
+        ],
+    }
+
+
+def test_run_time_chosen_tokens_match_their_wording() -> None:
+    wrong = [
+        (token, text, _legacy_token(text))
+        for token, texts in _run_time_wording().items()
+        for text in texts
+        if _legacy_token(text) != token
+    ]
+    assert not wrong, f"run-time wording no LEGACY pattern maps to its token: {wrong}"
 
 
 def test_every_cancelled_replay_wording_has_its_own_token() -> None:
@@ -350,7 +430,7 @@ def test_every_cancelled_replay_wording_has_its_own_token() -> None:
 def test_localized_copy_avoids_internal_vocabulary() -> None:
     catalog = json.loads(_EN_CATALOG.read_text(encoding="utf-8"))
     copy = catalog["pages"]["chat"]["gatewayNotice"]
-    assert len(copy) == 95
+    assert copy, "pages.chat.gatewayNotice is empty in en.json"
     for key, text in copy.items():
         lowered = text.lower()
         assert "hiccup" not in lowered and "backend" not in lowered, (key, text)
@@ -429,9 +509,13 @@ def test_kas_signed_out_row_carries_the_token_and_its_route(
     monkeypatch.setattr(kas_route, "_LAST_SPAWN_ROUTE", route)
     text = signed_out_message(ACP_BACKEND_KAS)
     meta = _terminal_error_meta(AcpAuthRequired(text, backend=ACP_BACKEND_KAS))
-    # The route rides along so the translated copy names it: every KAS prompt
-    # names the real route (the recorded decision on choosing KAS's engine).
+    # The route rides along so the translated row text names it where the row is
+    # shown as text (a crew window, the CLI); the sign-in prompts name no route
+    # (the recorded decision on signed-out sign-in prompts).
     expected: dict[str, object] = {"kind": "auth_required", "notice": "kas_signed_out"}
+    if named == "relay":
+        # Either sign-in starts the relay: the row offers kiro-cli's commands too.
+        expected = {"kind": "kiro_cli_sign_in", "crew_sign_in": True, "notice": "kas_signed_out"}
     if named:
         expected["notice_args"] = {"route": named}
     assert meta == expected
@@ -448,9 +532,106 @@ def test_other_signed_out_wording_keeps_its_english(monkeypatch: pytest.MonkeyPa
     text = signed_out_message(ACP_BACKEND_KAS)
     assert "kiro-cli login" in text
     meta = _terminal_error_meta(AcpAuthRequired(text, backend=ACP_BACKEND_KAS))
-    assert meta == {"kind": "auth_required"}
+    # Only kiro-cli's own sign-in starts a launcher no vault answers: no Sign in.
+    assert meta == {"kind": "kiro_cli_sign_in"}
     # A sentence written under another route than the live one is not re-labelled.
     monkeypatch.setattr(kas_route, "_LAST_SPAWN_ROUTE", KasRoute(bundle=False))
     bundle_text = f"{KasRoute(bundle=True, reason=REASON_CONFIGURED).describe()}. Not signed"
     meta = _terminal_error_meta(AcpAuthRequired(bundle_text, backend=ACP_BACKEND_KAS))
-    assert meta == {"kind": "auth_required"}
+    assert meta == {"kind": "kiro_cli_sign_in", "crew_sign_in": True}
+
+
+_RELAY_NOTICE = {"notice": "kas_signed_out", "notice_args": {"route": "relay"}}
+_BUNDLE_NOTICE = {"notice": "kas_signed_out", "notice_args": {"route": "bundle"}}
+
+
+@pytest.mark.parametrize(
+    ("written", "expected"),
+    [
+        (None, {"kind": "auth_required", "notice": "kas_signed_out"}),
+        (
+            KasRoute(bundle=False),
+            {"kind": "kiro_cli_sign_in", "crew_sign_in": True, **_RELAY_NOTICE},
+        ),
+        (
+            KasRoute(bundle=True, reason=REASON_NO_KIRO_CLI),
+            {"kind": "auth_required", **_BUNDLE_NOTICE},
+        ),
+        (
+            KasRoute(bundle=True, reason=REASON_CONFIGURED),
+            {"kind": "auth_required", **_BUNDLE_NOTICE},
+        ),
+        (KasRoute(bundle=False, reason=REASON_KIRO_CLI_LAUNCHER), {"kind": "kiro_cli_sign_in"}),
+        (
+            KasRoute(bundle=False, reason=REASON_KIRO_CLI_LAUNCHER, crew_auth=True),
+            {"kind": "kiro_cli_sign_in", "crew_sign_in": True},
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "moved_to",
+    [
+        None,
+        KasRoute(bundle=False),
+        KasRoute(bundle=True, reason=REASON_KIRO_CLI_SIGNED_OUT),
+        KasRoute(bundle=False, reason=REASON_KIRO_CLI_LAUNCHER),
+    ],
+)
+def test_the_row_follows_the_route_its_sentence_was_written_for(
+    monkeypatch: pytest.MonkeyPatch,
+    written: KasRoute | None,
+    expected: dict[str, object],
+    moved_to: KasRoute | None,
+) -> None:
+    """A second chat's spawn moves the process-wide route between the
+    failing runtime's spawn and its row. The row's kind and token follow the
+    failing runtime's route, read from its own sentence, whatever the last spawn
+    now says."""
+    from kiro_crew.acp.transport_errors import AcpAuthRequired
+    from kiro_crew.agent_sdk.host_auth import signed_out_message
+    from kiro_crew.dashboard.chat_turn.recovery import _terminal_error_meta
+
+    text = signed_out_message(ACP_BACKEND_KAS, route=written)
+    monkeypatch.setattr(kas_route, "_LAST_SPAWN_ROUTE", moved_to)
+    assert _terminal_error_meta(AcpAuthRequired(text, backend=ACP_BACKEND_KAS)) == expected
+
+
+@pytest.mark.parametrize(
+    ("route", "named"),
+    [
+        (None, None),
+        (KasRoute(bundle=False), "relay"),
+        (KasRoute(bundle=True, reason=REASON_CONFIGURED), "bundle"),
+    ],
+)
+@pytest.mark.parametrize("request_id", ["", "4f2a-77"])
+def test_kas_signed_out_error_frame_row_carries_the_token(
+    monkeypatch: pytest.MonkeyPatch, route: KasRoute | None, named: str | None, request_id: str
+) -> None:
+    from kiro_crew.acp.client import AcpError, _raise_acp_error
+    from kiro_crew.agent_sdk.host_auth import kas_signed_out_route
+    from kiro_crew.dashboard.chat_turn.recovery import _terminal_error_meta
+
+    monkeypatch.setattr(kas_route, "_LAST_SPAWN_ROUTE", route)
+    # kiro-cli's own refusal on a signed-out relay. The formatter's sign-in arm
+    # writes the signed-out sentence, then its model-switch note, then the
+    # request id when the frame carries one.
+    data = "Not logged in. Run `kiro-cli login` first."
+    if request_id:
+        data += f" request_id: {request_id}"
+    frame = {"code": -32000, "message": "Authentication required.", "data": data}
+    with pytest.raises(AcpError) as caught:
+        _raise_acp_error(frame, None, backend=ACP_BACKEND_KAS)
+    text = str(caught.value)
+    assert caught.value.auth_required is True
+    # The row's own text keeps the whole English answer; only its token is new.
+    assert "Switching models will not help" in text
+    assert (f"(request_id: {request_id})" in text) is bool(request_id)
+    expected: dict[str, object] = {"kind": "auth_required", "notice": "kas_signed_out"}
+    if named == "relay":
+        expected = {"kind": "kiro_cli_sign_in", "crew_sign_in": True, "notice": "kas_signed_out"}
+    if named:
+        expected["notice_args"] = {"route": named}
+    assert _terminal_error_meta(caught.value) == expected
+    # The sentence must lead the text: one quoted inside other prose is not this row.
+    assert kas_signed_out_route(f"Earlier: {text}") is None

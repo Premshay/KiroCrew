@@ -156,7 +156,13 @@ async def api_capability_mcp_uninstall(request: web.Request) -> web.Response:
     # package uninstalled while the spec still mounts it.
     from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402 circular: mcp imports agents
         _agent_home_not_owned,
+        _builtin_server_refusal,
     )
+
+    # Kiro Crew's own servers are never uninstalled.
+    builtin = await _builtin_server_refusal(server_id)
+    if builtin is not None:
+        return builtin
 
     not_owned = await asyncio.to_thread(_agent_home_not_owned, server_id)
     if not_owned is not None:
@@ -311,11 +317,13 @@ async def _mutate_agent_package(request: web.Request, *, install: bool) -> web.R
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     # A body that is valid JSON but not an object (or carries a non-string
     # ``package``) must be a 400, not an unhandled AttributeError -> 500.
     if not isinstance(body, dict):
-        return web.json_response({"error": "body must be an object"}, status=400)
+        return web.json_response(
+            {"error": "body must be an object", "code": "body_not_object"}, status=400
+        )
     package = body.get("package")
     if not isinstance(package, str):
         return web.json_response({"error": "package required"}, status=400)

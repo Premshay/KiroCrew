@@ -20,15 +20,23 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from taskrunner_switch_helpers import turn_task_runner_off
 
 import kiro_crew.llm_helpers as llm_helpers
 from kiro_crew.acp.runtime import AcpRequestTimeout
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.session import SessionManager
+from kiro_crew.taskrunner_switch import TASK_RUNNER_OFF_MESSAGE
+from kiro_crew.testing.synthetic_credentials import github_classic
 from kiro_crew.testing.wait import async_wait_until, await_until, finished
 from kiro_crew.workflows.library import WorkflowDefinitionLibrary
 from kiro_crew.workflows.service import WorkflowService
 from kiro_crew.workflows.store import WorkflowRunStore
+
+# A synthetic GitHub token with a valid checksum, which the source gate must
+# refuse. Built at run time; not a real credential. A bare 40-character run in an
+# AWS secret's shape is no credential by itself and would prove nothing here.
+_PLANTED = github_classic(seed=56)
 
 pytestmark = pytest.mark.asyncio
 
@@ -858,7 +866,7 @@ async def test_save_definition_validates_explicit_lineage_against_revision_histo
 async def test_save_and_update_reject_source_that_would_be_redacted(tmp_path) -> None:
     library = WorkflowDefinitionLibrary(tmp_path)
     svc = WorkflowService(sessions=FakeSessions([]), persist=False, definition_library=library)
-    sensitive = GOOD_SCRIPT.replace("ctx.log('hi')", "ctx.log('AKIAIOSFODNN7EXAMPLE')")
+    sensitive = GOOD_SCRIPT.replace("ctx.log('hi')", f"ctx.log('{_PLANTED}')")
 
     rejected_create = svc.save_definition(sensitive)
     saved = svc.save_definition(GOOD_SCRIPT)
@@ -1142,7 +1150,7 @@ async def test_host_rebind_persistence_runs_off_event_loop() -> None:
 async def test_promote_run_rejects_sensitive_raw_source(tmp_path) -> None:
     library = WorkflowDefinitionLibrary(tmp_path)
     svc = WorkflowService(sessions=FakeSessions([]), persist=False, definition_library=library)
-    sensitive = GOOD_SCRIPT.replace("ctx.log('hi')", "ctx.log('AKIAIOSFODNN7EXAMPLE')")
+    sensitive = GOOD_SCRIPT.replace("ctx.log('hi')", f"ctx.log('{_PLANTED}')")
     started = await svc.start(sensitive, name="Sensitive")
     await _wait_terminal(svc, started["run_id"])
 
@@ -1156,7 +1164,7 @@ async def test_promote_run_rejects_sensitive_raw_source(tmp_path) -> None:
 async def test_promote_run_rejects_redacted_source_restored_after_restart(tmp_path) -> None:
     store = WorkflowRunStore(tmp_path / "store")
     library = WorkflowDefinitionLibrary(tmp_path / "library")
-    sensitive = GOOD_SCRIPT.replace("ctx.log('hi')", "ctx.log('AKIAIOSFODNN7EXAMPLE')")
+    sensitive = GOOD_SCRIPT.replace("ctx.log('hi')", f"ctx.log('{_PLANTED}')")
     original = WorkflowService(sessions=FakeSessions([]), store=store, definition_library=library)
     started = await original.start(sensitive, name="Sensitive")
     await _wait_durable_terminal(original, started["run_id"])
@@ -1266,6 +1274,77 @@ async def test_task_plan_definition_accepts_structured_input_arg(tmp_path) -> No
 
     started = await svc.start_definition(saved["slug"], args={"input": "structured input"})
     assert started["run_id"] == "wf_task"
+
+
+async def test_start_task_plan_definition_delegates_to_taskrunner_without_python_execution(
+    tmp_path,
+) -> None:
+    library = WorkflowDefinitionLibrary(tmp_path)
+    saved = library.create(
+        source="agents:\n  test:\n    prompt: run tests\n",
+        name="Test project",
+        source_format="task-plan",
+    )
+
+    class FakeTaskRunner:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def start_workflow_definition(self, definition, **kwargs):
+            self.calls.append({"definition": definition, **kwargs})
+            return {"task_id": "task_123", "run_id": "wf_task"}
+
+    task_runner = FakeTaskRunner()
+    svc = WorkflowService(
+        sessions=FakeSessions([]),
+        persist=False,
+        definition_library=library,
+        task_runner=task_runner,
+    )
+
+    started = await svc.start_definition(saved["slug"], input_text="from slash")
+
+    assert started["run_id"] == "wf_task"
+    assert started["task_id"] == "task_123"
+    from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+
+    assert task_runner.calls == [
+        {
+            "definition": saved,
+            "input_text": "from slash",
+            "author": "",
+            "session_key": "",
+            "execution_context": ExecutionContext(
+                member_id=None,
+                store=MemoryStoreRef("default"),
+                selection_kind="template",
+                template_id="kirocrew",
+            ),
+        }
+    ]
+
+
+async def test_task_runner_turned_off_refuses_a_saved_task_plan(tmp_path) -> None:
+    # Task Runner plans and runs a saved task plan, so its switch applies.
+    library = WorkflowDefinitionLibrary(tmp_path)
+    saved = library.create(
+        source="agents:\n  test:\n    prompt: run tests\n",
+        name="Test project",
+        source_format="task-plan",
+    )
+    task_runner = SimpleNamespace(start_workflow_definition=AsyncMock())
+    svc = WorkflowService(
+        sessions=FakeSessions([]),
+        persist=False,
+        definition_library=library,
+        task_runner=task_runner,
+    )
+
+    turn_task_runner_off()
+    started = await svc.start_definition(saved["slug"], input_text="from slash")
+
+    assert started == {"error": TASK_RUNNER_OFF_MESSAGE, "app_disabled": True}
+    task_runner.start_workflow_definition.assert_not_awaited()
 
 
 async def test_start_definition_loads_saved_source_off_the_event_loop(
@@ -1812,7 +1891,7 @@ async def test_orderly_restart_waits_for_terminal_snapshot(tmp_path, monkeypatch
 
     monkeypatch.setattr(store, "save", delayed_save)
     original = WorkflowService(sessions=FakeSessions([]), store=store, definition_library=library)
-    sensitive = GOOD_SCRIPT.replace("ctx.log('hi')", "ctx.log('AKIAIOSFODNN7EXAMPLE')")
+    sensitive = GOOD_SCRIPT.replace("ctx.log('hi')", f"ctx.log('{_PLANTED}')")
     started = await original.start(sensitive)
     waiter = asyncio.create_task(_wait_durable_terminal(original, started["run_id"]))
     try:

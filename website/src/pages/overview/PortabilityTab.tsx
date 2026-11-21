@@ -11,6 +11,7 @@ import { noteStaleOwnerResponse } from '../../api/staleOwnerSignal'
 import { uiLocation } from '../../uiLocations/uiLocation'
 import { adoptHostUiPrefsOnNextLoad, pauseUiPrefsSync, resumeUiPrefsSync } from '../../lib/uiPrefs'
 import { downloadBlob } from '../../utils/download'
+import { apiTransport } from '../../api/apiTransport'
 
 /**
  * Where a settings restore leaves its result for the load it triggers.
@@ -278,6 +279,9 @@ export function chatImportLines(summary: Record<string, unknown>): string[] {
   const withheld = summaryCount(summary.sessions_withheld) ?? 0
   const lines = [i18nT('pages.overview.portabilityTab.import_chats_result', { added, existing })]
   if (withheld) lines.push(i18nT('pages.overview.portabilityTab.import_chats_withheld', { withheld }))
+  // A chat whose folder could not be moved to this computer's home lost its folder.
+  const cleared = summaryCount(summary.sessions_project_cleared) ?? 0
+  if (cleared) lines.push(i18nT('pages.overview.portabilityTab.import_chats_folder_missing', { cleared }))
   return lines
 }
 
@@ -397,7 +401,7 @@ export default function PortabilityTab() {
     fd.append('file', file)
     setChecking(true)
     try {
-      const resp = await fetch('/api/portability/preview', { method: 'POST', body: fd })
+      const resp = await apiTransport.request('/api/portability/preview', { method: 'POST', body: fd })
       const data = await resp.json()
       if (data.ok) {
         setPreview(data.manifest)
@@ -441,7 +445,7 @@ export default function PortabilityTab() {
       const params = new URLSearchParams({ mode: effectiveMode })
       if (memoryImport && effectiveMode === 'merge') params.set('components', 'memory')
       if (!memoryImport && pickedTemplates.length) params.set('agent_templates', pickedTemplates.join(','))
-      const resp = await fetch(`/api/portability/import?${params}`, { method: 'POST', body: fd })
+      const resp = await apiTransport.request(`/api/portability/import?${params}`, { method: 'POST', body: fd })
       const data = await resp.json()
       if (data.ok) {
         const summary = data.summary || {}

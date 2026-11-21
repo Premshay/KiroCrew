@@ -26,6 +26,7 @@ from typing import Any
 
 from kiro_crew import mate_capability_catalog as _mate_catalog
 from kiro_crew import member_goals as _goals
+from kiro_crew.acp_backends import CHAT_RUNTIME_SHARING_HARNESSES
 from kiro_crew.config.sections import (
     FEATURE_PREVIEW_FLAGS,
     MAX_PER_CREATOR_MAX,
@@ -185,6 +186,9 @@ _SETTING_ORDER: dict[str, tuple[Any, ...]] = {
     "agent.sandbox": ("strict", "auto", "off"),
     "agent.yolo_duration": ("30m", "1h", "6h", "12h", "24h", "until_shutdown"),
     "agent.sandbox_allow_no_isolation": (False, True),
+    # On, an agent that mounts the kirocrew-dashboard server may open, read,
+    # message, stop and close the person's other sessions.
+    "agent.session_control": (False, True),
     "dashboard.tailscale.enabled": (False, True),
     "dashboard.tailscale.trust_identity": (False, True),
     "dashboard.tailscale.bind_refresh_chains": (True, False),
@@ -195,6 +199,8 @@ _SETTING_ORDER: dict[str, tuple[Any, ...]] = {
     # On, an agent may add documents to the knowledge library
     # (``knowledge_add_document``); off, that tool refuses.
     "knowledge.auto_add_documents": (False, True),
+    # On, a personal KAS chat may read the memories other Kiro clients saved.
+    "agent.orchestrator_memory": (False, True),
     # Fair admission on holds each person to their limit; off lets one person
     # take the whole host.
     "dashboard.shared_crew.admission_enabled": (True, False),
@@ -203,10 +209,15 @@ _SETTING_ORDER: dict[str, tuple[Any, ...]] = {
     # On, the dashboard also listens on a loopback port for AWS SSM port forwards.
     "dashboard.shared_crew.ssm": (False, True),
     "skills.approval_required": (True, False),
+    # On, an agent may start a Task Runner run (``task_run``); off, every start refuses.
+    "taskrunner.enabled": (False, True),
     "telemetry.beacon_enabled": (False, True),
     # Kiro's own Chromium holds none of the person's logins; ``auto`` and
     # ``user_chrome`` hand the agent the person's Chrome, signed in.
     "browser.choice": ("headless", "kiro_chromium", "auto", "user_chrome"),
+    # ``shared`` lets a chat use whatever the one browser is already signed in
+    # to; ``per_session`` gives each chat a container no other chat can see.
+    "browser.isolation": ("per_session", "shared"),
     # Off, password boxes show in the live picture.
     "browser.live.mask_passwords": (True, False),
     # On, Kiro's Chromium starts signed in to the edition's sites.
@@ -217,6 +228,8 @@ _SETTING_ORDER: dict[str, tuple[Any, ...]] = {
     # How many live sessions one creator may hold: a higher number lets an agent
     # that opens sessions hold more of them without asking.
     "session.max_per_creator": tuple(range(MAX_PER_CREATOR_MIN, MAX_PER_CREATOR_MAX + 1)),
+    # On, a new KAS session reuses a stored remote MCP sign-in without asking.
+    "agent.kas_persist_mcp_sign_in": (False, True),
 }
 
 #: Card-editable config paths (``_EDITABLE_CONFIG``) that no value can widen
@@ -228,6 +241,12 @@ _SETTING_ORDER: dict[str, tuple[Any, ...]] = {
 _CANNOT_WIDEN_SETTINGS: frozenset[str] = frozenset(
     {
         "agent.chat_turn_timeout_secs",
+        # Whether one harness's chats may pool into one agent process while the
+        # sharing preview is on: process placement only, never what a chat can reach.
+        *(
+            f"agent.chat_runtime_sharing_harnesses.{_name}"
+            for _name in CHAT_RUNTIME_SHARING_HARNESSES
+        ),
         "agent.completion_keep",
         "agent.completion_keep_chars",
         "agent.fallback_model",
@@ -237,8 +256,10 @@ _CANNOT_WIDEN_SETTINGS: frozenset[str] = frozenset(
         "agent.refusal_fallback_model",
         "agent.role_efforts.background",
         "agent.role_efforts.subagent",
+        "agent.role_efforts.subagent_light",
         "agent.role_models.background",
         "agent.role_models.subagent",
+        "agent.role_models.subagent_light",
         "agent.soft_stop_budget_secs",
         "agent.tool_search",
         "auto_update",
@@ -253,11 +274,17 @@ _CANNOT_WIDEN_SETTINGS: frozenset[str] = frozenset(
         "computer_use.max_tree_nodes",
         "computer_use.screenshot_max_px",
         # A list, so no card reaches it (see ``skills.extra_paths``). Loopback
-        # ``host:port`` entries only, for the Preview tab, which no agent drives.
+        # ``host:port`` entries for the Preview tab, and also the only loopback
+        # addresses the agent's ``browser`` tool may open, so adding one widens
+        # what an agent may reach: if cards ever carry list values this moves to a
+        # widening class.
         "dashboard.browser_local_origins",
         # Which surface the quick-search shortcut opens; both show only what the
         # dashboard already shows this person.
         "dashboard.command_bar_enabled",
+        # Only whether Channels has a sidebar row; its page and `/api/channels`
+        # are served either way.
+        "dashboard.channels_enabled",
         "dashboard.crewmate_threads",
         "dashboard.dynamic_dashboard_cards",
         # A feature preview only decides whether the dashboard OFFERS an
@@ -284,6 +311,7 @@ _CANNOT_WIDEN_SETTINGS: frozenset[str] = frozenset(
         "dashboard.terminal.external_app",
         "dashboard.terminal.reuse_current",
         "dashboard.title_refresh_every_turns",
+        "dashboard.unfiled_sessions_above_folders",
         "dashboard.update_nudge",
         "dashboard.user_role",
         "dashboard.user_role_other",
@@ -328,6 +356,11 @@ _CANNOT_WIDEN_SETTINGS: frozenset[str] = frozenset(
         # Generated skills still wait for approval unless
         # ``skills.approval_required`` (ordered above) is turned off.
         "skills.auto_create_from_sessions",
+        # The weekly repeated-failures bell note: a reminder to the owner, which
+        # writes no memory and grants nothing.
+        "memory.repeated_failures_notice",
+        # How long the idle embedding model stays loaded: memory use only, grants nothing.
+        "memory.embedding_idle_evict_secs",
         # Local recording only: the write route refuses the enable on a host
         # where it would start sending data out.
         "telemetry.enabled",
@@ -487,12 +520,14 @@ KINDS: dict[str, KindDef] = {
         ),
         KindDef(
             KIND_CREWMATE_CREATE,
-            "Create a Bot that owns a goal, optionally on a daily/cron schedule.",
+            "Create a Bot that owns a goal, optionally on a daily/cron schedule and "
+            "pinned to a `model` (an id from the model list; omitted or 'auto' inherits).",
             _obj(
                 {
                     "name": {"type": "string", "maxLength": _CREWMATE_NAME_MAX},
                     "goal": {"type": "string", "maxLength": _CREWMATE_GOAL_MAX},
                     "schedule": _obj(dict(_CRON_FIELDS), ["cron_expr"]),
+                    "model": {"type": "string", "maxLength": 64},
                 },
                 ["name", "goal"],
             ),
@@ -1364,11 +1399,17 @@ def validate_params(kind: str, params: Any) -> dict[str, Any]:
             f["timezone"] = _clean_str(fields, "timezone", max_len=64, allow_empty=True) or ""
         return {"id": job_id, "fields": f}
     if kind == KIND_CREWMATE_CREATE:
-        _only(p, {"name", "goal", "schedule"})
+        _only(p, {"name", "goal", "schedule", "model"})
         out = {
             "name": _member_name(p, "name", max_len=_CREWMATE_NAME_MAX),
             "goal": _clean_str(p, "goal", max_len=_CREWMATE_GOAL_MAX),
         }
+        # Entitlement is judged where the pin is written: the create POST runs
+        # the same model check crewmate.update's PUT does, so an id this account
+        # cannot serve fails the card's first step and no Bot is made.
+        model = _clean_str(p, "model", required=False, max_len=64, allow_empty=True)
+        if model:
+            out["model"] = model
         schedule = p.get("schedule")
         if schedule is not None:
             if not isinstance(schedule, dict):

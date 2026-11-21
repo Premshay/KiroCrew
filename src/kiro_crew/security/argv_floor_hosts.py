@@ -104,13 +104,28 @@ _GLOB_CHARS: frozenset[str] = frozenset("*?[")
 _DNS_CANDIDATE_RE = re.compile(r"(?=.*[a-z])[a-z0-9_-]+(\.[a-z0-9_-]+)*\Z")
 
 
-_HOST_VERDICT_CACHE: "dict[str, bool]" = {}
+_HOST_VERDICT_CACHE: "dict[str, bool | str]" = {}  # "route" is an allow from ssh config only.
 
 
 _HOST_VERDICT_PENDING: "set[str]" = set()
 
 
 _HOST_VERDICT_LOCK = threading.Lock()
+
+
+# Signalled under the lock each time a resolver worker clears its host from
+# ``_HOST_VERDICT_PENDING``, so a check off the event loop can wait for it.
+_HOST_VERDICT_SETTLED = threading.Condition(_HOST_VERDICT_LOCK)
+
+
+# How long, in total, one check off the event loop waits for the lookups of
+# new dotted names before it answers.  A lookup still running after this is
+# refused, as before; the event loop itself never waits.
+_HOST_VERDICT_WAIT_SECS = 0.5
+
+
+# Key of one check's wait deadline in that check's ``_CALL_VIEWS`` memo.
+_HOST_VERDICT_WAIT_KEY = ("host_verdict_wait_deadline",)
 
 
 # ponytail: unbounded per-host growth is capped by evicting the oldest entry;
@@ -129,17 +144,25 @@ _HOST_VERDICT_ALLOW_TTL = 300.0
 _HOST_VERDICT_STAMP: "dict[str, float]" = {}
 
 
+# The resolver's "no such name" answers.  Unlike a temporary failure they are a
+# definite result: the name has no DNS address here.  ssh can still route such a
+# name through ~/.ssh/config, so it counts as not-self only once
+# ``route_is_not_self`` has cleared ssh's effective config as well.
+_NO_SUCH_NAME_ERRNOS = frozenset(
+    code
+    for code in (getattr(socket, "EAI_NONAME", None), getattr(socket, "EAI_NODATA", None))
+    if code is not None
+)
+
+
 def _resolve_host_verdict_into_cache(host: str) -> None:
     """Worker: resolve *host* off-loop and record whether it is local.
 
-    Any resolved address that is loopback/unspecified, or a member of the
-    own-address set, marks the host self.  A name that RESOLVES to no local
-    address is not self.  A resolution FAILURE caches nothing (round-25): a
-    transient DNS error latched as an allow would serve a recovered loopback
-    alias for the whole allow-TTL, so the failure only clears the pending
-    latch and the next decision retries.
+    DNS answers store a boolean; a proven route after NXDOMAIN stores "route".
+    Both expire after the allow-TTL. Failed revalidation removes a route-only
+    allow; other DNS failures cache nothing and leave existing DNS verdicts alone.
     """
-    verdict = False
+    verdict: bool | str = False
     resolved_ok = True
     try:
         infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
@@ -156,6 +179,13 @@ def _resolve_host_verdict_into_cache(host: str) -> None:
             if ip.is_loopback or ip.is_unspecified or str(ip).lower() in own:
                 verdict = True
                 break
+    except socket.gaierror as exc:
+        # "No such name" alone is not proof: ~/.ssh/config can still route the
+        # name here, so ssh's own effective config must clear every hop too.
+        from . import ssh_config_route
+
+        resolved_ok = exc.errno in _NO_SUCH_NAME_ERRNOS and ssh_config_route.route_is_not_self(host)
+        verdict = "route"
     except Exception:
         resolved_ok = False
     with _HOST_VERDICT_LOCK:
@@ -166,7 +196,12 @@ def _resolve_host_verdict_into_cache(host: str) -> None:
                 _HOST_VERDICT_STAMP.pop(evicted, None)
             _HOST_VERDICT_CACHE[host] = verdict
             _HOST_VERDICT_STAMP[host] = time.monotonic()
+        elif _HOST_VERDICT_CACHE.get(host) == "route":
+            # A failed route proof cannot keep an earlier route-only allow alive.
+            _HOST_VERDICT_CACHE.pop(host, None)
+            _HOST_VERDICT_STAMP.pop(host, None)
         _HOST_VERDICT_PENDING.discard(host)
+        _HOST_VERDICT_SETTLED.notify_all()
 
 
 def _hosts_file_paths() -> "tuple[str, ...]":
@@ -533,6 +568,11 @@ def _resolved_host_verdict(host: str, *, fail_closed: bool = True) -> bool:
     everyday ``ssh dev-dsk <cmd>`` shape) — and a later call reads the
     published verdict.  A worker that cannot start keeps this call's answer
     and clears the latch so a later call retries.
+
+    Off the event loop, a fail-closed miss first waits for that worker, up to
+    ``_HOST_VERDICT_WAIT_SECS`` in total per check, and answers from what it
+    published.  A loopback answer, a failed lookup, or a worker still running
+    when the wait ends all stay refused.
     """
     with _HOST_VERDICT_LOCK:
         if host in _HOST_VERDICT_CACHE:
@@ -553,7 +593,7 @@ def _resolved_host_verdict(host: str, *, fail_closed: bool = True) -> bool:
                     ).start()
                 except Exception:
                     _HOST_VERDICT_PENDING.discard(host)
-            return verdict
+            return False if verdict == "route" else bool(verdict)
         if host not in _HOST_VERDICT_PENDING:
             _HOST_VERDICT_PENDING.add(host)
             try:
@@ -565,7 +605,38 @@ def _resolved_host_verdict(host: str, *, fail_closed: bool = True) -> bool:
                 ).start()
             except Exception:
                 _HOST_VERDICT_PENDING.discard(host)
-    return fail_closed
+        if not fail_closed or host not in _HOST_VERDICT_PENDING:
+            return fail_closed
+    # The lock is released here: the loop check may import, and the waiter
+    # takes it again through the condition.
+    if _event_loop_running():
+        return fail_closed
+    remaining = _host_verdict_wait_left()
+    if remaining <= 0:
+        return fail_closed
+    with _HOST_VERDICT_SETTLED:
+        _HOST_VERDICT_SETTLED.wait_for(lambda: host not in _HOST_VERDICT_PENDING, remaining)
+        if host in _HOST_VERDICT_PENDING or host not in _HOST_VERDICT_CACHE:
+            return fail_closed
+        verdict = _HOST_VERDICT_CACHE[host]
+    return False if verdict == "route" else bool(verdict)
+
+
+def _host_verdict_wait_left() -> float:
+    """Seconds this check may still wait for a lookup; starts its clock on first use.
+
+    One gate call shares one deadline through its ``_CALL_VIEWS`` memo, so a
+    line naming many new hosts waits ``_HOST_VERDICT_WAIT_SECS`` at most in
+    all.  A call outside a gate call gets the whole budget.
+    """
+    from .call_views import _CALL_VIEWS  # local: a leaf, kept off this module's import line
+
+    now = time.monotonic()
+    memo = _CALL_VIEWS.get()
+    if memo is None:
+        return _HOST_VERDICT_WAIT_SECS
+    deadline = memo.setdefault(_HOST_VERDICT_WAIT_KEY, now + _HOST_VERDICT_WAIT_SECS)
+    return float(deadline) - now
 
 
 # This machine's own names/addresses, lowered.  Seeded SYNCHRONOUSLY from

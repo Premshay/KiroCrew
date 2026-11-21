@@ -10,7 +10,9 @@ import type { NoticeTone } from './NoticeCard'
  * tool, session stuck, session reconnect, model-session rebuild), the admission
  * `error` cards, and the `notice` rows (empty response, model fallback, a
  * cancelled recovery replay, the end-of-turn checks, the queue and agent-switch
- * notices, and a Bot chat that keeps its agent after the Bot was set to another).
+ * notices, a Bot chat that keeps its agent after the Bot was set to another, the
+ * permission mode a harness's session moved to, a harness's background task that
+ * ended, and Claude Code retrying a failed request).
  *
  * Each such row carries a structured wire token in `meta.notice`
  * (`TRANSIENT_NOTICE_*` in `src/kiro_crew/dashboard/chat_utils.py` and
@@ -66,6 +68,7 @@ const NOTICE_FAMILIES = {
   model_access_fallback: { role: 'notice', card: 'notice', tone: 'warn' },
   model_unavailable: { role: 'notice', card: 'notice', tone: 'info' },
   model_throttled_fallback: { role: 'notice', card: 'notice', tone: 'warn' },
+  model_server_error_fallback: { role: 'notice', card: 'notice', tone: 'warn' },
   refusal_fallback_same_model: { role: 'notice', card: 'notice', tone: 'info' },
   session_reconnecting: { role: 'error', card: 'error' },
   session_reconnect_give_up: { role: 'error', card: 'error' },
@@ -106,6 +109,12 @@ const NOTICE_FAMILIES = {
   agent_switch_blocked_channel: { role: 'notice', card: 'notice', tone: 'info' },
   channel_message_not_run: { role: 'notice', card: 'notice', tone: 'info' },
   member_rebind_kept_agent: { role: 'notice', card: 'notice', tone: 'info' },
+  agent_no_tools: { role: 'notice', card: 'notice', tone: 'info' },
+  harness_mode_changed: { role: 'notice', card: 'notice', tone: 'info' },
+  harness_task_completed: { role: 'notice', card: 'notice', tone: 'info' },
+  harness_task_failed: { role: 'notice', card: 'notice', tone: 'warn' },
+  harness_task_stopped: { role: 'notice', card: 'notice', tone: 'info' },
+  harness_api_retry: { role: 'notice', card: 'notice', tone: 'warn' },
   crew_name_undispatchable: { role: 'error', card: 'error' },
   code_channel_worktree_not_ready: { role: 'error', card: 'error' },
   remote_crew_read_only: { role: 'error', card: 'error' },
@@ -126,6 +135,7 @@ const NOTICE_FAMILIES = {
   kas_signed_out: { role: 'error', card: 'error' },
   windows_spawn_blocked: { role: 'error', card: 'error' },
   tools_not_ready: { role: 'error', card: 'error' },
+  resource_wake_budget_paused: { role: 'notice', card: 'notice', tone: 'info' },
 } as const satisfies Record<string, Family>
 
 export type GatewayNoticeToken = keyof typeof NOTICE_FAMILIES
@@ -157,6 +167,7 @@ const COPY_KEY = {
   model_access_fallback: 'pages.chat.gatewayNotice.model_access_fallback',
   model_unavailable: 'pages.chat.gatewayNotice.model_unavailable',
   model_throttled_fallback: 'pages.chat.gatewayNotice.model_throttled_fallback',
+  model_server_error_fallback: 'pages.chat.gatewayNotice.model_server_error_fallback',
   refusal_fallback_same_model: 'pages.chat.gatewayNotice.refusal_fallback_same_model',
   session_reconnecting: 'pages.chat.gatewayNotice.session_reconnecting',
   session_reconnect_give_up: 'pages.chat.gatewayNotice.session_reconnect_give_up',
@@ -197,6 +208,12 @@ const COPY_KEY = {
   agent_switch_blocked_channel: 'pages.chat.gatewayNotice.agent_switch_blocked_channel',
   channel_message_not_run: 'pages.chat.gatewayNotice.channel_message_not_run',
   member_rebind_kept_agent: 'pages.chat.gatewayNotice.member_rebind_kept_agent',
+  agent_no_tools: 'pages.chat.gatewayNotice.agent_no_tools',
+  harness_mode_changed: 'pages.chat.gatewayNotice.harness_mode_changed',
+  harness_task_completed: 'pages.chat.gatewayNotice.harness_task_completed',
+  harness_task_failed: 'pages.chat.gatewayNotice.harness_task_failed',
+  harness_task_stopped: 'pages.chat.gatewayNotice.harness_task_stopped',
+  harness_api_retry: 'pages.chat.gatewayNotice.harness_api_retry',
   crew_name_undispatchable: 'pages.chat.gatewayNotice.crew_name_undispatchable',
   code_channel_worktree_not_ready: 'pages.chat.gatewayNotice.code_channel_worktree_not_ready',
   remote_crew_read_only: 'pages.chat.gatewayNotice.remote_crew_read_only',
@@ -217,6 +234,7 @@ const COPY_KEY = {
   kas_signed_out: 'pages.chat.gatewayNotice.kas_signed_out',
   windows_spawn_blocked: 'pages.chat.gatewayNotice.windows_spawn_blocked',
   tools_not_ready: 'pages.chat.gatewayNotice.tools_not_ready',
+  resource_wake_budget_paused: 'pages.chat.gatewayNotice.resource_wake_budget_paused',
 } as const satisfies Record<GatewayNoticeToken, string>
 
 /** Copy for a row whose args carry a recovery ordinal (`n` of `max`). */
@@ -271,7 +289,11 @@ const BACKEND_HICCUP_RESUME_KEY = 'pages.chat.errorCard.retry_backend_hiccup'
  *   (the session's own limit vs the global setting), so the card's remedy is
  *   not the one English fragment in an otherwise-translated card;
  * - the never-started wait is a count of minutes, worded the same way;
- * - a dropped/discarded message's excerpt is quoted under a localized label.
+ * - a dropped/discarded message's excerpt is quoted under a localized label;
+ * - a harness's background task names what the harness's summary adds after the
+ *   task (its exit code), and a retry the error category or HTTP status, each only
+ *   when the row carries one; a category this build knows is a localized phrase, and
+ *   another is shown as its own token, the English fallback.
  *
  * A pre-token row persisted on disk carries only its English capture groups
  * (`limit`, `hint`, `waited`, the ` Text: "…"` suffix) and no structured field,
@@ -287,6 +309,22 @@ const TURN_LIMIT_HINT_KEY = {
 } as const
 const BACKGROUND_TURN_WAITED_KEY = 'pages.chat.gatewayNotice.background_turn_waited'
 const SEND_EXCERPT_KEY = 'pages.chat.gatewayNotice.send_excerpt'
+/** The retry categories Claude Code retries a request on (`SDKAssistantMessageError`). */
+const RETRY_REASON_KEY: Readonly<Record<string, string>> = {
+  rate_limit: 'pages.chat.gatewayNotice.harness_api_retry_rate_limit',
+  overloaded: 'pages.chat.gatewayNotice.harness_api_retry_overloaded',
+  server_error: 'pages.chat.gatewayNotice.harness_api_retry_server_error',
+  cloud_credential_error: 'pages.chat.gatewayNotice.harness_api_retry_cloud_credential_error',
+}
+const RETRY_STATUS_KEY = 'pages.chat.gatewayNotice.harness_api_retry_status'
+
+/** A retry's reason: its category localized, an unknown one as its token, else its HTTP status. */
+function retryReason(args: Args): string {
+  const reason = typeof args.reason === 'string' ? args.reason : ''
+  if (reason && Object.hasOwn(RETRY_REASON_KEY, reason)) return i18nT(RETRY_REASON_KEY[reason])
+  if (reason) return reason.replace(/_/g, ' ')
+  return typeof args.status === 'number' ? i18nT(RETRY_STATUS_KEY, { status: args.status }) : ''
+}
 
 /**
  * Word the variable parts a COMPOSED card carries, from its structured args,
@@ -310,6 +348,17 @@ function composedCardVars(token: GatewayNoticeToken, args: Args, vars: Record<st
   }
   if (token === 'background_turn_abandoned' && typeof args.waited_minutes === 'number') {
     return { ...vars, waited: i18nT(BACKGROUND_TURN_WAITED_KEY, { count: args.waited_minutes }) }
+  }
+  if (token === 'harness_task_completed' || token === 'harness_task_failed' || token === 'harness_task_stopped') {
+    // The frame abuts `{{detail}}` ("…: {{task}}{{detail}}"); the summary is the
+    // harness's own text, so only its separator is added here.
+    const detail = typeof args.detail === 'string' ? args.detail : ''
+    return { ...vars, detail: detail ? ` — ${detail}` : '' }
+  }
+  if (token === 'harness_api_retry') {
+    // The frame abuts `{{reason}}` ("…request{{reason}}, attempt…").
+    const reason = retryReason(args)
+    return { ...vars, reason: reason ? ` (${reason})` : '' }
   }
   if (token === 'send_dropped' || token === 'send_discarded') {
     // The structured arg is the BARE excerpt; a legacy row's `excerpt` is the
@@ -399,6 +448,10 @@ const LEGACY: readonly Legacy[] = [
     token: 'model_unavailable',
   },
   { re: /^⚠\uFE0F? (?<primary>.+?) is throttled — running on (?<fallback>.+?) until .+? recovers\.$/u, token: 'model_throttled_fallback' },
+  {
+    re: /^⚠\uFE0F? (?<primary>.+?) keeps returning server errors — running on (?<fallback>.+?) until .+? recovers\.$/u,
+    token: 'model_server_error_fallback',
+  },
   { re: /^⟳ The agent lost this chat's session — reconnecting…$/u, token: 'session_reconnecting' },
   {
     re: /^❌ Could not reconnect this chat's session\. Send your message again, or start a new chat if this keeps happening\.$/u,
@@ -493,7 +546,7 @@ const LEGACY: readonly Legacy[] = [
   },
   {
     // The first wording is what older transcripts stored; keep matching it.
-    re: /^📌 Agent switch to (?<agent>.+?) was blocked — this chat is in (?:Crew Mode, which stays on its conductor\. The next turn restarts on the conductor|Ultra Mode, which stays on its own agent\. The next turn restarts on that agent)\.$/u,
+    re: /^📌 Agent switch to (?<agent>.+?) was blocked — this chat is in (?:Crew Mode, which stays on its conductor\. The next turn restarts on the conductor|conductor mode, which stays on its own agent\. The next turn restarts on that agent)\.$/u,
     token: 'agent_switch_blocked_crew_mode',
   },
   {
@@ -574,7 +627,33 @@ const LEGACY: readonly Legacy[] = [
     re: /^capability_tool_limits_unsupported: This (?:crew member's|Bot's) saved capabilities turn off single tools on an MCP server\. The backend its chats run on \((?<setting>[^)]*)\) cannot turn off single tools, so they would be on\. On the member's Capabilities page, turn the whole server off or turn those tools back on, then start a new chat\.$/u,
     token: 'capability_tool_limits_unsupported',
   },
+  {
+    re: /^Resource subscription (?<subscription>\S+) on (?<server>.+?) reached its (?<limit>\d+) wakes for (?<day>\S+) \(UTC\) and is paused until the next UTC day\. Updates meanwhile are folded into one wake after the pause\.$/u,
+    token: 'resource_wake_budget_paused',
+  },
 ]
+
+/**
+ * The lead a notice may open with. Older gateways baked a status glyph into the
+ * text (U+2139 info, U+26A0 warning, U+26D4 no-entry, U+274C cross, U+27F3
+ * retry, U+1F4CC pin, U+23F1 stopwatch); current ones write a word (`Note:`,
+ * `Warning:`, `Blocked:`, `Error:`, `Stopped:`) or nothing. The table above is
+ * written in the glyph form, so the table and the content are both matched with
+ * the lead removed, and one row reads every spelling: saved history keeps the
+ * glyph forever.
+ */
+const NOTICE_LEAD_RE =
+  /^(?:(?:\u2139|\u26A0|\u26D4|\u274C|\u27F3|\u{1F4CC}|\u23F1)\uFE0F*\s*|(?:Note|Warning|Blocked|Error|Stopped):\s*)/u
+const SOURCE_LEAD_RE = /^\^(?:\u2139|\u26A0|\u26D4|\u274C|\u27F3|\u{1F4CC}|\u23F1)(?:\\uFE0F\?)? /u
+const LEGACY_LEADLESS: readonly Legacy[] = LEGACY.map(entry => ({
+  ...entry,
+  re: new RegExp(entry.re.source.replace(SOURCE_LEAD_RE, '^'), entry.re.flags),
+}))
+
+/** `content` without its lead glyph or lead word, if it has one. */
+export function stripNoticeLead(content: string): string {
+  return content.replace(NOTICE_LEAD_RE, '')
+}
 
 /**
  * The KAS signed-out sentences a row carries without their token: rows stored
@@ -589,8 +668,9 @@ function legacyKasSignedOutRoute(content: string): '' | 'relay' | 'bundle' | nul
   // row carries, never shown here (the token's catalog copy is).
   if (!content.endsWith(', then start a new chat.') && !content.endsWith(', then send your message again.')) return null
   const head = content.slice(0, content.lastIndexOf(', then '))
-  // The path names the Kiro Agent row the card sits in; older rows name it without.
-  const lead = /^(?<lead>.*?)Not signed in to Kiro\. Sign in from Settings → Agent Harness → (?:Kiro Agent → )?Kiro sign-in$/u
+  // The path names where the card was when the row was stored: its own Kiro
+  // account tab now, the Kiro Agent row before that, the harness tab before that.
+  const lead = /^(?<lead>.*?)Not signed in to Kiro\. Sign in from Settings → (?:Kiro account|Agent Harness → (?:Kiro Agent → )?Kiro sign-in)$/u
     .exec(head)?.groups?.lead
   if (lead === undefined) return null
   if (lead === '') return ''
@@ -608,8 +688,9 @@ function isToken(value: unknown): value is GatewayNoticeToken {
   return typeof value === 'string' && Object.prototype.hasOwnProperty.call(NOTICE_FAMILIES, value)
 }
 
-function legacyShape(content: string, m?: ChatMessage): Shape | null {
-  for (const entry of LEGACY) {
+function legacyShape(raw: string, m?: ChatMessage): Shape | null {
+  const content = stripNoticeLead(raw)
+  for (const entry of LEGACY_LEADLESS) {
     const match = entry.re.exec(content)
     if (!match) continue
     const token = entry.pendingWithRetryKind && m && isRetryNotice(m) ? entry.pendingWithRetryKind : entry.token
@@ -671,8 +752,8 @@ function copyOf({ token, args }: Shape): string {
 
 /**
  * *message* led by the route the KAS engine took, in plain words, when the row
- * names one: every KAS prompt names the real route
- * (docs/decisions/2026-10-30-choosing-kas-runs-kiro-crews-own-engine-when-kiro-cli-cannot.md).
+ * names one, where the row is shown as text. The sign-in prompts with a button
+ * name no route (the recorded decision on signed-out sign-in prompts).
  */
 function withKasRoute(args: Args, message: string): string {
   const route =
@@ -756,14 +837,11 @@ function outcomeAfter(messages: readonly ChatMessage[], index: number): Outcome 
 }
 
 /**
- * Copy for a KAS signed-out row drawn with the sign-in button under it, or null
- * for any other row. The row's own copy names the Settings path, for a surface
- * with no button; next to the button, the button is the way.
+ * True for a KAS signed-out row: the one whose fix is Kiro Crew's own sign-in.
+ * Not the launcher form, whose fix is kiro-cli's login (no token is stamped).
  */
-export function kasSignedOutBesideButton(m: ChatMessage): string | null {
-  const shape = shapeOf(m)
-  if (shape?.token !== 'kas_signed_out') return null
-  return withKasRoute(shape.args, i18nT('pages.chat.gatewayNotice.kas_signed_out_sign_in_below'))
+export function isKasSignedOut(m: ChatMessage): boolean {
+  return shapeOf(m)?.token === 'kas_signed_out'
 }
 
 /**
@@ -810,4 +888,16 @@ export function resolveGatewayNotice(
 export function resumeProseFor(content: string): string | null {
   const shape = legacyShape(content)
   return shape ? (resumeTextOf(shape) ?? null) : null
+}
+
+/**
+ * The agent a no-tools notice row names, or `null` for any other row. The row is
+ * the `agent_no_tools` family (`dashboard/agent_no_tools_notice.py`): its own
+ * renderer adds the link to that agent's page, so it is matched on the token and
+ * never on its words.
+ */
+export function agentNoToolsAgent(m: ChatMessage): string | null {
+  const shape = m.role === 'notice' ? shapeOf(m) : null
+  if (shape?.token !== 'agent_no_tools') return null
+  return typeof shape.args.agent === 'string' && shape.args.agent ? shape.args.agent : null
 }

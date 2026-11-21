@@ -31,13 +31,16 @@ from kiro_crew import agent_scratch, beacon, diagnostics, release_channel
 from kiro_crew.dashboard import crash_dump_store
 from kiro_crew.dashboard.handlers import diagnostics as dh
 from kiro_crew.diagnostics import BundleResult
+from kiro_crew.testing.synthetic_credentials import SAMPLE_AWS_SECRET
 
 _GATEWAY = (
     "09:00 boot ok\n"
     "Authorization: Bearer sk-ant-SECRETtoken1234567890abcXYZ\n"
     "Set-Cookie: mc_token_5476=supersecretcookievalueABCDEF123456\n"
     "Set-Cookie: mc_refresh_5476=REFRESHsecretVALUE9876543210\n"
-    "aws_secret_access_key=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY\n"
+    "aws_secret_access_key="
+    "Qh4Tm2Vx9KpRcZ8Nw3Hd"
+    "Jf1Lb5Gs0Ye9Ua2WkEQ2\n"
     "a perfectly normal log line\n"
 )
 
@@ -45,7 +48,7 @@ _SECRETS = (
     "sk-ant-SECRETtoken1234567890abcXYZ",
     "supersecretcookievalueABCDEF123456",
     "REFRESHsecretVALUE9876543210",
-    "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY",
+    "Qh4Tm2Vx9KpRcZ8Nw3Hd" "Jf1Lb5Gs0Ye9Ua2WkEQ2",
 )
 
 
@@ -105,6 +108,24 @@ def test_collect_bundle_redacts_and_zips(tmp_path, monkeypatch):
     assert r.redaction_summary["gateway.log"] >= 3
     assert manifest["total_redactions"] == r.total_redactions
     assert manifest["note"] == "every message fails"
+
+
+@pytest.mark.parametrize(
+    ("alignment", "line"),
+    [
+        ("aligned (1.2.3)", "version_alignment: aligned (1.2.3)\n"),
+        (None, f"version_alignment: {diagnostics._ALIGNMENT_NOT_CHECKED}\n"),
+    ],
+    ids=["doctor-bundle", "dashboard"],
+)
+def test_versions_txt_records_the_version_alignment(tmp_path, monkeypatch, alignment, line):
+    """The CLI hands its comparison in; the dashboard's in-gateway collector cannot make one."""
+    _isolate(monkeypatch, tmp_path / "home")
+
+    r = diagnostics.collect_bundle(output_dir=tmp_path / "out", version_alignment=alignment)
+
+    with zipfile.ZipFile(r.zip_path) as z:
+        assert line in z.read("versions.txt").decode()
 
 
 def test_home_prefixes_collapse_but_system_and_repo_frames_survive(tmp_path, monkeypatch):
@@ -480,9 +501,9 @@ def test_path_collapses_counted_apart_from_secrets(tmp_path, monkeypatch):
     home = tmp_path / "home"
     _isolate(monkeypatch, home)
     # One real secret + a couple of home-path frames (no secret in them).
-    secret = "AKIAIOSFODNN7EXAMPLE"
+    secret = SAMPLE_AWS_SECRET
     (home / "gateway.log").write_text(
-        f"AWS key {secret}\n"
+        f"AWS key aws_secret_access_key={secret}\n"
         f'  File "{home}{os.sep}gateway.log", line 1, in a\n'
         f'  File "{home}{os.sep}app{os.sep}x.py", line 2, in b\n'
     )

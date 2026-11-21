@@ -43,6 +43,7 @@ from kiro_crew.llm_helpers import (
     CREDENTIAL_RELOAD_RETRY_NOTICE,
     acp_error_is_connection_failure,
     acp_error_is_pipe_death,
+    acp_error_is_server_error,
     acp_error_is_throttle,
     acp_error_needs_fresh_credentials,
     connection_retry_delay,
@@ -61,6 +62,7 @@ if TYPE_CHECKING:
         DashboardState,
         ReplayFamily,
         _ChatSlot,
+        _fallback_swap_for_turn,
         _has_user_queued_followup,
         _should_suppress_requeue,
         crew_log_emit,
@@ -81,6 +83,7 @@ if TYPE_CHECKING:
         _shared_dependency_delay,
     )
     from kiro_crew.dashboard.chat_turn.turn_entry import _session_stop_generation, _stop_pressed
+    from kiro_crew.dashboard.chat_turn.turn_failures import _on_acp_error_card
     from kiro_crew.dashboard.chat_turn.turn_ledgers import (
         _queue_recovery,
         _replay_owes_delivery,
@@ -301,7 +304,7 @@ async def _on_process_died(turn: _ChatTurn, exc) -> None:
     # -- against this slot when the runtime was its own, against the
     # shared-death streak when it was not, under the SAME ladder limit. A
     # single-tenant runtime, which is every runtime at cap 1 with no
-    # sub-agent on it, takes the first branch and behaves exactly as before.
+    # sub-agent on it, takes the first branch.
     _own_fault = runtime_death.caused_by_this_session(client)
     if _own_fault:
         slot._acp_pipe_death_retries += 1
@@ -625,7 +628,7 @@ async def _on_acp_session_not_found(turn: _ChatTurn, exc) -> None:
         # drop that instruction.
         slot.append(
             "error",
-            f"❌ {credential_give_up_text(exc)} Then send your message again.",
+            f"Error: {credential_give_up_text(exc)} Then send your message again.",
             "msg msg-err",
         )
     else:
@@ -997,15 +1000,14 @@ def _append_transient_give_up(slot, throttled: bool) -> None:
     slot.append("error", text, "msg msg-err", meta={TRANSIENT_NOTICE_META_KEY: notice})
 
 
-async def _on_acp_transient_exhausted(turn: _ChatTurn, exc, _fb_candidate) -> None:
-    """A transient error before the first token, with the retries spent."""
+def _announce_fallback_swap(turn: _ChatTurn, exc, _fb_candidate: str) -> None:
+    """Record and announce that ``_fallback_swap_for_turn`` moved the turn onto a fallback.
+
+    Both swap arms call it: before the first token (``_on_acp_transient_exhausted``) and
+    after output streamed (``_on_acp_posttoken_transient``).
+    """
     from kiro_crew.dashboard import gateway_notice as gn
 
-    _crew_log_sid = turn._crew_log_sid
-    _crew_log_turn_no = turn._crew_log_turn_no
-    _is_synthetic = turn._is_synthetic
-    _message_without_merge_cards = turn._message_without_merge_cards
-    client = turn.client
     slot = turn.slot
     # Append-only the session's log (flag-gated, fail-soft). Emitted HERE,
     # in the branch body, so it runs after _fallback_swap_for_turn has
@@ -1013,8 +1015,63 @@ async def _on_acp_transient_exhausted(turn: _ChatTurn, exc, _fb_candidate) -> No
     # is the one model decision a transcript cannot answer afterwards:
     # the user picked the primary and the turn ran somewhere else.
     crew_log_emit.on_model_selected(
-        _crew_log_sid, _fb_candidate, "fallback", turn=_crew_log_turn_no
+        turn._crew_log_sid, _fb_candidate, "fallback", turn=turn._crew_log_turn_no
     )
+    if len(slot._fallback_walked) == 1:
+        # The walk's first swap: `exc` is the SELECTED model's own error. Record
+        # whether it was a capacity/rollout refusal, so a card the walk ends on
+        # is judged by that model (a Resume returns to it) and not by the last
+        # candidate's error (see `_on_acp_error_card`).
+        slot._fallback_walk_refused = getattr(exc, "model_unavailable", False) is True
+        slot._fallback_walk_server_error = acp_error_is_server_error(exc)
+    _fb_primary_safe, _ = redact_exfiltration_urls(
+        slot._fallback_primary_model or "the selected model"
+    )
+    _fb_primary_safe, _ = redact_credentials(_fb_primary_safe)
+    _fb_cand_safe = redact(_fb_candidate)
+    # Persisted notice card (withheld-pin pattern): the explanation has
+    # to survive a reload because the state it explains does (the
+    # session stays on the fallback until the restore probe succeeds).
+
+    # Name the selected model's own failure (recorded at the walk's first swap): a
+    # provider 5xx throttled nothing, so its row says so. Every other transient keeps
+    # the "throttled" row it had.
+    def _fb_meta(token: str) -> dict | None:
+        # No primary name to show: the row keeps its English wording.
+        if not slot._fallback_primary_model:
+            return None
+        return gn.gateway_notice_meta(token, primary=_fb_primary_safe, fallback=_fb_cand_safe)
+
+    if slot._fallback_walk_server_error:
+        slot.append(
+            "notice",
+            f"⚠️ {_fb_primary_safe} keeps returning server errors — running on "
+            f"{_fb_cand_safe} until {_fb_primary_safe} recovers.",
+            "msg msg-info",
+            meta=_fb_meta(gn.GATEWAY_NOTICE_MODEL_SERVER_ERROR_FALLBACK),
+        )
+    else:
+        slot.append(
+            "notice",
+            f"⚠️ {_fb_primary_safe} is throttled — running on {_fb_cand_safe} "
+            f"until {_fb_primary_safe} recovers.",
+            "msg msg-info",
+            meta=_fb_meta(gn.GATEWAY_NOTICE_MODEL_THROTTLED_FALLBACK),
+        )
+    logger.info(
+        "Re-queuing slot %s on fallback model %s (candidate %d of chain)",
+        slot.key,
+        _fb_candidate,
+        slot._fallback_candidate_idx,
+    )
+
+
+async def _on_acp_transient_exhausted(turn: _ChatTurn, exc, _fb_candidate) -> None:
+    """A transient error before the first token, with the retries spent."""
+    _is_synthetic = turn._is_synthetic
+    _message_without_merge_cards = turn._message_without_merge_cards
+    client = turn.client
+    slot = turn.slot
     # ── Throttle-exhaustion model fallback (agent.fallback_model) ──
     # The same-model budget of `_on_acp_transient_retry` is spent and the error is still
     # transient (throttle/capacity). _fallback_swap_for_turn already
@@ -1038,42 +1095,7 @@ async def _on_acp_transient_exhausted(turn: _ChatTurn, exc, _fb_candidate) -> No
     # in v1 and Stop-suppressed cycles never swap (both guarded in
     # _run_chat's elif condition before the side-effecting swap runs).
     slot.purge_chunks()
-    if len(slot._fallback_walked) == 1:
-        # The walk's first swap: `exc` is the SELECTED model's own error. Record
-        # whether it was a capacity/rollout refusal, so a card the walk ends on
-        # is judged by that model (a Resume returns to it) and not by the last
-        # candidate's error (see `_on_acp_error_card`).
-        slot._fallback_walk_refused = getattr(exc, "model_unavailable", False) is True
-    _fb_primary_safe, _ = redact_exfiltration_urls(
-        slot._fallback_primary_model or "the selected model"
-    )
-    _fb_primary_safe, _ = redact_credentials(_fb_primary_safe)
-    _fb_cand_safe = redact(_fb_candidate)
-    # Persisted notice card (withheld-pin pattern): the explanation has
-    # to survive a reload because the state it explains does (the
-    # session stays on the fallback until the restore probe succeeds).
-    slot.append(
-        "notice",
-        f"⚠️ {_fb_primary_safe} is throttled — running on {_fb_cand_safe} "
-        f"until {_fb_primary_safe} recovers.",
-        "msg msg-info",
-        # No primary name to show: the row keeps its English wording.
-        meta=(
-            gn.gateway_notice_meta(
-                gn.GATEWAY_NOTICE_MODEL_THROTTLED_FALLBACK,
-                primary=_fb_primary_safe,
-                fallback=_fb_cand_safe,
-            )
-            if slot._fallback_primary_model
-            else None
-        ),
-    )
-    logger.info(
-        "Re-queuing slot %s on fallback model %s (candidate %d of chain)",
-        slot.key,
-        _fb_candidate,
-        slot._fallback_candidate_idx,
-    )
+    _announce_fallback_swap(turn, exc, _fb_candidate)
     slot._transient_5xx_retries = fallback_rewound_transient_budget()
     await asyncio.sleep(transient_retry_delay(1))
     # The rewind runs before the Stop guard below, as in _on_acp_transient_retry.
@@ -1121,8 +1143,29 @@ async def _on_acp_transient_exhausted(turn: _ChatTurn, exc, _fb_candidate) -> No
         )
 
 
-async def _on_acp_posttoken_transient(turn: _ChatTurn, exc) -> None:
-    """A transient error after the turn streamed output."""
+async def _on_acp_posttoken_fallback(turn: _ChatTurn, exc) -> None:
+    """A capacity or throttle error after output, with this turn's one continue spent.
+
+    The partial is persisted while the live session is still on the model that wrote
+    it, so its usage row and footer name that model; then ``_fallback_swap_for_turn``
+    moves the session onto the next candidate, which gets its own continue. A spent or
+    unusable chain ends on the error card, whose own persist finds the partial saved.
+    """
+    await _persist_partial_reply(turn, "error: transient attempt")
+    _fb_candidate = await _fallback_swap_for_turn(turn.slot, turn.client)
+    if _fb_candidate is None:
+        await _on_acp_error_card(turn, exc)
+        return
+    await _on_acp_posttoken_transient(turn, exc, _fb_candidate)
+
+
+async def _on_acp_posttoken_transient(turn: _ChatTurn, exc, _fb_candidate: str = "") -> None:
+    """A transient error after the turn streamed output.
+
+    With *_fb_candidate*, ``_on_acp_posttoken_fallback`` already persisted the partial
+    and moved the live session onto that fallback: the swap is announced and the
+    candidate gets its own continue.
+    """
     _first_turn_history_assembled = turn._first_turn_history_assembled
     _msg = turn._msg
     _prompt_depth = turn._prompt_depth
@@ -1140,7 +1183,8 @@ async def _on_acp_posttoken_transient(turn: _ChatTurn, exc) -> None:
     # model NOT to re-run tools that already completed, so a post-tool
     # transient recovers safely (the model reads prior tool results and
     # continues) instead of double-running a side-effecting tool. We allow
-    # EXACTLY ONE such retry per turn (_posttoken_retry_used one-shot).
+    # EXACTLY ONE such retry per turn and model (_posttoken_retry_used one-shot; a
+    # fallback swap after a capacity or throttle error re-arms it for the candidate).
     #
     # PARITY NOTE: the subagent path carries a hand-maintained copy of
     # this ladder (subagent.py `_stream_with_transient_retry`) with
@@ -1164,10 +1208,11 @@ async def _on_acp_posttoken_transient(turn: _ChatTurn, exc) -> None:
     # gates — would wrongly burn the allowance on paths that never
     # recover, denying a LATER turn its one legitimate recovery. Loop
     # prevention still holds: a re-failure DURING the recovery turn takes
-    # the exception path (which never resets the flag) and the synthetic
-    # recovery turn is excluded from the per-turn reset, so the flag stays
-    # True across the recovery and a repeat post-token 5xx surfaces
-    # instead of re-queueing forever.
+    # the exception path, which resets the flag only when a capacity or
+    # throttle error moves the session to the next fallback candidate, and
+    # the synthetic recovery turn is excluded from the per-turn reset, so
+    # the flag stays True across the recovery and a repeat post-token 5xx
+    # surfaces instead of re-queueing forever.
     #
     # APPEND-ONLY design: never retract the streamed partial. We PRESERVE
     # it — finalize it as a normal assistant message exactly like
@@ -1199,6 +1244,12 @@ async def _on_acp_posttoken_transient(turn: _ChatTurn, exc) -> None:
     # and the drop-after-backoff arm inside the helper — neither can carry
     # this attempt's credits, so the seam is the only place that bills them.
     await _persist_partial_reply(turn, "error: transient attempt")
+    if _fb_candidate:
+        # The partial is already on screen, so the notice reads below the text it
+        # interrupts. The allowance re-arms for the candidate and is spent again only
+        # by the enqueue.
+        _announce_fallback_swap(turn, exc, _fb_candidate)
+        slot._posttoken_retry_used = False
     await _recover_posttoken_transient(
         slot,
         _msg,
@@ -1210,3 +1261,12 @@ async def _on_acp_posttoken_transient(turn: _ChatTurn, exc) -> None:
         _stop_pressed=functools.partial(_stop_pressed, turn),
         throttled=acp_error_is_throttle(exc),
     )
+    if _fb_candidate and not slot._posttoken_retry_used:
+        # The candidate's continue was dropped (Stop, a follow-up or a steer during the
+        # backoff), so this cycle ends here: refresh the walk state as the other
+        # no-requeue exits do. The sticky _active_fallback_model stays: the session
+        # really is on the fallback until the restore probe moves it back.
+        slot._fallback_candidate_idx = 0
+        slot._fallback_walked = []
+        slot._fallback_walk_refused = False
+        slot._fallback_walk_server_error = False

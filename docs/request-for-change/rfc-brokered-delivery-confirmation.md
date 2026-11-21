@@ -3,8 +3,8 @@ title: Commit a brokered inline-collected result on the parent turn's outcome, n
 status: draft
 author: kirocrew agent session, directed by jeeshofone
 created: 2026-10-28
-last-audited: 2026-10-28
-audited-at: ea38bdd5e5
+last-audited: 2026-11-20
+audited-at: fc89562d69
 doc-pr: 25214
 implementation-prs: []
 tracking-issues: [18743]
@@ -14,7 +14,7 @@ superseded-by: []
 
 # RFC: Commit a brokered inline-collected result on the parent turn's outcome, not on a relay acknowledgement
 
-Status: draft. Acceptance requested from a maintainer of the MCP broker and the sub-agent delivery path. Part of [#18743](https://github.com/kirodotdev/KiroCrew/issues/18743). Main-side references were read at `ea38bdd5e5`. References to the inline-collection mechanism were read on [#17684](https://github.com/kirodotdev/KiroCrew/pull/17684) at head `0592d79154`, which is open and not on main.
+Status: draft. Acceptance requested from a maintainer of the MCP broker and the sub-agent delivery path. Part of [#18743](https://github.com/kirodotdev/KiroCrew/issues/18743). Main-side references were read at `ea38bdd5e5`. References to the inline-collection mechanism were read on [#17684](https://github.com/kirodotdev/KiroCrew/pull/17684) at head `0592d79154`; #17684 was later closed unmerged, and the same change landed on main as [#27508](https://github.com/kirodotdev/KiroCrew/pull/27508) (`b053285be8`, `DeferredTool.on_answered` in `src/kiro_crew/mcp_shared_calls.py`).
 
 ## Summary
 

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import React from 'react'
 
@@ -18,10 +18,12 @@ const voiceConfig = {
   piper_length_scale: 1,
 }
 
+const { updateVoiceConfig } = vi.hoisted(() => ({ updateVoiceConfig: vi.fn() }))
+
 vi.mock('../api/client', () => ({
   api: {
     voiceConfig: () => Promise.resolve(voiceConfig),
-    updateVoiceConfig: () => Promise.resolve(voiceConfig),
+    updateVoiceConfig,
   },
 }))
 
@@ -38,5 +40,20 @@ describe('VoicePanel Pocket settings', () => {
     expect(screen.queryByText('Piper Model')).not.toBeInTheDocument()
     expect(screen.queryByText('Piper Binary')).not.toBeInTheDocument()
     expect(screen.queryByText('Piper speech speed (length scale)')).not.toBeInTheDocument()
+  })
+
+  it('keeps the Pocket voice draft when the save fails', async () => {
+    updateVoiceConfig.mockRejectedValueOnce(new Error('save failed'))
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(<QueryClientProvider client={client}><VoicePanel /></QueryClientProvider>)
+
+    const field = await screen.findByDisplayValue('michael')
+    fireEvent.change(field, { target: { value: 'draft voice' } })
+    fireEvent.blur(field)
+
+    expect(await screen.findByText('Failed to save voice config')).toBeInTheDocument()
+    expect(updateVoiceConfig).toHaveBeenCalledWith({ voice: 'draft voice' })
+    expect(field).toHaveValue('draft voice')
+    await waitFor(() => expect(client.getQueryData(['voiceConfig'])).toEqual(voiceConfig))
   })
 })

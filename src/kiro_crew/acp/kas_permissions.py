@@ -148,7 +148,9 @@ KAS_SPELLINGS: dict[str, str] = {"invoke_sub_agent": "use_subagent"}
 #: every such call raises a permission request; Crew then answers the ones the spec
 #: granted itself, after its own checks (:func:`crew_answered_builtins`, the gate's
 #: ``spec-builtin-grant`` row), which is how the spec's grant still means "no
-#: prompt" here without taking the call past the deny floor.
+#: prompt" here without taking the call past the deny floor. ``code`` is the
+#: exception: Crew never answers it as a whole, so each ``code`` call reaches the
+#: same tiers as on kiro-cli.
 WITHHELD_FROM_AUTO_APPROVE: frozenset[str] = frozenset(
     {
         # Filesystem reads.
@@ -211,6 +213,15 @@ CREW_ANSWERED_HOOK_HELD_KEY = "_crewAnsweredHookHeld"
 #: (:mod:`kiro_crew.acp.kas_spec_denies`).
 CREW_SPEC_DENIES_KEY = "_crewSpecDenies"
 
+#: The key of a Bot worker's ``deniedCommands`` entries that neither KAS nor the
+#: gate can judge (:func:`kiro_crew.acp.kas_spec_denies.with_unjudged_denies`).
+CREW_UNJUDGED_DENIES_KEY = "_crewShellUnjudgedDenies"
+
+#: Set on the session agent's entry of a batch that kept the folder PreToolUse hooks of its
+#: agent or left out a folder sub-agent target for them (maybe one a scheduled batch leaves
+#: out for another reason too): ``kas_project_hooks.scheduled_turn_reprojects`` reads it.
+CREW_FOLDER_PRE_TOOL_KEY = "_crewFolderPreToolHooks"
+
 #: Keys of a projected ``customAgents`` entry that never reach the engine.
 CREW_ONLY_ENTRY_KEYS: frozenset[str] = frozenset(
     {
@@ -219,6 +230,8 @@ CREW_ONLY_ENTRY_KEYS: frozenset[str] = frozenset(
         CREW_ANSWERED_HOOK_HELD_KEY,
         CREW_ANSWERED_WRITES_KEY,
         CREW_SPEC_DENIES_KEY,
+        CREW_UNJUDGED_DENIES_KEY,
+        CREW_FOLDER_PRE_TOOL_KEY,
         CREW_SHELL_ALLOWLIST_KEY,
         CREW_WRITE_ALLOWLIST_KEY,
         CREW_ANSWERED_PATHS_KEY,
@@ -591,6 +604,7 @@ def crew_answered_builtins(allowed_tools: Any, authored_permissions: Any = None)
     """The :data:`WITHHELD_FROM_AUTO_APPROVE` built-ins *allowed_tools* grants, and
     each one whose capabilities an unscoped ``allow`` in *authored_permissions*
     covers (no ``match``, or an empty one: every resource, as KAS reads it).
+    Never ``code``.
 
     Withholding a built-in from the KAS policy keeps its calls at ``ask``, so
     each one raises ``session/request_permission`` and reaches Crew's gate. The
@@ -620,6 +634,9 @@ def crew_answered_builtins(allowed_tools: Any, authored_permissions: Any = None)
         for name, capabilities in _ANSWERED_CAPABILITIES.items()
         if capabilities <= granted
     )
+    # ``code`` starts language servers and edits files, so on KAS it is never
+    # answered as a whole: each call reaches the same tiers as on kiro-cli.
+    out.discard("code")
     return frozenset(out)
 
 
@@ -1012,6 +1029,15 @@ def _asking_only(refs: str, outcome: str, reason: str) -> None:
     """The ``audit_decision`` of :func:`projection_accepts`: a question, not a refusal."""
 
 
+class RefusalReason:
+    """An ``audit_decision`` that keeps why a block is refused and reports nothing."""
+
+    why = ""
+
+    def __call__(self, refs: str, outcome: str, reason: str) -> None:
+        """A left-out allow is not a refusal of the block: nothing to keep."""
+
+
 def projection_accepts(raw: Any) -> bool:
     """Whether :func:`parse_user_permissions` would relay *raw* rather than refuse it whole.
 
@@ -1046,6 +1072,9 @@ def _refuse_block(
     every grant in it."""
     if audit_decision is _asking_only:
         return
+    if isinstance(audit_decision, RefusalReason):
+        audit_decision.why = audit_decision.why or why
+        return
     audit_decision("the authored `permissions` block", "withheld", f"refused: {why}")
     logger.warning(
         "agent %r: refusing its whole `permissions` block -- %s. None of it travels; "
@@ -1062,7 +1091,7 @@ _DROPPED: dict[str, Any] = {}
 
 def _drop_rule(agent_id: str, where: str, count: int, audit_decision: _AuditDecision) -> None:
     """Report one authored ``allow`` left out for an ``exclude`` list too long to send."""
-    if audit_decision is _asking_only:
+    if audit_decision is _asking_only or isinstance(audit_decision, RefusalReason):
         return
     audit_decision(
         f"the authored `permissions` {where}",

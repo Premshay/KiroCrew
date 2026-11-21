@@ -10,7 +10,8 @@ those servers and for a non-managed server the base declares
 (:func:`base_server_selections`). Its restrictions (``excludedTools``, ``disabledTools``, MCP-page
 switch-offs, :func:`globally_disabled_refs`) narrow whoever declared them;
 its ``hooks``, ``permissions`` and ``toolsSettings`` are layered on exactly
-(:mod:`kiro_crew.mate_spec_policy`); ``model`` is ignored. Nothing from the file
+(:mod:`kiro_crew.mate_spec_policy`); ``model`` is ignored, and a file that
+names one is logged once (``crewmate_harness.note_unread_file_model``). Nothing from the file
 reaches the conductor. The merged spec is governed
 and the projection re-applies the ceiling, so an addition never lifts the worker
 above POLICY ∩ PROFILE. Stateless.
@@ -20,15 +21,18 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew import crewmate_prompts
+from kiro_crew.agent_capabilities_resources import resource_row_key
 from kiro_crew.agent_files import (
     MATE_CONDUCTOR_AGENT_FILENAME,
     MATE_WORKER_AGENT_FILENAME,
     is_mate_service_agent,
 )
+from kiro_crew.context_assembly.output_contract import ASK_CORE, WORKER_ASK_TAIL
 from kiro_crew.user_json import copy_json_document
 
 if TYPE_CHECKING:
@@ -52,15 +56,42 @@ MATE_CONDUCTOR_AGENT = Path(MATE_CONDUCTOR_AGENT_FILENAME).stem
 #: (``mate_thread_wakes.report_prompt``).
 MISSING_CAPABILITY_PREFIX = "MISSING CAPABILITY:"
 
-#: The worker's own principles, appended to its source-defined prompt
-#: (``service_agents._install_mate_worker_agent``). Its crewmate is the one that
-#: can ask the user for a tool, so a gap goes back to it, named. The coding rules
-#: after them are the same text ``kirocrew-worker`` carries.
-MATE_WORKER_PROMPT = (
-    crewmate_prompts.fill("worker.principles", missing_prefix=MISSING_CAPABILITY_PREFIX)
-    + "\n\n"
-    + crewmate_prompts.text("worker.coding_rules")
-)
+
+@lru_cache(maxsize=1)
+def mate_worker_prompt() -> str:
+    """The worker's own principles, appended to its source-defined prompt
+    (``service_agents._install_mate_worker_agent``), then the coding rules.
+
+    Its crewmate is the one that can ask the user for a tool, so a gap goes back to
+    it, named. Every other placeholder is a work-protocol rule ``kirocrew-worker`` is
+    assembled from too (``agent._LEDGER_WORKER_RULES``), so the two workers cannot
+    drift; a placeholder naming no rule raises ``KeyError`` at the first read. The
+    coding rules are the same text ``kirocrew-worker`` carries, and so is the shared
+    ask core and worker tail at the end (``context_assembly.output_contract``). A
+    function, not a module constant: the rules live behind the ``agent`` facade,
+    which this module does not import at load.
+    """
+    # Not a top-level import: only the facade may import ``agent_parts``
+    # (``test_agent_parts.py``), and loading the facade here would pull it into
+    # every importer of this module.
+    from kiro_crew import agent as agent_mod
+
+    rules = agent_mod._LEDGER_WORKER_RULES
+    names = crewmate_prompts.placeholders("worker.principles") - {"missing_prefix"}
+    principles = crewmate_prompts.fill(
+        "worker.principles",
+        missing_prefix=MISSING_CAPABILITY_PREFIX,
+        **{name: rules[name].strip() for name in names},
+    )
+    return (
+        principles
+        + "\n\n"
+        + crewmate_prompts.text("worker.coding_rules")
+        + "\n\n"
+        + ASK_CORE
+        + WORKER_ASK_TAIL
+    )
+
 
 #: The sub-agent tools a crewmate's conductor does not mount. Its hand-off is a
 #: worker session (``session_create`` / ``session_send`` /
@@ -319,6 +350,21 @@ def _strings(value: Any) -> list[str]:
     return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
 
 
+def resource_entries(value: Any) -> dict[str, Any]:
+    """*value*'s ``resources`` entries by row key, first one of each key kept.
+
+    A string is its own key and an object (a knowledge base) is keyed
+    ``<type>:<name>`` (``agent_capabilities_resources.resource_row_key``), so an
+    object is carried as written and a list never gains two entries sharing a key.
+    """
+    out: dict[str, Any] = {}
+    for entry in value if isinstance(value, list) else []:
+        key = resource_row_key(entry)
+        if key is not None and key not in out:
+            out[key] = copy_json_document(entry)
+    return out
+
+
 def _servers(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
@@ -390,9 +436,16 @@ def worker_additions(base: dict[str, Any], mate_spec: dict[str, Any]) -> dict[st
         *server_selectors(mate_spec, added_servers),
         *base_server_selections(base, mate_spec, "tools"),
     ]
-    for key in ("resources", "skills"):
-        have = set(_strings(base.get(key)))
-        additions[key] = [s for s in dict.fromkeys(_strings(mate_spec.get(key))) if s not in have]
+    have = set(_strings(base.get("skills")))
+    additions["skills"] = [
+        s for s in dict.fromkeys(_strings(mate_spec.get("skills"))) if s not in have
+    ]
+    held = resource_entries(base.get("resources"))
+    additions["resources"] = [
+        entry
+        for key, entry in resource_entries(mate_spec.get("resources")).items()
+        if key not in held
+    ]
     additions["allowedTools"] = [
         *(
             ref
@@ -490,10 +543,15 @@ def merge_worker_spec(base: dict[str, Any], additions: dict[str, Any]) -> dict[s
     for name in muted:
         servers[name] = {**servers[name], "disabled": True}
     spec["mcpServers"] = servers
-    for key in ("resources", "skills"):
-        extra_items = _strings(additions.get(key))
-        if extra_items:
-            spec[key] = list(dict.fromkeys([*_strings(spec.get(key)), *extra_items]))
+    extra_skills = _strings(additions.get("skills"))
+    if extra_skills:
+        spec["skills"] = list(dict.fromkeys([*_strings(spec.get("skills")), *extra_skills]))
+    extra_resources = resource_entries(additions.get("resources"))
+    if extra_resources:
+        merged = resource_entries(spec.get("resources"))
+        for key, entry in extra_resources.items():
+            merged.setdefault(key, entry)
+        spec["resources"] = list(merged.values())
     # Selectors reach a server the file adds, and one the base declares
     # (``base_server_selections`` already chose which of those count).
     selectable = set(servers) - set(muted)
@@ -683,6 +741,13 @@ def resolve_worker_spec(
             f"Bot {member_id!r}: its worker file {name!r} cannot be read, so its "
             f"worker would run without the Bot's own limits; fix or re-save the file"
         ) from exc
+    from kiro_crew.agent_discovery import spec_model
+
+    file_model = spec_model(mate_spec).strip()
+    if file_model and file_model != "auto":
+        from kiro_crew.crewmate_harness import note_unread_file_model
+
+        note_unread_file_model(member_id, name, file_model)
     if mcp_tool_limits_carried:
         limits = uncarried_tool_limits_of(
             mate_spec, native_tool_limits_carried=native_tool_limits_carried
@@ -699,12 +764,54 @@ def resolve_worker_spec(
         carried = policy_of(mate_spec)
         if carried:
             raise uncarried(sorted(carried), "this backend does not apply them; run the Bot on kas")
+    _use_registered_app_launch_lines(base, mate_spec)
     additions = worker_additions(base, mate_spec)
-    # An approval the owner took away in Approvals stays away, base-granted or not.
-    return revocations.strip(
-        merge_worker_spec(base, _with_global_tool_offs(base, additions)),
-        _revoked_or_refuse(member_id, name),
+    from kiro_crew.mate_held_rules import strip_held_approvals
+
+    # An approval the owner took away in Approvals stays away, base-granted or not,
+    # and a capability a held limit covers keeps no pre-approval, so its calls ask.
+    return strip_held_approvals(
+        revocations.strip(
+            merge_worker_spec(base, _with_global_tool_offs(base, additions)),
+            _revoked_or_refuse(member_id, name),
+        ),
+        member_id,
+        name,
     )
+
+
+def _use_registered_app_launch_lines(base: dict[str, Any], mate_spec: dict[str, Any]) -> None:
+    """Launch each enabled app's server *mate_spec* adds as the gateway registers it now.
+
+    The file says WHICH of an app's servers the Bot has; how to start one is the
+    app's current install, re-read from the agent config the add copied it from,
+    so an upgrade that replaces the install leaves no worker on a deleted path.
+    The file keeps the keys an add never copies (``autoApprove``, ``disabled``,
+    ``disabledTools``). Every other server, an app server that config does not
+    list now, and one whose declared name has a ``/`` keep the file's entry: only
+    an unaliased ``app:server`` key carries a ``:``, and an alias can be another
+    server's. Blocking.
+    """
+    servers = mate_spec.get("mcpServers")
+    base_servers = _servers(base.get("mcpServers"))
+    if not isinstance(servers, dict) or not set(servers) - set(base_servers):
+        return
+    from kiro_crew import agent as agent_mod
+    from kiro_crew.apps import bridges
+    from kiro_crew.mate_capability_catalog import _TRANSPORT_DROP
+    from kiro_crew.mcp_provenance import DERIVED_KEY, WITHHELD_KEY
+
+    enabled = agent_mod._app_owned_mcp_keys()
+    registered = bridges.registered_app_mcp_servers()
+    not_launch = _TRANSPORT_DROP | {DERIVED_KEY, WITHHELD_KEY}
+    for name, entry in servers.items():
+        live = registered.get(name)
+        if name in base_servers or ":" not in name or enabled.get(name) is not True:
+            continue
+        if not isinstance(entry, dict) or not isinstance(live, dict):
+            continue
+        own = {k: v for k, v in entry.items() if k in _TRANSPORT_DROP}
+        servers[name] = {**{k: v for k, v in live.items() if k not in not_launch}, **own}
 
 
 def _binding_alias(member_id: str) -> str:
@@ -850,20 +957,25 @@ def cron_worker_execution(execution: Any, config: Any = None) -> Any:
     and app kept. A crewmate whose own file is gone runs on the worker too
     (:func:`_claimed_crewmate_file`), so the worker's own refusal
     (:func:`resolve_worker_spec`) stops it rather than the conductor running it.
+    A user-level spec of the crewmate's name answers that name, and its chats run
+    on it (:func:`member_chat_agent`), so its turn keeps the member route there.
     ``None`` for any other record.
     Blocking config read.
     """
+    from kiro_crew.config import loader
+
     member_id = getattr(execution, "member_id", None)
-    if (
-        execution is None
-        or getattr(execution, "selection_kind", "") != "member"
-        or not member_id
-        or not (
-            mate_file_for_member(member_id, config=config)
-            or _claimed_crewmate_file(member_id, config)
-        )
-    ):
+    if execution is None or getattr(execution, "selection_kind", "") != "member" or not member_id:
         return None
+    if not mate_file_for_member(member_id, config=config):
+        claimed = _claimed_crewmate_file(member_id, config)
+        # Only a user-level spec that parses and declares the name answers it, as
+        # for chats: a same-stem file naming another agent, or one that does not
+        # parse, leaves the name mate-owned or undeclared, so the worker refuses.
+        if not claimed or (
+            not is_mate_owned_agent(claimed) and claimed in loader._MATERIALIZED_AGENTS
+        ):
+            return None
     # The hand-off's own spelling (``session_create``): a template selection on
     # the worker under its own name, the member id kept.
     return execution.with_template(MATE_WORKER_AGENT, MATE_WORKER_AGENT)
@@ -993,6 +1105,30 @@ def crewmate_worker_backend(config: KiroCrewConfig, crewmate: str | None = None)
         crewmate,
         resolve_selected_backend(getattr(config.agent, "member_acp_backend", "")),
     )
+
+
+def subagent_start_backend(config: KiroCrewConfig, execution: Any, backend: str | None) -> str:
+    """The backend a sub-agent run admitted under *execution* starts on.
+
+    *backend* is the run's own (named or inherited at admission), ``None`` for
+    none. The allocation gate's answer, read ahead of allocation: a run's own
+    backend wins (``backend_override``); a crewmate's worker runs on its
+    crewmate's (:func:`crewmate_worker_backend`); every other run starts on
+    ``agent.acp_backend``. *execution* is taken as the run will hold it, so a
+    conductor selection becomes its worker first (:func:`spawn_worker_execution`).
+    Raises :class:`~kiro_crew.crewmate_harness.CrewmateHarnessUnavailable` for a
+    crewmate pin that cannot start. Blocking config read.
+    """
+    from kiro_crew.acp_backends import resolve_selected_backend
+    from kiro_crew.crewmate_harness import crew_for_member_id
+
+    if backend is not None:
+        return resolve_selected_backend(backend)
+    execution = spawn_worker_execution(execution) or execution
+    if is_own_worker_execution(execution):
+        crew = crew_for_member_id(config, str(execution.member_id or ""))
+        return crewmate_worker_backend(config, crew)
+    return str(config.agent.acp_backend)
 
 
 def worker_kit_backend_refusal(

@@ -11,6 +11,8 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import type { ReactElement } from 'react'
+import { existsSync, readFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
 import { render, screen, renderHook, act, cleanup, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, useLocation, useNavigationType } from 'react-router-dom'
@@ -49,17 +51,21 @@ import {
   PREVIEW_FLAG_PREFIX,
   PREVIEW_INSTANCE_SESSIONS,
   PREVIEW_REMOTE_CREW_CHAT,
+  PREVIEW_VISUAL_REFRESH,
   PREVIEW_WEBHOOKS,
   PREVIEW_DASHBOARD_STALE_FIELDS,
   PREVIEW_DASHBOARD_STALE_WAKE,
   PREVIEW_BRIDGE_APPROVALS,
-  PREVIEW_SECRETS_VAULT,
+  PREVIEW_WORKER_GRILL,
+  PREVIEW_APP_BROWSER_SDK,
+  PREVIEW_WIDGETS,
   readPreviewFlag,
   setPreviewFlag,
 } from '../utils/previewFlags'
 import { usePreviewFlag, usePreviewFlagRevision } from '../hooks/usePreviewFlag'
 import { createPagesProvider } from '../components/commandPalette/providers/pagesProvider'
 import { api } from '../api/client'
+import { i18nT } from '../i18n/t'
 import { FeaturePreviewsSection, FEATURE_PREVIEWS_HIGHLIGHT_ANCHOR } from '../pages/settings/FeaturePreviewsSection'
 import { __resetPreviewFlagServerSyncForTests, usePreviewFlagServerSync } from '../hooks/usePreviewFlagServerSync'
 import DeveloperPage from '../pages/DeveloperPage'
@@ -364,6 +370,87 @@ describe('Settings > Developer > Feature Previews', () => {
       </QueryClientProvider>,
     )
 
+  /**
+   * Every `<SettingsToggle>` the section's own sources declare, keyed by its
+   * rendered label; the value says whether it passes a `hint`. Read from
+   * `FeaturePreviewsSection.tsx` and every module under `pages/settings` it
+   * imports, so a row added to the section is covered without editing this file.
+   */
+  const declaredToggles = (): Map<string, boolean> => {
+    const settingsDir = resolve(process.cwd(), 'src/pages/settings')
+    const seen = new Set<string>()
+    const declared = new Map<string, boolean>()
+    const walk = (file: string) => {
+      if (seen.has(file)) return
+      seen.add(file)
+      const text = readFileSync(file, 'utf-8')
+      for (const [, spec] of text.matchAll(/from '(\.[^']+)'/g)) {
+        const base = resolve(dirname(file), spec)
+        if (!base.startsWith(settingsDir)) continue
+        const hit = ['.tsx', '.ts'].map(ext => base + ext).find(existsSync)
+        if (hit) walk(hit)
+      }
+      for (const [, props] of text.matchAll(/<SettingsToggle\b([\s\S]*?)\/>/g)) {
+        const key = props.match(/label=\{i18nT\('([^']+)'\)\}/)?.[1]
+        if (key) declared.set(i18nT(key), /\bhint=/.test(props))
+      }
+    }
+    walk(resolve(settingsDir, 'FeaturePreviewsSection.tsx'))
+    return declared
+  }
+  /** The drawn rows: label -> carries an InfoTip. */
+  const renderedRows = () =>
+    new Map(
+      screen.getAllByRole('switch').map(sw => {
+        const row = sw.closest('[data-setting-label]')
+        return [sw.getAttribute('aria-label') ?? '?', !!row?.querySelector('[data-settings-hint] button')] as const
+      }),
+    )
+  /**
+   * Awaited: the Decisions card is not drawn until the governance read
+   * (`decisions_enabled`) lands, so its row arrives a tick late.
+   */
+  const expectAllRows = () =>
+    waitFor(() => { expect(screen.getByRole('switch', { name: 'Decisions' })).toBeTruthy() })
+
+  /** Declared rows the stubbed state does not draw, because their gate is closed. */
+  const ROWS_GATED_OFF_IN_STUB = new Set(['Remote dispatch', 'Shared Crew', 'Wake bots to update out-of-date fields'])
+
+  it('gives every drawn row the InfoTip its declaration asks for', async () => {
+    // A `hint` the row was given but does not show leaves an unfinished feature
+    // with no explanation; an InfoTip with no declared hint is a stray button.
+    renderTab()
+    await expectAllRows()
+    const declared = declaredToggles()
+    const rows = renderedRows()
+    expect([...declared.values()].filter(Boolean).length, 'no declared row carries a hint').toBeGreaterThan(0)
+    expect(rows.size).toBeGreaterThan(0)
+    // Every declared row is drawn in this stubbed state except the ones whose
+    // gate is closed here; a row that stops rendering fails.
+    expect([...declared.keys()].filter(label => !rows.has(label)).sort()).toEqual([...ROWS_GATED_OFF_IN_STUB].sort())
+    for (const [label, hasTip] of rows) {
+      expect(declared.has(label), `drawn row "${label}" is not a SettingsToggle the section's sources declare`)
+        .toBe(true)
+      expect(hasTip, `row "${label}" InfoTip`).toBe(declared.get(label))
+    }
+  })
+
+  /**
+   * Ratchet: preview rows that ship without a `hint`. Every other row explains its
+   * unfinished feature, so a row that loses its hint, or a new row added without
+   * one, fails. May only shrink.
+   */
+  const ROWS_WITHOUT_HINT = new Set(['Shared Crew'])
+
+  it('explains every preview row except the recorded ones', () => {
+    const declared = declaredToggles()
+    expect(declared.size, 'the section declares no SettingsToggle').toBeGreaterThan(0)
+    const missing = [...declared].filter(([label, hint]) => !hint && !ROWS_WITHOUT_HINT.has(label))
+    expect(missing.map(([label]) => label), 'preview rows with no hint').toEqual([])
+    const stale = [...ROWS_WITHOUT_HINT].filter(label => declared.get(label) !== false)
+    expect(stale, 'ROWS_WITHOUT_HINT names a row that now has a hint or is gone').toEqual([])
+  })
+
   /** `aria-checked` via the ATTRIBUTE: the Toggle is a `div role="switch"`, and
    *  the reflected `ariaChecked` DOM property is not populated for one. */
   const toggleState = () =>
@@ -417,8 +504,9 @@ describe('Settings > Developer > Feature Previews', () => {
     //
     // Counted as `<button>` ELEMENTS rather than by accessible name: the name of
     // a link that no longer exists is not in any catalog, so a name query could
-    // never fail. `SettingsToggle`'s own row is a `div role="button"`, so it is
-    // correctly not counted here. The "See what it looks like" button each card
+    // never fail. A row's switch is a `button role="switch"`: it flips a setting
+    // and never opens a page, so it is excluded by that role. The "See what it
+    // looks like" button each card
     // may carry (`FeaturePreviewIntroButton`) is excluded by its test id: it is
     // not an ingress — it opens an explainer dialog, never the page — and it is
     // present on either side of the toggle by design.
@@ -439,7 +527,7 @@ describe('Settings > Developer > Feature Previews', () => {
      */
     const realButtons = () =>
       Array.from(
-        container.querySelectorAll('button:not([data-testid="feature-preview-intro-button"])'),
+        container.querySelectorAll('button:not([data-testid="feature-preview-intro-button"]):not([role="switch"])'),
       )
     /**
      * The Decisions card is WALKED, not allowed for.
@@ -461,31 +549,19 @@ describe('Settings > Developer > Feature Previews', () => {
     // SettingsCard is borderless now (no `.card-glow`); its root carries
     // `animate-rise`, which is the enclosing card frame the switch sits in.
     const decisionsFrame = () =>
-      screen.queryByRole('switch', { name: 'Decisions (Jev)' })?.closest('.animate-rise') ?? null
+      screen.queryByRole('switch', { name: 'Decisions' })?.closest('.animate-rise') ?? null
     const decisionsButtons = () =>
       Array.from(
         decisionsFrame()?.querySelectorAll(
-          'button:not([data-testid="feature-preview-intro-button"])',
+          'button:not([data-testid="feature-preview-intro-button"]):not([role="switch"])',
         ) ?? [],
       )
-        .map(nameOf)
-        .sort()
-    /**
-     * The built-in KAS engine card is WALKED the same way. This tab stubs no API, so
-     * its status read fails and it draws the read-failure notice's Retry and the
-     * hand-off; neither navigates. Its Install button exists only once a status
-     * says nothing is installed, which `KasBundleCard.test.tsx` pins.
-     */
-    const kasFrame = () =>
-      container.querySelector('[data-testid="kas-bundle-card"]')?.closest('.animate-rise') ?? null
-    const kasButtons = () =>
-      Array.from(kasFrame()?.querySelectorAll('button') ?? [])
         .map(nameOf)
         .sort()
     // Outside those cards, unfiltered and unchanged: this is the ingress property.
     const ingressButtons = () =>
       realButtons()
-        .filter(el => !decisionsFrame()?.contains(el) && !kasFrame()?.contains(el))
+        .filter(el => !decisionsFrame()?.contains(el))
         .map(nameOf)
         .sort()
     // Every button outside the Decisions card is observed and partitioned:
@@ -495,7 +571,10 @@ describe('Settings > Developer > Feature Previews', () => {
     // an unexpected button lands in `ingress`, an extra or missing tip
     // changes `tips` -- while saying what each half protects.
     const INFO_TIP = 'More information'
-    const INFO_TIP_COUNT = 15 // one per Feature Previews row carrying a `hint`
+    // One per drawn row carrying a tip, outside the Decisions card (its own row's
+    // tip is in the Decisions set below), so a tip outside any row lands here.
+    const INFO_TIP_COUNT = [...renderedRows()]
+      .filter(([label, hint]) => hint && label !== 'Decisions').length
     const partition = () => {
       const all = ingressButtons()
       return { tips: all.filter(n => n === INFO_TIP).length, ingress: all.filter(n => n !== INFO_TIP) }
@@ -509,9 +588,6 @@ describe('Settings > Developer > Feature Previews', () => {
     // moment it hit. A button this set does not name never converges, so it fails here.
     await waitFor(() => {
       expect(decisionsButtons()).toEqual(['Ask the agent', 'More information', 'More information'])
-    })
-    await waitFor(() => {
-      expect(kasButtons()).toEqual(['Ask the agent', 'Retry'])
     })
     // The webhooks card HAS its link, so the empty census above is not the
     // ingress mechanism having been broken.
@@ -537,18 +613,14 @@ describe('Settings > Developer > Feature Previews', () => {
     // enclose the header and every card — an anchor on a single card would
     // answer "is this row selected?" instead.
     const { container } = renderTab()
-    // Awaited: the Decisions card is not drawn until the governance read
-    // (`decisions_enabled`) lands, so the last switch arrives a tick late.
-    await waitFor(() => {
-      expect(screen.getAllByRole('switch')).toHaveLength(17)
-    })
+    await expectAllRows()
     const anchors = container.querySelectorAll(`[data-setting-key="${FEATURE_PREVIEWS_HIGHLIGHT_ANCHOR}"]`)
     expect(anchors).toHaveLength(1)
     const anchor = anchors[0]
     expect(anchor.contains(screen.getByText('Unfinished features. Turn one on to try it.'))).toBe(true)
     for (const h of screen.getAllByRole('heading')) expect(anchor.contains(h)).toBe(true)
-    // The count is here so a card added outside the anchor fails rather than
-    // silently escaping the ring. The last is Decisions, whose switch is
+    // Every row is awaited first so a card added outside the anchor fails rather
+    // than silently escaping the ring. The last is Decisions, whose switch is
     // backend config — a different write path, the same ring.
     for (const s of screen.getAllByRole('switch')) expect(anchor.contains(s)).toBe(true)
   })
@@ -557,7 +629,7 @@ describe('Settings > Developer > Feature Previews', () => {
     // The Dynamic Dashboard is on for every reader, so it has no preview card.
     // Automatic cards is a server setting with its own card on the Developer tab.
     renderTab()
-    await waitFor(() => { expect(screen.getAllByRole('switch')).toHaveLength(17) })
+    await expectAllRows()
     expect(screen.queryByRole('switch', { name: /^dynamic dashboard$/i })).toBeNull()
     expect(screen.queryByRole('switch', { name: /automatic cards for all sessions/i })).toBeNull()
   })
@@ -603,12 +675,40 @@ describe('Settings > Developer > Feature Previews', () => {
     expect(localStorage.getItem(PREVIEW_BRIDGE_APPROVALS)).toBe('1')
   })
 
-  it('offers the Secrets vault redesign switch, off by default', async () => {
+  it('offers the worker grill switch, off by default', async () => {
     renderTab()
-    const vault = screen.getByRole('switch', { name: /^secrets vault redesign$/i })
-    expect(vault.getAttribute('aria-checked')).toBe('false')
-    await act(async () => { vault.click() })
-    expect(localStorage.getItem(PREVIEW_SECRETS_VAULT)).toBe('1')
+    const grill = screen.getByRole('switch', { name: /^quick worker check before a hard choice$/i })
+    expect(grill.getAttribute('aria-checked')).toBe('false')
+    await act(async () => { grill.click() })
+    expect(localStorage.getItem(PREVIEW_WORKER_GRILL)).toBe('1')
+  })
+
+  it('offers the app browser access switch, off by default', async () => {
+    renderTab()
+    const browser = screen.getByRole('switch', { name: /^app browser access$/i })
+    expect(browser.getAttribute('aria-checked')).toBe('false')
+    await act(async () => { browser.click() })
+    expect(localStorage.getItem(PREVIEW_APP_BROWSER_SDK)).toBe('1')
+  })
+
+  it('offers the phone widgets switch, off by default', async () => {
+    renderTab()
+    const widgets = screen.getByRole('switch', { name: /^phone widgets$/i })
+    expect(widgets.getAttribute('aria-checked')).toBe('false')
+    await act(async () => { widgets.click() })
+    expect(localStorage.getItem(PREVIEW_WIDGETS)).toBe('1')
+  })
+
+  it('has a Visual refresh switch that starts off and writes only its own key', async () => {
+    expect(readPreviewFlag(PREVIEW_VISUAL_REFRESH)).toBe(false)
+    renderTab()
+    const toggle = () => screen.getByRole('switch', { name: /^visual refresh$/i })
+    expect(toggle().getAttribute('aria-checked')).toBe('false')
+    await act(async () => { toggle().click() })
+    expect(toggle().getAttribute('aria-checked')).toBe('true')
+    const written = Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i) ?? '')
+      .filter(k => k.startsWith(PREVIEW_FLAG_PREFIX))
+    expect(written).toEqual([PREVIEW_VISUAL_REFRESH])
   })
 
   it('reads the retired instance-sessions key as on, and clears it when turned off', async () => {

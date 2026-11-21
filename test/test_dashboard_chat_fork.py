@@ -11,12 +11,17 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_app, _make_app_with_agent_routes, _make_state
+from redaction_structured_cases import github_classic
 
+from kiro_crew.dashboard.chat_persistence import DeleteWitness
 from kiro_crew.dashboard.slot_buffers import (
     MAX_FORK_PARENT_KEY_CHARS,
     MERGED_FROM_MAX_CREATED_AT_CHARS,
 )
 
+# A GitHub token with a valid checksum: the plan redacts it, while an AWS key ID
+# stays visible as an identifier.
+_SECRET = github_classic(seed=81)
 _OVER_LONG_FORK_PARENT = "s" * (MAX_FORK_PARENT_KEY_CHARS + 1)
 
 
@@ -156,7 +161,7 @@ class TestForkSlot:
 
     @pytest.mark.asyncio
     async def test_fork_aborts_and_keeps_dirty_when_source_save_fails(self, tmp_path):
-        # Regression (double-persistence data-loss): the fork persists the dirty
+        # Double-persistence data loss: the fork persists the dirty
         # source slot before reading it as the source of truth, then clears
         # `_dirty` (which also disables the periodic retry). If that save is
         # best-effort it can silently drop the write under a lock timeout / I/O
@@ -517,7 +522,7 @@ class TestForkSlot:
         state = _make_state(tmp_path)
         slot = state.get_or_create_slot("src")
         slot.append("user", "show me the key", "msg msg-u")
-        slot.append("assistant", "Here: AKIAIOSFODNN7EXAMPLE", "msg msg-a")
+        slot.append("assistant", f"Here: {_SECRET}", "msg msg-a")
         slot.drain()
 
         app = _make_app(state)
@@ -528,7 +533,7 @@ class TestForkSlot:
 
         new_slot = state._slots.get(data["key"])
         assistant_msgs = [m for m in new_slot.messages if m["role"] == "assistant"]
-        assert "AKIAIOSFODNN7EXAMPLE" not in assistant_msgs[0]["content"]
+        assert _SECRET not in assistant_msgs[0]["content"]
         assert "[REDACTED" in assistant_msgs[0]["content"]
 
     @pytest.mark.asyncio
@@ -539,7 +544,7 @@ class TestForkSlot:
         """
         state = _make_state(tmp_path)
         slot = state.get_or_create_slot("src")
-        slot.title = "Leaked AKIAIOSFODNN7EXAMPLE key"
+        slot.title = f"Leaked {_SECRET} key"
         slot._titled = True
         slot.append("user", "hi", "msg msg-u")
         slot.append("assistant", "ok", "msg msg-a")
@@ -550,11 +555,11 @@ class TestForkSlot:
             resp = await client.post("/api/chat/slots/src/fork", json={})
             data = await resp.json()
 
-        assert "AKIAIOSFODNN7EXAMPLE" not in data["title"]
+        assert _SECRET not in data["title"]
         assert "[REDACTED" in data["title"]
         assert data["title"].startswith("↳ Fork of ")
         new_slot = state._slots.get(data["key"])
-        assert "AKIAIOSFODNN7EXAMPLE" not in new_slot.title
+        assert _SECRET not in new_slot.title
 
     @pytest.mark.asyncio
     async def test_fork_rejects_bool_index(self, tmp_path):
@@ -685,7 +690,10 @@ class TestForkSlot:
 
         with (
             patch("kiro_crew.dashboard.chat_fork.slot_history_key", return_value="dashboard:src"),
-            patch("kiro_crew.dashboard.chat_fork.session_was_deleted", return_value=False),
+            patch(
+                "kiro_crew.dashboard.chat_fork.session_delete_witness",
+                return_value=DeleteWitness.PRESENT,
+            ),
         ):
             async with TestClient(TestServer(_make_app(state))) as client:
                 resp = await client.post("/api/chat/slots/src/fork", json={})

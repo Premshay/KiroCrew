@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from kiro_crew.platform import redact_via_context
+from kiro_crew.security import refuses
 
 
 def safe_view(value: Any) -> Any:
@@ -117,8 +118,7 @@ def _safe_view(value: Any, inherited_secrets: tuple[str, ...]) -> Any:
     if isinstance(value, str):
         if any(secret in value for secret in inherited_secrets):
             return "[REDACTED]"
-        redacted = redact_via_context(value)
-        return "[REDACTED]" if redacted != value else value
+        return "[REDACTED]" if refuses(value, redact_via_context) else value
     return value
 
 

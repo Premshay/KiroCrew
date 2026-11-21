@@ -138,6 +138,7 @@ def test_ssh_batchmode_is_not_refused(monkeypatch):
         f"echo $({_CM} 600 /etc/shadow)",
         f"cat <({_CM} 600 /etc/shadow)",
         f"echo `{_CM} 600 /etc/shadow`",
+        f'echo "`{_CM} 600 /etc/shadow`"',
         f"echo \"$(bash -c '{_CM} 600 /etc/shadow')\"",
         f"sh <<EOF\n{_CM} 600 /etc/shadow\nEOF",
         f"echo '{_CM} 600 /etc/shadow' | bash",
@@ -227,8 +228,10 @@ def test_every_argv_rule_is_a_catalog_row():
     from kiro_crew.security import argv_rules
 
     ids = {r.id for r in security.BUILTIN_DENIED_RULES}
+    assert argv_rules.ARGV_RULE_BY_ID, "no argv rule is registered"
     assert set(argv_rules.ARGV_RULE_BY_ID) <= ids
-    assert len(argv_rules.ARGV_RULE_BY_ID) == 14
+    # A predicate whose id has no catalog row would be dropped from enforcement.
+    assert sorted(set(argv_rules._PREDICATES) - set(argv_rules.ARGV_RULE_BY_ID)) == []
 
 
 def test_a_command_that_cannot_name_the_programs_is_not_read(monkeypatch):

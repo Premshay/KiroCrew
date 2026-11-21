@@ -437,6 +437,34 @@ def acp_error_is_throttle(exc: BaseException) -> bool:
     return bool(client.classify_provider_error(str(exc)).kind == client.PROVIDER_ERROR_THROTTLE)
 
 
+def acp_error_is_server_error(exc: BaseException) -> bool:
+    """True when *exc* is a transient provider 5xx; same sources as the throttle verdict."""
+    if not acp_error_is_transient(exc):
+        return False
+    flag = getattr(exc, "server_error", None)
+    if isinstance(flag, bool):
+        return flag
+    client: Any = provider_error_client()
+    if client is None:
+        return False
+    return bool(client.classify_provider_error(str(exc)).kind == client.PROVIDER_ERROR_HTTP_5XX)
+
+
+def acp_error_is_capacity_or_throttle(exc: BaseException) -> bool:
+    """True when *exc* is a transient failure another model may serve.
+
+    A provider throttle (:func:`acp_error_is_throttle`) or a capacity/rollout
+    refusal of the selected model (the raise-time ``AcpError.model_unavailable``
+    flag). A plain 5xx or a dropped connection is neither, and neither is Kiro's
+    per-user rate limit (``AcpError.user_rate_limit``), which every model shares.
+    """
+    if getattr(exc, "user_rate_limit", False) is True:
+        return False
+    if acp_error_is_throttle(exc):
+        return True
+    return acp_error_is_transient(exc) and getattr(exc, "model_unavailable", False) is True
+
+
 def connection_recovery_open(
     exc: BaseException, ladder_started_at: float, *, now: float | None = None
 ) -> bool:

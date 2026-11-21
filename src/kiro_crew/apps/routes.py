@@ -17,11 +17,13 @@ import logging
 import mimetypes
 import os
 import re
+import secrets  # noqa: F401
 import stat
 import sys
 import sys as _sys
 import threading
 import time
+from dataclasses import asdict, dataclass, field  # noqa: F401
 from email.utils import formatdate
 from functools import partial
 from pathlib import Path
@@ -92,6 +94,14 @@ from kiro_crew.apps.manager import (
     update_app,
 )
 from kiro_crew.apps.manifest import Dependencies, PlatformConfig, app_endpoint_allowed
+from kiro_crew.apps.market_source import LISTING_REF_RE  # noqa: F401
+from kiro_crew.apps.marketplace_install import (  # noqa: F401
+    MarketInstallError,
+    PreparedInstall,
+    complete_market_install,
+    market_staging_root,
+    prepare_market_install,
+)
 from kiro_crew.apps.official_category_order import forget_cache as forget_category_order_cache
 from kiro_crew.apps.official_category_order import load_category_order
 from kiro_crew.apps.official_editorial import forget_cache as forget_editorial_cache
@@ -156,12 +166,14 @@ from kiro_crew.apps.registry_pipeline.subprocess_env import (
     _proxy_env_has_credentials,
 )
 from kiro_crew.apps.routes_art import handle_app_art_file, handle_blob_proxy
+from kiro_crew.apps.routes_bot_grants import handle_bot_grants
 from kiro_crew.apps.routes_enable import handle_disable_app, handle_enable_app, handle_open_app
 from kiro_crew.apps.routes_install import (
     handle_install_app,
     handle_register_external,
     handle_update_app,
 )
+from kiro_crew.apps.routes_kiro import register_kiro_call_routes
 from kiro_crew.apps.routes_listing import (
     handle_app_config,
     handle_get_app,
@@ -169,6 +181,8 @@ from kiro_crew.apps.routes_listing import (
     handle_list_apps,
     handle_publish_providers,
 )
+from kiro_crew.apps.routes_market_install import register_market_install_routes
+from kiro_crew.apps.routes_market_registry import register_market_registry_routes
 from kiro_crew.apps.routes_proxy import handle_app_api_proxy
 from kiro_crew.apps.routes_registry import (
     handle_registries,
@@ -211,6 +225,7 @@ from kiro_crew.pinned_fs import (
 )
 from kiro_crew.publish_governance import DEPLOY_WEB_PROVIDER_ID, publish_denied_reason
 from kiro_crew.sandbox import (
+    app_backend_secret_mask_targets,
     cgroup_scope_argv,
     create_subprocess_limited,
     scrub_env,
@@ -228,7 +243,11 @@ def register_app_routes(app: web.Application) -> None:
     async def _start_proxy_session(app: web.Application) -> None:
         # No auto-decompress: the relay copies the backend's Content-Encoding and
         # Content-Length, so the body must stay the bytes those headers describe.
-        app["_proxy_session"] = aiohttp.ClientSession(auto_decompress=False)
+        # No cookie jar: a relayed answer's cookies belong to the browser that asked,
+        # never to the next request this shared session makes for anyone else.
+        app["_proxy_session"] = aiohttp.ClientSession(
+            auto_decompress=False, cookie_jar=aiohttp.DummyCookieJar()
+        )
 
     async def _close_proxy_session(app: web.Application) -> None:
         session = app.get("_proxy_session")
@@ -252,6 +271,11 @@ def register_app_routes(app: web.Application) -> None:
     app.router.add_post("/api/apps/registry/install", handle_registry_install)
     app.router.add_post("/api/apps/registry/install-stream", handle_registry_install_stream)
     app.router.add_post("/api/apps/install", handle_install_app)
+    # Kiro Space install: prepare, then confirm. Registered before the
+    # `/api/apps/{name}` catch-all; `market` is a reserved first segment.
+    register_market_install_routes(app)
+    # Kiro Space stores as App Store sources, and the install routes' factory.
+    register_market_registry_routes(app)
     app.router.add_post("/api/apps/register", handle_register_external)
     app.router.add_get("/api/apps/{name}", handle_get_app)
     app.router.add_get("/api/apps/{name}/manifest", handle_get_manifest)
@@ -264,6 +288,10 @@ def register_app_routes(app: web.Application) -> None:
     app.router.add_post("/api/apps/{name}/disable", handle_disable_app)
     app.router.add_post("/api/apps/{name}/open", handle_open_app)
     app.router.add_post("/api/apps/{name}/dev", handle_app_dev_mode)
+    app.router.add_get("/api/apps/{name}/bot-grants", handle_bot_grants)
+    app.router.add_put("/api/apps/{name}/bot-grants", handle_bot_grants)
+    # An app's calls to its approved Kiro operations (`permissions.kiroOperations`).
+    register_kiro_call_routes(app)
     app.router.add_delete("/api/apps/{name}/migrate-cleanup", handle_migrate_cleanup)
     app.router.add_get("/apps/{name}/ui/{path:.*}", handle_app_ui_file)
     app.router.add_get("/apps/{name}/art/{path:.*}", handle_app_art_file)
@@ -287,7 +315,11 @@ def register_app_routes(app: web.Application) -> None:
 #   ``routes_static`` -- An installed app's UI bundle and the dev-mode toggle.
 #   ``routes_art`` -- The installed-art route, and the git blob proxy with its validators.
 #   ``routes_listing`` -- The app list, one app, its manifest and config, the publish providers.
+#   ``routes_bot_grants`` -- The Bots the owner ticked for an app (``permissions.bots``).
+#   ``routes_kiro`` -- An app's calls to its approved Kiro operations (``permissions.kiroOperations``).
 #   ``routes_install`` -- Installing from a local path, updating, and registering an external app.
+#   ``routes_market_install`` -- Installing an app from Kiro Space: prepare, then confirm.
+#   ``routes_market_registry`` -- Kiro Space stores as sources: add, sign in, list, one listing.
 #   ``routes_uninstall`` -- The uninstall, its preview and cron retry, and migrated-app cleanup.
 #   ``routes_enable`` -- Enable, disable and open an installed app.
 #   ``routes_registry`` -- Browsing, refreshing and installing from the registry; its configured sources.
@@ -298,7 +330,11 @@ _OWNERS = (
     "kiro_crew.apps.routes_static",
     "kiro_crew.apps.routes_art",
     "kiro_crew.apps.routes_listing",
+    "kiro_crew.apps.routes_bot_grants",
+    "kiro_crew.apps.routes_kiro",
     "kiro_crew.apps.routes_install",
+    "kiro_crew.apps.routes_market_install",
+    "kiro_crew.apps.routes_market_registry",
     "kiro_crew.apps.routes_uninstall",
     "kiro_crew.apps.routes_enable",
     "kiro_crew.apps.routes_registry",
@@ -313,9 +349,44 @@ _sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
 __all__ = sorted(n for n in set(globals()) | set(_EXPORTS) if not n.startswith("_"))
 
 if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
+    from kiro_crew.apps.bot_grant_store import (  # noqa: F401
+        MAX_BOT_GRANTS,
+    )
+    from kiro_crew.apps.bot_grants import (  # noqa: F401
+        app_granted_bots,
+        set_app_granted_bots,
+    )
     from kiro_crew.apps.bridges import (  # noqa: F401
         _prune_stale_app_resources,
         _registration_source,
+    )
+    from kiro_crew.apps.kiro_calls import (  # noqa: F401
+        MAX_REQUEST_BYTES,
+        KiroCallError,
+        audit_kiro_call,
+        call_kiro_operation,
+        parse_json_body,
+    )
+    from kiro_crew.apps.kiro_operations import (  # noqa: F401
+        MAX_KIRO_OPERATIONS,
+    )
+    from kiro_crew.apps.market_registries import (  # noqa: F401
+        MAX_ADDED,
+        NEEDS_SIGN_IN,
+        NO_ACCESS,
+        SIGNED_IN,
+        added_ids_from,
+        fetch_listings,
+        install_store,
+        installed_by_name,
+        listing_row,
+        make_market_client_factory,
+        normalize_status,
+        offered,
+        provider_of,
+        require_usable_registry,
+        sign_in_view,
+        write_added_ids,
     )
     from kiro_crew.apps.point_grants import (  # noqa: F401
         point_grant_families,
@@ -337,14 +408,34 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _read_declared_art,
         _touch_served_blob,
     )
+    from kiro_crew.apps.routes_bot_grants import (  # noqa: F401
+        _not_installed,
+        _owner_denial,
+        _view,
+    )
     from kiro_crew.apps.routes_enable import (  # noqa: F401
+        _APP_STATE_BOOT,
+        _APP_STATE_SEQ_LOCK,
         _BUILTIN_SERVICE_APPS,
         _OPEN_COMMAND_DESKTOP_ENV_KEYS,
+        _announce_app_state,
+        _app_state_last_seq,
+        _end_turned_off_app_views,
+        _next_app_state_seq,
         _notify_builtin_service,
         _sync_builtin_config,
     )
     from kiro_crew.apps.routes_install import (  # noqa: F401
         _resync_app_crons_after_update,
+    )
+    from kiro_crew.apps.routes_kiro import (  # noqa: F401
+        _KIRO_READ_CHUNK,
+        _is_host_owner,
+        _kiro_error,
+        _read_kiro_body,
+        handle_kiro_call,
+        kiro_caller,
+        kiro_consent_refusal,
     )
     from kiro_crew.apps.routes_lifecycle import (  # noqa: F401
         _announce_app_ui_changed,
@@ -378,6 +469,54 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _stamp_installed_trust_repository,
         collect_publish_providers,
     )
+    from kiro_crew.apps.routes_market_install import (  # noqa: F401
+        _STAGING_ID_RE,
+        MARKET_ACCOUNT_KEY,
+        MARKET_CLIENT_FACTORY_KEY,
+        MARKET_STAGING_KEY,
+        MARKET_STORE_KEY,
+        MAX_METADATA_BYTES,
+        MAX_PENDING,
+        STAGING_TTL_SECONDS,
+        MarketStagingRegistry,
+        _discard_off_loop,
+        _Entry,
+        _error,
+        _metadata_bytes,
+        _not_configured,
+        _now,
+        _read_body,
+        _refuse_if_store_or_account_changed,
+        _registry,
+        _under_staging_root,
+        handle_market_install_confirm,
+        handle_market_install_prepare,
+    )
+    from kiro_crew.apps.routes_market_registry import (  # noqa: F401
+        _install_account,
+        _install_store_id,
+        _store_added_ids,
+        _store_audit,
+        _store_begin,
+        _store_client,
+        _store_error,
+        _store_gate,
+        _store_installed,
+        _store_off_loop,
+        _store_read_failed,
+        _store_sign,
+        _store_status,
+        _store_still,
+        _store_unavailable,
+        _store_usable,
+        handle_market_listing,
+        handle_market_listings,
+        handle_market_registries_get,
+        handle_market_registries_put,
+        handle_market_registry_signin,
+        handle_market_registry_signout,
+        register_market_client_factory,
+    )
     from kiro_crew.apps.routes_proxy import (  # noqa: F401
         _PROXY_HOP_HEADERS,
         _PROXY_IDLE_TIMEOUT,
@@ -391,6 +530,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _forwarded_query,
         _get_app_secret,
         _is_event_stream,
+        _is_memory_provider_route,
         _proxy_principal,
         _resolve_app_backend_url,
         invalidate_app_secret_cache,
@@ -398,6 +538,8 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.apps.routes_registry import (  # noqa: F401
         _announce_app_updates,
         _derive_registry_name,
+        _held_mcp_servers,
+        _reach_open_chats,
         _registry_fetch_failures,
         _resolve_app_update_notes,
         _write_registries_config,

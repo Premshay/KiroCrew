@@ -24,6 +24,7 @@ from types import SimpleNamespace
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from redaction_structured_cases import github_classic
 
 from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
 
@@ -644,7 +645,7 @@ class TestAHarnessChangeReloadsTheLiveChat:
         state.sessions.get_provider = MagicMock(return_value=provider)
         order: list[str] = []
 
-        async def reset(key, *, skip_if_busy=False):
+        async def reset(key, *, skip_if_busy=False, forget_unused_start=False):
             order.append("reset")
             return not provider.turns[0]
 
@@ -722,7 +723,7 @@ class TestAHarnessChangeReloadsTheLiveChat:
         # the respawn that starts the new harness.
         assert chat.order == ["reset", "refresh:claude"]
         chat.state.sessions.reset.assert_awaited_once_with(
-            f"dashboard:{self.KEY}", skip_if_busy=True
+            f"dashboard:{self.KEY}", skip_if_busy=True, forget_unused_start=True
         )
         chat.eager.assert_called_once()
         assert chat.eager.call_args.kwargs.get("allow_resume") is True
@@ -875,7 +876,7 @@ class TestAHarnessChangeReloadsTheLiveChat:
 
     @pytest.mark.asyncio
     async def test_a_label_the_roster_would_mask_is_never_echoed(self, chat):
-        secret = "Atlas AKIAIOSFODNN7EXAMPLE"
+        secret = "Atlas " + github_classic(seed=20)  # a checksummed GitHub token
         cfg = KiroCrewConfig.load()
         cfg.agents["atlas"].display_name = secret
         cfg.save()
@@ -1540,9 +1541,9 @@ class TestCrewmateHarnesses:
         monkeypatch.setattr(backends, "selectable_backends", lambda: frozenset(selectable))
         assert crewmate_harnesses(_cfg()) == ["claude", "codex", "kas"]
 
-    @pytest.mark.parametrize("harness", ["pi", "deepseek"])
-    def test_a_capable_harness_without_the_worker_kit_is_chat_only(self, monkeypatch, harness):
+    def test_deepseek_is_chat_only(self, monkeypatch):
         """A chat pin keeps its harness; workers still require their own kit."""
+        from kiro_crew import sandbox
         from kiro_crew.agent_sdk import backends
         from kiro_crew.crewmate_harness import (
             crewmate_harnesses,
@@ -1551,11 +1552,34 @@ class TestCrewmateHarnesses:
         )
 
         monkeypatch.setattr(
-            backends, "selectable_backends", lambda: frozenset({"", "kas", "claude", harness})
+            backends, "selectable_backends", lambda: frozenset({"", "kas", "claude", "deepseek"})
         )
-        assert crewmate_harnesses(_cfg()) == sorted(["claude", "kas", harness])
-        assert harness_pin_rejected(harness, _cfg()) is None
-        assert harness not in worker_harnesses(_cfg())
+        assert crewmate_harnesses(_cfg()) == ["claude", "deepseek", "kas"]
+        monkeypatch.setattr(sandbox, "credential_mask_applies", lambda _mode: False)
+        assert harness_pin_rejected("deepseek", _cfg()) is not None
+        monkeypatch.setattr(sandbox, "credential_mask_applies", lambda _mode: True)
+        assert harness_pin_rejected("deepseek", _cfg()) is None
+        assert "deepseek" not in worker_harnesses(_cfg())
+
+    def test_pi_carries_the_worker_kit_so_it_is_offered_and_saved(self, monkeypatch):
+        """RFC 5.4: pi's worker capture landed, so a Crew bot's chat and its workers
+        run there and the picker offers it."""
+        from kiro_crew import sandbox
+        from kiro_crew.agent_sdk import backends
+        from kiro_crew.crewmate_harness import (
+            crewmate_harnesses,
+            harness_pin_rejected,
+            worker_harnesses,
+        )
+
+        monkeypatch.setattr(
+            backends, "selectable_backends", lambda: frozenset({"", "kas", "claude", "pi"})
+        )
+        # A host whose sandbox can confine pi, like the save test below.
+        monkeypatch.setattr(sandbox, "credential_mask_applies", lambda _mode: True)
+        assert crewmate_harnesses(_cfg()) == ["claude", "kas", "pi"]
+        assert harness_pin_rejected("pi", _cfg()) is None
+        assert "pi" in worker_harnesses(_cfg())
 
     def test_no_offered_harness_lands_on_kas(self):
         """The picker and the pin fallback read one rule: an offered pick runs where picked."""
@@ -1642,18 +1666,36 @@ class TestCrewmateHarnesses:
         assert "kiro" not in worker_harnesses(_cfg(kas_bundle=True))
 
     def test_the_save_accepts_exactly_the_offered_list(self, monkeypatch):
+        from kiro_crew import sandbox
         from kiro_crew.agent_sdk import backends
         from kiro_crew.crewmate_harness import crewmate_harnesses, harness_pin_rejected
 
         monkeypatch.setattr(
             backends, "selectable_backends", lambda: frozenset({"", "kas", "codex", "opencode"})
         )
+        # A host whose sandbox can confine codex; the refusing host is the next test.
+        monkeypatch.setattr(sandbox, "credential_mask_applies", lambda _mode: True)
         cfg = _cfg()
         for stored in crewmate_harnesses(cfg):
             assert harness_pin_rejected(stored, cfg) is None
         assert harness_pin_rejected("", cfg) is None
         for refused in ("kiro", "opencode", "claude"):
             assert "must be one of" in (harness_pin_rejected(refused, cfg) or "")
+
+    def test_a_harness_the_launch_refuses_on_this_host_is_not_saved(self, monkeypatch):
+        """A pin every session start refuses here is refused with that sentence."""
+        from kiro_crew import sandbox
+        from kiro_crew.agent_sdk import backends
+        from kiro_crew.agent_sdk.tool_gate import sandbox_floor_refusal
+        from kiro_crew.crewmate_harness import harness_pin_rejected
+
+        monkeypatch.setattr(
+            backends, "selectable_backends", lambda: frozenset({"", "kas", "codex"})
+        )
+        monkeypatch.setattr(sandbox, "credential_mask_applies", lambda _mode: False)
+        cfg = _cfg()
+        assert harness_pin_rejected("codex", cfg) == sandbox_floor_refusal("codex", "auto")
+        assert harness_pin_rejected("kas", cfg) is None
 
 
 class TestSaveRefusesAnUncapableHarness:

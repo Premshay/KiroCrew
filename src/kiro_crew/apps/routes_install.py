@@ -128,6 +128,26 @@ async def handle_update_app(request: web.Request) -> web.Response:
             status=400,
         )
 
+    # A marketplace app is never updated from a folder, whether the request names
+    # its recorded source (``market:<ref>@<n>``, what the Update button and
+    # ``kirocrew app update`` send) or a ``--source`` folder: refuse before anything
+    # is stopped or deregistered. ``update_app`` refuses the same way.
+    from kiro_crew.apps.market_source import MARKET_OVERWRITE_HINT, is_market_source
+
+    if is_market_source(source) or is_market_source(info.get("source")):
+        error = f"{name!r} cannot be updated from a folder. {MARKET_OVERWRITE_HINT}"
+        sel().log_api_access(
+            caller="dashboard",
+            operation="provenance",
+            outcome="rejected",
+            resources=name,
+            error=error,
+        )
+        return web.json_response(
+            {"ok": False, "name": name, "error": error, "code": "app_update_market_source"},
+            status=400,
+        )
+
     # Registry-installed apps: re-clone from registry.
     if is_registry_source(source):
         registry_name = registry_name_from_source(source)
@@ -424,7 +444,7 @@ async def handle_register_external(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except (LookupError, RecursionError, ValueError):
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     not_object = body_not_object_error(body)
     if not_object is not None:
         return not_object
@@ -455,6 +475,7 @@ async def handle_register_external(request: web.Request) -> web.Response:
     # sourceUrl/provenance snapshot over a concurrent registry transition.
     # The manager call performs blocking filesystem and secret-store I/O, so it
     # belongs in the subprocess executor while the loop owns the lock.
+    ui_copy_error = ""
     async with app_lifecycle_lock(name):
         result = await asyncio.get_running_loop().run_in_executor(
             subprocess_executor(),
@@ -477,6 +498,28 @@ async def handle_register_external(request: web.Request) -> web.Response:
             await asyncio.get_running_loop().run_in_executor(
                 subprocess_executor(), refresh_app_config_keys
             )
+            # The scripts the dashboard runs for this app are the ones in its folder
+            # now, at the owner's registration (``protected_app_ui``). Imported here
+            # so the routes facade, which serves this module's names, gains none.
+            from kiro_crew.apps import protected_app_ui
+            from kiro_crew.apps.manager import apps_dir
+
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    subprocess_executor(),
+                    partial(protected_app_ui.record_folder, apps_dir(), name),
+                )
+            except (OSError, ValueError) as exc:
+                # The registration itself is committed, so it still answers as one;
+                # only the scripts are not served until the copy succeeds.
+                logger.warning("could not copy app %s's UI scripts", name, exc_info=True)
+                ui_copy_error = (
+                    f"registered {name}, but could not keep a copy of its UI scripts "
+                    f"({exc}); its UI does not load until it is registered again"
+                )
+            else:
+                # Its scripts were just replaced: an open dashboard reloads them.
+                _announce_app_ui_changed(request, name)
     if not result.ok:
         sel().log_api_access(
             caller="dashboard",
@@ -493,6 +536,9 @@ async def handle_register_external(request: web.Request) -> web.Response:
     # Include the generated app secret so the caller can use it for auth
     if result.secret:
         resp["secret"] = result.secret
+    if ui_copy_error:
+        resp["code"] = "app_ui_copy_failed"
+        resp["warning"] = ui_copy_error
     return web.json_response(resp, status=201)
 
 
@@ -510,7 +556,7 @@ async def handle_install_app(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except (LookupError, RecursionError, ValueError):
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     not_object = body_not_object_error(body)
     if not_object is not None:
         return not_object
@@ -570,7 +616,12 @@ async def handle_install_app(request: web.Request) -> web.Response:
                 )
             ver_err = _check_min_version(manifest_data)
             if ver_err:
-                return web.json_response({"error": ver_err}, status=400)
+                # Call-time import: the ``routes`` facade mirrors this module's names.
+                from kiro_crew.apps.version import MIN_VERSION_REFUSAL_CODE
+
+                return web.json_response(
+                    {"error": ver_err, "code": MIN_VERSION_REFUSAL_CODE}, status=400
+                )
             raw_name = manifest_data.get("name")
             if isinstance(raw_name, str) and raw_name:
                 lock_name = raw_name

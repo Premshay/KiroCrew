@@ -21,6 +21,7 @@ from kiro_crew.config.loader import DASHBOARD_PORT, config_dir
 from kiro_crew.dashboard import pinned_session_order
 from kiro_crew.dashboard.folder_repository import FOLDERS_FILE
 from kiro_crew.dashboard.interaction_coordinator import ApprovalCoordinator, QuestionCoordinator
+from kiro_crew.dashboard.repeated_failures_notice import RepeatedFailuresNotifier
 from kiro_crew.dashboard.restart_barrier import RestartBarrier
 from kiro_crew.dashboard.slot_registry import SlotRegistry, TakeoverWatch, TruncationClaim
 from kiro_crew.dashboard.state_parts import dashboard_services as _dashboard_services
@@ -102,6 +103,31 @@ def set_build_info(info: tuple[str, str]) -> None:
     _build_info = info
 
 
+def _share_tree_root(state: Any, session_key: str) -> str:
+    """The session key of *session_key*'s tree root, over this gateway's live slots.
+
+    The provider hands a session key (``dashboard:chat-...``) while the slots, the
+    creator edges and the persisted lineage are all keyed by slot name, so the key
+    is folded to its slot name before the walk and the root slot is mapped back to
+    the session key its turns run on (the member record is read by that key). No I/O.
+    """
+    from kiro_crew import crew_mode
+    from kiro_crew.dashboard.chat_utils_slots import _history_key_for, effective_session_key
+    from kiro_crew.dashboard.session_control_parts.crew_filing import _frame_parents
+
+    slot_key = _slot_directory._normalize_slot_key(session_key)
+    root = crew_mode.share_tree_root(
+        state._slots,
+        slot_key,
+        _frame_parents(state),
+        settled=crew_mode.lineage_is_settled(),
+    )
+    if root == slot_key:
+        return session_key
+    root_slot = state._slots.get(root)
+    return effective_session_key(root_slot) if root_slot is not None else _history_key_for(root)
+
+
 # ── Constants ──
 
 
@@ -109,6 +135,42 @@ _DEFAULT_PORT = DASHBOARD_PORT
 
 
 _SSE_INTERVAL_SECS = 5
+
+
+def _while_alive(owner: Any, call: Callable[..., Any], gone: Callable[..., Any]):
+    """A hook for a process-global seam that does not keep *owner* alive.
+
+    ``DashboardState`` wires a few module globals that live for the process
+    (``set_share_tree_reader``, ``set_parent_project_resolver``,
+    ``impl_llm.set_runner_factory``). A closure over the state there pins the state, and
+    everything it holds, until the next state replaces it. The gateway keeps its state for
+    the process, so this answers exactly as before; once *owner* is gone the hook returns
+    ``gone(*args)``, which each call site chooses to equal that seam's "not wired" answer.
+    An *owner* that cannot be weakly referenced is held strongly, as it always was.
+    """
+    try:
+        ref = weakref.ref(owner)
+    except TypeError:
+        return lambda *args: call(owner, *args)
+
+    def hook(*args: Any) -> Any:
+        live = ref()
+        return gone(*args) if live is None else call(live, *args)
+
+    return hook
+
+
+def _no_runner_after_close(model: str) -> Callable[[str], Any]:
+    """The decisions runner once its session manager is gone: every ask raises.
+
+    The lane treats a raising ``ask`` as a provider failure and fires the tick ungated,
+    which is what it does with no runner registered at all.
+    """
+
+    async def runner(_prompt: str) -> str:
+        raise RuntimeError(f"decisions runner for {model!r}: the session manager is gone")
+
+    return runner
 
 
 class DashboardState:
@@ -122,6 +184,7 @@ class DashboardState:
     bridge_actions: BridgeActionRegistry
     notification_channel_settings: ChannelSettings
     resource_pressure_notifier: ResourcePressureNotifier
+    repeated_failures_notifier: RepeatedFailuresNotifier
     file_indexes: FileIndexRegistry
     _chat_pins_lock: LoopBoundLock
     _folders_lock: LoopBoundLock
@@ -323,7 +386,11 @@ class DashboardState:
             from kiro_crew.decisions import impl_llm
 
             impl_llm.set_runner_factory(
-                lambda model: impl_llm.build_session_runner(sessions, model=model)
+                _while_alive(
+                    sessions,
+                    lambda live, model: impl_llm.build_session_runner(live, model=model),
+                    _no_runner_after_close,
+                )
             )
         except Exception:
             logger.debug("decisions: LLM lane runner not registered", exc_info=True)
@@ -357,6 +424,7 @@ class DashboardState:
         # Cloud provisioning launch jobs (lazy-init in handlers_cloud).
         self.cloud_launch_store: Any = None  # LaunchJobStore
         self.cloud_launch_cancels: Any = None  # dict[str, threading.Event]
+        self.cloud_launch_skips: Any = None  # dict[str, threading.Event]
         self.cloud_launch_engine: Any = (
             None  # test-injected LaunchEngine (None -> RealLaunchEngine)
         )
@@ -434,6 +502,9 @@ class DashboardState:
         # /api/slack/reconnect). Set by the gateway that owns the Slack socket;
         # None on a server with no socket owner.
         self.slack_reconnect: Callable[[], Awaitable[dict[str, Any]]] | None = None
+        # The Slack owner-claim window (``kiro_crew.slack.owner_claim.OwnerClaim``,
+        # /api/slack/owner-claim). Set beside ``slack_reconnect``; None otherwise.
+        self.slack_owner_claim: Any = None
         # True once the Discord channel's Gateway WebSocket transport started
         # this session (set by maybe_start_discord). Read by the Discord
         # settings status badge.
@@ -607,6 +678,8 @@ class DashboardState:
         # system.resources. State-owned like the bus/limiter/settings so its
         # lifecycle matches the gateway instance.
         self.resource_pressure_notifier = ResourcePressureNotifier(self.notification_bus)
+        # The opt-in weekly repeated-failures note, checked from the heartbeat.
+        self.repeated_failures_notifier = RepeatedFailuresNotifier()
         # Channel turn-ceiling producer. Registered HERE, once, beside the bus it
         # delivers through, rather than injected per channel: a channel that
         # forgot the wire would be a channel whose pauses are invisible to the
@@ -662,6 +735,14 @@ class DashboardState:
         # connection (``slot_retention.note_foreground``). The idle sweep never
         # archives a slot someone is looking at.
         self._foreground_slots: dict[int, str] = {}
+        # The slot an owner dashboard last reported focused, and the other slots
+        # reported alongside it, kept across a blur or a closed socket so the
+        # shutdown flush still records what the person was looking at.
+        self.last_focused_slot: str = ""
+        self.last_visible_slots: tuple[str, ...] = ()
+        # Tabs a client focused while the startup restore still owed them, in the
+        # order asked; the restore builds them before the rest of its queue.
+        self.restore_front_keys: list[str] = []
         # Return-triggered warm task briefs: when each thread was last on screen
         # in an owner view (wall time, this process only), a read-saving "not
         # eligible before" cache, and the live tasks. The claim and the durable
@@ -972,13 +1053,19 @@ class DashboardState:
             from kiro_crew.dashboard.handlers._shared import session_project_for_spawn_gate
             from kiro_crew.subagent import set_parent_project_resolver
 
-            set_parent_project_resolver(lambda key: session_project_for_spawn_gate(self, key))
+            set_parent_project_resolver(
+                _while_alive(self, session_project_for_spawn_gate, lambda _key: ())
+            )
             # A child's prompt carries the folder steering its parent receives.
             from kiro_crew.dashboard.handlers._shared import session_folder_steering_dirs
 
             self.subagents._parent_steering_dirs = lambda key: session_folder_steering_dirs(
                 self, key
             )
+        # Chat runtime sharing places a chat only inside its own session tree.
+        from kiro_crew.agent_sdk.chat_runtime_sharing import set_share_tree_reader
+
+        set_share_tree_reader(_while_alive(self, _share_tree_root, lambda _key: ""))
         if self.context_builder is not None:
             self.context_builder.live_memory_mode_for_session = (
                 lambda key: live_session_memory_mode(self, key)
@@ -1027,13 +1114,13 @@ class DashboardState:
     _QUESTION_TIMEOUT_DEFAULT = 300  # 5 minutes
 
     # Hard ceiling set by the ACP tool-stall watchdog, NOT by the `wait` tool.
-    # `acp/client_timeouts.py::_TOOL_STALL_TIMEOUT` is 600s and is armed once a tool call
+    # `acp/client_timeouts.py::_TOOL_STALL_TIMEOUT` is 720s and is armed once a tool call
     # is dispatched; a blocked ask_question emits no progress frames, so a window
-    # at or beyond 600s lets the watchdog declare the turn dead and kill it —
-    # after which an answer has no turn left to return to. 540s keeps a 60s
-    # margin below the watchdog. `wait` can afford 1800s because it is a
+    # at or beyond 720s lets the watchdog declare the turn dead and kill it —
+    # after which an answer has no turn left to return to. 540s stays well
+    # below the watchdog. `wait` can afford 1800s because it is a
     # different mechanism; copying that number here was the bug.
-    _QUESTION_TIMEOUT_MAX = 540  # 9 minutes — 60s under the 600s tool-stall watchdog
+    _QUESTION_TIMEOUT_MAX = 540  # 9 minutes — under the 720s tool-stall watchdog
 
     # The blocking MCP ``ask_question`` is not bound by the cap above: its tool
     # call waits in short slices and pings /api/session-keepalive between them,
@@ -1232,6 +1319,8 @@ class DashboardState:
     resolve_skill_review_notifications = _dashboard_services.resolve_skill_review_notifications
     acknowledge_notifications_where = _dashboard_services.acknowledge_notifications_where
     clear_notifications = _dashboard_services.clear_notifications
+    clear_visible_notifications = _dashboard_services.clear_visible_notifications
+    acknowledge_visible_notifications = _dashboard_services.acknowledge_visible_notifications
     ensure_context_snapshots_loaded = _dashboard_services.ensure_context_snapshots_loaded
     context_snapshot_for = _dashboard_services.context_snapshot_for
     _persist_context_snapshots = _dashboard_services._persist_context_snapshots
@@ -1261,6 +1350,7 @@ class DashboardState:
     running_session_keys = _slot_directory.running_session_keys
     spend_slot_by_session = _slot_directory.spend_slot_by_session
     native_subagent_snapshots = _slot_directory.native_subagent_snapshots
+    dismiss_native_subagent = _slot_directory.dismiss_native_subagent
     has_slot = _slot_directory.has_slot
     slot_exists = _slot_directory.slot_exists
     session_still_loading = _slot_directory.session_still_loading
@@ -1319,6 +1409,7 @@ class DashboardState:
     _slot_links = _slots_frame._slot_links
     serialize_slot = _slots_frame.serialize_slot
     serialize_slots = _slots_frame.serialize_slots
+    serialize_slots_yielding = _slots_frame.serialize_slots_yielding
     serialize_slot_views = _slots_frame.serialize_slot_views
     _reproject_slots = _slots_frame._reproject_slots
     _drop_orphaned_mcp_report = _slots_frame._drop_orphaned_mcp_report

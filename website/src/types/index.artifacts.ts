@@ -140,7 +140,7 @@ export interface Artifact {
    *  deliberately NOT in any picker: the backend keeps it out of
    *  `USER_SELECTABLE_KINDS` so nobody can mint one by hand, and a kind offered in
    *  the UI that the server refuses is a dead menu entry. */
-  kind: 'widget' | 'html' | 'markdown' | 'svg' | 'json' | 'text' | 'webapp' | 'image' | 'dashboard'
+  kind: 'widget' | 'html' | 'markdown' | 'svg' | 'json' | 'text' | 'webapp' | 'image' | 'dashboard' | 'canvas'
   /** Provenance/origin bucket. Carries either a legacy bucket
    * (chat|cron|subagent|manual|import) or the actual session origin
    * (dashboard|slack|cli|task-runner|unknown), so treated as an open string. */
@@ -159,6 +159,9 @@ export interface Artifact {
   /** Opaque optimistic-concurrency token for `content`; echo it back as
    * `expected_token` on a content save. Absent for live file-backed artifacts. */
   content_token?: string
+  /** The shown `content` had text masked (credentials, suspicious URLs), so it is
+   *  not the stored content; saving it back would write the placeholders. */
+  content_redacted?: boolean
   /** Original source path for file-backed artifacts (live pointer). */
   source_path?: string
   /** True when the live state differs from the latest numbered snapshot.
@@ -191,6 +194,11 @@ export interface Artifact {
    * "save permanently" action changes. Absent on older payloads — treat
    * undefined as false. */
   auto_registered?: boolean
+  /** List responses only: true when the auto-widget sweep could delete this
+   *  record (the server's own `_is_sweepable_auto_widget`). It is the Artifacts
+   *  home page's "Recent output" row; everything else is made or kept. Absent
+   *  on older payloads -- treat undefined as false. */
+  sweepable?: boolean
   /** True for a crewmate's weekly report or monthly review, set by the gateway
    * when `save_goal_report` files it (never through the artifact API). The
    * viewer opens such a page in the crewmate Dashboard page's sandbox

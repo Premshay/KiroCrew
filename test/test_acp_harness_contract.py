@@ -14,6 +14,7 @@ import ast
 import dataclasses
 import inspect
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
     ACP_BACKEND_DEEPSEEK,
+    ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_CLIENT_CAPABILITIES,
@@ -49,6 +51,7 @@ from kiro_crew.acp.types import (
     METHOD_SESSION_TERMINATE,
     METHOD_SESSION_UPDATE,
 )
+from kiro_crew.agent_sdk.backends import ACP_BACKEND_LAUNCH
 from kiro_crew.config import paths as paths_mod
 from kiro_crew.mcp_gateway import session_servers as session_servers_mod
 
@@ -57,14 +60,13 @@ ALL_BACKENDS = [
     ACP_BACKEND_KAS,
     ACP_BACKEND_CODEX,
     ACP_BACKEND_CLAUDE,
-    # The operator-owned exception: deepseek's routing is UNVERIFIED, so it is
-    # absent from the selectable switch and reachable only through an engine map
-    # entry the operator owns. Registered on the shared runtime for the direct
-    # consumers (Sage's review pool) that bind such an entry; the runtime harness
-    # carries the same no-mask, host-decided-tools posture as the client
-    # transport already serves for the same seat. See harness/deepseek.py.
+    ACP_BACKEND_GOOSE,
     ACP_BACKEND_DEEPSEEK,
 ]
+
+#: Hosts with a shared-runtime harness that no session is routed to yet: they keep
+#: their per-process adapter until the routing change names them.
+REGISTERED_AHEAD_OF_ROUTING = {ACP_BACKEND_CLAUDE, ACP_BACKEND_GOOSE, ACP_BACKEND_DEEPSEEK}
 
 #: The hosts reached through kiro-cli's own binary and ACP relay. They share a
 #: notification vocabulary, an agent-spec permission routing and a spawn-time effort
@@ -223,12 +225,19 @@ def test_every_override_accepts_the_base_signature(backend):
         if not callable(base) or not callable(override) or base is override:
             continue
         try:
-            declared = set(inspect.signature(base).parameters)
-            provided = set(inspect.signature(override).parameters)
+            declared = inspect.signature(base).parameters
+            provided = inspect.signature(override).parameters
         except (TypeError, ValueError):
             continue
-        if not declared <= provided:
-            narrowed.append(f"{seam} drops {sorted(declared - provided)}")
+        missing = declared.keys() - provided.keys()
+        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in provided.values()):
+            missing = {
+                name
+                for name in missing
+                if declared[name].kind != inspect.Parameter.KEYWORD_ONLY
+            }
+        if missing:
+            narrowed.append(f"{seam} drops {sorted(missing)}")
     assert not narrowed, f"{type(harness).__name__}: " + "; ".join(narrowed)
 
 
@@ -361,9 +370,8 @@ async def test_kas_spawn_reports_the_auth_owner_it_chose(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
 async def test_a_missing_binary_aborts_the_spawn(monkeypatch, tmp_path, backend):
-    from kiro_crew.acp import launch
-    from kiro_crew.acp.client import AcpError
-    from kiro_crew.acp.harness import claude as claude_mod
+    from kiro_crew.acp import launch as launch_mod
+    from kiro_crew.acp.harness import claude as claude_harness
     from kiro_crew.acp.session_handle import AcpRuntimeError
 
     async def _no_bin(*, environ, home):
@@ -376,16 +384,20 @@ async def test_a_missing_binary_aborts_the_spawn(monkeypatch, tmp_path, backend)
     # no harness may return an argv for a binary that is not there -- and narrowing
     # it to one family would leave the next host's spawn unasserted.
     monkeypatch.setattr(client_mod, "_resolve_codex_acp_bin", lambda: (None, "/nowhere"))
-    monkeypatch.setattr(claude_mod, "_resolve_claude_acp_bin", lambda: (None, "/nowhere"))
-    monkeypatch.setattr(launch, "_self_served_bin_caches", {})
-    monkeypatch.setattr(launch, "_resolve_self_served_bin", lambda backend: (None, "/nowhere"))
-    with pytest.raises((AcpRuntimeError, AcpError), match="not found") as raised:
+    monkeypatch.setattr(claude_harness, "_resolve_claude_acp_bin", lambda: (None, "/nowhere"))
+    monkeypatch.setattr(claude_harness, "_claude_acp_argv_cache", launch_mod._UNRESOLVED)
+    # goose resolves through the shared self-served ladder and its per-backend
+    # cache; emptied too, so a developer machine with goose installed still sees
+    # the refusal instead of a plan.
+    monkeypatch.setattr(launch_mod, "_resolve_self_served_bin", lambda b: (None, "/nowhere"))
+    monkeypatch.setattr(launch_mod, "_self_served_bin_caches", {})
+    with pytest.raises(AcpRuntimeError, match="not found") as raised:
         await harness_for(backend).resolve_spawn(_ctx(tmp_path))
     # The two kiro-cli hosts tag the refusal so the chat row can offer the
-    # feature-request form; codex-acp is a different binary whose install the
-    # operator chose, and its refusal stays an untagged error row.
+    # feature-request form; codex-acp and claude-agent-acp are different binaries
+    # whose install the operator chose, and their refusals stay untagged error rows.
     assert getattr(raised.value, "kiro_cli_missing", False) is (
-        backend in {ACP_BACKEND_KIRO, ACP_BACKEND_KAS}
+        backend in (ACP_BACKEND_KIRO, ACP_BACKEND_KAS)
     )
 
 
@@ -484,11 +496,17 @@ def test_kas_capabilities_open_only_settings_external_urls_and_user_input():
 
     Any other ``_meta.kiro`` capability would invite a request with no handler
     (``secretStorage`` would make Crew the MCP token store). ``userInput`` is served
-    by ``acp/elicitation.py``. The settings channel is empty here; the runtime fills
-    it at spawn.
+    by ``acp/elicitation.py``. The settings channel carries only ``codeIntelligence``
+    here; the runtime adds the rest at spawn.
     """
     kas = harness_for(ACP_BACKEND_KAS).client_capabilities
-    assert kas["_meta"] == {"kiro": {"settings": {}, "openExternalUrl": True, "userInput": True}}
+    assert kas["_meta"] == {
+        "kiro": {
+            "settings": {"codeIntelligence": {"enabled": True}},
+            "openExternalUrl": True,
+            "userInput": True,
+        }
+    }
     assert harness_for(ACP_BACKEND_KAS).opens_external_urls is True
     assert harness_for(ACP_BACKEND_KIRO).opens_external_urls is False
     # The shared set carries a ``_meta`` of its own (claude-agent-acp's
@@ -922,7 +940,11 @@ def test_kiro_keeps_its_legacy_notification_drain():
 
 
 def test_kas_stages_status_and_catalog_and_requires_readiness():
-    from kiro_crew.acp.types import METHOD_KAS_MCP_STATUS, METHOD_KAS_TOOLS_CHANGED
+    from kiro_crew.acp.types import (
+        METHOD_KAS_MCP_GOVERNANCE_DISABLED,
+        METHOD_KAS_MCP_STATUS,
+        METHOD_KAS_TOOLS_CHANGED,
+    )
 
     aliases = harness_for(ACP_BACKEND_KAS).notification_aliases
     assert aliases.session_update == KIRO_FAMILY_ALIASES.session_update
@@ -930,6 +952,10 @@ def test_kas_stages_status_and_catalog_and_requires_readiness():
     assert aliases.mcp_init == KIRO_FAMILY_ALIASES.mcp_init + (
         METHOD_KAS_MCP_STATUS,
         METHOD_KAS_TOOLS_CHANGED,
+        # Staged like the status frames: the host emits it under the session id
+        # during session/new, and the readiness wait reads it to end a
+        # fail-closed start early instead of timing out.
+        METHOD_KAS_MCP_GOVERNANCE_DISABLED,
     )
     assert aliases.mcp_readiness
 
@@ -1088,7 +1114,9 @@ def test_reclaim_thresholds_pass_the_operator_configuration_through(backend):
                 f"ceiling through; got {policy.max_rss_mb!r} for {rss!r}"
             )
         else:
-            assert isinstance(depth, int) and depth >= 1
+            # 0 is the launched process alone (claude-agent-acp: the adapter, not the
+            # per-session children below it).
+            assert isinstance(depth, int) and depth >= 0
             assert policy.max_rss_mb == ceiling, (
                 f"{backend!r} measures a bounded scope (depth {depth}) and must state its "
                 f"declared ceiling {ceiling!r} in that unit; got {policy.max_rss_mb!r} for "
@@ -1196,10 +1224,7 @@ def test_no_harness_holds_state_beyond_its_backend_id(backend):
     object it happened to hold, which is the coupling this layer removes.
     """
     harness = harness_for(backend)
-    if backend == ACP_BACKEND_DEEPSEEK:
-        assert isinstance(vars(harness).get("_launch"), DeepseekLaunch)
-    else:
-        assert vars(harness) == {}
+    assert vars(harness) == {}
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
@@ -1405,15 +1430,8 @@ def test_an_enforced_host_may_not_spawn_without_a_mask():
     passive read -- so an empty mask there is a missing control, not a
     simplification.
 
-    Three classes, read off the routing table rather than a host list:
-
-    * ``AGENT_SPEC`` -- asks by construction: no mask needed, and none claimed.
-    * enforced (``SESSION_CONFIG`` / seeded / verified) -- must resolve a mask
-      onto the plan.
-    * ``UNVERIFIED`` (deepseek) -- the operator-owned exception: the seat runs
-      with no mask on the client transport too, its documented posture is the
-      harness's own workspace-write sandbox deciding tool calls, and a mask the
-      gate cannot enforce would read as a control nothing performs.
+    The tool gate's enforced hosts must resolve a mask onto the plan.
+    Other hosts follow their declared routing without that mask.
 
     Read off the class rather than by spawning: resolving a real mask touches the
     filesystem, and this asks a question about the harness's contract.
@@ -1424,17 +1442,18 @@ def test_an_enforced_host_may_not_spawn_without_a_mask():
     from kiro_crew.acp.harness import _HARNESSES
 
     for backend, harness_cls in _HARNESSES.items():
-        routing = acp_tool_gate.routing_for(backend)
         source = _inspect.getsource(harness_cls.resolve_spawn)
         if backend == ACP_BACKEND_DEEPSEEK:
             source += _inspect.getsource(DeepseekLaunch.resolve_spawn)
-        if routing in (acp_tool_gate.Routing.AGENT_SPEC, acp_tool_gate.Routing.UNVERIFIED):
-            # Asks by construction, or the operator-owned no-mask seat: no mask
-            # needed, and none claimed.
+        if not acp_tool_gate.is_enforced(backend):
+            # The gate does not enforce this host, so there is no gate a mask
+            # compensates for: an AGENT_SPEC host asks by construction, and claude
+            # (SEEDED_SETTINGS) is made to ask by the seed Crew writes, with no mask
+            # on its per-process launch either. None claimed.
             assert "extra_hidden_dirs" not in source, backend
             continue
         assert "extra_hidden_dirs=" in source, (
-            f"{backend} is enforced, so its harness must resolve an "
+            f"{backend} is enforced by the tool gate, so its harness must resolve an "
             f"OS credential mask and put it on the plan"
         )
 
@@ -1533,18 +1552,14 @@ def test_an_enforced_host_must_consult_the_sandbox_tier():
     harness that only resolved one would spawn a third-party binary with the
     operator's credential homes readable and nothing compensating.
 
-    The two mask-less classes are exempt: ``AGENT_SPEC`` hosts ask by
-    construction, and the ``UNVERIFIED`` deepseek seat resolves no mask on either
-    transport, so there is no tier whose answer would drop one. Read off the
-    class because the property is that the source consults the tier, which a
-    passing spawn on this machine cannot show.
+    Inspect the source for hosts where the tool gate requires a mask. A passing
+    spawn on this machine cannot establish that the harness checks the tier.
     """
     from kiro_crew import acp_tool_gate
     from kiro_crew.acp.harness import _HARNESSES
 
     for backend, harness_cls in _HARNESSES.items():
-        routing = acp_tool_gate.routing_for(backend)
-        if routing in (acp_tool_gate.Routing.AGENT_SPEC, acp_tool_gate.Routing.UNVERIFIED):
+        if not acp_tool_gate.is_enforced(backend):
             continue
         source = inspect.getsource(harness_cls.resolve_spawn)
         if backend == ACP_BACKEND_DEEPSEEK:
@@ -1560,3 +1575,185 @@ def _runtime_module():
     from kiro_crew.acp import runtime as runtime_mod
 
     return runtime_mod
+
+
+# ── The per-process hosts AcpClient launches, each by its own adapter ──
+#
+# The client half of the layer: a host ``AcpClient`` starts one process per session
+# for resolves its launch in a ``ProcessAdapter``, and kiro-cli keeps the client's
+# own arm. These assert the registry's shape and each adapter's plan through its own
+# interface, with the host binary injected rather than looked up on this machine.
+
+
+def _process_adapters():
+    from kiro_crew.acp.harness import _PROCESS_ADAPTERS
+
+    return _PROCESS_ADAPTERS
+
+
+def test_every_per_process_host_has_an_adapter_and_no_runtime_harness():
+    """Exactly the known hosts the shared runtime does not serve, each refused there.
+
+    A per-process host left out of the registry would fall through to the client's
+    kiro-cli arm and be spawned as kiro-cli; one the runtime also claimed would be
+    served by two different launch paths. ``harness_for`` keeps refusing them by
+    name, which is the runtime's error mode.
+    """
+    from kiro_crew.acp.harness import ProcessAdapter, process_adapter_for
+    from kiro_crew.agent_sdk.backends import ACP_BACKENDS_ACP_RUNTIME, ACP_BACKENDS_KNOWN
+
+    per_process = ACP_BACKENDS_KNOWN - ACP_BACKENDS_ACP_RUNTIME
+    assert set(_process_adapters()) == per_process
+    for backend in sorted(per_process):
+        adapter = process_adapter_for(backend)
+        assert isinstance(adapter, ProcessAdapter)
+        assert adapter.backend == backend
+        if backend in REGISTERED_AHEAD_OF_ROUTING:
+            # Its runtime harness exists for its own tests; no session reaches it.
+            assert backend not in ACP_BACKENDS_ACP_RUNTIME
+            continue
+        with pytest.raises(ValueError, match="no ACP harness for backend"):
+            harness_for(backend)
+
+
+def test_the_client_keeps_its_own_arm_for_every_runtime_served_host():
+    """kiro-cli, KAS and codex reach the client's kiro-cli arm, as they always have."""
+    from kiro_crew.acp.harness import process_adapter_for
+
+    for backend in ALL_BACKENDS:
+        if backend in REGISTERED_AHEAD_OF_ROUTING:
+            # Still launched per process, by its own adapter, until it is routed.
+            assert process_adapter_for(backend) is not None
+            continue
+        assert process_adapter_for(backend) is None
+
+
+def test_each_launch_gets_a_fresh_adapter():
+    """An adapter carries one launch's facts from its plan to its child's environment.
+
+    A shared instance would hand one session's gate nonce or routing seed to the
+    next session's child.
+    """
+    from kiro_crew.acp.harness import process_adapter_for
+
+    for backend in sorted(_process_adapters()):
+        assert process_adapter_for(backend) is not process_adapter_for(backend)
+
+
+def test_the_kiro_client_spawn_never_consults_a_process_adapter(tmp_path):
+    """harness-parity H13: the Kiro construction path gains no step for an adapter.
+
+    Every per-process adapter entry point raises if reached, and kiro-cli's and
+    KAS's client launches must still come out exactly as the committed golden.
+    """
+    from unittest.mock import patch
+
+    import acp_launch_capture as capture_mod
+
+    from kiro_crew.acp.harness import ProcessAdapter
+
+    def _forbidden(*_args, **_kwargs):
+        raise AssertionError("the Kiro construction path reached a process adapter")
+
+    stubs = [patch.object(ProcessAdapter, "prepare_spawn_env", _forbidden)]
+    for adapter_cls in _process_adapters().values():
+        stubs.append(patch.object(adapter_cls, "resolve_spawn", _forbidden))
+        stubs.append(patch.object(adapter_cls, "apply_spawn_env", _forbidden))
+    golden = capture_mod.read_golden()
+    for backend in (ACP_BACKEND_KIRO, ACP_BACKEND_KAS):
+        answer = capture_mod.capture(
+            backend, tmp_path / capture_mod.golden_key(backend), extra_patches=stubs
+        )
+        assert answer == golden[capture_mod.golden_key(backend)]
+
+
+@pytest.fixture
+def _fresh_resolution():
+    """Forget every cached host resolution before and after, through the public seam."""
+    from kiro_crew.agent_sdk.drivers.acp import forget_cached_resolution
+
+    backends = sorted(_process_adapters())
+    for backend in backends:
+        forget_cached_resolution(backend)
+    yield
+    for backend in backends:
+        forget_cached_resolution(backend)
+
+
+def _goose_context(tmp_path, client):
+    return SpawnContext(
+        agent="kirocrew",
+        work_dir=tmp_path,
+        model=None,
+        environ={},
+        home=tmp_path,
+        sandbox_mode="auto",
+        session=client,
+    )
+
+
+def test_a_self_served_host_resolves_the_binary_it_is_pointed_at(
+    monkeypatch, tmp_path, _fresh_resolution
+):
+    """goose's plan is its own binary plus its ACP subcommand and builtin, masked.
+
+    The binary is injected through the harness's own override variable, pointing at
+    an executable that exists on every platform (this interpreter), so nothing on
+    this machine's PATH decides the answer.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from kiro_crew import acp_tool_gate
+    from kiro_crew.acp import launch as launch_mod
+    from kiro_crew.acp.client import AcpClient
+    from kiro_crew.acp.harness import process_adapter_for
+    from kiro_crew.agent_sdk.backends import ACP_BACKEND_GOOSE, launch_for
+
+    fake_binary = launch_mod._normalize_exe_casing(sys.executable) or sys.executable
+    monkeypatch.setenv(launch_for(ACP_BACKEND_GOOSE).bin_env_var, sys.executable)
+    monkeypatch.setattr(launch_mod, "_sandbox_preflight", lambda backend, mode: ("/opt/creds",))
+    client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_GOOSE)
+    monkeypatch.setattr(client, "_prepare_session_mcp", AsyncMock())
+
+    plan = asyncio.run(
+        process_adapter_for(ACP_BACKEND_GOOSE).resolve_spawn(_goose_context(tmp_path, client))
+    )
+
+    assert plan.argv == [fake_binary, "acp", "--with-builtin", "developer"]
+    assert plan.extra_hidden_dirs == ("/opt/creds",)
+    assert (plan.spawn_label, plan.stderr_label) == ("goose acp", "goose")
+    mode_key, required = acp_tool_gate.permission_setting_for(ACP_BACKEND_GOOSE)
+    assert client._extra_env["GOOSE_MODE"] == required
+
+
+@pytest.mark.parametrize("backend", sorted(ACP_BACKEND_LAUNCH))
+def test_a_missing_self_served_binary_names_its_install_command(
+    monkeypatch, tmp_path, _fresh_resolution, backend
+):
+    """The refusal carries the remedy, and what was searched, before any child starts."""
+    import asyncio
+
+    from kiro_crew.acp import client as acp_client
+    from kiro_crew.acp.harness import process_adapter_for
+    from kiro_crew.acp.transport_errors import AcpError
+    from kiro_crew.agent_sdk.backends import launch_for
+
+    launch = launch_for(backend)
+    empty = tmp_path / "empty-bin"
+    empty.mkdir()
+    monkeypatch.delenv(launch.bin_env_var, raising=False)
+    monkeypatch.setattr(acp_client, "_mise_which", lambda _name: None)
+    monkeypatch.setattr(acp_client, "augmented_path", lambda _path: str(empty))
+    # ``tmp_path`` is its own repo, so the Copilot config walk stops there, not in the
+    # host's home, where a real ``.mcp.json`` would refuse the spawn.
+    (tmp_path / ".git").mkdir()
+    client = acp_client.AcpClient(work_dir=tmp_path, acp_backend=backend)
+
+    with pytest.raises(AcpError) as excinfo:
+        asyncio.run(process_adapter_for(backend).resolve_spawn(_goose_context(tmp_path, client)))
+
+    message = str(excinfo.value)
+    assert f"{launch.binary} not found" in message
+    assert launch.install_command in message
+    assert str(empty) in message

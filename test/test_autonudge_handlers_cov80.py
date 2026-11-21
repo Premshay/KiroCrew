@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
+from redaction_structured_cases import github_classic
 
 from kiro_crew.autonudge import AutoNudgeService, NudgeLoop
 from kiro_crew.dashboard.handlers import autonudge as h
@@ -202,7 +203,7 @@ async def test_session_monitor_read_admits_webex_legacy_loop(
 async def test_session_monitor_read_redacts_provider_controlled_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    secret = "AKIAIOSFODNN7EXAMPLE"
+    secret = github_classic(seed=19)
     loop = _monitor_loop(slot_key="chat-1-111")
     assert loop.monitor is not None
     loop.monitor.last_observation = {
@@ -447,7 +448,7 @@ async def test_monitor_list_excludes_persistence_only_fields(
         "review_decision": "approved",
         "review_threads_complete": True,
         "state": "open",
-        "target": f"github.com/acme/widgets#7?token={secret}",
+        "target": f"https://github.com/acme/widgets/pull/7?token={secret}",
         "unresolved_review_threads": 0,
     }
     _svc(monkeypatch, _FakeSvc([loop]))
@@ -1481,7 +1482,7 @@ async def test_start_400_on_undecodable_body(monkeypatch: pytest.MonkeyPatch) ->
     _svc(monkeypatch, _FakeSvc())
     response = await h.api_autonudge_start(_mk("POST", "/api/autonudge", body=None))
     assert response.status == 400
-    assert _body(response) == {"error": "invalid JSON"}
+    assert _body(response) == {"error": "invalid JSON", "code": "invalid_json"}
 
 
 @pytest.mark.asyncio
@@ -1645,7 +1646,7 @@ async def test_update_400_on_undecodable_body(monkeypatch: pytest.MonkeyPatch) -
     request = _mk("PATCH", "/api/autonudge/lp-1", match={"loop_id": "lp-1"}, body=None)
     response = await h.api_autonudge_update(request)
     assert response.status == 400
-    assert _body(response) == {"error": "invalid JSON"}
+    assert _body(response) == {"error": "invalid JSON", "code": "invalid_json"}
 
 
 @pytest.mark.asyncio
@@ -1837,7 +1838,7 @@ async def test_session_monitor_read_reports_armed_autonudge_loop(
     loop = _loop(slot_key="chat-1-111")
     loop.cycle_count = 4
     loop.last_fire_ts = 123.0
-    loop.message = "keep driving PR 42"  # agent-controlled: must NOT be echoed
+    loop.message = "keep driving PR 42"
     _svc(monkeypatch, _FakeSvc([loop]))
 
     payload = _body(await h.api_session_monitor_get(_authed_session_monitor_request()))
@@ -1853,9 +1854,30 @@ async def test_session_monitor_read_reports_armed_autonudge_loop(
     assert reading["idle_secs"] == 300
     assert reading["cycle_count"] == 4
     assert reading["last_fire_ts"] == 123.0
-    # The free-text instruction is not surfaced by this presence reading.
-    assert "message" not in reading
-    assert "keep driving PR 42" not in json.dumps(payload)
+    # The current instruction is read back so a monitor_update can be confirmed.
+    assert reading["message"] == "keep driving PR 42"
+    assert reading["watch"] is None
+
+
+@pytest.mark.asyncio
+async def test_session_monitor_read_names_a_gated_loops_watched_subject(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gated loop reports the pull request it now watches, after a retarget too."""
+    loop = _monitor_loop(slot_key="chat-1-111")
+    loop.gate = True
+    loop.message = "watch https://github.com/acme/widgets/pull/7"
+    _svc(monkeypatch, _FakeSvc([loop]))
+
+    reading = _body(await h.api_session_monitor_get(_authed_session_monitor_request()))[
+        "autonudge_loop"
+    ]
+
+    assert reading["message"] == "watch https://github.com/acme/widgets/pull/7"
+    assert reading["watch"] == {
+        "kind": "github_pull_request",
+        "target": "https://github.com/acme/widgets/pull/7",
+    }
 
 
 @pytest.mark.asyncio

@@ -96,6 +96,9 @@ function freshStartFailureKey(err: unknown): string {
  *  an at-a-glance status, and a per-second re-render of the whole drawer for
  *  a readout that already drops seconds above a minute buys nothing. */
 const PATROL_TICK_MS = 15_000
+/** The phone identity stack's offset from the top of the viewport: the
+ *  header's `top-1` on the stack button (MembersPageThreadHeader.tsx). */
+const PHONE_STACK_TOP_PX = 4
 
 interface MembersPageThreadStateOptions {
   profileCard: MembersPageProfileState
@@ -428,9 +431,12 @@ export function useMembersPageThreadView({
   // sight. Asking again once `open` is reported finds the shell's current one.
   const topbarSlot = useShellSlot('mobile-topbar-slot', isMobile && rosterBar === 'open')
   const headerInBar = !!topbarSlot
-  /** The transcript's top inset: the floating header's height, or nothing
-   *  once the header sits in the shell bar above the pane. */
-  const headerInset = headerInBar ? 0 : threadHeaderH
+  /** The transcript's top inset: the floating header's height, or, once the
+   *  header sits in the shell bar, how far the identity stack (measured by
+   *  the same ref) hangs below that bar. */
+  const headerInset = headerInBar
+    ? Math.max(0, threadHeaderH + PHONE_STACK_TOP_PX - (topbarSlot?.offsetHeight ?? 0))
+    : threadHeaderH
   const [betweenHeaderRef, betweenHeaderH] = useMeasuredHeight<HTMLDivElement>()
   const pillStreamState = useAppSelector((s) => (pillSlotKey ? selectSlotStreamState(s, pillSlotKey) : 'idle'))
   const pillLiveSlot = useAppSelector((s) => (pillSlotKey ? slotRowByKey(s.dashboard.slots, pillSlotKey) : undefined))
@@ -486,9 +492,11 @@ export function useMembersPageThreadView({
       window.removeEventListener('blur', onVis)
     }
   }, [])
-  // The New crewmate card hides the chat while it
-  // stays mounted: hidden is not viewed, so it neither reads nor suppresses.
-  const threadShown = pageVisible && !createOpen
+  // The New crewmate card hides the chat while it stays mounted, and a relay
+  // Crew tab covers the whole page: hidden is not viewed, so it neither reads
+  // nor suppresses.
+  const relayCovered = useAppSelector(s => s.instances?.relayActive != null)
+  const threadShown = pageVisible && !createOpen && !relayCovered
   // What the PANE may count as seen: the thread is shown AND nothing floats
   // over the chat. An overlay side panel (a phone sheet, a desktop overlay
   // under its scrim), a floating Profile card and the phone roster drawer all
@@ -580,6 +588,10 @@ interface MembersPageThreadColumnProps {
   setPostCreateError: Dispatch<SetStateAction<PostCreateFailure | null>>
   postCreateDismissable: boolean
   createHeld: string | null
+  /** Import from file is the owner's (a relay teammate's view). */
+  importHeld: boolean
+  /** The owner check behind `importHeld` failed: said here while the roster is not. */
+  ownerCheckFailed: boolean
   threadOutcome: MemberThreadOutcome | undefined
   slotsLoaded: boolean
   active: MemberRosterRow | undefined
@@ -593,7 +605,7 @@ export function MembersPageThreadColumn({
   rosterRead, crewEditing, teamsRead, layout, profileCard, drawers, rosterView, thread, sidePanel, threadView,
   rosterSignals, profileFlight, navigation, teamView, navigate, location, activeName, setSearchParams,
   editingCrew, profile, gone, openCreate, openAdvanced, openQuick, threadColumnRef, postCreateError,
-  setPostCreateError, postCreateDismissable, createHeld, threadOutcome, slotsLoaded, active, leftCreateFailure,
+  setPostCreateError, postCreateDismissable, createHeld, importHeld, ownerCheckFailed, threadOutcome, slotsLoaded, active, leftCreateFailure,
   setLeftCreateFailure, retryPostCreate,
 }: MembersPageThreadColumnProps) {
   const { t } = useTranslation()
@@ -716,7 +728,7 @@ export function MembersPageThreadColumn({
                 team view too: a team can exist before its first crewmate does,
                 and the pane is the team's then. */}
             {!active && !activeTeam && !postCreateError && loaded && !loadError && hasNoCrewmates(members) && (
-              <CrewmateEmptyHero onCreate={openQuick} onAdvanced={openAdvanced} held={createHeld} onImport={() => setImporting(true)} />
+              <CrewmateEmptyHero onCreate={openQuick} onAdvanced={openAdvanced} held={createHeld} onImport={importHeld ? undefined : () => setImporting(true)} />
             )}
             {importing && <CrewmateImportDialog open onOpenChange={setImporting} />}
             {/* A failed roster read at md and up: the roster column shows its own
@@ -826,7 +838,7 @@ export function MembersPageThreadColumn({
                   thread={thread} threadView={threadView} rosterSignals={rosterSignals}
                   profileFlight={profileFlight} navigation={navigation} navigate={navigate} location={location}
                   setSearchParams={setSearchParams} profile={profile} openQuick={openQuick}
-                  createHeld={createHeld} active={active}
+                  createHeld={createHeld} importHeld={importHeld} active={active}
                 />
                 {/* Everything that can sit between the header and the pane —
                     notices, the greeting cards — stays in flow and is padded
@@ -848,11 +860,22 @@ export function MembersPageThreadColumn({
                     is visible and this wrapper steps aside; below md the roster is
                     hidden regardless of the pin. No hand-off: the Profile card may
                     hold an unsaved schedule draft, and Ask the agent navigates away. */}
-                {(patrol.failed || teamsNoticeShown || starError) && (
+                {(patrol.failed || teamsNoticeShown || starError || ownerCheckFailed) && (
                   <div
                     className={`${rosterPinned ? 'md:hidden' : ''} flex flex-col gap-2 px-4 pb-2`}
                     data-testid="member-main-roster-errors"
                   >
+                    {/* The owner check behind Import from file failed: the roster
+                        says so, and this is its copy while the roster is folded,
+                        so the switcher's missing Import is explained. */}
+                    {ownerCheckFailed && (
+                      <ErrorNotice
+                        message={t('pages.membersPage.owner_check_failed')}
+                        variant="inline"
+                        askAgent={false}
+                        testId="member-thread-owner-check-error"
+                      />
+                    )}
                     {patrol.failed && (
                       <ErrorNotice
                         message={t('pages.membersPage.patrol_error_roster')}
@@ -1106,13 +1129,17 @@ export function MembersPageThreadColumn({
                         composerInput={CrewComposer}
                         frameless
                         followContentWidth
-                        // The DM is this page's only composer, so it owns the
+                        // The DM is this page's main composer, so it owns the
                         // "Start Dictation with a Key" binding (#24967) — but
                         // only while nothing covers it: the key listens on the
                         // whole document, so under the New crewmate form or an
                         // overlay it would dictate into (and maybe send to)
                         // the hidden chat.
-                        pushToTalk={threadView.chatUncovered}
+                        // ...and gives it up while the side panel's open session holds focus.
+                        pushToTalk={threadView.chatUncovered && !sidePanel.panelSessionFocused}
+                        // ⌘F / Ctrl+F: Find in chat, on the same terms as the
+                        // dictation key above (#39585).
+                        findInChat={threadView.chatUncovered && !sidePanel.panelSessionFocused}
                         // The failure notice above owns the verdict on this thread
                         // while a repair has failed; the pane's own "Session
                         // ready" would contradict it one line down.

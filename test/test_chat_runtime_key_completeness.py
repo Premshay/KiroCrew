@@ -34,7 +34,9 @@ from kiro_crew.acp.runtime import AcpRuntime
 _SPAWN_INPUT_KEYED = {
     "work_dir": "work_dir",
     "agent": "agent",
-    "sandbox_mode": "sandbox_mode",
+    # The raw value the runtime spawns with and reports; ``sandbox_mode`` in the
+    # key is the effective tier observed from it (_OBSERVED_KEYED).
+    "sandbox_mode": "spawn_sandbox_mode",
     "extra_env": "extra_env",
     "mcp_gateway_overlay": "mcp_gateway_overlay",
     "mcp_gateway_socket": "mcp_gateway_socket",
@@ -43,7 +45,6 @@ _SPAWN_INPUT_KEYED = {
     "model_switch_method": "model_switch_method",
     "memory_mode": "memory_mode",
     "tool_search": "tool_search",
-    "shared_scratch": "shared_scratch",
     "forward_ssh_auth_sock": "forward_ssh_auth_sock",
     "launch_agent": "launch_agent",
     "harness_pin": "harness_pin",
@@ -53,19 +54,20 @@ _SPAWN_INPUT_KEYED = {
     # The telemetry opt-out, judged once by the placement and sent in the founding
     # KAS initialize, which otherwise judges it at spawn.
     "kas_telemetry": "kas_telemetry",
+    # Whether the session is a Bot's: a Bot session carries its member id (and its
+    # store, beside it), a plain chat none, so the two never share and two Bots never do.
+    "member_context": "member_id",
 }
 
 #: Runtime constructor parameter -> why it is NOT a compatibility property.
 #: A reason, never a boolean: the next reader needs to know why without
 #: re-deriving it, and a boolean invites flipping.
 _SPAWN_INPUT_NOT_KEYED = {
-    "member_context": (
-        "Whether this is a crew-member session. A member session is REFUSED chat "
-        "sharing (chat_sharing_ineligible_reason returns 'member_session') and keeps "
-        "its own process, so it never reaches the key and this bool selects no "
-        "shared process -- member isolation of memory and workspace is the safe "
-        "default this change does not cross. Member sharing can return in a "
-        "follow-up once a maintainer approves it."
+    "shared_scratch": (
+        "The scratch tree a resumed chat was recorded in. Sessions of one tree share "
+        "by tree_root, which IS keyed; a joiner runs in the directory the process it "
+        "joins mounts and records that one, so keying the directory only split one "
+        "tree into one process per directory it had ever recorded."
     ),
     "max_age_secs": (
         "A recycle threshold, not an input the child behaves differently under. "
@@ -82,6 +84,12 @@ _SPAWN_INPUT_NOT_KEYED = {
         "Whether sessions wait for the MCP readiness ceiling. A hard default with "
         "no config path; the one caller that passes a different value is the "
         "background session path, which does not share a chat runtime."
+    ),
+    "background_qos": (
+        "The Windows background-work mark. Only the sub-agent companion runtime "
+        "and a task run's own runtime pass it; a chat runtime, shared placements "
+        "included, never does, so every chat slot passes the same False and it "
+        "selects no shared process."
     ),
     "crew_agent": (
         "The canonical crew identity for telemetry context and watchdog settings. "
@@ -112,6 +120,11 @@ _SETTINGS_KEYED = {
 #: it. Neither population above can carry these, and a field with no producer at
 #: all is dead weight in a compatibility key -- so each names its source here.
 _OBSERVED_KEYED = {
+    "sandbox_mode": (
+        "The effective tier: the raw sandbox_mode parameter clamped by the governed "
+        "sandbox.min_level floor, which wrap_argv reads at spawn rather than taking "
+        "from the caller; a floor raised after a spawn makes two keys of one raw value."
+    ),
     "spawn_identity": (
         "The account era the allocator read immediately before start(). The process "
         "authenticates once, at spawn, and every parameter a session passes is "
@@ -124,6 +137,22 @@ _OBSERVED_KEYED = {
         "startup, so it is neither a parameter this layer passes nor a file this "
         "layer writes; a grant revoked in it cannot be undone inside a running "
         "process, so two generations must be two keys."
+    ),
+    "tree_root": (
+        "The root of the session's tree, read from the gateway's slot lineage at the "
+        "start. It is no spawn input: it is the sharing scope, so sessions share only "
+        "inside one tree and a process dying takes at most one tree with it."
+    ),
+    "memory_store": (
+        "The Bot session's memory store, read from its execution record beside its "
+        "member id. A store is per member, so a session of another store must never "
+        "land on this Bot's process even when a lineage names one root."
+    ),
+    "tool_surface_pinned": (
+        "Whether the session's own spec grants no tool_search loader while Tool Search "
+        "is on, read from its projected spec at the start. The handshake decides the "
+        "deferral once per process from the founder's spec, so such a session keys its "
+        "agent and spec and never shares with another spec's process."
     ),
 }
 
@@ -138,6 +167,12 @@ _HANDSHAKE_NOT_KEYED = {
     "with_telemetry_opt_out": (
         "A pure transform of the capabilities dict by the boolean the read above "
         "produced; it reads nothing of its own, so it adds no input."
+    ),
+    "kiro_cli_code_intelligence_enabled": (
+        "A feature setting, not a privacy opt-out: read when the KAS process "
+        "starts, so a changed value applies to the next process. Its workspace "
+        "file follows work_dir, which is keyed, and Crew's gate still answers "
+        "every code call a joiner's session makes."
     ),
 }
 _HANDSHAKE_MODULE = "src/kiro_crew/acp/runtime_spawn_launch.py"

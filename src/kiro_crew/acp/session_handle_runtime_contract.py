@@ -12,11 +12,16 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
+    from kiro_crew.acp.harness.base import HarnessAdapter
     from kiro_crew.acp.session_handle import AcpSessionHandle
 
 
 class AcpRuntimeError(Exception):
     """Base error for AcpRuntime operations."""
+
+    #: The JSON-RPC error frame an awaited request was answered with, when the
+    #: error came from the backend (``runtime_reader_loop._runtime_rpc_exception``).
+    rpc_error: object = None
 
 
 class AcpRuntimeDead(AcpRuntimeError):
@@ -153,6 +158,20 @@ class AcpRuntimeOverloaded(AcpRequestTimeout):
     transient = False
 
 
+class AcpScopeAdmissionTimeout(AcpRuntimeError):
+    """The user systemd manager did not admit the agent's scope within its bound.
+
+    ``systemd-run --user --scope`` waits for the manager to move its own pid into
+    the new scope before it execs the agent, so while the pid is outside the scope
+    no agent exists and nothing was written to its stdin.
+
+    ``transient = False``: the cause is a manager that is behind, and each retry
+    asks it for one more transient unit, so a retry adds to the queue it waits in.
+    """
+
+    transient = False
+
+
 class AcpRuntimeProtocol(Protocol):
     """Minimal interface that AcpSessionHandle needs from AcpRuntime."""
 
@@ -171,6 +190,16 @@ class AcpRuntimeProtocol(Protocol):
     """
 
     @property
+    def _harness(self) -> HarnessAdapter:
+        """The host this runtime serves. A handle reads its per-session refusals
+        (``permission_refusal``, ``session_update_issue``) only where
+        ``per_session_state`` is True."""
+        ...
+
+    _session_harness_states: dict[str, Any]
+    """What the host prepared for each session, by session id."""
+
+    @property
     def pid(self) -> int | None:
         """Subprocess pid (sandbox launcher parent under the Linux namespace
         sandbox) — the liveness oracle scans its descendant tree for evidence."""
@@ -183,6 +212,15 @@ class AcpRuntimeProtocol(Protocol):
         Only the Linux namespace sandbox leaves its launcher at ``pid``, with the
         harness as that launcher's sole child. macOS Seatbelt execs the harness in
         place, so ``pid`` is the harness there even when this is True.
+        """
+        ...
+
+    @property
+    def engine_is_child(self) -> bool:
+        """Whether the harness relays to a sole engine child that spawns the tools.
+
+        True on KAS's kiro-cli relay: a shell tool's parent is that engine, one
+        level below the harness, so the stalled-shell cleanup pins one more hop.
         """
         ...
 
@@ -307,6 +345,14 @@ class AcpRuntimeProtocol(Protocol):
 
     def is_alive(self) -> bool: ...
 
+    async def kill(self, *, expected: bool = False, reason: str = "") -> None:
+        """Kill the process, through the ownership gate (``authorize_runtime_kill``).
+
+        A dead runtime's leases do not hold the gate, so a caller that marked the
+        runtime dead first is let through; a tenant mid-flight still refuses it.
+        """
+        ...
+
     @property
     def stdin_stall_death(self) -> bool:
         """Whether the runtime died of a stdin stall with its child still alive."""
@@ -355,3 +401,15 @@ AcpModeNotFound.__module__ = "kiro_crew.acp.session_handle"
 AcpAgentUnavailable.__module__ = "kiro_crew.acp.session_handle"
 AcpRequestTimeout.__module__ = "kiro_crew.acp.session_handle"
 AcpRuntimeOverloaded.__module__ = "kiro_crew.acp.session_handle"
+AcpScopeAdmissionTimeout.__module__ = "kiro_crew.acp.session_handle"
+
+
+def host_checks_sessions(runtime: object) -> bool:
+    """Whether *runtime*'s host runs its own per-session refusals.
+
+    Read before every call into them (``HarnessAdapter.per_session_state``), so a
+    host without per-session state, and a runtime stand-in with no harness, makes
+    none. Only a literal ``True`` counts: a stand-in whose attributes answer
+    anything (a ``MagicMock`` runtime) is not a host that checks sessions.
+    """
+    return getattr(getattr(runtime, "_harness", None), "per_session_state", False) is True

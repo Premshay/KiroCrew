@@ -19,6 +19,7 @@ if TYPE_CHECKING:
         KiroCrewConfig,
         SshTunnelManager,
         TunnelState,
+        _sweep_remote_closes,
         logger,
         register_pre_exec_stop,
         shutdown_event,
@@ -63,6 +64,10 @@ async def _retake_hops_then_revive(
                 sorted(unheld),
             )
     await _revive_intended_instances(registry, manager, state)
+    if state is not None:
+        # Remote dispatch (preview): close retired remote worker slots once, now that
+        # the revived crews read connected. Off, it does nothing.
+        await _sweep_remote_closes(state)
 
 
 async def _revive_intended_instances(
@@ -99,9 +104,13 @@ async def _revive_intended_instances(
     shutting down stops it the same way: the cleanup hook tears every tunnel
     down, and nothing would stop one connected after that.
     """
-    # A disabled crew keeps its intent so enabling it brings it back, but it is
-    # not revived while it stays disabled.
-    intended = [inst for inst in registry.list() if inst.was_connected and not inst.disabled]
+    # A disabled or cloud-stopped crew keeps its intent so enabling or starting it
+    # brings it back, but it is not revived until then.
+    intended = [
+        inst
+        for inst in registry.list()
+        if inst.was_connected and not inst.disabled and not inst.cloud_stopped
+    ]
     if not intended:
         return
     logger.info("Auto-reconnecting %d instance(s) on startup", len(intended))
@@ -137,7 +146,7 @@ def _register_instances_hooks(app: web.Application, state: DashboardState, port:
 
     The registry + SSH tunnel manager are created lazily inside the startup
     hook (which fires during ``runner.setup()``), gated on ``instances.enabled``
-    (default off). We then auto-reconnect every instance the operator left
+    (default on). We then auto-reconnect every instance the operator left
     connected (``was_connected``) via :func:`_revive_intended_instances`, which
     isolates per-instance failures so a down host's tab persists in an error
     state instead of vanishing; the user re-authenticates and retries from the
@@ -201,14 +210,17 @@ def _register_instances_hooks(app: web.Application, state: DashboardState, port:
         revive_task.add_done_callback(state._background_tasks.discard)
 
     async def _instances_shutdown(app_: web.Application) -> None:
-        if unregister_pre_exec_stop is not None:
-            unregister_pre_exec_stop()
         manager = getattr(state, "instances_manager", None)
         if manager is not None:
             try:
                 await manager.shutdown()
             except Exception:  # noqa: BLE001 — one cleanup hook must not suppress later hooks
                 logger.warning("Instance tunnel shutdown failed", exc_info=True)
+        # After the teardown, not before: a graceful shutdown that runs out of
+        # time cancels this hook mid-teardown, and the gateway's exit path then
+        # runs it again through the pre-exec seam while it is still registered.
+        if unregister_pre_exec_stop is not None:
+            unregister_pre_exec_stop()
 
     async def _crew_log_drain(app_: web.Application) -> None:
         """Write out the session's log buffered appends before the process goes.

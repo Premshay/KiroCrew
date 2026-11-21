@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 import pytest
@@ -54,6 +55,49 @@ class TestModelRegistry:
             == "us.anthropic.claude-opus-4-8[1m]"
         )
         assert mr.to_provider_id("nonexistent-model", "claude_code") == "nonexistent-model"
+
+    def test_to_provider_id_logs_each_unregistered_pass_through_once(self, caplog):
+        # Every config load translates the same configured ids again, so the
+        # DEBUG line names each (value, provider) pair once, not once per call.
+        with caplog.at_level(logging.DEBUG, logger=mr.__name__):
+            for _ in range(3):
+                assert mr.to_provider_id("nonexistent-model", "acp") == "nonexistent-model"
+            mr.to_provider_id("nonexistent-model", "claude_code")
+            mr.to_provider_id("another-nonexistent-model", "acp")
+        assert [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == mr.__name__ and "not in registry" in r.getMessage()
+        ] == [
+            "Model 'nonexistent-model' not in registry for provider acp; passing through",
+            "Model 'nonexistent-model' not in registry for provider claude_code; passing through",
+            "Model 'another-nonexistent-model' not in registry for provider acp; passing through",
+        ]
+
+    def test_the_pass_through_log_memory_is_bounded(self, monkeypatch, caplog):
+        # Request handlers pass arbitrary ids, so neither the number of remembered
+        # pairs nor the size of one can grow with the input.
+        monkeypatch.setattr(mr, "_PASSTHROUGH_LOGGED_MAX", 2, raising=False)
+        with caplog.at_level(logging.DEBUG, logger=mr.__name__):
+            for i in range(5):
+                mr.to_provider_id(f"nonexistent-model-{i}", "acp")
+            mr.to_provider_id("x" * 100_000, "acp")
+        assert 0 < len(mr._passthrough_logged) <= 2
+        assert all(len(repr(entry)) < 200 for entry in mr._passthrough_logged)
+
+    def test_a_pass_through_while_debug_is_off_is_still_logged_once_it_is_on(self, caplog):
+        # A gateway loads its config before it raises the log level, so a call the
+        # level filtered out must not count as logged.
+        with caplog.at_level(logging.WARNING, logger=mr.__name__):
+            mr.to_provider_id("nonexistent-model", "acp")
+        with caplog.at_level(logging.DEBUG, logger=mr.__name__):
+            mr.to_provider_id("nonexistent-model", "acp")
+            mr.to_provider_id("nonexistent-model", "acp")
+        assert [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == mr.__name__ and "not in registry" in r.getMessage()
+        ] == ["Model 'nonexistent-model' not in registry for provider acp; passing through"]
 
     def test_corrupt_registry_default_translates_to_valid_provider_id(self, monkeypatch):
         # If model_registry.json is corrupt/missing, _REGISTRY is empty and the
@@ -1041,20 +1085,31 @@ class TestClaude55Rows:
     @pytest.mark.parametrize(
         "pin",
         [
-            "claude-fable-5.1",
-            "claude-fable-5-1",
-            "claude-fable-5-1[1m]",
-            "global.anthropic.claude-fable-5-1[1m]",
+            # kiro-cli advertises claude-fable-5.1, so a kiro pin of it must not be refused.
+            *(
+                pytest.param(pin, id=f"no_fable_5_1_spelling_lacks_an_acp_id-{pin}")
+                for pin in (
+                    "claude-fable-5.1",
+                    "claude-fable-5-1",
+                    "claude-fable-5-1[1m]",
+                    "global.anthropic.claude-fable-5-1[1m]",
+                )
+            ),
+            *(
+                pytest.param(
+                    pin, id=f"a_kiro_served_row_auto_or_an_unknown_id_does_not_lack_one-{pin}"
+                )
+                for pin in (
+                    "claude-opus-4.8",
+                    "claude-opus-5-5",
+                    "auto",
+                    "",
+                    "not-a-registered-model",
+                )
+            ),
         ],
     )
-    def test_no_fable_5_1_spelling_lacks_an_acp_id(self, pin):
-        # kiro-cli advertises claude-fable-5.1, so a kiro pin of it must not be refused.
-        assert mr.lacks_acp_id(pin) is False
-
-    @pytest.mark.parametrize(
-        "pin", ["claude-opus-4.8", "claude-opus-5-5", "auto", "", "not-a-registered-model"]
-    )
-    def test_a_kiro_served_row_auto_or_an_unknown_id_does_not_lack_one(self, pin):
+    def test_a_pin_kiro_can_serve_does_not_lack_an_acp_id(self, pin):
         assert mr.lacks_acp_id(pin) is False
 
     @pytest.mark.parametrize("pin", [CLAUDE_ONLY_ALIAS, CLAUDE_ONLY_ID, CLAUDE_ONLY_KEY])

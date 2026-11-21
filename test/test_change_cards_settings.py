@@ -205,6 +205,21 @@ def test_check_setting_value_takes_only_a_list_of_strings_for_str_list():
         assert exc.value.code == "invalid_value", bad
 
 
+def test_check_setting_value_takes_auto_where_the_route_does():
+    """The idle-unload key is ``int | str``: a card may set a number or put "auto" back."""
+    from kiro_crew.dashboard.handlers.core import _EDITABLE_CONFIG
+
+    spec = _EDITABLE_CONFIG["memory.embedding_idle_evict_secs"]
+    cards.check_setting_value(spec, "auto")
+    cards.check_setting_value(spec, 900)
+    for bad in ("soon", -1, True):
+        with pytest.raises(catalog.CardCatalogError) as exc:
+            cards.check_setting_value(spec, bad)
+        assert exc.value.code == "invalid_value", bad
+    with pytest.raises(catalog.CardCatalogError):
+        cards.check_setting_value(_EDITABLE_CONFIG["session.pool_size"], "auto")
+
+
 def test_check_setting_value_runs_a_normalized_settings_own_normalizer():
     # The route's spec for these keys, so a card is refused with the same reason
     # the PATCH route would give, before anyone is asked to approve it.
@@ -235,6 +250,19 @@ def test_check_setting_value_holds_a_str_list_to_its_bounds():
             cards.check_setting_value(spec, bad)
         assert exc.value.code == "invalid_value", bad
         assert reason in str(exc.value), bad
+
+
+def test_check_setting_value_holds_each_str_list_item_to_the_routes_item_pattern():
+    """A list setting whose route checks each item's shape refuses a bad item up front."""
+    from kiro_crew.dashboard.handlers.core import _EDITABLE_CONFIG
+
+    spec = _EDITABLE_CONFIG["dashboard.browser_local_origins"]
+    cards.check_setting_value(spec, ["localhost:5173", "127.0.0.1:8080"])
+    for bad in (["https://example.com"], ["localhost:5173", "localhost"], ["10.0.0.1:80"]):
+        with pytest.raises(catalog.CardCatalogError) as exc:
+            cards.check_setting_value(spec, bad)
+        assert exc.value.code == "invalid_value", bad
+        assert "wrong shape" in str(exc.value), bad
 
 
 def test_a_list_value_stays_refused_on_a_card_for_the_extra_paths():
@@ -467,7 +495,10 @@ def test_shim_routes_find_setting(monkeypatch):
     )
     out = json.loads(mcp_guide._call_tool_inner("find_setting", {"query": "shorter replies"}))
     assert sent == ["/api/cards/agent/settings?q=shorter+replies"]
-    assert out == {"settings": [{"a": 1}]}
+    assert out["settings"] == [{"a": 1}]
+    # Not every answer is a setting: the result points at search_docs, so a
+    # question like "stop asking for this MCP tool" reaches the docs page.
+    assert "search_docs" in out["next"]
 
 
 # ── settings diagnosis ──

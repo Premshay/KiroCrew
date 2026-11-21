@@ -369,7 +369,9 @@ class TestEnvDumpGrepAwsNarrowing:
         from kiro_crew import security
 
         shared = {rule.pattern for rule in security._ENV_CRED_SHARED_RULES}
-        assert all(compiled.pattern not in shared for compiled in security._ENV_CRED_PATTERNS)
+        assert all(
+            compiled.pattern not in shared for compiled in security._ENV_CRED_PATTERNS.values()
+        )
         real = security._deny_matcher
         seen: list[str] = []
 
@@ -446,7 +448,7 @@ class TestEnvDumpGrepAwsNarrowing:
 
         denial = _first_tool_input_denial(["env | egrep AWS_SECRET"], None, command_rules=True)
         assert denial is not None
-        assert _ENV_CRED_DENIAL_REASON in denial
+        assert denial[1].splitlines()[0] == _ENV_CRED_DENIAL_REASON
 
     @pytest.mark.parametrize("cmd", PRINTENV_DENIED)
     def test_printenv_of_a_secret_is_denied(self, cmd: str) -> None:
@@ -1013,18 +1015,21 @@ class TestImdsMixedBaseEncodings:
             assert is_sensitive_bash_command(cmd) is not None, host
 
     def test_unbounded_extraction_stays_linear(self) -> None:
-        import time
-
+        from conftest import assert_rejected_without_backtracking
         from kiro_crew.security import _check_imds_access
 
         # Guards the reason the caps are gone: unbounded runs over plain
-        # character classes must not backtrack. Generous bound -- the observed
-        # cost is single-digit milliseconds.
-        for payload in ("9" * 40000, "0" * 40000, "0x" + "a" * 40000):
-            start = time.monotonic()
-            _check_imds_access(f"curl http://{payload}/x")
-            # flake-ok: pre-existing 5 s ceiling over single-digit-millisecond extraction work; moved verbatim and tracked for a de-flake pass
-            assert time.monotonic() - start < 5.0, payload
+        # character classes must not backtrack. The cost is inside the regex
+        # engine, which no work counter can see, so the shared ramp holds this
+        # thread's CPU to its default budget, one character at a time and then at
+        # growing runs, each costing at most a linear multiple of the one before.
+        def reject(command: str) -> None:
+            assert _check_imds_access(command) is None, command
+
+        for head, unit in (("", "9"), ("", "0"), ("0x", "a")):
+            assert_rejected_without_backtracking(
+                reject, lambda n, head=head, unit=unit: f"curl http://{head}{unit * n}/x"
+            )
 
     def test_mixed_base_non_imds_not_overblocked(self) -> None:
         from kiro_crew.security import _check_imds_access, canonicalize_ip
@@ -1197,6 +1202,46 @@ class TestARefusalNamesItsRuleAndSpan:
         assert "governance-pin-unresolved" in caplog.text
         assert "component=commands-ceiling-pin" in caplog.text
         assert absent not in caplog.text
+
+    @pytest.mark.parametrize(
+        ("command", "rule"),
+        [
+            ("env | grep AWS_SECRET", "credential-exfil-env-grep-aws"),
+            ("printenv AWS_SECRET_ACCESS_KEY", "credential-exfil-printenv-aws"),
+            ("declare -p AWS_SECRET_ACCESS_KEY", "keystone-env-cred-declare"),
+            ("echo $AWS_SECRET_ACCESS_KEY", "keystone-env-cred-echo"),
+            (
+                "awk 'BEGIN{print ENVIRON[\"AWS_SECRET_ACCESS_KEY\"]}'",
+                "keystone-env-cred-awk-environ",
+            ),
+            # Two reported over-blocks, refused on purpose until a narrowing is
+            # designed; changing either row is that decision.
+            (
+                "D=/usr/local/lib/python3.12/site-packages/kiro_crew/security\n"
+                'grep -n -A8 -E "^_(ENV_DUMP_GREP_AWS|ENV_DUMP_AWK_SED_AWS|PRINTENV_AWS_SECRET)'
+                '_PATTERN" '
+                '"$D/denied_rules_catalog.py" | head -40',
+                "keystone-env-cred-interpreter",
+            ),
+            (
+                "cat > script.sh <<'EOF'\n"
+                "# the token comes from env/Keychain\n"
+                "body=$(curl -s https://jira.example.com/rest | sed '$d')\n"
+                "jq -n --arg t 'Finding from AWS Security Hub' '{summary:$t}'\n"
+                "EOF",
+                "credential-exfil-env-awk-sed-aws",
+            ),
+        ],
+    )
+    def test_an_env_credential_refusal_names_which_rule_fired(
+        self, command: str, rule: str
+    ) -> None:
+        """Every rule of this tier shares one first line, so only the diagnostic can say which."""
+        from kiro_crew.security import _ENV_CRED_DENIAL_REASON
+
+        lines = self._reason(command).splitlines()
+        assert lines[0] == _ENV_CRED_DENIAL_REASON
+        assert f"rule={rule} component=env-credential " in self._diagnostic(command)
 
     def test_read_only_self_observation_is_still_allowed(self) -> None:
         """The diagnostic is not a new matcher: it says nothing about an allow."""

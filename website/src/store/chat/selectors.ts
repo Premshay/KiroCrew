@@ -135,6 +135,7 @@ export const selectProjectChipLocked = (state: RootState, slot: string | null): 
 const TURN_INJECT_DISPATCHED: Readonly<Record<InjectKind, boolean>> = {
   cron: true,
   mcp_app: true,
+  resource: true,
   recovery: true,
   synthesis: true,
   user_replay: true,
@@ -306,6 +307,13 @@ export const isQuietEndRow = (m: ChatMessage): boolean => {
   return meta?.ends_turn === true && absentOr(meta.tool_name, QUIET_END_TOOL) && absentOr(meta.mcp_server, QUIET_END_SERVER)
 }
 
+/** `meta.kind` of the notice row an agent harness's advisory is shown as: text the
+ *  harness sends in place of reply text, such as a hook's block reason. Mirrors
+ *  `HARNESS_ADVISORY_KIND` in `src/kiro_crew/dashboard/system_notices.py`. */
+export const HARNESS_ADVISORY_KIND = 'harness_advisory'
+export const isHarnessAdvisoryRow = (m: ChatMessage): boolean =>
+  m.role === 'notice' && (m.meta as { kind?: unknown } | undefined)?.kind === HARNESS_ADVISORY_KIND
+
 export const selectTurnInterrupted = (state: RootState, slot?: string | null): boolean => {
   // `slot` is the session to ask about, the active one when omitted (see
   // `selectContinuable`); `selectSlotMessages` reads the active mirror for it.
@@ -317,6 +325,9 @@ export const selectTurnInterrupted = (state: RootState, slot?: string | null): b
   // A drained sub-agent completion (role `subagent`) opens a turn of its own,
   // so a refused-model card older than it settles only its own turn.
   let sawLaterOpener = false
+  // A harness's advisory of the newest turn answers it as an assistant row does,
+  // whichever side of an error row the runner landed it on.
+  let sawAdvisory = false
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i]
     if (m.role === 'subagent') sawLaterOpener = true
@@ -352,11 +363,12 @@ export const selectTurnInterrupted = (state: RootState, slot?: string | null): b
     // CONTINUE_SCAN_SKIP, where `inject` stays for the selectors that look
     // through continuations to the prior user floor. Mirrors
     // `is_turn_interrupted` in `dashboard/state_parts/transcript_rows.py`.
-    if (m.role === 'inject' && m.content && TURN_INJECT_KINDS.has((m.meta as { injectKind?: unknown } | undefined)?.injectKind)) return true
+    if (m.role === 'inject' && m.content && TURN_INJECT_KINDS.has((m.meta as { injectKind?: unknown } | undefined)?.injectKind)) return sawAdvisory ? sawTrailingError : true
     // A monitor loop's cycle row always dispatches a turn; unanswered, it is
     // the same shape as an unanswered user row. Decided before the skip set,
     // where `nudge` stays for the selectors that look through it.
-    if (m.role === 'nudge' && m.content) return true
+    if (m.role === 'nudge' && m.content) return sawAdvisory ? sawTrailingError : true
+    if (isHarnessAdvisoryRow(m) && m.content) { sawAdvisory = true; continue }
     if (CONTINUE_SCAN_SKIP.has(m.role)) continue
     if ((m.role === 'user' || m.role === 'assistant') && m.content) {
       const meta = m.meta as { kind?: string; notice?: string } | undefined
@@ -384,6 +396,7 @@ export const selectTurnInterrupted = (state: RootState, slot?: string | null): b
       // client-side and never sent, so no transcript the server can produce
       // carries a row for it to read, and the two cannot disagree.
       if (m.meta?.optimistic) return false
+      if (sawAdvisory) return sawTrailingError
       // A `/compact` answered by its compaction notice is a FINISHED turn --
       // unless an error row trails the notice, the same evidence the
       // plain-assistant branch honors. First-whitespace-token match using
@@ -399,6 +412,23 @@ export const selectTurnInterrupted = (state: RootState, slot?: string | null): b
   // tool rows here. A trailing error row is still the evidence the assistant
   // branch honors, so it decides the same way.
   return sawTrailingError
+}
+
+/**
+ * Whether the composer may offer Resume for `slot`: the transcript shows an
+ * interruption (`selectTurnInterrupted`) AND the gateway does not say
+ * otherwise. The `slots` row carries the gateway's own reading, `interrupted`,
+ * worked out by `is_turn_interrupted` over the server transcript. An idle row
+ * that says `interrupted: false` means the turn handed the floor back, so a tab
+ * whose transcript still ends on the user's row has missed the rows that
+ * answered it. Offering Resume there would rerun a turn that finished. A row
+ * that is running, has no `interrupted` field (an older gateway), or is not in
+ * the list leaves the transcript's reading as it was.
+ */
+export const selectResumeInterrupted = (state: RootState, slot?: string | null): boolean => {
+  if (!selectTurnInterrupted(state, slot)) return false
+  const row = slotRowByKey(state.dashboard.slots, slot ?? state.chat.activeSlot)
+  return !(row && row.running === false && row.interrupted === false)
 }
 
 /**

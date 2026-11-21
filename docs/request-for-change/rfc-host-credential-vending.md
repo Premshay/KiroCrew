@@ -3,9 +3,9 @@ title: Host Credential Vending for Masked Credentials
 status: draft
 author: zejiangg
 created: 2026-09-23
-last-audited: 2026-09-24
-audited-at: 3d2bfa8f45
-doc-pr:
+last-audited: 2026-11-19
+audited-at: fc89562d69
+doc-pr: 12971
 implementation-prs: []
 tracking-issues: []
 supersedes: []
@@ -56,7 +56,7 @@ no `.aws` hole and gets no grant. The last row is the adapter mask. A harness wh
 routing is in `ENFORCED_ROUTINGS` (`agent_sdk/tool_gate.py`) is one whose passive
 reads never reach the tool gate, so `adapter_hidden_credential_dirs` projects the
 whole `_SENSITIVE_HOME_DIRS` floor onto its child. `ACP_BACKEND_ROUTING` in
-`agent_sdk/backends.py` puts five harnesses there today. One file comes back for
+`agent_sdk/backends_routing.py` (split out of `agent_sdk/backends.py` by #21616) puts five harnesses there today. One file comes back for
 `codex`, read-only: `ADAPTER_EXPOSED_CREDENTIAL_LEAVES` re-exposes `~/.aws/config`.
 
 That leaves the child holding a config file and nothing the config points at:

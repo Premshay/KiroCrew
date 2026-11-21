@@ -66,8 +66,8 @@ export interface CapabilityPreview extends CapabilityView {
 }
 /** Deadline for the two reads the Bot editor's Abilities pane waits on, which
  *  shows its spinner until they settle. Longer than the gateway's own 20s bound
- *  on each read (`_GET_TIMEOUT_SECS` in `dashboard/handlers/agent_capabilities.py`
- *  and `member_worker_kit.py`), so its coded 503 normally answers first; this
+ *  on each read (`GET_TIMEOUT_SECS` in `dashboard/handlers/_bounded_read.py`),
+ *  so its coded 503 normally answers first; this
  *  ends the wait when no answer comes back at all. */
 export const ABILITIES_READ_TIMEOUT_MS = 30_000
 const { getWithSignal, post, put, j } = apiTransport
@@ -87,6 +87,10 @@ export const crewCapabilitiesKey = (member: string) => ['crew-capabilities', mem
 export interface WorkerKitView {
   member: string
   revision: string
+  /** The file's blocked commands nobody can check, as written; the worker refuses its non-read-only commands while any is left. */
+  unenforced_denies?: string[]
+  /** The file's blocked commands only the gate checks, in a simple command or plain chain; the worker refuses any other non-read-only command while one is left. */
+  conditional_denies?: string[]
 }
 export interface WorkerKitChange {
   /** `disabledTools` / `disabledServers`: a limit on a server the worker base declares. */
@@ -102,6 +106,10 @@ export interface WorkerKitPreview {
   template: string
   revision: string
   runs_unasked: boolean
+  /** The blocked commands nobody can check once the add lands, as written. */
+  unenforced_denies?: string[]
+  /** The blocked commands only the gate checks, in a simple command or plain chain, once the add lands. */
+  conditional_denies?: string[]
   /** The behaviour directions the add writes; `""` when the agent has none. */
   directions?: string
   /** The directions the slot holds now, which a `replaced` row overwrites; `""` when empty. */

@@ -23,6 +23,7 @@ from kiro_crew.work_vocab import (
     WORK_ASK_WHAT_CHARS,
     WORK_ASK_WHY_CHARS,
     WORK_BLOCKED_REASONS,
+    WORK_CONDUCTOR_RETIRE_REASONS,
     WORK_ITEM_STATES,
     WORK_REASON_STATUSES,
     WORK_VERDICTS,
@@ -216,8 +217,9 @@ _WORK_ITEM_STATES = frozenset(WORK_ITEM_STATES)
 #: A superset of the store's six conductor actions: ``accept`` promotes a worker's
 #: claimed ``pr`` into ``acceptance`` and is served by its own store function.
 #: ``ask`` records what an item needs from the person, why, and the options.
+#: ``retire`` moves the caller's own crew-bound item off its crew.
 _WORK_RECORD_ACTIONS = frozenset(
-    {"create", "bind", "decide", "verdict", "close", "goal", "accept", "ask"}
+    {"create", "bind", "decide", "verdict", "close", "goal", "accept", "ask", "retire"}
 )
 
 WORK_BRIEF_SCHEMA = ToolSchema(tool_name="work_brief")
@@ -246,6 +248,9 @@ WORK_REPORT_SCHEMA = ToolSchema(
         # When a ``progress`` report's worker will resume. Whether it parses, is in the
         # future and pairs with ``progress`` is the store's check (``_require_wake_at``).
         FieldSpec("wake_at", str, max_len=40),
+        # Where a hosted discussion stands. Its parts and their caps are the store's
+        # check (``_require_discussion``), which names the part that failed.
+        FieldSpec("discussion", dict),
     ],
     custom_validator=lambda cleaned: _validate_work_report(cleaned),
 )
@@ -317,6 +322,8 @@ WORK_LEDGER_RECORD_SCHEMA: ToolSchema = ToolSchema(
         ),
         FieldSpec("pick", str, max_len=WORK_ASK_LABEL_CHARS),
         FieldSpec("pick_why", str, max_len=WORK_ASK_OUTCOME_CHARS),
+        # ``retire``: only a conductor's reasons; ``crew_unreachable`` is the hub's.
+        FieldSpec("reason", str, allowed=frozenset(WORK_CONDUCTOR_RETIRE_REASONS)),
     ],
 )
 
@@ -515,6 +522,10 @@ DASHBOARD_SAVE_SCHEMA = ToolSchema(
         # Optional: a client can drop an empty object, and the package store reads a
         # missing theme as ``{"tokens": {}}``.
         FieldSpec("theme", dict),
+        # Optional, and absent means "keep the stored widgets": a save without it
+        # behaves as it did before widgets existed. Typed only as a list for the same
+        # reason as above; ``dashboard_widgets`` owns the shape and its refusals.
+        FieldSpec("widgets", list),
     ],
 )
 

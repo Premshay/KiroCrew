@@ -203,7 +203,9 @@ def test_every_owner_control_meets_the_policy_at_entry_and_commit() -> None:
     assert src(interactions.dispatch).count("channel_refusal(channel") >= 2  # pick, Archive
     assert "channel_refusal(channel" in src(wa.dispatch_card_click)
     assert "channel_refusal(channel" in src(agent_picker._still_admitted)
-    assert "channel_policy_refusal" in src(commands.handle_slash)
+    # handle_slash and the context bar's Create PR both run their gates in run_command.
+    assert "run_command(" in src(commands.handle_slash)
+    assert "channel_policy_refusal" in src(commands.run_command)
     assert "channel_policy_refusal" in src(agent_picker.authorize)
     assert "channel_policy_refusal" in src(agent_picker._sync_gates)
     # Each control: authorize first, then a commit fence through _sync_gates.
@@ -335,12 +337,15 @@ def test_a_worker_cards_text_goes_through_the_display_sink(relay: Any) -> None: 
     on the card it relays, and a mention in it is defanged."""
     import json
 
-    key = "AKIA" + "QWERTYUIOPASDFGH"
-    url = (
-        "https://attacker.example/collect?data="
-        + "c2VjcmV0LXRva2VuLXZhbHVlLWhlcmUtMTIzNDU2Nzg5MA=="
-    )
-    relay.worker.title = f"Fix {key} AKIA**ZXCVBNMASDFGHJKL** <!channel> {url}"
+    from redaction_structured_cases import github_classic
+
+    from kiro_crew.testing.synthetic_credentials import SAMPLE_SLACK_BOT_TOKEN as slack_token
+
+    key = github_classic(seed=118)
+    # A credential parameter inside a link: its value goes, the link stays.
+    value = "c2VjcmV0LXRva2VuLXZhbHVlLWhlcmUtMTIzNDU2Nzg5MA=="
+    url = "https://attacker.example/collect?access_token=" + value
+    relay.worker.title = f"Fix {key} {slack_token[:5]}**{slack_token[5:]}** <!channel> {url}"
 
     async def go() -> Any:
         card, _fut = await _run_relay(relay)
@@ -349,8 +354,9 @@ def test_a_worker_cards_text_goes_through_the_display_sink(relay: Any) -> None: 
     assert asyncio.run(go()) is not None
     _channel, blocks, fallback, _thread = relay.slack.blocks_posts[-1]
     shown = json.dumps(blocks, ensure_ascii=False) + fallback
-    assert key not in shown and "attacker.example/collect" not in shown
-    assert "ZXCVBNMASDFGHJKL" not in shown  # only the display-form scan finds this one
+    assert key not in shown
+    assert value[:16] not in shown
+    assert slack_token[5:19] not in shown  # only the display-form scan finds this one
     assert "[REDACTED" in shown and "<!channel>" not in shown
 
 

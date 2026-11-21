@@ -28,6 +28,7 @@ from publish_sync_helpers import (  # noqa: F401 -- fixtures are requested by na
     store_fixture,
     wire,
 )
+from redaction_structured_cases import github_classic
 
 from kiro_crew import publish_sync
 from kiro_crew.artifacts import (
@@ -36,6 +37,11 @@ from kiro_crew.artifacts import (
 )
 
 # ── publish ──────────────────────────────────────────────────────────────────
+
+
+# A synthetic GitHub token the redactor removes; an AWS key ID and a bare 40-character
+# run stay visible.
+_SECRET = github_classic(seed=203)
 
 
 @pytest.mark.asyncio
@@ -490,6 +496,8 @@ async def test_push_version_noop_when_not_published(store, fake_client):
     store.create(name="Doc", content="v1", kind="text", slug="d")
     await publish_sync.push_version(store.get("d"))
     assert fake_client.called("upload_version") == []
+    art = store.get("d")
+    assert (art.publication, art.version) == (None, 1)
 
 
 # ── sharing ────────────────────────────────────────────────────────────────────
@@ -984,6 +992,10 @@ def test_wrap_widget_html_self_contained():
     assert "cdn.tailwindcss.com" not in html
     # MCP auto-injects <base>; the wrapper must not add it.
     assert "<base" not in html
+    # The scheme is an attribute on the body, as the dashboard's frame marks it, so a
+    # widget's own `.light` rule reaches none of the wrapper's markup.
+    assert '<body data-mode="light">' in html
+    assert re.search(r"<body[^>]*\sclass=", html) is None
 
 
 def _csp_directives(csp: str) -> dict[str, set[str]]:
@@ -1125,10 +1137,10 @@ def test_redact_untrusted_scans_every_source():
     # later updates the content, so a `manual`-labelled artifact can carry
     # LLM/agent bytes by publish time — it MUST still be scanned. An AKIA-shaped
     # credential is redacted regardless of source.
-    secret = "leak AKIAIOSFODNN7EXAMPLE now"
+    secret = f"leak {_SECRET} now"
     for source in ("manual", "chat", "cron", "subagent", "import"):
         out = publish_sync._redact_untrusted(secret, source)
-        assert "AKIAIOSFODNN7EXAMPLE" not in out, source
+        assert _SECRET not in out, source
     # Empty text short-circuits unchanged.
     assert publish_sync._redact_untrusted("", "manual") == ""
 
@@ -1357,7 +1369,7 @@ async def test_publish_redacts_the_providers_notice_before_persisting_it(store, 
     fake_client.upload_response = dict(
         fake_client.upload_response,
         # AWS's own documentation example key -- not a live credential.
-        notice="rolling out; debug key AKIAIOSFODNN7EXAMPLE",
+        notice=f"rolling out; debug key {_SECRET}",
         notice_code="rolling_out",
     )
     store.create(name="Doc", content="x", kind="text", slug="red1")
@@ -1365,7 +1377,7 @@ async def test_publish_redacts_the_providers_notice_before_persisting_it(store, 
     stored = store.get("red1").publication
     assert stored is not None
     # The key must not survive into the record the dashboard reads.
-    assert "AKIAIOSFODNN7EXAMPLE" not in stored.notice
+    assert _SECRET not in stored.notice
     assert "REDACTED" in stored.notice
     # The discriminator is a constrained enum, so it passes through untouched.
     assert stored.notice_code == "rolling_out"

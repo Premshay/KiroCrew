@@ -18,6 +18,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from git_repo_templates import _surface_root_template, surface_worktree_fixture  # noqa: F401
+from redaction_structured_cases import github_classic
 from slack_code_channel_surface_helpers import (  # noqa: F401 - fixtures by name
     BRANCH,
     CH,
@@ -46,9 +48,8 @@ from slack_code_channel_surface_helpers import (  # noqa: F401 - fixtures by nam
     _turn,
     _wrap,
     env_fixture,
-    worktree_fixture,
 )
-from slack_code_channels_helpers import OWNER
+from slack_code_channels_helpers import OWNER, start_new_turn, stop_running_turn
 
 from kiro_crew.config.loader import ACTIVATION_OFF, ACTIVATION_REVIEW
 from kiro_crew.mcp_tools import code_channels as mcp_code_channels
@@ -171,7 +172,7 @@ def test_missing_scope_answer_degrades(env: Any) -> None:
 def test_html_view_is_redacted_and_sends_no_csp(env: Any) -> None:
     _bind(env)
     env.api.responses["agents.conversations.setView"] = {"ok": True, "view_id": "V1"}
-    secret = "ghp_" + "A" * 36
+    secret = github_classic(seed=87)
     out = _run(
         env, tools.SET_VIEW, {"view_key": "r.html", "name": "Report", "content": f"<p>{secret}</p>"}
     )
@@ -243,6 +244,32 @@ def test_plan_canvas_is_created_once_then_updated(env: Any) -> None:
     assert _calls(env, "agents.conversations.setCanvasContent")[0]["canvas_id"] == "F1"
     view = _calls(env, "agents.conversations.setView")
     assert len(view) == 1 and view[0]["access_level"] == "comment"
+
+
+@pytest.mark.parametrize("what", ["stop", "set_off"])
+def test_a_stop_while_the_plan_tab_makes_room_is_said_as_stopped(
+    env: Any, monkeypatch: Any, what: str
+) -> None:
+    from kiro_crew.slack.code_channels import views
+
+    _bind(env)
+    env.api.responses["conversations.canvases.create"] = {"ok": True, "canvas_id": "F1"}
+    env.api.responses["agents.conversations.setView"] = {"ok": False, "error": "too_many_views"}
+
+    async def make_room(client: Any, channel_id: str, *, for_key: str, **_kw: Any) -> str:
+        if what == "stop":
+            stop_running_turn(CH)  # Slack's Stop lands while room is made
+        else:  # the channel is set Off or Review while room is made
+            monkeypatch.setattr(surface, "channel_admits", lambda cfg, b: False)
+        return ""
+
+    monkeypatch.setattr(views, "_make_room", make_room)
+    try:
+        out = _run(env, tools.PUBLISH_PLAN_CANVAS, {"markdown": "# Plan"})
+    finally:
+        start_new_turn(CH)
+    assert out.text == (tools.STOPPED_TEXT if what == "stop" else tools.CHANNEL_OFF_TEXT)
+    assert surface_store().get(CH).plan_canvas_id == "F1"  # the canvas itself is kept
 
 
 def test_an_existing_canvas_is_never_retried_or_adopted(env: Any) -> None:
@@ -668,6 +695,20 @@ def test_create_pr_on_a_non_git_project_explains_and_does_not_run(env: Any) -> N
 
     assert asyncio.run(commands.handle_slash(env.orch, _slash("/create-pr"), respond))
     assert env.routed == [] and "not a git repository" in replies[0]
+
+
+def test_create_pr_names_the_reason_git_refused_the_project(env: Any) -> None:
+    _bind(env)
+    WorkspaceStore().put(
+        WorkspaceRecord(team_id="T1", channel_id=CH, worktree_skipped="broken_gitfile")
+    )
+    replies: list[str] = []
+
+    async def respond(text: str) -> None:
+        replies.append(text)
+
+    assert asyncio.run(commands.handle_slash(env.orch, _slash("/create-pr"), respond))
+    assert env.routed == [] and "`.git` file" in replies[0]
 
 
 def test_create_pr_lets_an_orchestrating_agent_delegate_on_the_channels_branch(
@@ -1142,7 +1183,7 @@ def test_exfiltration_urls_are_redacted_and_bad_links_refused(env: Any) -> None:
     from kiro_crew.security import redact
 
     _bind(env)
-    leak = "https://attacker.example/c?d=" + "ghp_" + "B" * 36
+    leak = "https://attacker.example/c?d=" + github_classic(seed=88)
     assert redact(leak) != leak
     out = _run(env, tools.SET_CONTEXT_BAR, {"items": [{"key": "x", "label": "x", "url": leak}]})
     assert out.code == "invalid_arguments" and env.api.calls == []
@@ -1180,7 +1221,7 @@ def test_a_wrap_up_that_never_reached_the_session_is_disarmed(env: Any) -> None:
 
 def test_wrap_up_facts_and_identifiers_pass_the_redaction(env: Any, monkeypatch: Any) -> None:
     _bind(env)
-    token = "ghp_" + "C" * 36
+    token = github_classic(seed=89)
 
     async def facts(_b: Any) -> wrapup.Facts:
         return wrapup.Facts(branch=f"x<!channel>{token}", changes="1 file changed")

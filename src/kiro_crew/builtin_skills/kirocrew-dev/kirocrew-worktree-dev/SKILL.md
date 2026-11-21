@@ -243,10 +243,11 @@ Committing, pushing and opening a PR each require explicit user authorization.
 Permission to commit is not permission to push, and green gates grant neither.
 A fix-and-push monitoring scope must be explicit; absent it, confirm each push.
 Never push to a protected base branch. For authorized publication, follow
-prepare-pr's SHA-pinned force-with-lease protocol and `single_commit` handling,
-and AGENTS.md's at-most-two-commit limit; never use an implicit lease or interactive
-git. No direct merge: hand back
-review-ready work; only explicit ship intent permits prepare-pr's auto-merge path.
+kirocrew-prepare-pr's SHA-pinned force-with-lease protocol and `single_commit`
+handling, and AGENTS.md's one-logical-change-per-commit rule. Use an explicit
+lease and non-interactive Git. Hand back review-ready work. Arm the prepare-pr
+auto-merge path only with explicit ship intent and no hold. Auto-merge still
+waits for required approvals and checks.
 
 ## Cleanup and comments
 

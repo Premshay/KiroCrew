@@ -31,8 +31,8 @@ vi.mock('../components/settingRef/useConfigSchema', () => ({
   useConfigSchema: () => schemaMock(),
 }))
 
-vi.mock('../pages/developer/KiroSignInCard', () => ({
-  KiroSignInCard: () => <div data-testid="kiro-sign-in-card" />,
+vi.mock('../pages/developer/KiroAccountStatusLine', () => ({
+  KiroAccountStatusLine: () => <div data-testid="kiro-account-status-line" />,
 }))
 
 import { schemaWith, probeRow, wrap } from './AgentBackendTabTestUtils'
@@ -42,6 +42,7 @@ const rows = [probeRow('kiro'), probeRow('kas'), probeRow('claude')]
 beforeEach(() => {
   localStorage.clear()
   patchConfigMock.mockClear()
+  kirocrewConfigMock.mockResolvedValue({ agent: { acp_backend: 'kas' } })
   acpBackendsMock.mockReset()
   acpBackendRecheckMock.mockReset()
   schemaMock.mockReturnValue(schemaWith(['kiro', 'claude', 'kas']))
@@ -81,6 +82,75 @@ describe('a Kiro CLI pick that runs on KAS', () => {
     await screen.findByTestId('kiro-runs-on-kas-saved')
     expect(screen.queryByTestId('kiro-runs-on-kas-states')).toBeNull()
     expect(screen.queryByTestId('kiro-row-your-setting')).toBeNull()
+  })
+
+  it('offers no switch on the Kiro CLI row, and says where Kiro CLI runs', async () => {
+    acpBackendsMock.mockResolvedValue({
+      backends: rows,
+      kiro_selection_runs_on_kas: true,
+      kiro_cli_runs_on_kas: true,
+    })
+    wrap()
+    await screen.findByTestId('kiro-runs-on-kas')
+    fireEvent.click(screen.getByRole('radio', { name: 'Kiro CLI' }))
+    expect((await screen.findByTestId('kiro-row-runs-on-kas')).textContent).toBe(
+      'Kiro CLI now runs on Kiro Agent. New sessions already use Kiro Agent, so there is nothing to switch here.',
+    )
+    // The setting already is Kiro CLI: a button here would save the saved value.
+    expect(screen.queryByRole('button', { name: 'Use Kiro CLI' })).toBeNull()
+    expect(screen.queryByText('New sessions switch from Kiro Agent to Kiro CLI.')).toBeNull()
+    expect(patchConfigMock).not.toHaveBeenCalled()
+  })
+
+  it('offers no switch on the Kiro CLI row with Kiro Agent saved, when Kiro CLI would run on it', async () => {
+    acpBackendsMock.mockResolvedValue({
+      backends: rows,
+      kiro_selection_runs_on_kas: false,
+      kiro_cli_runs_on_kas: true,
+    })
+    wrap()
+    fireEvent.click(await screen.findByRole('radio', { name: 'Kiro CLI' }))
+    expect((await screen.findByTestId('kiro-row-runs-on-kas')).textContent).toBe(
+      'Kiro CLI now runs on Kiro Agent. New sessions already use Kiro Agent, so there is nothing to switch here.',
+    )
+    // Saving Kiro CLI here would still run new sessions on Kiro Agent.
+    expect(screen.queryByRole('button', { name: 'Use Kiro CLI' })).toBeNull()
+    expect(screen.queryByText('New sessions switch from Kiro Agent to Kiro CLI.')).toBeNull()
+    expect(patchConfigMock).not.toHaveBeenCalled()
+  })
+
+  it('keeps the switch on the Kiro CLI row while another harness runs', async () => {
+    kirocrewConfigMock.mockResolvedValue({ agent: { acp_backend: 'claude' } })
+    acpBackendsMock.mockResolvedValue({
+      backends: rows,
+      kiro_selection_runs_on_kas: false,
+      kiro_cli_runs_on_kas: true,
+    })
+    wrap()
+    fireEvent.click(await screen.findByRole('radio', { name: 'Kiro CLI' }))
+    // Use here moves new sessions off Claude Code, so the switch stays.
+    expect(await screen.findByRole('button', { name: 'Use Kiro CLI' })).toBeTruthy()
+    expect(screen.getByText('New sessions switch from Claude Code to Kiro CLI.')).toBeTruthy()
+    expect(screen.queryByTestId('kiro-row-runs-on-kas')).toBeNull()
+  })
+
+  it('keeps the switch on every other row', async () => {
+    acpBackendsMock.mockResolvedValue({ backends: rows, kiro_selection_runs_on_kas: true })
+    wrap()
+    await screen.findByTestId('kiro-runs-on-kas')
+    fireEvent.click(screen.getByRole('radio', { name: 'Claude Code' }))
+    expect(await screen.findByRole('button', { name: 'Use Claude Code' })).toBeTruthy()
+    expect(screen.getByText('New sessions switch from Kiro Agent to Claude Code.')).toBeTruthy()
+    expect(screen.queryByTestId('kiro-row-runs-on-kas')).toBeNull()
+  })
+
+  it('keeps the switch on the Kiro CLI row when Kiro CLI does not run on Kiro Agent', async () => {
+    acpBackendsMock.mockResolvedValue({ backends: rows, kiro_selection_runs_on_kas: false })
+    wrap()
+    fireEvent.click(await screen.findByRole('radio', { name: 'Kiro CLI' }))
+    expect(await screen.findByRole('button', { name: 'Use Kiro CLI' })).toBeTruthy()
+    expect(screen.getByText('New sessions switch from Kiro Agent to Kiro CLI.')).toBeTruthy()
+    expect(screen.queryByTestId('kiro-row-runs-on-kas')).toBeNull()
   })
 
   it('brings the callout back when Kiro CLI is picked again after saving Kiro Agent', async () => {

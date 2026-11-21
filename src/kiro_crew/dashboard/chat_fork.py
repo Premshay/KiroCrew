@@ -13,10 +13,12 @@ from aiohttp import web
 from kiro_crew.config.loader import KiroCrewConfig, resolve_agent_identity
 from kiro_crew.dashboard import transcript_snapshot
 from kiro_crew.dashboard.chat_folders import _unhide_folder
+from kiro_crew.dashboard.chat_fork_conductor import conductor_root_fork_template
 from kiro_crew.dashboard.chat_persistence import (
+    DeleteWitness,
     _coerce_requested_mode,
     save_slot_off_loop,
-    session_was_deleted,
+    session_delete_witness,
 )
 from kiro_crew.dashboard.chat_title import (
     _TITLE_ORIGIN_AUTO,
@@ -59,7 +61,6 @@ from kiro_crew.dashboard.transcript_snapshot import (
 from kiro_crew.history import carry_provenance
 from kiro_crew.history_projection import drop_persisted_tail_prefix as _drop_persisted_tail_prefix
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
-from kiro_crew.security.redaction_allow import allowed_hosts_for
 from kiro_crew.sel import sel
 
 if TYPE_CHECKING:
@@ -143,12 +144,16 @@ def _fork_execution_context(
     return execution.with_mode(memory_mode)
 
 
-def _bind_fork_execution(source, child_key: str, execution, promote: bool = False) -> None:
+def _bind_fork_execution(
+    source, child_key: str, execution, promote: bool = False, to_template: str = ""
+) -> None:
     from kiro_crew.execution_context import bind_session_execution, source_vouch_agrees
     from kiro_crew.memory_stores import UnknownMemoryStore
 
     if _fork_execution_context(*source) != execution:
         raise UnknownMemoryStore("The fork source's execution changed")
+    if to_template:  # A conductor mode root's fork: chat_fork_conductor.
+        execution = execution.with_template(to_template, to_template)
     # The child's identity is copied from the source's own record, which the
     # source can write, so the fork never vouches on that record's word. It
     # carries own-store authority only when the gateway already vouches the source
@@ -258,6 +263,23 @@ class _ForkRefused(Exception):
     def __init__(self, response: web.Response) -> None:
         super().__init__(response.status)
         self.response = response
+
+
+def _source_refusal(witness: DeleteWitness) -> tuple[str, web.Response]:
+    """The log cause and the 409 for a source the fork must not copy.
+
+    An UNVERIFIABLE read refuses too, but it proves no delete, so it says the check
+    failed and can be retried. The code stays ``fork_source_deleted`` for both
+    because clients match on it.
+    """
+    if witness is DeleteWitness.DELETED:
+        cause, error = "was permanently deleted", "the source session was permanently deleted"
+    else:
+        cause, error = (
+            "could not be checked",
+            "the source session could not be checked; retry the fork",
+        )
+    return cause, web.json_response({"error": error, "code": "fork_source_deleted"}, status=409)
 
 
 @dataclass(frozen=True)
@@ -576,6 +598,7 @@ async def api_chat_slot_fork(
         # never get it: pinned marks a session as human-owned.
         stamp=_inherit_pin(source.slot),
         audit_operation=_operation,
+        to_template=await conductor_root_fork_template(source.slot, source.execution),
         _promote_from_ephemeral=_promote_from_ephemeral,
     )
     if isinstance(result, web.Response):
@@ -623,10 +646,15 @@ def _shape_fork_child(
     if len(forked_from) <= MAX_FORK_PARENT_KEY_CHARS:
         new_slot.forked_from = forked_from
         new_slot.forked_from_created_at = bounded_transcript_created_at(slot._disk_meta_created_at)
+    # Keep the namespace that made the parent's alias-or-template decision. The
+    # execution carrier alone cannot preserve it: a template-stamped alias and
+    # an alias mistakenly stored as a template id share one carrier shape on
+    # disk. Saving the stamp on the child lets a later read tell them apart.
+    new_slot.agent_kind = str(getattr(slot, "agent_kind", "") or "")
     new_slot.reasoning_effort = slot.reasoning_effort
     # Inherited beside the model it belongs to: the constructor takes `model` and
     # the routing choice is the other half of the same answer, so a fork of an
-    # "Auto (Jev)" session that arrived pinned would run the parent's next turns
+    # "Auto (decision model)" session that arrived pinned would run the parent's next turns
     # on a model the parent had explicitly stopped choosing by hand.
     # Inheriting is arming a SECOND routed session, so it answers to the same owner
     # predicate as the arm itself; the caller says whether it passed that predicate.
@@ -635,6 +663,8 @@ def _shape_fork_child(
     # context (agent resolution, steering files, CWD) instead of falling back to
     # the config/workspace default on first message.
     new_slot.project = slot.project
+    # And whether a person picked it, so a forked Bot worker keeps that folder.
+    new_slot._project_picked = getattr(slot, "_project_picked", False) is True
     # Keep the app-owned agent binding with the agent it binds: the fork runs as
     # the same app agent, so the per-turn shadow check must still apply to it.
     new_slot.app_agent_owner = slot.app_agent_owner
@@ -704,6 +734,7 @@ async def fork_slot(
     stamp: "Callable[[_ChatSlot], None] | None" = None,
     recheck: "Callable[[], None] | None" = None,
     reveal_folder: bool = True,
+    to_template: str = "",
     _promote_from_ephemeral: bool = False,
 ) -> "ForkResult | web.Response":
     """Copy *source*'s transcript up to (or after) the fork point into a new slot.
@@ -742,6 +773,8 @@ async def fork_slot(
     eligibility, the source's addressability, the folder's existence -- true at
     the act rather than at the moment they were first read, across the
     suspensions this function takes for the transcript read and the memory bind.
+
+    ``to_template``, when given, replaces the parent's agent (``chat_fork_conductor``).
 
     ``reveal_folder`` says whether a hidden folder the child is filed into is
     un-hidden once the fork is acknowledged. The human route leaves it True: a
@@ -1031,19 +1064,11 @@ async def fork_slot(
         # ``saved``-checks above only cover a delete observed by THIS
         # handler's flush; this probe answers regardless of who consumed the
         # signal.
-        if session_was_deleted(state, slot):
-            logger.warning(
-                "chat_fork: source slot=%s belongs to a permanently deleted "
-                "session; refusing to fork it",
-                slot.key,
-            )
-            return web.json_response(
-                {
-                    "error": "the source session was permanently deleted",
-                    "code": "fork_source_deleted",
-                },
-                status=409,
-            )
+        witness = session_delete_witness(state, slot)
+        if witness is not DeleteWitness.PRESENT:
+            cause, refusal = _source_refusal(witness)
+            logger.warning("chat_fork: source slot=%s %s; refusing to fork it", slot.key, cause)
+            return refusal
     # Fork indices arrive in the PAGINATED corpus's visible-row space, which
     # prepends each chain key's size-rotated archive head
     # (read_messages_chained_full). Mirror that corpus here, or every index
@@ -1284,7 +1309,7 @@ async def fork_slot(
     with state.suspend_slots_push():
         new_slot = state.get_or_create_slot(
             name=None,
-            agent=slot.agent,
+            agent=to_template or slot.agent,
             workspace=slot.workspace,
             model=slot.model,
             mode=fork_mode,
@@ -1312,6 +1337,8 @@ async def fork_slot(
                 bind = _bind_fork_execution
                 if _promote_from_ephemeral:
                     bind = partial(_bind_fork_execution, promote=True)
+                elif to_template:
+                    bind = partial(_bind_fork_execution, to_template=to_template)
                 await drained_to_thread(
                     bind,
                     (*source_memory_identity[:4], source_memory_identity[6]),
@@ -1347,6 +1374,8 @@ async def fork_slot(
                 folder_principal=folder_principal,
                 promote=_promote_from_ephemeral,
             )
+            if to_template:  # The parent's namespace and app binding go with its agent.
+                new_slot.agent_kind, new_slot.app_agent_owner = "template", ""
             if stamp is not None:
                 stamp(new_slot)
         except Exception:
@@ -1397,14 +1426,8 @@ async def fork_slot(
         # verdicts already judge them. Without this the birth save rescans the
         # whole copied window whenever the process cache has gone cold (a
         # restart, or other sessions' renders): 1,624 scans and 2.7 s of a
-        # 2.9 s fork for a 25 MB parent. Stored tags carry the workspace's
-        # allowed link hosts and the save judges with none, so with any host
-        # allowed no tag would match; the scope is skipped rather than seeding
-        # the parent's sidecar with tags no render reads.
-        reuse = not await asyncio.to_thread(allowed_hosts_for, slot.workspace)
-        await save_slot_off_loop(
-            state, new_slot, verdict_source=slot_history_key(slot) if reuse else None
-        )
+        # 2.9 s fork for a 25 MB parent.
+        await save_slot_off_loop(state, new_slot, verdict_source=slot_history_key(slot))
         new_slot._resumed_count = len(new_slot.messages)
     except Exception:
         # The child's row was announced when the mint block exited. A partial
@@ -1434,7 +1457,9 @@ async def fork_slot(
     # survives the source, the way a repo fork outlives what it came from.
     # Acknowledgment is the only boundary a handler owns, so it is the line
     # drawn here.
-    if session_was_deleted(state, slot):
+    witness = session_delete_witness(state, slot)
+    if witness is not DeleteWitness.PRESENT:
+        cause, refusal = _source_refusal(witness)
         # Roll the destination back. It has not been acknowledged, and no
         # message of it was broadcast (every ``append`` above passed
         # ``broadcast=False``). Its sidebar row went out when the mint block
@@ -1442,8 +1467,7 @@ async def fork_slot(
         # back. Removing it leaves no trace of the deleted conversation instead
         # of a fresh key holding a full copy. Removing the destination cannot
         # harm the source -- different key, different lock -- so a false positive
-        # here (``session_was_deleted`` fails CLOSED when a stat or metadata
-        # read is unverifiable) costs a retryable 409 against a still-live
+        # here (an UNVERIFIABLE stat or metadata read refuses too) costs a retryable 409 against a still-live
         # source, not data.
         removed = False
         if state.conversation_log is not None:
@@ -1466,9 +1490,10 @@ async def fork_slot(
         await _withdraw_fork_child(state, new_slot, announced=True)
         if removed:
             logger.warning(
-                "chat_fork: source slot=%s was permanently deleted during the "
-                "destination save; removed the unacknowledged fork %s",
+                "chat_fork: source slot=%s %s during the destination save; "
+                "removed the unacknowledged fork %s",
                 slot.key,
+                cause,
                 new_slot.key,
             )
         else:
@@ -1477,10 +1502,11 @@ async def fork_slot(
             # prevent and it now needs a human -- but still a 409: reporting
             # success would additionally hide it.
             logger.error(
-                "chat_fork: source slot=%s was permanently deleted during the "
-                "destination save, but the fork transcript for %s could not be "
-                "removed; a copy of the deleted conversation remains on disk",
+                "chat_fork: source slot=%s %s during the destination save, but "
+                "the fork transcript for %s could not be removed; a copy of the "
+                "source remains on disk",
                 slot.key,
+                cause,
                 new_slot.key,
             )
         sel().log_api_access(
@@ -1492,15 +1518,9 @@ async def fork_slot(
                 f"from={slot.key},to={new_slot.key},"
                 f"rollback={'removed' if removed else 'failed'}"
             ),
-            error="source session permanently deleted during the destination save",
+            error=f"source session {cause} during the destination save",
         )
-        return web.json_response(
-            {
-                "error": "the source session was permanently deleted",
-                "code": "fork_source_deleted",
-            },
-            status=409,
-        )
+        return refusal
     sel().log_api_access(
         caller=audit_caller,
         operation=audit_operation,

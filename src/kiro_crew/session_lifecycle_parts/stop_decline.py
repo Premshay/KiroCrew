@@ -29,7 +29,7 @@ StopOutcome = Literal["soft", "hard", "idle", "compacting"]
 #: What a channel says for the ``compacting`` outcome. One string, so every
 #: surface that declines the Stop declines it in the same words.
 STOP_DECLINED_COMPACTING_TEXT = (
-    "⏳ Compacting context — nothing was stopped. The compaction finishes on its own; "
+    "Compacting context — nothing was stopped. The compaction finishes on its own; "
     "a message sent now runs once it has. Send stop again within a minute to force it, "
     "which restarts the session (the agent keeps only a recent excerpt of the conversation)."
 )
@@ -190,8 +190,8 @@ def compaction_in_flight(sessions: Any, key: str) -> bool:
     them leaves a Stop that ended nothing having destroyed queued work. Callers:
     the dashboard stop and interrupt routes, Slack (events, handler,
     interactions), the shared ``messaging.commands.stop_running_turn`` (Discord,
-    Telegram, Teams), the Webex, WeCom, Weixin, Feishu and iMessage dispatchers, WhatsApp, and Spec
-    Builder's Pause. Fail-soft
+    Telegram, Teams), the Webex, WeCom, Weixin, Feishu and iMessage dispatchers, WhatsApp, Spec
+    Builder's Pause, and an app's own chat slot stop (``ChatSlotSDK.stop_turn``). Fail-soft
     to False and ``is True`` rather than truthiness: a manager double without the
     method, or one answering a truthy Mock, keeps the ordinary stop path.
 

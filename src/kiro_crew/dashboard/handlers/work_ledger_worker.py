@@ -21,6 +21,7 @@ from aiohttp import web
 from kiro_crew import work_ledger, work_preview
 from kiro_crew.crew_log import emit as crew_log_emit
 from kiro_crew.crew_log.resolve import unit_for_session_key
+from kiro_crew.dashboard import trace_binding
 from kiro_crew.dashboard.handlers.work_ledger_caller import (
     _caller_key,
     _contained_channel_caller,
@@ -59,6 +60,7 @@ from kiro_crew.dashboard.handlers.work_ledger_refusals import (
 )
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.metrics import work as work_metrics
+from kiro_crew.tracing import work as trace_work
 from kiro_crew.validation import (
     WORK_REPORT_REMOTE_DISPATCH_SCHEMA,
     WORK_REPORT_SCHEMA,
@@ -138,8 +140,8 @@ _CODE_DONE_WITHOUT_EVIDENCE = "done_without_evidence"
 async def api_work_report(request: web.Request) -> web.Response:
     """POST /api/work-ledger/report — this worker's status against its own item.
 
-    ``status`` and ``summary`` are required; ``artifacts``, ``pr``, ``reason`` and
-    ``wake_at`` are optional. There is no ``item_id``, no ``session``, no ``acceptance``, no
+    ``status`` and ``summary`` are required; ``artifacts``, ``pr``, ``reason``,
+    ``wake_at`` and ``discussion`` are optional. There is no ``item_id``, no ``session``, no ``acceptance``, no
     ``verdict`` and no ``state``, so no round trip through here can write a
     conductor-owned field.
     """
@@ -188,6 +190,13 @@ async def api_work_report(request: web.Request) -> web.Response:
         cleaned = crew_log_emit.safe_work_fields(cleaned)
     except crew_log_emit.WorkFieldError as exc:
         return _refuse_400(work_ledger.CODE_INVALID_VALUE, str(exc))
+    # Checked here as well as in the store, so a bad part is refused by name before
+    # the fit probe, and the probe measures the complete object the store keeps.
+    try:
+        discussion = work_ledger._require_discussion(cleaned.get("discussion"))
+    except WorkLedgerError as exc:
+        _audit(key, "work_report", "denied", resources=item_id, error=exc.code)
+        return _refuse_store_error(exc)
     if cleaned.get("status") == "done" and not cleaned.get("artifacts") and not cleaned.get("pr"):
         # A ``done`` names what the conductor should check. One pointer is enough,
         # and a check that could not run is still a pointer when it says so.
@@ -230,6 +239,7 @@ async def api_work_report(request: web.Request) -> web.Response:
         wake_at=_WIDEST_STAMP if cleaned.get("wake_at") is not None else None,
         summary=cleaned.get("summary"),
         artifacts=cleaned.get("artifacts") or {},
+        discussion=discussion,
         pr=work_ledger.MAX_PR,
         last_report_at=_WIDEST_STAMP,
         event=_WIDEST_EVENT_TEXT,
@@ -294,6 +304,7 @@ async def api_work_report(request: web.Request) -> web.Response:
                     cleaned.get("pr"),
                     cleaned.get("reason"),
                     cleaned.get("wake_at"),
+                    discussion,
                 )
             except WorkLedgerError as exc:
                 _audit(caller, "work_report", "denied", resources=item_id, error=exc.code)
@@ -327,6 +338,7 @@ async def api_work_report(request: web.Request) -> web.Response:
                 wake_at=item.wake_at,
                 summary=item.summary,
                 artifacts=item.artifacts,
+                discussion=item.discussion,
                 pr=item.pr,
                 last_report_at=item.last_report_at,
                 event=getattr(result.get("event"), "text", None),
@@ -371,7 +383,26 @@ async def api_work_report(request: web.Request) -> web.Response:
                         landed = await asyncio.to_thread(
                             crew_log_emit.on_work_recorded, acting_unit, entry
                         )
-            if landed and parent_unit and own_unit and parent_unit != own_unit:
+            if not landed:
+                return await _refuse_unrecorded(
+                    caller, "work_report", item.item_id, conductor_key, snapshot
+                )
+            # Queue the report link before the mirror can wake a patrol turn.
+            # shortcut: the board copy's eager publication (crew_log/emit_surfaces._note_eager)
+            # can still wake the conductor during this call's thread hop, so a wake turn that
+            # binds inside that window misses the link and the next patrol turn takes it; closing
+            # it needs a post-append, pre-publication hook in emit_surfaces.
+            await trace_work.recorded(
+                own_unit,
+                conductor_key,
+                "report",
+                actor="worker",
+                item=item,
+                header=board,
+                event_id=getattr(result.get("event"), "id", None),
+                root_kind=lambda: trace_binding.root_kind(state, conductor_key),
+            )
+            if parent_unit and own_unit and parent_unit != own_unit:
                 # The worker's own copy, marked as a mirror of the board's. Nothing reads
                 # it to rebuild the board, so a failure here is logged and the report
                 # stands.
@@ -383,10 +414,6 @@ async def api_work_report(request: web.Request) -> web.Response:
                         "work report for %s landed on the board; the worker's copy did not",
                         item.item_id,
                     )
-            if not landed:
-                return await _refuse_unrecorded(
-                    caller, "work_report", item.item_id, conductor_key, snapshot
-                )
             await asyncio.to_thread(_mark_recorded, conductor_key, item.item_id)
             # Counted from the COMMITTED item, after its record landed: a refused
             # report -- an unknown or closed item, a ``done`` with no evidence, a
@@ -439,6 +466,7 @@ _WORKER_REPORT_FIELDS: tuple[str, ...] = (
     "wake_at",
     "summary",
     "artifacts",
+    "discussion",
     "pr",
     "round",
     "last_report_at",
@@ -454,6 +482,7 @@ def _report(
     pr: Any,
     reason: Any = None,
     wake_at: Any = None,
+    discussion: Any = None,
 ) -> dict[str, Any]:
     return work_ledger.apply_worker_report(
         conductor_key,
@@ -464,6 +493,7 @@ def _report(
         pr=pr,
         reason=reason,
         wake_at=wake_at,
+        discussion=discussion,
     )
 
 
@@ -587,49 +617,72 @@ async def record_person_steer_result(
                 error=STEER_ITEM_TOO_LARGE,
             )
             return "", STEER_ITEM_TOO_LARGE
-        snapshot = await asyncio.to_thread(
-            functools.partial(work_ledger.snapshot_for_write, board_key, item_id=item_id)
-        )
-        try:
-            result = await asyncio.to_thread(
-                functools.partial(
-                    work_ledger.apply_person_steer, board_key, item_id, text, id_salt=id_salt
+
+        # Commit then record as one drained transaction, like the worker-report
+        # route: once ``apply_person_steer`` commits the event, a cancellation
+        # (shutdown) must not land between it and ``on_work_recorded``, or the
+        # steer event would sit in the cache with no crew-log entry and no undo,
+        # and the next rebuild would silently drop it. Draining finishes the
+        # append-or-restore before the cancellation is re-raised.
+        async def _commit_and_record() -> tuple[str, str]:
+            snapshot = await asyncio.to_thread(
+                functools.partial(work_ledger.snapshot_for_write, board_key, item_id=item_id)
+            )
+            try:
+                result = await asyncio.to_thread(
+                    functools.partial(
+                        work_ledger.apply_person_steer, board_key, item_id, text, id_salt=id_salt
+                    )
                 )
+            except WorkLedgerError:
+                _audit(
+                    board_key, "crew_mode.steer", "denied", resources=item_id, error=STEER_NO_ITEM
+                )
+                return "", STEER_NO_ITEM
+            if result is None:
+                return "", STEER_ITEM_CLOSED
+            item, event = result["item"], result["event"]
+            board = await asyncio.to_thread(work_ledger.read_conductor, board_key)
+            established, board = await _board_header(board_key, board)
+            landed = established and await asyncio.to_thread(
+                crew_log_emit.on_work_recorded,
+                unit,
+                _entry_with_baseline(
+                    board_key,
+                    item,
+                    board,
+                    actor="person",
+                    by=board_key,
+                    action="steer",
+                    item_id=item.item_id,
+                    generation=getattr(board, "generation", None) or None,
+                    event=event.text,
+                    event_kind="steer",
+                    event_id=event.id or None,
+                    event_ts=event.ts or None,
+                ),
             )
-        except WorkLedgerError:
-            _audit(board_key, "crew_mode.steer", "denied", resources=item_id, error=STEER_NO_ITEM)
-            return "", STEER_NO_ITEM
-        if result is None:
-            return "", STEER_ITEM_CLOSED
-        item, event = result["item"], result["event"]
-        board = await asyncio.to_thread(work_ledger.read_conductor, board_key)
-        established, board = await _board_header(board_key, board)
-        landed = established and await asyncio.to_thread(
-            crew_log_emit.on_work_recorded,
-            unit,
-            _entry_with_baseline(
+            if not landed:
+                await _refuse_unrecorded(
+                    board_key, "crew_mode.steer", item.item_id, board_key, snapshot
+                )
+                return "", STEER_NOT_RECORDED
+            await asyncio.to_thread(_mark_recorded, board_key, item.item_id)
+            _audit(board_key, "crew_mode.steer", "ok", resources=item.item_id)
+            # The person's write: no turn of theirs is streaming, so it sits under the item.
+            await trace_work.recorded(
+                "",
                 board_key,
-                item,
-                board,
+                "steer",
                 actor="person",
-                by=board_key,
-                action="steer",
-                item_id=item.item_id,
-                generation=getattr(board, "generation", None) or None,
-                event=event.text,
-                event_kind="steer",
-                event_id=event.id or None,
-                event_ts=event.ts or None,
-            ),
-        )
-        if not landed:
-            await _refuse_unrecorded(
-                board_key, "crew_mode.steer", item.item_id, board_key, snapshot
+                item=item,
+                header=board,
+                event_id=event.id,
+                root_kind=lambda: trace_binding.root_kind(state, board_key),
             )
-            return "", STEER_NOT_RECORDED
-        await asyncio.to_thread(_mark_recorded, board_key, item.item_id)
-        _audit(board_key, "crew_mode.steer", "ok", resources=item.item_id)
-    return item.item_id, ""
+            return item.item_id, ""
+
+        return await _drain_before_cancelling(_commit_and_record())
 
 
 # ── the person's answer to a worker's approval ask ───────────────────────
@@ -655,12 +708,13 @@ def _waits_on_approval(
     """Whether an item, as it stands, still waits on the person for *worker_key*'s approval.
 
     Open, still bound to *worker_key*, last report with reason ``approval``, and not
-    answered since (``work_ledger_board.awaits_person``). With *report_id*, that last
+    answered since (``work_ledger_board.names_person``: the worker's own claim, so a
+    person's answer is recorded whether or not the conductor relayed it). With *report_id*, that last
     report must also be the one the answer was matched to: asked again under the
     board lock, so a newer report filed in between (an approval ask too) is never
     answered by it.
     """
-    from kiro_crew.dashboard.handlers.work_ledger_board import awaits_person
+    from kiro_crew.dashboard.handlers.work_ledger_board import names_person
 
     def waits(item: work_ledger.WorkItem, events: list[dict[str, Any]]) -> bool:
         return (
@@ -668,7 +722,7 @@ def _waits_on_approval(
             and item.worker_session_key == worker_key
             and item.reason == "approval"
             and (report_id is None or (bool(report_id) and _last_report_id(events) == report_id))
-            and awaits_person(item, events)
+            and names_person(item, events)
         )
 
     return waits

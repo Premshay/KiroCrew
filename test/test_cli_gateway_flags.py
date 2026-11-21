@@ -79,9 +79,10 @@ class TestNoFlags:
         assert result["no_crons"] is False
         assert result["no_dashboard"] is False
 
-    def test_test_mode_does_not_imply_no_tunnel(self):
+    def test_test_mode_implies_no_tunnel(self):
+        # A test home may hold a team key, which hosts through the relay by default.
         result = _resolve_gateway_args(_ns(test_mode=True))
-        assert result["no_tunnel"] is False
+        assert result["no_tunnel"] is True
 
 
 class TestTestModeBundle:
@@ -243,7 +244,7 @@ class TestApprovalYoloSafetyRail:
         assert "main gateway home" in captured.err
 
     def test_yolo_refused_when_resolves_to_legacy_home(self, monkeypatch, capsys):
-        # GPT 5.6 HIGH regression: after the data-home move, the rail must reject the
+        # After the data-home move, the rail must reject the
         # LEGACY ~/.kirocrew too, not just ~/.kiro/crew. On an unmigrated/downgraded
         # install the legacy home still holds the LIVE data, so yolo against it is
         # exactly as destructive as against the new home.

@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from acp_client_helpers import _native_projection_for_fake_processes  # noqa: F401 - fixture
 from acp_client_helpers import _pin_the_installed_kiro_cli_version  # noqa: F401 - fixture
+from acp_client_helpers import _windows_cleanup_admission_passes_through  # noqa: F401
 from acp_client_helpers import _POSIX_EXEC_PATHS_ONLY, _stop_stderr_drain
 from spawn_test_helpers import strip_spawn_shim
 
@@ -69,8 +70,8 @@ class TestVendoredClaudeAcp:
         assert _resolve_vendored_claude_acp(pkg_dir=pkg_dir) is None
 
     def test_skips_incomplete_copy_missing_deps(self, tmp_path, monkeypatch):
-        # Regression: an entry script whose dependency Node could not import must
-        # be rejected (it would crash with ERR_MODULE_NOT_FOUND @agentclientprotocol/sdk),
+        # An entry script whose dependency Node cannot import must be
+        # rejected (it would crash with ERR_MODULE_NOT_FOUND @agentclientprotocol/sdk),
         # falling through to a complete copy under KIROCREW_PROJECT_DIR.
         pkg_dir = tmp_path / "site-packages" / "kiro_crew"
         pkg_dir.mkdir(parents=True)

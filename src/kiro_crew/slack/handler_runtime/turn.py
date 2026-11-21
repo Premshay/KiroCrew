@@ -112,6 +112,7 @@ if TYPE_CHECKING:
         session_stop_generation,
         session_store_for_turn,
         settle_turn,
+        shared_user_refused_for_session,
         slack_script_hooks,
         stop_reason_landed,
         turn_ceiling,
@@ -150,6 +151,7 @@ class _SlackTurn:
     had_voice_input: "bool"
     spool_text: "str | None"
     spool_attachments: "int"
+    spool_attachment_names: "tuple[str, ...]"
     _compaction_replay: "_CompactionReplay | None"
     start_priority: "StartPriority"
     user_meta: "dict[str, Any] | None"
@@ -167,6 +169,7 @@ class _SlackTurn:
     # session's channel link (``test_crew_log_class_recorder`` reads it as one).
     _acquired: "bool"
     _agent: "str | None"
+    spec_agent: "str | None"
     answer: "_AnswerStream"
     client: "LLMProvider | None"
     _had_error: "bool"
@@ -221,6 +224,7 @@ class _SlackTurn:
         had_voice_input: "bool",
         spool_text: "str | None",
         spool_attachments: "int",
+        spool_attachment_names: "tuple[str, ...]",
         _compaction_replay: "_CompactionReplay | None",
         start_priority: "StartPriority",
         user_meta: "dict[str, Any] | None" = None,
@@ -255,6 +259,7 @@ class _SlackTurn:
         self.had_voice_input = had_voice_input
         self.spool_text = spool_text
         self.spool_attachments = spool_attachments
+        self.spool_attachment_names = spool_attachment_names
         self._compaction_replay = _compaction_replay
         # Set by ``_run_turn``; none until a turn has run its hooks.
         self._hook_turn = None
@@ -293,9 +298,13 @@ class _SlackTurn:
         still intact in ``answer.accumulated``.
         """
         if self._hook_turn is not None and self._turn_completed_ok:
-            await slack_script_hooks.stop_hooks_after(
-                self._hook_turn, self._stop_reason, redact(self.answer.accumulated)
-            )
+            # A hook is a sink no output seam lists: it reads the answer redacted in
+            # full, inside the turn's channel seam with the owner's redaction off too.
+            from kiro_crew.security.redaction_switch import always_scan
+
+            with always_scan():
+                shown = redact(self.answer.accumulated)
+            await slack_script_hooks.stop_hooks_after(self._hook_turn, self._stop_reason, shown)
 
     # Release the retained permit once delivery and accounting have run. Called
     # explicitly right after accounting so a queued turn can proceed while the
@@ -419,11 +428,13 @@ async def _run_turn(turn: _SlackTurn) -> bool:
     session_key = turn.session_key
     _agent = turn._agent
 
+    from kiro_crew.slack.code_channels.binding import no_reactions
+
     status_ctrl = StatusReactionController(
         slack,
         channel,
         msg_ts,
-        enabled=KiroCrewConfig.load().slack.reactions_enabled,
+        enabled=KiroCrewConfig.load().slack.reactions_enabled and not no_reactions(channel),
     )
     _had_error = False
     _unsent = False
@@ -582,6 +593,7 @@ async def _run_turn(turn: _SlackTurn) -> bool:
                 try:
                     await slack.delete_message(channel, _ts)
                 except Exception:
+                    # A message that cannot be deleted stays; the replay posts its own.
                     pass
         _working_ts = None
         turn._working_ts = None
@@ -628,6 +640,7 @@ async def _run_turn(turn: _SlackTurn) -> bool:
                 had_voice_input=had_voice_input,
                 spool_text=turn.spool_text,
                 spool_attachments=turn.spool_attachments,
+                spool_attachment_names=turn.spool_attachment_names,
                 _compaction_replay=replay,
                 start_priority=start_priority,
                 user_meta=turn.user_meta,
@@ -673,6 +686,11 @@ async def _run_turn(turn: _SlackTurn) -> bool:
             if memory_error is not None:
                 raise memory_error
             break
+        # The owner may have linked this thread to a code channel's session since the
+        # linked-thread check ran: a shared user's turn never runs there.
+        if await shared_user_refused_for_session(user_id, session_key, reply_ts, channel):
+            await turn.clear_working_indicators()
+            return False
         # Re-resolve _agent against (possibly linked) session_key for the main
         # LLM path — linked dashboard sessions may carry a different thread agent.
         _agent = _thread_agents.get(session_key) or channel_agent or _get_default_agent() or None
@@ -911,9 +929,11 @@ async def _run_turn(turn: _SlackTurn) -> bool:
 
         # The permission ladder reads the routed conversation, its agent and this
         # turn's presentation off the turn (``_answer_permission_request``); none of
-        # them is rebound past this point.
+        # them is rebound past this point. Its spec hooks are the template's, so a
+        # channel bound to a Crew record is gated by the agent the record runs.
         turn.session_key = session_key
         turn._agent = _agent
+        turn.spec_agent = _context_agent
         turn.answer = answer
         turn.task = task
 

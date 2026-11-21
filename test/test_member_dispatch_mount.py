@@ -22,7 +22,7 @@ import pytest
 
 import kiro_crew.validation  # noqa: F401 - break the legacy import cycle first
 from kiro_crew import acp_tool_gate
-from kiro_crew.acp.client import AcpClient
+from kiro_crew.acp.client import AcpClient, ClaudeAcpClient
 from kiro_crew.acp.harness import process_adapter_for
 from kiro_crew.acp.kas_agents import to_client_custom_agent
 from kiro_crew.acp.types import (
@@ -379,7 +379,7 @@ class _ClientStub:
         # reached at call time through the live class so the stub cannot drift
         # from what production actually reads -- and so a tree without the
         # property fails these tests at call rather than at collection.
-        return AcpClient._permission_surface_governed.fget(self)
+        return ClaudeAcpClient._permission_surface_governed.fget(self)
 
 
 def _base_servers() -> list[dict]:
@@ -860,6 +860,7 @@ class TestRuntimeMemberThreading:
             engine_features=frozenset(),
             forward_ssh_auth_sock=False,
             governance_app=None,
+            scope_muted=None,
         ):
             seen.append(member_dispatch)
             return [{"id": agent}]
@@ -943,6 +944,7 @@ class TestMemberServerJoinsSubtraction:
             engine_features=frozenset(),
             forward_ssh_auth_sock=False,
             governance_app=None,
+            scope_muted=None,
         ):
             seen.append(frozenset(stub_server_names))
             return [{"id": agent}]
@@ -987,6 +989,7 @@ class TestMemberServerJoinsSubtraction:
             engine_features=frozenset(),
             forward_ssh_auth_sock=False,
             governance_app=None,
+            scope_muted=None,
         ):
             seen.append(frozenset(stub_server_names))
             return [{"id": agent}]

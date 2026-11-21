@@ -9,7 +9,47 @@ import { autoSiteRef } from '../uiLocations/targetRegistry'
 
 /* ── Shared UI primitives ── */
 
+/**
+ * `grouped` draws a `Card` the way a Settings group reads: its `CardTitle`
+ * becomes the group heading ABOVE the box, and the rest sits in one plain
+ * rounded box (no glow, no shadow) at the Settings content width. Settings
+ * provides it around its pane, so a panel's cards line up with the grouped
+ * `SettingsCard` rows beside them.
+ */
+export const CardFrameContext = React.createContext<'framed' | 'grouped'>('framed')
+
 export function Card({ children, className = '', ...rest }: Omit<React.ComponentPropsWithoutRef<'div'>, 'dangerouslySetInnerHTML'>) {
+  const frame = React.useContext(CardFrameContext)
+  if (frame === 'grouped') {
+    const { style, ...restNoStyle } = rest
+    const items = React.Children.toArray(children)
+    const first = items[0]
+    // The heading leaves the box: a bare CardTitle, or a header row (title plus
+    // an action button) whose children hold one.
+    const isTitle = (el: React.ReactNode) => React.isValidElement(el) && el.type === CardTitle
+    // A header ROW only (a flex line of title and actions), never a wrapper
+    // that holds the whole card body.
+    const holdsTitle = (el: React.ReactNode) => isTitle(el) || (React.isValidElement<{ children?: React.ReactNode; className?: string }>(el)
+      && /\bflex\b/.test(el.props.className ?? '') && /\bitems-center\b/.test(el.props.className ?? '')
+      && React.Children.toArray(el.props.children).some(isTitle))
+    const title = holdsTitle(first) ? first : null
+    // A plain paragraph right under the heading is the group's description:
+    // it sits under the heading, outside the box, at the heading's indent.
+    const second = title ? items[1] : undefined
+    // Only when the box keeps rows of its own: a lone paragraph (an empty
+    // state) stays inside, or the box would draw empty.
+    const lede = React.isValidElement(second) && second.type === 'p' && items.length > 2 ? second : null
+    const body = items.slice((title ? 1 : 0) + (lede ? 1 : 0))
+    return (
+      <div className={twMerge('mb-8 animate-rise max-w-[720px]', className, 'border-0 bg-transparent shadow-none rounded-none p-0 md:px-0')} {...restNoStyle}>
+        {title}
+        {lede && <div className="-mt-1 mb-2 px-4 [&>p]:m-0">{lede}</div>}
+        {/* A caller's style (a hero background) paints the box, not the
+            transparent wrapper around the heading and the box. */}
+        <div data-settings-box="" className="rounded-xl overflow-hidden border border-border bg-card px-4 py-3" style={style}>{body}</div>
+      </div>
+    )
+  }
   // Written narrow-first, like the rest of the layout: the unprefixed inset is
   // the phone one (10px horizontal, 20px vertical) and `md:` widens it. Only the
   // HORIZONTAL value changes, because horizontal is the axis a phone cannot
@@ -41,6 +81,10 @@ export function Card({ children, className = '', ...rest }: Omit<React.Component
 }
 
 export function CardTitle({ children, className, ...rest }: Omit<React.ComponentPropsWithoutRef<'h3'>, 'dangerouslySetInnerHTML'>) {
+  const frame = React.useContext(CardFrameContext)
+  if (frame === 'grouped') {
+    return <h3 className={twMerge('text-base font-semibold text-text-strong mb-2 px-4 flex items-center gap-2 [&_svg.lucide-inline]:hidden', className)} {...rest}>{children}</h3>
+  }
   return <h3 className={twMerge("text-sm font-semibold tracking-tight text-text-strong mb-3.5 flex items-center gap-2", className)} {...rest}>{children}</h3>
 }
 
@@ -471,15 +515,20 @@ export function PageHeader({ title, subtitle, actions }: { title: React.ReactNod
   )
 }
 
-export function Toggle({ checked, onChange, disabled, busy, label, describedBy, tone = 'accent', 'data-ui-auto': uiAuto }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean; /** Opt-in: the switch is writing its own change right now. It stays in the tab order (not `tabIndex={-1}`, which drops a keyboard user to the page) and ignores presses while the write runs, announced as `aria-disabled` + `aria-busy`. Default unset keeps today's behaviour. `busy` wins when both are set. */ busy?: boolean; label?: string; describedBy?: string; tone?: 'accent' | 'muted'; /** The build's auto-tier marker (scripts/lib/ui-auto-stamp.mjs), put on the switch a guide points at. */ 'data-ui-auto'?: string }) {
+export function Toggle({ checked, onChange, disabled, busy, label, describedBy, id, tone = 'accent', 'data-ui-auto': uiAuto }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean; /** Opt-in: the switch is writing its own change right now. It stays in the tab order (not `tabIndex={-1}`, which drops a keyboard user to the page) and ignores presses while the write runs, announced as `aria-disabled` + `aria-busy`. Default unset keeps today's behaviour. `busy` wins when both are set. */ busy?: boolean; label?: string; describedBy?: string; /** Lets a `<label htmlFor>` point at the switch, so a click on the label's text presses it. */ id?: string; tone?: 'accent' | 'muted'; /** The build's auto-tier marker (scripts/lib/ui-auto-stamp.mjs), put on the switch a guide points at. */ 'data-ui-auto'?: string }) {
   // While busy the switch refuses presses but stays focusable, so it keeps a
   // tab stop; a non-busy `disabled` leaves the tab order as before.
   const inert = disabled || busy
   return (
-    <div
+    // A real <button>, so a <label> can be tied to it and the row around a
+    // switch needs no click handler of its own. `type="button"` keeps it from
+    // submitting a form it sits in.
+    <button
+      type="button"
       role="switch"
+      id={id}
       data-ui-auto={uiAuto}
-      ref={autoSiteRef<HTMLDivElement>(uiAuto)}
+      ref={autoSiteRef<HTMLButtonElement>(uiAuto)}
       aria-checked={checked}
       // Without this a screen reader announces a disabled switch as actionable:
       // the disabled state was carried only by `tabIndex={-1}` and an opacity
@@ -497,6 +546,8 @@ export function Toggle({ checked, onChange, disabled, busy, label, describedBy, 
       // A switch is the one control whose physical twin clicks under the thumb, so
       // it gets a tap where the device can give one (phones); elsewhere no-op.
       onClick={() => { if (!inert) { haptic(); onChange(!checked) } }}
+      // The key is handled here and its default stopped, so the button's own
+      // press-to-click does not flip the switch a second time.
       onKeyDown={e => { if (!inert && (e.key === ' ' || e.key === 'Enter')) { e.preventDefault(); haptic(); onChange(!checked) } }}
       // `muted` is for a LIST of switches, where an accent fill on every row
       // shouts and duplicates a state the row's own grouping already carries.
@@ -504,8 +555,10 @@ export function Toggle({ checked, onChange, disabled, busy, label, describedBy, 
       // the hue. Accent stays the default so a lone switch keeps its emphasis.
       className={`w-9 h-5 rounded-full relative transition-colors shrink-0 cursor-pointer ${inert ? 'opacity-40 cursor-not-allowed' : ''} ${checked ? (tone === 'muted' ? 'bg-border-strong' : 'bg-accent') : 'bg-border'}`}
     >
-      <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${checked ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
-    </div>
+      {/* `left-0` is spelled out: a button centres its content, and an
+          absolutely placed child with no `left` would start from that centre. */}
+      <span className={`absolute left-0 top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${checked ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
+    </button>
   )
 }
 

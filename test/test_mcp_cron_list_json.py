@@ -28,6 +28,7 @@ import pytest
 
 from kiro_crew import mcp_cron
 from kiro_crew.cron import CronJob, CronSchedule
+from kiro_crew.testing.synthetic_credentials import github_classic
 
 
 @pytest.fixture(autouse=True)
@@ -274,7 +275,7 @@ class TestBoundsAndSafety:
 
     def test_a_credential_in_a_prompt_is_redacted_before_truncation(self) -> None:
         """Truncate-then-sanitize leaves a credential's prefix in the surviving span."""
-        secret = "AKIAIOSFODNN7EXAMPLE"
+        secret = github_classic(seed=314)  # a bare 40-character run stays visible
         out = _call([_job(message=f"Check {secret} and report the timestamp.")])
         assert secret not in out
         for n in (8, 12, 16):
@@ -309,7 +310,7 @@ class TestTextModesUnchanged:
     def test_verbose_is_still_text(self) -> None:
         with patch.object(mcp_cron.CronService, "list_jobs", return_value=[_job()]):
             out = mcp_cron._call_tool_inner("cron_list", {"verbose": True})
-        assert "• poller (✅ active) [agent]" in out
+        assert "• poller (active) [agent]" in out
 
     def test_json_wins_over_the_verbose_that_ids_forces_on(self) -> None:
         """ids implies verbose; a machine consumer still needs a document."""
