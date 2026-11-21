@@ -990,9 +990,8 @@ async def routed_spawn(
         if not cands:
             return None
         ag_models = [c["model"] for c in cands if c["vendor"] == "antigravity"]
-        tombs = await asyncio.to_thread(cached_health)
         limits = await asyncio.to_thread(limit_health, ag_models)
-        health = merged_health(tombs, limits)
+        health = merged_health({}, limits)
         _apply_quota_outs(health, outs)
         cands, fits, too_big = fit_local_candidates(
             cands, brief, health, groups=context_groups, pinned=pinned_groups

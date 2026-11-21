@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -71,6 +73,14 @@ class TestExtractCheck:
         assert lc.check_for(info) == "make test"
         info.delegation = {}
         assert lc.check_for(info) == "pytest test/test_x.py"
+
+    @pytest.mark.parametrize("check", ["true; false", "true\nfalse", "true | false"])
+    def test_explicit_shell_syntax_is_refused(self, check, monkeypatch):
+        info = SubagentInfo(id="a", task="run `pytest test/test_x.py`")
+        info.delegation = {"check": check}
+        assert lc.check_for(info) == ""
+        monkeypatch.setattr(lc.subprocess, "run", lambda *a, **k: pytest.fail("check ran"))
+        assert lc.run_check(check, "") == (False, "check contains unsupported shell syntax")
 
     def test_successor_reads_the_original_brief(self):
         info = SubagentInfo(id="a", task="handoff text")
@@ -234,10 +244,21 @@ def _head(repo):
     ).stdout.strip()
 
 
+def _capture_commit_scope(info):
+    snapshot = getattr(lc, "snapshot_commit_scope", None)
+    if snapshot is not None:
+        info._local_commit_scope = snapshot(info.cwd)
+
+
 class TestPassCommits:
     def test_pass_commits_the_workers_changes(self, git_repo, reroute):
         mgr = _Manager()
         info = _local(cwd=git_repo, delegation={"check": "test -f work.txt"})
+        Path(git_repo, "work.txt").unlink()
+        _capture_commit_scope(info)
+        Path(git_repo, "work.txt").write_text("worker change", encoding="utf-8")
+        subprocess.run(["git", "-C", git_repo, "add", "work.txt"], check=True)
+        Path(git_repo, "private.txt").write_text("untracked", encoding="utf-8")
         assert asyncio.run(lc.handle_run_end(mgr, info)) == "pass"
         sha, subject = _head(git_repo).split(" ", 1)
         assert subject == "local run loc00001: check passed"
@@ -246,11 +267,12 @@ class TestPassCommits:
         status = subprocess.run(
             ["git", "-C", git_repo, "status", "--porcelain"], capture_output=True, text=True
         ).stdout
-        assert status == ""
+        assert status == "?? private.txt\n"
 
     def test_pass_on_a_protected_branch_is_not_committed(self, git_repo, reroute):
         subprocess.run(["git", "-C", git_repo, "checkout", "-q", "-b", "main"], check=True)
         info = _local(cwd=git_repo, delegation={"check": "true"})
+        info._local_commit_scope = lc.snapshot_commit_scope(git_repo)
         assert asyncio.run(lc.handle_run_end(_Manager(), info)) == "pass_uncommitted"
         assert "protected branch main" in info.local_check_line
         assert _head(git_repo).endswith("base")
@@ -258,19 +280,120 @@ class TestPassCommits:
     def test_pass_with_nothing_to_commit(self, git_repo, reroute):
         subprocess.run(["git", "-C", git_repo, "clean", "-fdq"], check=True)
         info = _local(cwd=git_repo, delegation={"check": "true"})
+        info._local_commit_scope = lc.snapshot_commit_scope(git_repo)
         assert asyncio.run(lc.handle_run_end(_Manager(), info)) == "pass_uncommitted"
         assert (
             info.local_check_line
-            == "local check: true PASS -> not committed (no uncommitted changes)"
+            == "local check: true PASS -> not committed (no eligible changes)"
         )
+
+    def test_dirty_primary_checkout_is_refused(self, git_repo):
+        info = _local(cwd=git_repo, delegation={"check": "true"})
+        _capture_commit_scope(info)
+        assert asyncio.run(lc.handle_run_end(_Manager(), info)) == "pass_uncommitted"
+        assert "working directory was dirty before the run" in info.local_check_line
+
+    def test_linked_worktree_leaves_preexisting_paths_and_runs_hooks(self, git_repo, tmp_path):
+        worktree = tmp_path / "linked"
+        subprocess.run(
+            ["git", "-C", git_repo, "worktree", "add", "-qb", "linked", str(worktree)],
+            check=True,
+        )
+        (worktree / "user.txt").write_text("preexisting work", encoding="utf-8")
+        subprocess.run(["git", "-C", str(worktree), "add", "user.txt"], check=True)
+        info = _local(cwd=str(worktree), delegation={"check": "true"})
+        _capture_commit_scope(info)
+        (worktree / "new.txt").write_text("worker change", encoding="utf-8")
+        subprocess.run(["git", "-C", str(worktree), "add", "new.txt"], check=True)
+        hooks = tmp_path / "hooks"
+        hooks.mkdir()
+        hook = hooks / "pre-commit"
+        hook.write_text("#!/bin/sh\necho hook-refused >&2\nexit 1\n", encoding="utf-8")
+        hook.chmod(0o755)
+        subprocess.run(
+            ["git", "-C", git_repo, "config", "core.hooksPath", str(hooks)], check=True
+        )
+        assert asyncio.run(lc.handle_run_end(_Manager(), info)) == "pass_uncommitted"
+        assert "hook-refused" in info.local_check_line
+        hook.unlink()
+        assert asyncio.run(lc.handle_run_end(_Manager(), info)) == "pass"
+        assert subprocess.check_output(
+            ["git", "-C", str(worktree), "show", "--pretty=", "--name-only", "HEAD"], text=True
+        ).strip() == "new.txt"
+        assert subprocess.check_output(
+            ["git", "-C", str(worktree), "status", "--porcelain"], text=True
+        ) == "A  user.txt\n"
+
+    def test_opt_in_defaults_off(self, git_repo):
+        from kiro_crew.config import KiroCrewConfig
+
+        section = KiroCrewConfig().to_dict().get("subagent", {})
+        assert section.get("local_check", {}).get("auto_commit") is False
+        info = _local(cwd=git_repo, delegation={"check": "true"})
+        assert asyncio.run(lc.handle_run_end(_Manager(), info)) == "pass_uncommitted"
+
+    def test_run_stopped_during_check_does_not_commit(self, git_repo, monkeypatch):
+        info = _local(cwd=git_repo, delegation={"check": "true"})
+        _capture_commit_scope(info)
+
+        def stopped(*args):
+            info.user_stopped = True
+            return True, ""
+
+        monkeypatch.setattr(lc, "run_check", stopped)
+        monkeypatch.setattr(lc, "commit_changes", lambda *a: pytest.fail("commit ran"))
+        assert asyncio.run(lc.handle_run_end(_Manager(), info)) == ""
+
+    @pytest.mark.asyncio
+    async def test_cancelled_finalizer_stops_pending_commit(self, git_repo, monkeypatch):
+        info = _local(cwd=git_repo, delegation={"check": "true"})
+        Path(git_repo, "work.txt").unlink()
+        _capture_commit_scope(info)
+        Path(git_repo, "work.txt").write_text("worker change", encoding="utf-8")
+        subprocess.run(["git", "-C", git_repo, "add", "work.txt"], check=True)
+        started = asyncio.Event()
+        release = threading.Event()
+        settled = threading.Event()
+        loop = asyncio.get_running_loop()
+        original_git = lc._git
+
+        def blocked_git(cwd, *args):
+            if args[0] == "status":
+                loop.call_soon_threadsafe(started.set)
+                release.wait()
+            return original_git(cwd, *args)
+
+        def commit(*args):
+            try:
+                return original_commit(*args)
+            finally:
+                settled.set()
+
+        original_commit = lc.commit_changes
+        monkeypatch.setattr(lc, "_git", blocked_git)
+        monkeypatch.setattr(lc, "commit_changes", commit)
+        job = asyncio.create_task(lc.handle_run_end(_Manager(), info))
+        try:
+            await started.wait()
+            job.cancel()
+            scheduled = asyncio.Event()
+            loop.call_soon(scheduled.set)
+            await scheduled.wait()
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await job
+        await asyncio.to_thread(settled.wait)
+        assert _head(git_repo).endswith("base")
 
 
 class TestFailFallsThrough:
-    def test_failed_check_goes_to_cloud_with_a_handoff(self, git_repo, reroute):
+    def test_failed_check_goes_to_cloud_with_a_handoff(self, git_repo, reroute, monkeypatch):
         mgr = _Manager()
+        monkeypatch.setattr(lc, "run_check", lambda *a: (False, "2 failed\n(exit 1)"))
         info = _local(
             cwd=git_repo,
-            delegation={"check": "echo 2 failed; exit 1"},
+            delegation={"check": "pytest"},
             quota_chain=("antigravity",),
         )
         assert asyncio.run(lc.handle_run_end(mgr, info)) == lc.REASON_CHECK_FAILED
@@ -280,7 +403,7 @@ class TestFailFallsThrough:
         ((brief, kw),) = mgr.spawned
         assert kw["cwd"] == git_repo and kw["model"] == "gpt-6.2-sol" and kw["backend"] == "codex"
         assert kw["_execution_context"] == {"template_id": "kirocrew"}
-        assert kw["delegation"] == {"check": "echo 2 failed; exit 1"}
+        assert kw["delegation"] == {"check": "pytest"}
         assert brief.startswith("Write work.txt.\n\n---\n## Handoff (local_check_failed")
         assert "2 failed" in brief and "(exit 1)" in brief
         assert "branch: feat/x" in brief and "?? work.txt" in brief

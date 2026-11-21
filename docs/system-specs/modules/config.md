@@ -5,6 +5,10 @@
 Fork settings follow the same owner modules: per-parent subagent caps and their
 agent-pattern overrides live with agent fields; `decisions.spawn_route` lives
 with decision fields; and the batch-only `bridge` recogniser lives with STT.
+Set `subagent.local_check.auto_commit` to `true` to commit eligible local worker
+changes after a passing check. The default is `false`.
+The commit keeps hooks enabled and excludes paths already dirty at run start.
+New files must be staged by the worker. A dirty primary checkout is ineligible.
 Resolved bindings include a member's reasoning-effort pin in dispatch identity.
 `KiroCrewConfig.mcp_gateway_provider_kwargs()` exposes broker construction values
 to companion providers whenever servers are stubbed. The sharing toggle alone

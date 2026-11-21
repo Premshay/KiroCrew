@@ -347,14 +347,8 @@ class TestRoutedSpawn:
         died = _local(2026, 9, 26, 0, 12)
         monkeypatch.setattr(
             sr,
-            "load_tombstones",
-            lambda root=None: [
-                _hit(
-                    "crew-codex",
-                    died,
-                    "usage limit. try again at Oct 1st, 2026 9:19 AM. usageLimitExceeded",
-                )
-            ],
+            "limit_health",
+            lambda models: {"codex": {"out": True, "resets_at": died + 3600}},
         )
         monkeypatch.setattr(sr.time, "time", lambda: died + 600)
         oracle = install_oracle(_Oracle("codex/large/0"))

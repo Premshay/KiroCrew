@@ -523,6 +523,14 @@ def routed_env(monkeypatch):
 
 
 class TestRoutedAcrossVendors:
+    def test_generic_tombstone_rate_limit_does_not_block_a_vendor(self, routed_env, monkeypatch):
+        oracle = routed_env(_Oracle("claude/small/0"))
+        monkeypatch.setattr(
+            sr, "cached_health", lambda: {"claude": {"out": True, "until": NOW + 100}}
+        )
+        assert asyncio.run(sr.routed_spawn("x", agent="crew-claude", session_key="s1"))
+        assert not oracle.states[0]["health"].get("claude", {}).get("out")
+
     def test_another_vendor_comes_back_with_its_seat(self, routed_env):
         oracle = routed_env(_Oracle("antigravity/small/0"))
         got = asyncio.run(

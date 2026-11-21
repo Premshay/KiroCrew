@@ -2745,6 +2745,54 @@
       "defaultValue": 50
     },
     {
+      "path": "subagent",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "subagent",
+      "help": "",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {
+        "local_check": {
+          "auto_commit": false
+        }
+      }
+    },
+    {
+      "path": "subagent.local_check",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "local_check",
+      "help": "",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {
+        "auto_commit": false
+      }
+    },
+    {
+      "path": "subagent.local_check.auto_commit",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Auto-commit",
+      "help": "Commit eligible local worker changes after a passing check.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
       "path": "taskrunner",
       "kind": "core",
       "type": "object",

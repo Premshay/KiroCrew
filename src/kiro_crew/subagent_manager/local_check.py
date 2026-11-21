@@ -13,9 +13,9 @@ so its output is accepted on evidence, not on its own say-so:
    (:func:`handle_run_end`):
 
    * it ended cleanly and has a check -> the check runs in the run's cwd,
-     bounded by :data:`CHECK_TIMEOUT_S`. PASS -> uncommitted changes the worker
-     left are committed (message names the run and the check); never on a
-     protected branch. FAIL -> ``local_check_failed``.
+     bounded by :data:`CHECK_TIMEOUT_S`. PASS -> eligible worker changes may be
+     committed when ``subagent.local_check.auto_commit`` is enabled.
+     FAIL -> ``local_check_failed``.
    * it ended on an error (context overflow, ``lane_busy``, a crash, a
      timeout) -> ``local_unusable``, check or not.
    * it ended cleanly with no check -> nothing: no check, no auto-commit.
@@ -474,7 +474,7 @@ _NODE_ID = re.compile(
 )
 #: Characters a check extracted from a brief may not contain: it is run by a
 #: shell, and a brief is text an agent wrote.
-_UNSAFE = re.compile(r"[;&|<>$`\\(){}!]")
+_UNSAFE = re.compile(r"[;&|<>$`\\(){}!\r\n]")
 
 
 def extract_check(brief: str) -> str:
@@ -499,7 +499,7 @@ def check_for(info: Any) -> str:
     """The run's check: the explicit one, else the brief's own."""
     explicit = str((getattr(info, "delegation", None) or {}).get("check") or "").strip()
     if explicit:
-        return explicit
+        return explicit if not _UNSAFE.search(explicit) else ""
     task = (
         getattr(info, "quota_origin_task", "")
         or getattr(info, "_raw_task", "")
@@ -510,9 +510,11 @@ def check_for(info: Any) -> str:
 
 def run_check(cmd: str, cwd: str, timeout: float = CHECK_TIMEOUT_S) -> tuple[bool, str]:
     """(passed, output tail). A timeout or a spawn failure is a fail. Never raises."""
+    if _UNSAFE.search(cmd):
+        return False, "check contains unsupported shell syntax"
     try:
         p = subprocess.run(
-            ["bash", "-c", cmd],
+            shlex.split(cmd),
             cwd=cwd or None,
             capture_output=True,
             text=True,
@@ -535,37 +537,90 @@ def _git(cwd: str, *args: str) -> tuple[int, str]:
             ["git", "-C", cwd, *args],
             capture_output=True,
             text=True,
+            errors="surrogateescape",
             timeout=GIT_TIMEOUT_S,
             check=False,
         )
     except Exception as exc:
         return 1, str(exc)
-    return p.returncode, (p.stdout or p.stderr or "").strip()
+    return p.returncode, p.stderr.strip() if p.returncode else p.stdout
 
 
-def commit_changes(cwd: str, run_id: str, cmd: str) -> tuple[str, str]:
-    """Commit what the worker left uncommitted: ``(sha, "")`` or ``("", why not)``. Never raises."""
+def _git_status(cwd: str) -> dict[str, str] | None:
+    rc, status = _git(cwd, "status", "--porcelain=v1", "-z", "--no-renames", "-uall")
+    if rc:
+        return None
+    return {row[3:]: row[:2] for row in status.split("\0") if row}
+
+
+def start_commit_scope(info: Any) -> tuple[str, str, str, frozenset[str]] | str | None:
+    from kiro_crew.config import KiroCrewConfig
+
+    if served_local(info) and KiroCrewConfig.load().subagent.local_check.auto_commit:
+        return snapshot_commit_scope(info.cwd or "")
+    return None
+
+
+def snapshot_commit_scope(cwd: str) -> tuple[str, str, str, frozenset[str]] | str:
+    """Capture the paths already dirty before a worker starts."""
     if not cwd:
-        return "", "no cwd"
-    rc, branch = _git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
-    if rc != 0:
-        return "", "not a git work tree"
-    rc, status = _git(cwd, "status", "--porcelain")
-    if rc != 0:
-        return "", f"git status failed: {status[:200]}"
-    if not status:
-        return "", "no uncommitted changes"
+        return "no cwd"
+    rc, root = _git(cwd, "rev-parse", "--show-toplevel")
+    if rc:
+        return "not a git work tree"
+    root = root.rstrip("\n")
+    rc, branch = _git(root, "symbolic-ref", "--quiet", "--short", "HEAD")
+    if rc:
+        return "detached HEAD"
+    branch = branch.strip()
     if branch in PROTECTED_BRANCHES:
-        return "", f"on protected branch {branch}; left uncommitted"
-    rc, out = _git(cwd, "add", "-A")
-    if rc != 0:
-        return "", f"git add failed: {out[:200]}"
+        return f"on protected branch {branch}"
+    rc, head = _git(root, "rev-parse", "--verify", "HEAD")
+    status = _git_status(root)
+    if rc or status is None:
+        return "git snapshot failed"
+    if status:
+        rc, dirs = _git(root, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir")
+        if rc or len(set(dirs.splitlines())) != 2:
+            return "working directory was dirty before the run"
+    return root, branch, head, frozenset(status)
+
+
+def commit_changes(
+    scope: tuple[str, str, str, frozenset[str]] | str,
+    run_id: str,
+    cmd: str,
+    cancelled: threading.Event,
+) -> tuple[str, str]:
+    """Commit only new tracked or explicitly staged paths, with normal hooks."""
+    if cancelled.is_set():
+        return "", "commit cancelled"
+    if isinstance(scope, str):
+        return "", scope
+    cwd, original_branch, original_head, excluded = scope
+    rc, branch = _git(cwd, "symbolic-ref", "--quiet", "--short", "HEAD")
+    branch = branch.strip()
+    if rc or branch in PROTECTED_BRANCHES:
+        return "", f"on protected branch {branch}" if branch else "detached HEAD"
+    if branch != original_branch:
+        return "", "branch changed during the run"
+    rc, head = _git(cwd, "rev-parse", "--verify", "HEAD")
+    if rc or head != original_head:
+        return "", "HEAD changed during the run"
+    status = _git_status(cwd)
+    if status is None:
+        return "", "git status failed"
+    paths = [path for path, code in status.items() if path not in excluded and code != "??"]
+    if not paths:
+        return "", "no eligible changes"
+    if cancelled.is_set():
+        return "", "commit cancelled"
     msg = f"local run {run_id}: check passed\n\nCheck: {cmd}\nRun: {run_id}"
-    rc, out = _git(cwd, "commit", "-q", "--no-verify", "-m", msg)
+    rc, out = _git(cwd, "--literal-pathspecs", "commit", "-q", "--only", "-m", msg, "--", *paths)
     if rc != 0:
         return "", f"git commit failed: {out[:200]}"
     rc, sha = _git(cwd, "rev-parse", "--short", "HEAD")
-    return (sha, "") if rc == 0 else ("", "commit made, sha unreadable")
+    return (sha.strip(), "") if rc == 0 else ("", "commit made, sha unreadable")
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +700,8 @@ async def handle_run_end(manager: Any, info: Any) -> str:
     if not _eligible(manager, info) or not served_local(info):
         return ""
     cmd = check_for(info)
+    if not cmd and (getattr(info, "delegation", None) or {}).get("check"):
+        info.local_check_line = "local check skipped: unsupported check syntax"
     errored = bool(info.error)
     if not errored and not cmd:
         return ""
@@ -652,8 +709,27 @@ async def handle_run_end(manager: Any, info: Any) -> str:
     output = ""
     if not errored:
         passed, output = await asyncio.to_thread(run_check, cmd, cwd)
+        if not _eligible(manager, info):
+            return ""
         if passed:
-            sha, why_not = await asyncio.to_thread(commit_changes, cwd, info.id, cmd)
+            sha, why_not = "", "auto-commit disabled or no start snapshot"
+            scope = getattr(info, "_local_commit_scope", None)
+            if scope is not None:
+                cancelled = threading.Event()
+                commit = asyncio.create_task(
+                    asyncio.to_thread(commit_changes, scope, info.id, cmd, cancelled)
+                )
+                try:
+                    sha, why_not = await asyncio.shield(commit)
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    while not commit.done():
+                        try:
+                            await asyncio.wait({commit})
+                        except asyncio.CancelledError:
+                            continue
+                    commit.result()
+                    raise
             if sha:
                 info.local_check_line = f"local check: {cmd} PASS -> committed {sha}"
                 outcome = "pass"
