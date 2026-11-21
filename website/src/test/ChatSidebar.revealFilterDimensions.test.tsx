@@ -149,6 +149,22 @@ beforeEach(() => localStorage.clear())
 afterEach(() => vi.clearAllMocks())
 
 describe('reveal-in-sidebar drops every registered filter dimension', () => {
+  it('reveals a pinned session whose Bot is open', async () => {
+    await withScrollStub(async () => {
+      const utils = renderSidebar([
+        { key: 'member-baton', mode: 'member', running: false, messages: 0 },
+        { ...SLOTS[0], mate_root: 'member-baton', pinned: true },
+        { ...SLOTS[1], mate_root: 'member-baton' },
+      ])
+      expect(utils.getByText('alpha session')).toBeVisible()
+      expect(utils.queryByText('beta session')).toBeNull()
+
+      act(() => { utils.store.dispatch(requestSlotReveal('k-alpha')) })
+
+      await waitFor(() => expect(Element.prototype.scrollIntoView).toHaveBeenCalled())
+    })
+  })
+
   it('clears a search that hides the reveal target', async () => {
     await withScrollStub(async () => {
       const utils = renderSidebar()

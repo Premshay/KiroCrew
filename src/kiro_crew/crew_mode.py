@@ -588,9 +588,9 @@ def list_view(rows: list[dict[str, Any]], view: str, *, agent: bool) -> list[dic
 
     A session a Crew Mode root dispatched is that root's to show (its side panel's
     worker list), so a PERSON's list leaves it out unless *view* is ``all``. A
-    session a live mate thread dispatched (:data:`MATE_ROOT_FIELD`) is the mate's
-    Sessions tab's to show and is left out the same way; the mate thread itself
-    stays, and a session whose mate thread is not in *rows* (closed) stays too. An *agent*'s read keeps every row
+    session a live mate thread dispatched (:data:`MATE_ROOT_FIELD`) appears in
+    the mate's Sessions tab. Unpinned sessions leave the person's list while
+    that mate thread is open. An *agent*'s read keeps every row
     by default: its folder, status and lineage tools resolve their own and their
     children's rows from this list.
 
@@ -601,7 +601,11 @@ def list_view(rows: list[dict[str, Any]], view: str, *, agent: bool) -> list[dic
     if view == VIEW_ALL or agent:
         return rows
     hiding = {r["key"] for r in rows if r.get("mode") == MATE_SLOT_MODE and r.get("key")}
-    return [r for r in rows if not r.get(WORKER_FIELD) and r.get(MATE_ROOT_FIELD) not in hiding]
+    return [
+        r
+        for r in rows
+        if not r.get(WORKER_FIELD) and (r.get("pinned") or r.get(MATE_ROOT_FIELD) not in hiding)
+    ]
 
 
 def _live_row(slot: Any) -> dict[str, Any]:

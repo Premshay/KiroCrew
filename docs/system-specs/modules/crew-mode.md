@@ -2846,9 +2846,11 @@ mounted.
 slots whose `mate_root` is the Bot's DM slot (birth `created_by` alone does not count), merged
 with the Bot's `GET .../crew-workers` answer, which adds closed sessions, the
 ledger line and the server's group (`MateSessionsList`, `liveMateWorkers`). While
-the Bot's thread is live, the same sessions leave the person's own lists (sidebar,
-Recents, grid, unread counts and a person's `GET /api/chat/slots`; `crewModeView`,
-`crew_mode.list_view`). There is no switch to keep them listed; a stored
+the Bot's thread is live, its sessions are hidden by default in the person's
+sidebar, Recents, grid, unread counts and `GET /api/chat/slots` (`crewModeView`,
+`crew_mode.list_view`). The Nexus fork keeps pinned sessions in those views,
+including their unread status. There is no switch
+to keep all of a Bot's sessions listed. A stored
 `show_sessions_in_list` value is ignored. The tab keeps its name (a recorded decision), but its empty
 box speaks the reader's words, not the mechanism's: a first-time user has no
 model for why a Bot would "drive sessions", so the box says session, chat or
