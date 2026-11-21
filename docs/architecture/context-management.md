@@ -605,6 +605,10 @@ re-adds, once:
    `shared_resources_part` gate as session start, re-read from disk, payload scrubbed
    of structural markers.
 
+Lean local helpers skip shared resources at start and after compaction. The run
+record keeps the lean flag across gateway restarts. Local fit estimates count the
+shared files when the project group is included and the helper uses the full contract.
+
 9. `[REINJECTED AFTER COMPACTION — goal-conductor]` — one line telling a
    conductor to re-read the `goal-conductor` skill, whose body the compaction
    dropped, via `context_assembly/turn.py` → `conductor_reread_part`: a chat on

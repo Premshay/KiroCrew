@@ -548,6 +548,7 @@ def build_message(
                     )
                     parts.extend(
                         _turn.steering_parts(
+                            session_key=session_key,
                             agent=agent,
                             project=project,
                             context_groups=context_groups,

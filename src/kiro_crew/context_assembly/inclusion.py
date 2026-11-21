@@ -254,6 +254,7 @@ def shared_resources_part(
     context_groups: frozenset[str] | None,
     project: str | None = None,
     member_template: str = "",
+    session_key: str | None = None,
 ) -> str:
     """The ``context.shared_resources`` text for this session, or ``""``.
 
@@ -261,10 +262,8 @@ def shared_resources_part(
     re-injection frames it as a ``[REINJECTED AFTER COMPACTION ...]`` block. One
     gate for both, so the two cannot drift in who receives it.
 
-    Unlike :func:`steering_resources_part`, no harness, agent kind or member
-    envelope is excluded: the point of the key is that every session gets the
-    documents, whether its spec lists them or not. Two things narrow it. The
-    ``project`` context group, as for steering: a parent that withholds project
+    Lean local helpers use their own contract and skip these documents.
+    The ``project`` context group applies as for steering: a parent that withholds project
     context from a sub-agent withholds these rules too, and the sub-agent is told
     the group was withheld. And de-duplication: a document the session's own spec
     already delivers is not sent again. The specs consulted are *agent*'s (the
@@ -278,8 +277,11 @@ def shared_resources_part(
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
     from kiro_crew.agent_files import is_kirocrew_default_agent
     from kiro_crew.context_assembly import shared_resources as _shared
+    from kiro_crew.subagent_manager.local_check import is_lean_session
 
     if not _group_included(context_groups, CONTEXT_GROUP_PROJECT):
+        return ""
+    if is_lean_session(session_key):
         return ""
     entries = _shared.configured_shared_resources()
     if not entries:

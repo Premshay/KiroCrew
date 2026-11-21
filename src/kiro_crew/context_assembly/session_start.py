@@ -436,13 +436,9 @@ def build_session_context(
         append_required(
             "[Steering resources]\n" + steering_ctx + "\n[End of steering resources]\n\n"
         )
-    # Operator-configured documents (``context.shared_resources``) for EVERY
-    # session: no harness, agent-kind or member-envelope exclusion, only the
-    # project group and de-duplication against what the session's own spec
-    # already delivers. A member chat's spec is its member template, whose
-    # documents ride in the essentials envelope. The caller scrubs this tail;
-    # the bodies arrive pre-scrubbed as well.
+    # The shared-resource gate handles lean helpers and de-duplicates agent resources.
     shared_ctx = _inclusion.shared_resources_part(
+        session_key=session_key,
         agent=agent,
         provider_type=provider_type,
         context_groups=context_groups,

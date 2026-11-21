@@ -235,6 +235,7 @@ def post_compaction_parts(
         parts.append("[REINJECTED AFTER COMPACTION — response preferences]\n" + _prefs)
     parts.extend(
         steering_parts(
+            session_key=session_key,
             agent=agent,
             project=project,
             context_groups=context_groups,
@@ -302,6 +303,7 @@ def lessons_parts(
 
 def steering_parts(
     *,
+    session_key: str | None = None,
     agent: str | None,
     project: str | None,
     context_groups: frozenset[str] | None,
@@ -344,6 +346,7 @@ def steering_parts(
     # and then the gate skips them), so the compaction dropped them everywhere.
     # Re-read the CURRENT files; the payload is scrubbed, the wrapper kept outside.
     _shared_ctx = _inclusion.shared_resources_part(
+        session_key=session_key,
         agent=agent,
         provider_type=provider_type,
         context_groups=context_groups,

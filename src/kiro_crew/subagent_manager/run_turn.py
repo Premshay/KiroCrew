@@ -431,6 +431,7 @@ async def _run_inner_impl(
 
         _lean = await asyncio.to_thread(_local_check.prepare_lean_run, info, session_key)
         if _lean is not None:
+            await self._manager._write_state_off_loop(info, "lean helper", lean_helper=True)
             extra_kwargs["local_helper_profile"] = _lean
     if info.cwd:
         extra_kwargs["cwd"] = info.cwd

@@ -157,6 +157,15 @@ def context_tokens(groups: frozenset[str] | None, role: str = "") -> int:
     """
     kept = _ALL_GROUPS if groups is None else groups
     base = KEPT_CONTEXT_TOKENS - (LEAN_CONTRACT_SAVED_TOKENS if role in LEAN_CONTRACT_ROLES else 0)
+    if "project" in kept and role not in LEAN_CONTRACT_ROLES:
+        from kiro_crew.context_assembly.shared_resources import (
+            configured_shared_resources,
+            load_shared_resources,
+        )
+
+        shared = load_shared_resources(configured_shared_resources())
+        if shared:
+            base += brief_tokens("[Shared resources]\n" + shared + "\n[End of shared resources]\n")
     return base + sum(t for g, t in CONTEXT_GROUP_TOKENS.items() if g in kept)
 
 
@@ -171,12 +180,8 @@ def estimate_tokens(
     """
     out = {}
     for role, over in LOCAL_HARNESS_OVERHEAD_TOKENS.items():
-        if groups is not None:
+        if groups is not None or include_context:
             ctx = context_tokens(groups, role)
-        elif include_context:
-            ctx = INJECTED_CONTEXT_TOKENS - (
-                LEAN_CONTRACT_SAVED_TOKENS if role in LEAN_CONTRACT_ROLES else 0
-            )
         else:
             ctx = 0
         out[role] = brief_tokens(brief) + ctx + over
@@ -244,7 +249,7 @@ def fit_local(
         if group in kept and group not in pinned:
             kept.discard(group)
             drop.append(group)
-            need = context_tokens(frozenset(kept), role)
+            need -= CONTEXT_GROUP_TOKENS[group]
     fits = need <= room
     return LocalFit(role, fits, tuple(drop) if fits else (), budget, need)
 
@@ -384,7 +389,15 @@ def is_lean_session(session_key: str | None) -> bool:
     if not session_key:
         return False
     with _LEAN_SESSIONS_LOCK:
-        return session_key in _LEAN_SESSIONS
+        if session_key in _LEAN_SESSIONS:
+            return True
+    from kiro_crew.subagent_persistence import read_state, subagent_id_from_conversation_key
+
+    owner = subagent_id_from_conversation_key(session_key)
+    if owner and (read_state(owner) or {}).get("lean_helper") is True:
+        mark_lean_session(session_key)
+        return True
+    return False
 
 
 def local_role_of_run(info: Any) -> str:
@@ -448,10 +461,15 @@ def prepare_lean_run(info: Any, session_key: str) -> dict[str, list[str]] | None
     ``local_helper_profile`` the provider factory takes. Blocking (reads the
     config): call it off the event loop.
     """
+    from kiro_crew.subagent_persistence import subagent_id_from_conversation_key
+
     role = local_role_of_run(info)
-    if role not in LEAN_CONTRACT_ROLES:
+    owner = subagent_id_from_conversation_key(session_key)
+    if owner and owner != info.id:
+        return lean_helper_profile() if is_lean_session(session_key) else None
+    if role not in LEAN_CONTRACT_ROLES and not is_lean_session(session_key):
         return None
-    if getattr(info, "route_vendor", "") != "local":
+    if role in LEAN_CONTRACT_ROLES and getattr(info, "route_vendor", "") != "local":
         fit = fit_seat_run(info, role)
         logger.info(
             "Subagent %s: lean %s helper, first turn fitted to %d tokens%s",
