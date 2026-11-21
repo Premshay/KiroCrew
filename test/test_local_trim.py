@@ -155,9 +155,7 @@ def routed_env(tmp_path, monkeypatch):
     monkeypatch.setattr(vl, "_data_home", lambda: tmp_path)
     vl._reset_for_tests()
     monkeypatch.setattr(sr, "_limits_cache", None)
-    monkeypatch.setattr(sr, "_health_cache", None)
     monkeypatch.setattr(sr, "_agy_models_cache", None)
-    monkeypatch.setattr(sr, "load_tombstones", lambda root=None: [])
     consent = tmp_path / "decisions_consent.json"
     consent.write_text(
         json.dumps({"enabled": True, "endpoint": DECISION_PROVIDER_ENDPOINT_DEFAULT}),
