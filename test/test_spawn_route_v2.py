@@ -1,8 +1,4 @@
-"""spawn.route v2 (fork): cross-vendor candidates, vendor headroom, and the backend switch.
-
-Contract: nexus ``docs/upstream/kirocrew-delegation-fit-issue.md`` and
-``eval/decision-lane/POLICY.md`` (operator ruling of 2026-11-20).
-"""
+"""Spawn routing tests for cross-vendor candidates, quota, and backend selection."""
 
 from __future__ import annotations
 

@@ -157,7 +157,9 @@ def template_model_pin(config: KiroCrewConfig, template: str | None) -> str:
 class LocalCheckConfig:
     auto_commit: bool = field(
         default=False,
-        metadata=_meta("Auto-commit", "Commit eligible local worker changes after a passing check."),
+        metadata=_meta(
+            "Auto-commit", "Commit eligible local worker changes after a passing check."
+        ),
     )
 
 

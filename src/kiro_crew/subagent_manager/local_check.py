@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import shlex
 import subprocess
@@ -513,9 +514,13 @@ def run_check(cmd: str, cwd: str, timeout: float = CHECK_TIMEOUT_S) -> tuple[boo
     if _UNSAFE.search(cmd):
         return False, "check contains unsupported shell syntax"
     try:
+        argv = shlex.split(cmd)
+        if not argv:
+            return False, "check command is empty"
         p = subprocess.run(
-            shlex.split(cmd),
+            argv,
             cwd=cwd or None,
+            env={name: os.environ[name] for name in ("PATH", "HOME", "LANG") if name in os.environ},
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -524,7 +529,7 @@ def run_check(cmd: str, cwd: str, timeout: float = CHECK_TIMEOUT_S) -> tuple[boo
     except subprocess.TimeoutExpired as exc:
         out = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
         return False, f"{out[-CHECK_OUTPUT_TAIL_CHARS:]}\n(check timed out after {timeout:.0f}s)"
-    except Exception as exc:  # cwd gone, bash missing
+    except (OSError, ValueError) as exc:
         return False, f"check could not run: {exc}"
     out = (p.stdout or "") + (p.stderr or "")
     tail = out[-CHECK_OUTPUT_TAIL_CHARS:]
@@ -580,7 +585,9 @@ def snapshot_commit_scope(cwd: str) -> tuple[str, str, str, frozenset[str]] | st
     if rc or status is None:
         return "git snapshot failed"
     if status:
-        rc, dirs = _git(root, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir")
+        rc, dirs = _git(
+            root, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"
+        )
         if rc or len(set(dirs.splitlines())) != 2:
             return "working directory was dirty before the run"
     return root, branch, head, frozenset(status)

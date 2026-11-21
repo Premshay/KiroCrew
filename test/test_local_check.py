@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -283,8 +284,7 @@ class TestPassCommits:
         info._local_commit_scope = lc.snapshot_commit_scope(git_repo)
         assert asyncio.run(lc.handle_run_end(_Manager(), info)) == "pass_uncommitted"
         assert (
-            info.local_check_line
-            == "local check: true PASS -> not committed (no eligible changes)"
+            info.local_check_line == "local check: true PASS -> not committed (no eligible changes)"
         )
 
     def test_dirty_primary_checkout_is_refused(self, git_repo):
@@ -310,19 +310,23 @@ class TestPassCommits:
         hook = hooks / "pre-commit"
         hook.write_text("#!/bin/sh\necho hook-refused >&2\nexit 1\n", encoding="utf-8")
         hook.chmod(0o755)
-        subprocess.run(
-            ["git", "-C", git_repo, "config", "core.hooksPath", str(hooks)], check=True
-        )
+        subprocess.run(["git", "-C", git_repo, "config", "core.hooksPath", str(hooks)], check=True)
         assert asyncio.run(lc.handle_run_end(_Manager(), info)) == "pass_uncommitted"
         assert "hook-refused" in info.local_check_line
         hook.unlink()
         assert asyncio.run(lc.handle_run_end(_Manager(), info)) == "pass"
-        assert subprocess.check_output(
-            ["git", "-C", str(worktree), "show", "--pretty=", "--name-only", "HEAD"], text=True
-        ).strip() == "new.txt"
-        assert subprocess.check_output(
-            ["git", "-C", str(worktree), "status", "--porcelain"], text=True
-        ) == "A  user.txt\n"
+        assert (
+            subprocess.check_output(
+                ["git", "-C", str(worktree), "show", "--pretty=", "--name-only", "HEAD"], text=True
+            ).strip()
+            == "new.txt"
+        )
+        assert (
+            subprocess.check_output(
+                ["git", "-C", str(worktree), "status", "--porcelain"], text=True
+            )
+            == "A  user.txt\n"
+        )
 
     def test_opt_in_defaults_off(self, git_repo):
         from kiro_crew.config import KiroCrewConfig
@@ -353,8 +357,8 @@ class TestPassCommits:
         subprocess.run(["git", "-C", git_repo, "add", "work.txt"], check=True)
         started = asyncio.Event()
         release = threading.Event()
-        settled = threading.Event()
         loop = asyncio.get_running_loop()
+        settled = asyncio.Event()
         original_git = lc._git
 
         def blocked_git(cwd, *args):
@@ -367,7 +371,7 @@ class TestPassCommits:
             try:
                 return original_commit(*args)
             finally:
-                settled.set()
+                loop.call_soon_threadsafe(settled.set)
 
         original_commit = lc.commit_changes
         monkeypatch.setattr(lc, "_git", blocked_git)
@@ -383,7 +387,7 @@ class TestPassCommits:
             release.set()
         with pytest.raises(asyncio.CancelledError):
             await job
-        await asyncio.to_thread(settled.wait)
+        await settled.wait()
         assert _head(git_repo).endswith("base")
 
 
@@ -527,6 +531,21 @@ class TestNoCheck:
 
 
 class TestRunCheck:
+    def test_only_allowed_environment_reaches_explicit_check(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GATEWAY_TEST_SECRET", "fixture-value")
+        monkeypatch.setenv("LANG", "C")
+        script = tmp_path / "verify_env.py"
+        script.write_text(
+            "import os\nprint(os.environ.get('LANG'))\n"
+            "print('GATEWAY_TEST_SECRET' in os.environ)\n",
+            encoding="utf-8",
+        )
+        info = SubagentInfo(id="a", task="Check the environment.")
+        info.delegation = {"check": f'"{sys.executable}" verify_env.py'}
+        passed, output = lc.run_check(lc.check_for(info), str(tmp_path))
+        assert passed
+        assert output.splitlines() == ["C", "False", "(exit 0)"]
+
     def test_timeout_is_a_fail(self, tmp_path):
         ok, out = lc.run_check("sleep 5", str(tmp_path), timeout=0.2)
         assert ok is False and "timed out" in out
