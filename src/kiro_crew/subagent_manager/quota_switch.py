@@ -175,7 +175,9 @@ def detect(
             return QuotaHit(vendor, model, _reset_from(text, vendor, now), line)
     if vendor == "claude" and use_health:
         state = vl.claude_health(now)
-        if state.get("out") and state.get("resets_at"):
+        # The provider's own refusal, not the out_pct threshold: a run that failed
+        # while Claude reads 96 % used failed for some other reason.
+        if state.get("status") == "rejected" and state.get("resets_at"):
             return QuotaHit(
                 vendor, model, float(state["resets_at"]), "rate_limit_event status rejected"
             )

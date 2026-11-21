@@ -45,7 +45,10 @@ class TestDefaults:
         ``model_route`` map may already name -- ids the account advertises -- and it
         sends nothing anywhere: the question it answers is only asked once the
         keystone consents, so it chooses where a consented answer lands and arms
-        nothing."""
+        nothing.
+
+        ``quota_limits`` is two thresholds that only reorder candidates already
+        offered; it sends nothing and arms nothing."""
         from dataclasses import fields
 
         assert {f.name for f in fields(DecisionsConfig)} == {
@@ -53,6 +56,7 @@ class TestDefaults:
             "history_budget_chars",
             "model_route",
             "spawn_route",
+            "quota_limits",
             "model_route_derive",
             "nudge_wake",
             "provider",
@@ -154,6 +158,7 @@ class TestMigrationFromThePreviewSpelling:
             "history_budget_chars",
             "model_route",
             "spawn_route",
+            "quota_limits",
             "model_route_derive",
             "nudge_wake",
             "provider",

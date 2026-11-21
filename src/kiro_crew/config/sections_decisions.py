@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from kiro_crew.config.fields import _meta, _safe_bool, _safe_int
+from kiro_crew.config.fields import _meta, _safe_bool, _safe_float, _safe_int
 from kiro_crew.config.sections_agent_fields import normalize_agent_model
 from kiro_crew.config.sections_defaults import SectionReader
 
@@ -86,6 +86,38 @@ def coerce_spawn_route(raw: object) -> dict[str, dict[str, list[str]]]:
                 for m in (normalize_agent_model(i) for i in (ids or []) if isinstance(i, str))
                 if m
             ]
+    return out
+
+
+# Subscription quota thresholds, as a percentage of a window used: the ONE place
+# their defaults are named. ``kiro_crew.quota_rules`` derives "low" and "out" from
+# them for every vendor and account alike, and spawn.route sends them to the
+# decision server in its state (``state["limits"]``) so both sides judge with the
+# same numbers. 2026-11-20: a 95 %-used Codex review failed on quota, so 95 % is
+# out, not merely low.
+QUOTA_LOW_PCT_DEFAULT = 50.0
+QUOTA_OUT_PCT_DEFAULT = 95.0
+QUOTA_LIMITS_DEFAULT: dict[str, float] = {
+    "low_pct": QUOTA_LOW_PCT_DEFAULT,
+    "out_pct": QUOTA_OUT_PCT_DEFAULT,
+}
+
+
+def coerce_quota_limits(raw: object) -> dict[str, float]:
+    """Normalize ``decisions.quota_limits`` to ``{"low_pct", "out_pct"}``, each 0..100.
+
+    A missing or unreadable value reads as its default. A pair whose ``low_pct``
+    is above its ``out_pct`` cannot describe a window (low would start after out),
+    so the whole pair falls back to the defaults rather than guessing which half
+    the hand-edit meant.
+    """
+    section = raw if isinstance(raw, dict) else {}
+    out = {
+        key: _safe_float(section.get(key, default), default, 0.0, 100.0)
+        for key, default in QUOTA_LIMITS_DEFAULT.items()
+    }
+    if out["low_pct"] > out["out_pct"]:
+        return dict(QUOTA_LIMITS_DEFAULT)
     return out
 
 
@@ -329,6 +361,20 @@ class DecisionsConfig:
             "A per-spawn model pin is never overridden.",
         ),
     )
+    quota_limits: dict[str, float] = field(
+        default_factory=lambda: dict(QUOTA_LIMITS_DEFAULT),
+        metadata=_meta(
+            "Subscription quota thresholds",
+            "When a vendor's subscription window counts as low or out, as the share "
+            "of the window used: {low_pct, out_pct}, defaults 50 and 95. The same two "
+            "numbers apply to every vendor and every account (Claude, Codex, "
+            "Antigravity, ...): a vendor at or past low_pct is skipped for routine "
+            "sub-agent work while another vendor has room, and one at or past "
+            "out_pct, or refused by its provider, is not offered at all. A vendor "
+            "with several accounts is out only when every account is. Each value is "
+            "clamped to 0-100; a low_pct above out_pct reads as the defaults.",
+        ),
+    )
     model_route: dict[str, str] = field(
         default_factory=lambda: dict(DECISION_MODEL_ROUTE_DEFAULT),
         metadata=_meta(
@@ -463,6 +509,7 @@ class DecisionsConfig:
             # against the provider's advertised list at routing time.
             model_route=coerce_model_route(section.get("model_route")),
             spawn_route=coerce_spawn_route(section.get("spawn_route")),
+            quota_limits=coerce_quota_limits(section.get("quota_limits")),
             # A real bool only: anything else reads as the default, off, so a
             # hand-edit that fails to parse never turns routing on.
             model_route_derive=reader.read("model_route_derive", _safe_bool),
