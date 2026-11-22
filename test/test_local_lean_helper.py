@@ -1,11 +1,7 @@
 """The lean helper profile for runs on the CPU lane of the local fleet.
 
-Measured 2026-11-20: a helper spawned on ``local-background`` sent a 24,532-token
-first turn to a local model (Claude Code harness 15,153; Kiro Crew block 9,379, of
-which the shipped contract was 7,152) and was reaped at 300 s before its first
-output. The lean profile sends the short contract, the four coding tools and a
-context trimmed to a first-turn TOKEN TARGET, not to the window: raising the
-lane's window to 64k had switched the window-only trim off.
+The lean profile sends a short contract and four coding tools. It trims context
+to a first-turn token target even when the lane has a larger context window.
 """
 
 from __future__ import annotations
@@ -114,9 +110,9 @@ class TestLocalRoleOfRun:
         self._seats(
             monkeypatch,
             {
-                "local-background": {"runtime_agent": "kirocrew-heartbeat"},
-                "local-fleet": {"runtime_agent": "crew-local"},
-                "claude-max": {"runtime_agent": "crew-claude"},
+                "local-cpu-example": {"runtime_agent": "kirocrew-heartbeat"},
+                "local-gpu-example": {"runtime_agent": "crew-local"},
+                "claude-example": {"runtime_agent": "crew-claude"},
             },
         )
 
@@ -162,8 +158,8 @@ class TestPrepareLeanRun:
         monkeypatch.setattr(
             "kiro_crew.execution_seats.declared_execution_seats",
             lambda cfg=None: {
-                "local-background": {"runtime_agent": "kirocrew-heartbeat"},
-                "local-fleet": {"runtime_agent": "crew-local"},
+                "local-cpu-example": {"runtime_agent": "kirocrew-heartbeat"},
+                "local-gpu-example": {"runtime_agent": "crew-local"},
             },
         )
 

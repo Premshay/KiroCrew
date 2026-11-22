@@ -280,7 +280,9 @@ class TestOtherVendors:
         monkeypatch.setattr("urllib.request.urlopen", opener)
 
         assert vl.local_health()["lanes"]["subagent"]
-        opener.assert_called_once_with(override or companion_url, timeout=vl.FLEET_TIMEOUT_S)
+        opener.assert_called_once()
+        assert opener.call_args.args == (override or companion_url,)
+        assert opener.call_args.kwargs == {"timeout": vl.FLEET_TIMEOUT_S}
 
     def test_local_health_has_no_builtin_endpoint(self, monkeypatch):
         from unittest.mock import Mock
@@ -383,11 +385,15 @@ class TestCandidates:
         monkeypatch.setattr(sr, "effective_tiers", _fake_tiers)
         backends = {
             "local/subagent": {
-                "backend": "local-background",
+                "backend": "local-cpu-example",
                 "runtime_agent": "kirocrew-lite",
                 "native": "",
             },
-            "local/agent": {"backend": "local-fleet", "runtime_agent": "crew-local", "native": ""},
+            "local/agent": {
+                "backend": "local-gpu-example",
+                "runtime_agent": "crew-local",
+                "native": "",
+            },
         }
         cands = [
             c for c in sr.all_candidates("claude", backends=backends) if c["vendor"] == "local"
@@ -398,14 +404,14 @@ class TestCandidates:
                 "vendor": "local",
                 "tier": "subagent",
                 "model": "subagent",
-                "backend": "local-background",
+                "backend": "local-cpu-example",
             },
             {
                 "key": "local/agent/0",
                 "vendor": "local",
                 "tier": "agent",
                 "model": "agent",
-                "backend": "local-fleet",
+                "backend": "local-gpu-example",
             },
         ]
 
@@ -434,13 +440,13 @@ class TestCandidates:
                     "runtime_agent": "crew-antigravity",
                     "runtime": "Antigravity",
                 },
-                "local-background": {
-                    "id": "local-background",
+                "local-cpu-example": {
+                    "id": "local-cpu-example",
                     "runtime_agent": "kirocrew-lite",
                     "runtime": "local",
                 },
-                "local-fleet": {
-                    "id": "local-fleet",
+                "local-gpu-example": {
+                    "id": "local-gpu-example",
                     "runtime_agent": "crew-local",
                     "runtime": "local",
                 },
@@ -452,8 +458,8 @@ class TestCandidates:
             "runtime_agent": "crew-antigravity",
             "native": "",
         }
-        assert b["local/subagent"]["backend"] == "local-background"
-        assert b["local/agent"]["backend"] == "local-fleet"
+        assert b["local/subagent"]["backend"] == "local-cpu-example"
+        assert b["local/agent"]["backend"] == "local-gpu-example"
         assert b["codex"] == {"backend": "codex", "runtime_agent": "", "native": "codex"}
         assert "claude" not in b  # the parent's own vendor runs on its own seat
         assert "deepseek" not in b
@@ -686,16 +692,16 @@ class TestCompanionSeats:
         from kiro_crew.platform import context
 
         rows = [
-            {"id": "claude-max", "runtime_agent": "crew-claude", "vendor": "claude"},
-            {"id": "codex-sub", "runtime_agent": "crew-codex", "vendor": "codex"},
+            {"id": "claude-example", "runtime_agent": "crew-claude", "vendor": "claude"},
+            {"id": "codex-example", "runtime_agent": "crew-codex", "vendor": "codex"},
             {
-                "id": "local-fleet",
+                "id": "local-gpu-example",
                 "runtime_agent": "crew-local",
                 "vendor": "local",
                 "role": "agent",
             },
             {
-                "id": "local-background",
+                "id": "local-cpu-example",
                 "runtime_agent": "kirocrew-heartbeat",
                 "vendor": "local",
                 "role": "subagent",
@@ -712,15 +718,15 @@ class TestCompanionSeats:
     def test_every_cross_vendor_role_resolves_to_its_seat(self, companion_cfg):
         b = sr.route_backends("antigravity", companion_cfg)
         assert {k: (v["backend"], v["runtime_agent"], v["native"]) for k, v in b.items()} == {
-            "claude": ("claude-max", "crew-claude", ""),
-            "codex": ("codex-sub", "crew-codex", ""),
-            "local/agent": ("local-fleet", "crew-local", ""),
-            "local/subagent": ("local-background", "kirocrew-heartbeat", ""),
+            "claude": ("claude-example", "crew-claude", ""),
+            "codex": ("codex-example", "crew-codex", ""),
+            "local/agent": ("local-gpu-example", "crew-local", ""),
+            "local/subagent": ("local-cpu-example", "kirocrew-heartbeat", ""),
         }
 
     def test_a_seat_wins_over_the_native_backend_of_its_vendor(self, companion_cfg):
         b = sr.route_backends("claude", companion_cfg)
-        assert b["codex"]["backend"] == "codex-sub" and b["codex"]["native"] == ""
+        assert b["codex"]["backend"] == "codex-example" and b["codex"]["native"] == ""
         assert "claude" not in b and "deepseek" not in b
 
     def test_ordinary_runs_are_admitted_onto_every_seat(self, companion_cfg):

@@ -1,12 +1,9 @@
 """A custom agent ("seat") on Claude Code or Codex gets its spec's absolute ``file://`` documents.
 
 Neither harness reads an agent's ``resources``; kiro-cli loads them natively and a
-crew member's essentials envelope carries its own. A seat such as
-``crew-claude-example`` used to get only its ``prompt``, so a shared guide named by
-absolute path never reached it. ``inclusion.steering_resources_part`` now loads
-the seat's ABSOLUTE entries (``agent_spec._load_seat_resources``) at session start
-and after a compaction, through one gate; relative entries keep their old
-behaviour (not loaded), and members and kiro-cli are unchanged.
+crew member's essentials envelope carries its own.
+``inclusion.steering_resources_part`` loads a seat's absolute entries at session
+start and after compaction. It skips relative entries.
 """
 
 from __future__ import annotations

@@ -134,8 +134,8 @@ def _fake_tiers(vendor, config=None):
 
 
 BACKENDS = {
-    "local/subagent": {"backend": "claude", "runtime_agent": "local-background", "native": ""},
-    "local/agent": {"backend": "claude", "runtime_agent": "local-fleet", "native": ""},
+    "local/subagent": {"backend": "claude", "runtime_agent": "local-cpu-example", "native": ""},
+    "local/agent": {"backend": "claude", "runtime_agent": "local-gpu-example", "native": ""},
 }
 
 

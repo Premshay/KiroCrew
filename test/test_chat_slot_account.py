@@ -46,7 +46,7 @@ def account_state(monkeypatch):
 
     def _policy(name: str):
         if name in ("derrick", "crew-derrick"):
-            return {"engine": "claude-max", "backend": "claude", "priority": 0}
+            return {"engine": "claude-example", "backend": "claude", "priority": 0}
         if name in ("codex", "codex-engine"):
             return {"engine": "codex", "backend": "codex", "priority": 1}
         return None
