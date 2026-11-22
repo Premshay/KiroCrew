@@ -6,6 +6,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from kiro_crew import vendor_limits as vl
@@ -265,7 +266,8 @@ class TestOtherVendors:
 
     @pytest.mark.parametrize("override", [None, "http://127.0.0.1:8081/fleet/status"])
     def test_local_health_uses_the_configured_status_url(self, monkeypatch, override):
-        from unittest.mock import Mock, mock_open
+        from contextlib import nullcontext
+        from unittest.mock import Mock
 
         from kiro_crew.platform import context
 
@@ -276,13 +278,14 @@ class TestOtherVendors:
         if override:
             monkeypatch.setenv("KIROCREW_FLEET_STATUS_URL", override)
         status = {"lanes": {"cpu": {"available": True}}, "roles": {"subagent": {"lane": "cpu"}}}
-        opener = Mock(return_value=mock_open(read_data=json.dumps(status))())
-        monkeypatch.setattr("urllib.request.urlopen", opener)
+        response = httpx.Response(200, json=status, request=httpx.Request("GET", companion_url))
+        stream = Mock(return_value=nullcontext(response))
+        monkeypatch.setattr(httpx, "stream", stream)
 
         assert vl.local_health()["lanes"]["subagent"]
-        opener.assert_called_once()
-        assert opener.call_args.args == (override or companion_url,)
-        assert opener.call_args.kwargs == {"timeout": vl.FLEET_TIMEOUT_S}
+        stream.assert_called_once()
+        assert stream.call_args.args == ("GET", override or companion_url)
+        assert stream.call_args.kwargs == {"timeout": vl.FLEET_TIMEOUT_S, "follow_redirects": True}
 
     def test_local_health_has_no_builtin_endpoint(self, monkeypatch):
         from unittest.mock import Mock
@@ -294,11 +297,18 @@ class TestOtherVendors:
             context, "current_context", lambda: SimpleNamespace(providers=DefaultProviderRegistry())
         )
         monkeypatch.delenv("KIROCREW_FLEET_STATUS_URL", raising=False)
-        opener = Mock()
-        monkeypatch.setattr("urllib.request.urlopen", opener)
+        stream = Mock()
+        monkeypatch.setattr(httpx, "stream", stream)
 
         assert vl.local_health() == {}
-        opener.assert_not_called()
+        stream.assert_not_called()
+
+    def test_local_health_does_not_read_a_file_url(self, monkeypatch, tmp_path):
+        path = tmp_path / "status.json"
+        path.write_text('{"roles": {}, "lanes": {}}', encoding="utf-8")
+        monkeypatch.setenv("KIROCREW_FLEET_STATUS_URL", path.as_uri())
+
+        assert vl.local_health() == {}
 
 
 # ---------------------------------------------------------------------------

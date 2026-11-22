@@ -404,7 +404,7 @@ def local_health(status: Mapping[str, Any] | None = None) -> dict[str, Any]:
 
 
 def _fleet_status() -> Any:
-    import urllib.request
+    import httpx
 
     try:
         url = os.environ.get("KIROCREW_FLEET_STATUS_URL")
@@ -415,8 +415,14 @@ def _fleet_status() -> Any:
             url = getter() if callable(getter) else None
         if not url:
             return None
-        with urllib.request.urlopen(url, timeout=FLEET_TIMEOUT_S) as resp:  # noqa: S310
-            return json.loads(resp.read(1 << 20))
+        with httpx.stream("GET", url, timeout=FLEET_TIMEOUT_S, follow_redirects=True) as response:
+            response.raise_for_status()
+            body = bytearray()
+            for chunk in response.iter_bytes(chunk_size=64 * 1024):
+                body.extend(chunk)
+                if len(body) > 1 << 20:
+                    return None
+            return json.loads(body)
     except Exception:
         logger.debug("vendor_limits: fleet status unreachable", exc_info=True)
         return None
