@@ -10,7 +10,7 @@ This module turns such an ending into a decision:
 2. The vendor (Antigravity: the model's quota group) is marked out in
    :mod:`kiro_crew.vendor_limits` until that reset, so ``spawn.route`` drops it
    for every new spawn (a hard filter, ``spawn_route.drop_quota_outs``).
-3. A ROUTED run (no model, backend, seat, crew or agent pin) is continued by a
+3. A ROUTED run (no model, backend, or seat pin) is continued by a
    successor on the next routed candidate (``spawn_route.reroute_after_quota``)
    with the same cwd and memory identity and a brief that is the original task
    plus a handoff (the failed run's transcript tail and its cwd's git state).
@@ -355,8 +355,8 @@ async def handle_run_end(manager: Any, info: Any, now: float | None = None) -> Q
     logger.warning("Subagent %s hit its quota: %s (%s)", info.id, what, hit.detail)
     if not info.quota_routable:
         info.error = (
-            f"{QUOTA_ERROR_CODE}: {what}. The run was pinned (model, backend, seat, crew "
-            f"or agent), so it was not switched. {hit.detail}"
+            f"{QUOTA_ERROR_CODE}: {what}. The run was pinned to its model or transport, "
+            f"so it was not switched. {hit.detail}"
         ).strip()
         return hit
     await _fall_through(manager, info, hit, now)
@@ -382,6 +382,8 @@ async def _fall_through(manager: Any, info: Any, hit: QuotaHit, now: float | Non
             session_key=info.parent_session_key or None,
             exclude_vendors=chain,
             tier=info.route_tier,
+            start_vendor=hit.vendor,
+            execution=info.execution_context,
             **_local_scope(info),
         )
         if not routed:
