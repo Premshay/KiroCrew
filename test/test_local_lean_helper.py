@@ -110,8 +110,16 @@ class TestLocalRoleOfRun:
         self._seats(
             monkeypatch,
             {
-                "local-cpu-example": {"runtime_agent": "kirocrew-heartbeat"},
-                "local-gpu-example": {"runtime_agent": "crew-local"},
+                "local-cpu-example": {
+                    "runtime_agent": "kirocrew-heartbeat",
+                    "vendor": "local",
+                    "role": "subagent",
+                },
+                "local-gpu-example": {
+                    "runtime_agent": "crew-local",
+                    "vendor": "local",
+                    "role": "agent",
+                },
                 "claude-example": {"runtime_agent": "crew-claude"},
             },
         )
@@ -158,8 +166,16 @@ class TestPrepareLeanRun:
         monkeypatch.setattr(
             "kiro_crew.execution_seats.declared_execution_seats",
             lambda cfg=None: {
-                "local-cpu-example": {"runtime_agent": "kirocrew-heartbeat"},
-                "local-gpu-example": {"runtime_agent": "crew-local"},
+                "local-cpu-example": {
+                    "runtime_agent": "kirocrew-heartbeat",
+                    "vendor": "local",
+                    "role": "subagent",
+                },
+                "local-gpu-example": {
+                    "runtime_agent": "crew-local",
+                    "vendor": "local",
+                    "role": "agent",
+                },
             },
         )
 

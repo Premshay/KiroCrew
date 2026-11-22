@@ -285,7 +285,7 @@ class TestOtherVendors:
         assert vl.local_health()["lanes"]["subagent"]
         stream.assert_called_once()
         assert stream.call_args.args == ("GET", override or companion_url)
-        assert stream.call_args.kwargs == {"timeout": vl.FLEET_TIMEOUT_S, "follow_redirects": True}
+        assert stream.call_args.kwargs == {"timeout": vl.FLEET_TIMEOUT_S, "follow_redirects": False}
 
     def test_local_health_has_no_builtin_endpoint(self, monkeypatch):
         from unittest.mock import Mock
@@ -453,12 +453,14 @@ class TestCandidates:
                 "local-cpu-example": {
                     "id": "local-cpu-example",
                     "runtime_agent": "kirocrew-lite",
-                    "runtime": "local",
+                    "vendor": "local",
+                    "role": "subagent",
                 },
                 "local-gpu-example": {
                     "id": "local-gpu-example",
                     "runtime_agent": "crew-local",
-                    "runtime": "local",
+                    "vendor": "local",
+                    "role": "agent",
                 },
             },
         )

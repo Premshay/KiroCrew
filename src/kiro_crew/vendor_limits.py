@@ -415,7 +415,7 @@ def _fleet_status() -> Any:
             url = getter() if callable(getter) else None
         if not url:
             return None
-        with httpx.stream("GET", url, timeout=FLEET_TIMEOUT_S, follow_redirects=True) as response:
+        with httpx.stream("GET", url, timeout=FLEET_TIMEOUT_S, follow_redirects=False) as response:
             response.raise_for_status()
             body = bytearray()
             for chunk in response.iter_bytes(chunk_size=64 * 1024):
