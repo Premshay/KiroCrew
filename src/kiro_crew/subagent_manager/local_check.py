@@ -693,7 +693,6 @@ def _eligible(manager: Any, info: Any) -> bool:
         and not info.reaped
         and not getattr(info, "_reap_started", False)
         and not getattr(info, "_recovering", False)
-        and not getattr(info, "_ending_claimed", False)
         and not getattr(info, "_retried_as", "")
         and not getattr(info, "_continued_as", "")
         and not getattr(manager, "_shutting_down", False)

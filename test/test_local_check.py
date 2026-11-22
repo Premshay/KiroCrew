@@ -260,6 +260,7 @@ class TestPassCommits:
     def test_pass_commits_the_workers_changes(self, git_repo, reroute):
         mgr = _Manager()
         info = _local(cwd=git_repo, delegation={"check": "test -f work.txt"})
+        info._ending_claimed = True
         Path(git_repo, "work.txt").unlink()
         _capture_commit_scope(info)
         Path(git_repo, "work.txt").write_text("worker change", encoding="utf-8")
