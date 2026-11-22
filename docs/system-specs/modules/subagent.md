@@ -719,8 +719,9 @@ execution plan to dedicated and preserves the per-spawn model field, so
 continuations retain the distinction between an explicit pin and routing. A
 `backend` inherited from the parent is a fallback for a fresh helper. The
 decider can choose a compatible seat across vendors. An explicit spawn backend
-or seat limits candidates to that transport. A named helper template still
-supplies its instructions and tools. Member worker kits retain their own
+or seat limits candidates to that transport. An explicitly named vendor
+template keeps its vendor. Generic templates and a member's own template
+leave routing open. Member worker kits retain their own
 harness checks. Queue replay retains the fallback, and resume uses the
 transport recorded for the conversation. A
 `session/new` timeout or a scope admission timeout ends the shared attempt

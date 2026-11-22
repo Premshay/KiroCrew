@@ -281,7 +281,10 @@ async def _run_inner_impl(
     from kiro_crew.mate_worker import is_own_worker_execution
 
     own_worker = not info.agent and is_own_worker_execution(execution)
-    if own_worker:
+    named_vendor = (
+        await asyncio.to_thread(_spawn_route.named_agent_vendor, info) if info.agent else ""
+    )
+    if own_worker or named_vendor:
         _spawn_route.clear_inherited_backend(info)
     if own_worker and not info.runtime_agent:
         # The worker's spec lives in the crewmate folder, which the agent roster
@@ -352,20 +355,17 @@ async def _run_inner_impl(
         info, child_aws_profile=await self._resolve_child_aws_profile(info)
     )
     eff_model = plan.eff_model
+    vendor_pinned = _spawn_route.pins_vendor(info, own_worker=own_worker, named_vendor=named_vendor)
     if info.quota_routable is None:
         # Decided once, before the route below writes a backend onto the run: a
         # quota fall-through (``quota_switch``) moves only a start that named no
-        # model or transport and has no fixed worker kit. A successor keeps its value.
-        info.quota_routable = not (
-            info.model or _spawn_route.pins_vendor(info, own_worker=own_worker)
-        )
+        # model or vendor and has no fixed transport. A successor keeps its value.
+        info.quota_routable = not (info.model or vendor_pinned)
     if not info.model:
         # Fork (spawn.route v2): a spawn that did not pick its vendor may be
         # routed to another one's backend; the route is dropped whole when that
         # backend cannot carry the run, so the seat's default stands.
-        routed = await self._route_spawn_model(
-            info, agent, cross_vendor=not _spawn_route.pins_vendor(info, own_worker=own_worker)
-        )
+        routed = await self._route_spawn_model(info, agent, cross_vendor=not vendor_pinned)
         if routed and await asyncio.to_thread(
             _spawn_route.apply_route_backend, info, routed, captured_execution
         ):

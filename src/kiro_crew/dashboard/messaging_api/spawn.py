@@ -631,7 +631,7 @@ async def api_spawn(request: web.Request) -> web.Response:
         None if seat else requested_backend
     )
     inherited_backend_pick = bool(requested_backend and not explicit_backend)
-    if backend_refusal is not None and (not inherited_backend_pick or cleaned.get("model")):
+    if backend_refusal is not None and not inherited_backend_pick:
         if seats and backend_refusal.status == 400 and backend_refusal.text is not None:
             import json
 

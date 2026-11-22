@@ -266,6 +266,9 @@ class RunEventCoordinator(ManagerComponent):
                 start_vendor = ""
             elif info.backend is not None:
                 start_vendor = await asyncio.to_thread(_spawn_route.vendor_of_seat, info.backend)
+            elif info.agent:
+                start_vendor = await asyncio.to_thread(_spawn_route.vendor_of_seat, agent)
+                start_vendor = start_vendor or None
             elif info.crew:
                 start_vendor = await asyncio.to_thread(_spawn_route.vendor_of_seat, info.crew)
                 start_vendor = start_vendor or None

@@ -654,7 +654,7 @@ class TestManager:
 
 
 def _run(
-    backend: str | None, runtime_agent: str = "", agents=None, delegation=None
+    backend: str | None, runtime_agent: str = "", agents=None, delegation=None, agent=""
 ) -> tuple[dict, AsyncMock]:
     from kiro_crew.config.loader import AgentConfig, KiroCrewConfig
     from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
@@ -691,6 +691,7 @@ def _run(
         backend=backend,
         runtime_agent=runtime_agent,
         delegation=dict(delegation or {}),
+        agent=agent,
     )
     runner._log_spawned(info)
     sessions.is_session_sharing_eligible = MagicMock(return_value=True)
@@ -728,7 +729,7 @@ class TestRun:
         decide = AsyncMock(return_value=routed)
         monkeypatch.setattr(spawn_route, "routed_spawn", decide)
         marker = {spawn_route.INHERITED_BACKEND: "true"}
-        captured, _ = _run("claude", delegation=marker)
+        captured, _ = _run("claude", delegation=marker, agent="kirocrew")
         assert decide.await_args.kwargs["cross_vendor"] is True
         assert decide.await_args.kwargs["start_vendor"] == "claude"
         expected = "codex" if selected else "claude"
@@ -736,6 +737,20 @@ class TestRun:
         record = subagent_persistence.read_state("sub1")
         assert record["backend"] == expected
         assert spawn_route.INHERITED_BACKEND not in record["delegation"]
+
+    def test_vendor_agent_does_not_inherit_a_different_backend(self, monkeypatch):
+        from kiro_crew.decisions.points import spawn_route
+
+        decide = AsyncMock(return_value={"backend": "", "vendor": "codex", "model": "gpt-test"})
+        monkeypatch.setattr(spawn_route, "routed_spawn", decide)
+        captured, _ = _run(
+            "claude",
+            delegation={spawn_route.INHERITED_BACKEND: "true"},
+            agent="crew-codex-example",
+        )
+        assert decide.await_args.kwargs["cross_vendor"] is False
+        assert decide.await_args.kwargs["start_vendor"] == "codex"
+        assert "backend_override" not in captured
 
     def test_missing_fallback_cannot_start_the_gateway_default(self, monkeypatch):
         from kiro_crew.decisions.points import spawn_route

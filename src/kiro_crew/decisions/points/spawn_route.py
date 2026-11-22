@@ -25,8 +25,9 @@ vendor that is out or low.
 Never behind the caller's back
 ------------------------------
 A per-spawn ``model`` is the parent's answer to this question and is never
-overridden. A per-spawn backend or execution seat pins the vendor. An inherited
-backend is the fallback when routing makes no selection. No model id is hardcoded (``model-selection.md``): a candidate is
+overridden. A per-spawn backend, execution seat, or vendor-specific agent pins
+the vendor. An inherited backend is the fallback when routing makes no
+selection. No model id is hardcoded (``model-selection.md``): a candidate is
 always an id the adapter advertised to this account, or one the owner pinned. The
 point runs only with the Decisions keystone consented, like every other point.
 
@@ -1093,15 +1094,40 @@ def clear_inherited_backend(info: Any) -> None:
         info.delegation.pop(INHERITED_BACKEND_ERROR, None)
 
 
-def pins_vendor(info: Any, *, own_worker: bool = False) -> bool:
+def named_agent_vendor(info: Any) -> str:
+    agent = getattr(info, "agent", "")
+    if not agent or agent in {"kirocrew", "kirocrew-lite"}:
+        return ""
+    vendor = vendor_of_seat(agent)
+    member_id = getattr(getattr(info, "execution_context", None), "member_id", None)
+    if vendor and member_id is not None:
+        from kiro_crew.config.loader import KiroCrewConfig, member_template_id
+
+        # Admission replaces the captured execution template with the requested
+        # agent. Resolve the member's own template from its durable identity.
+        for alias, member in KiroCrewConfig.load().agents.items():
+            if member.member_id == member_id and agent in (
+                alias,
+                member.kiro_agent,
+                member_template_id(member),
+            ):
+                return ""
+    return vendor
+
+
+def pins_vendor(info: Any, *, own_worker: bool = False, named_vendor: str | None = None) -> bool:
     """Whether the spawn already chose its vendor, so the route stays within it.
 
-    An explicit backend or seat pins the vendor. Member workers keep the
-    harness that carries their kit. A continuation keeps its recorded transport.
+    An explicit backend, seat, or vendor-specific helper name pins the vendor.
+    Worker kits and resumed conversations keep their own transport.
     """
     if own_worker or (getattr(info, "backend", None) is not None and not inherited_backend(info)):
         return True
-    return bool(getattr(info, "runtime_agent", "") or getattr(info, "conversation_key", ""))
+    return bool(
+        getattr(info, "runtime_agent", "")
+        or getattr(info, "conversation_key", "")
+        or (named_agent_vendor(info) if named_vendor is None else named_vendor)
+    )
 
 
 def _validate_route_transport(routed: Mapping[str, Any], execution: Any) -> None:

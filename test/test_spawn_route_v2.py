@@ -748,6 +748,23 @@ class TestApply:
     def test_names_for_identity_leave_the_transport_open(self):
         assert not sr.pins_vendor(self._info(crew="member", agent="template"))
 
+    @pytest.mark.parametrize("agent", ["kirocrew", "kirocrew-lite"])
+    def test_generic_names_do_not_pin_even_when_mapped(self, monkeypatch, agent):
+        monkeypatch.setattr(sr, "vendor_of_seat", lambda _: "local")
+        assert not sr.pins_vendor(self._info(agent=agent))
+
+    def test_members_own_template_does_not_pin(self, monkeypatch):
+        from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
+
+        member = KiroCrewAgentConfig(kiro_agent="crew-codex-example", member_id="member-id")
+        config = KiroCrewConfig(agents={"member": member})
+        monkeypatch.setattr(KiroCrewConfig, "load", lambda: config)
+        execution = SimpleNamespace(member_id="member-id", template_id="crew-codex-example")
+        assert not sr.pins_vendor(
+            self._info(agent="crew-codex-example", execution_context=execution)
+        )
+        assert sr.pins_vendor(self._info(agent="crew-claude-example", execution_context=execution))
+
 
 class TestCompanionSeats:
     """Exercise seat routing with the same generic records any companion can supply."""
