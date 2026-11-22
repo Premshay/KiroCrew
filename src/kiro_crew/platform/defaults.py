@@ -70,6 +70,9 @@ class DefaultProviderRegistry:
     def routing_vendors(self) -> tuple[VendorSpec, ...] | None:
         return None
 
+    def fleet_status_url(self) -> str | None:
+        return None
+
     def agent_runtime_policy(self, engine_identity: str) -> dict[str, Any] | None:
         return None
 

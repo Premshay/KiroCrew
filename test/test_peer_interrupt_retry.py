@@ -56,7 +56,7 @@ async def _held(monkeypatch, tmp_path, steer_results):
     message = ChannelMessage(
         id="interrupt9",
         from_id="peer",
-        from_role="Baton",
+        from_role="Coordinator",
         mention=["claude"],
         msg_type="mention",
         delivery="interrupt",

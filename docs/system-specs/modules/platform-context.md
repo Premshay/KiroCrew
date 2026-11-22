@@ -37,6 +37,10 @@ declaration before using it. Metered entries are excluded from cross-vendor
 routing. A declared native backend must still pass native backend admission.
 A registry that returns `None` retains the existing routing rules.
 
+Fleet health reads `KIROCREW_FLEET_STATUS_URL` first, then
+`ProviderRegistry.fleet_status_url()`. Without either endpoint, fleet health
+is unknown.
+
 Companion execution seats can declare `vendor`, `role`, `account`, `ctx`,
 `overhead_tokens`, and `metered`. Core validates types and ranges and still
 reserves native backend IDs. Invalid rows are logged and skipped individually.
@@ -58,7 +62,7 @@ Composition failures propagate, while other lookup failures log at debug and
 omit the policy. `ProviderRegistry.session_account_state(session_key, engine_identity, backend=...)`
 and `ProviderRegistry.set_session_account(session_key, account, engine_identity, backend=...)`
 likewise let an edition companion expose per-session subscription-account
-switching (such as `personal` vs `atlomy` Claude subscription seats) to the
+switching (such as personal and work Claude subscription seats) to the
 owner-only `/api/chat/slots/{slot}/account` endpoint. An explicit native pin supplies
 the optional `backend` keyword; without it the companion keeps engine-map
 eligibility. An explicit execution seat keeps its mapped eligibility even when

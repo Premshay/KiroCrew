@@ -1,4 +1,4 @@
-"""Budget-aware context trimming for spawns routed to a local lane (fork, Nexus).
+"""Budget-aware context trimming for spawns routed to a local lane.
 
 Operator ruling 2026-11-20: a local worker keeps skills, the seat/crew spec and
 the project group; only what does not fit its lane is trimmed, memory first,
@@ -134,8 +134,8 @@ def _fake_tiers(vendor, config=None):
 
 
 BACKENDS = {
-    "local/subagent": {"backend": "claude", "runtime_agent": "local-background", "native": ""},
-    "local/agent": {"backend": "claude", "runtime_agent": "local-fleet", "native": ""},
+    "local/subagent": {"backend": "claude", "runtime_agent": "local-cpu-example", "native": ""},
+    "local/agent": {"backend": "claude", "runtime_agent": "local-gpu-example", "native": ""},
 }
 
 

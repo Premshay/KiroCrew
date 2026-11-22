@@ -1885,7 +1885,7 @@ def _post_consolidation_request(
     headers = {
         "Content-Type": "application/json",
         "anthropic-version": "2023-06-01",
-        # Consolidation is maintenance on Nexus's shared local fleet. It may
+        # Consolidation is maintenance on a shared local fleet. It may
         # run only on an idle compatible lane, so it cannot queue behind or
         # evict an interactive turn.
         "X-Fleet-Require-Idle": "true",

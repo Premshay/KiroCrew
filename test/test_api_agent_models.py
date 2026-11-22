@@ -208,7 +208,7 @@ async def test_workspace_alias_resolves_policy_by_kiro_agent():
     )
     sessions = _Sessions(provider)
     config = SimpleNamespace(
-        agents={"codex-atlas": KiroCrewAgentConfig(kiro_agent="codex")},
+        agents={"codex-example": KiroCrewAgentConfig(kiro_agent="codex")},
         default_agent="codex",
     )
     policy_calls = []
@@ -228,14 +228,14 @@ async def test_workspace_alias_resolves_policy_by_kiro_agent():
 
     with patch("kiro_crew.dashboard.handlers.agents.KiroCrewConfig.load", return_value=config):
         async with TestClient(TestServer(app)) as client:
-            response = await client.get("/api/agents/codex-atlas/models")
+            response = await client.get("/api/agents/codex-example/models")
             assert response.status == 200
             body = await response.json()
             assert body["models"] == [{"modelId": "opus", "name": "Opus", "description": ""}]
 
     assert policy_calls == ["codex"]
     # Discovery still binds the alias so its workspace and pins apply.
-    assert sessions.agent == "codex-atlas"
+    assert sessions.agent == "codex-example"
 
 
 @pytest.mark.asyncio

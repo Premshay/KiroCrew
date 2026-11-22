@@ -233,7 +233,7 @@ def _tiers(vendor, config=None):
 
 
 BACKENDS = {
-    "claude": {"backend": "claude-max", "runtime_agent": "crew-claude", "native": ""},
+    "claude": {"backend": "claude-example", "runtime_agent": "crew-claude", "native": ""},
     "codex": {"backend": "codex", "runtime_agent": "", "native": "codex"},
 }
 
@@ -336,7 +336,7 @@ ROUTED = {
     "model": "sonnet",
     "tier": "small",
     "vendor": "claude",
-    "backend": "claude-max",
+    "backend": "claude-example",
     "runtime_agent": "crew-claude",
     "native_backend": "",
     "p": 0.8,

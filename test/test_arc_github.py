@@ -10,7 +10,7 @@ from kiro_crew import arc_brief, arc_github, arcs
 
 TENON = "chat-1-1"
 ATELIER = "chat-2-2"
-BATON = "chat-3-3"
+LEAD = "chat-3-3"
 REPO = "o/r"
 HEAD = "c4978e364f41029eccefed06f64fb420cfb3e486"
 
@@ -32,7 +32,7 @@ def _arc(**over: Any) -> dict[str, Any]:
         members=[
             {"session_key": TENON, "role": "Tenon"},
             {"session_key": ATELIER, "role": "Atelier (timetable)"},
-            {"session_key": BATON, "role": "Baton"},
+            {"session_key": LEAD, "role": "Reviewer"},
         ],
     )
 
@@ -158,18 +158,18 @@ def test_github_is_not_a_lane_in_idle_metrics():
 
 def test_coordinator_signoff_advances_the_milestone_atomically():
     arc = _arc()
-    arcs.update_settings(arc["id"], coordinator=BATON)
+    arcs.update_settings(arc["id"], coordinator=LEAD)
     entry = arcs.append_entry(
         arc["id"],
-        BATON,
-        {"kind": "FACT", "text": "Owner via Baton: M1 signed off", "signoff": True},
+        LEAD,
+        {"kind": "FACT", "text": "Owner via reviewer: M1 signed off", "signoff": True},
     )
     assert entry["signoff"] is True and entry["milestone"] == 0
     assert arcs.read_arc(arc["id"])["milestone_index"] == 1
     # A replay aimed at the old milestone does not skip M2.
     with pytest.raises(arcs.ArcConflict):
         arcs.append_entry(
-            arc["id"], BATON, {"kind": "FACT", "text": "again", "signoff": True, "milestone": 0}
+            arc["id"], LEAD, {"kind": "FACT", "text": "again", "signoff": True, "milestone": 0}
         )
     assert arcs.read_arc(arc["id"])["milestone_index"] == 1
 
@@ -177,13 +177,13 @@ def test_coordinator_signoff_advances_the_milestone_atomically():
 def test_only_the_coordinator_can_sign_off():
     arc = _arc()
     with pytest.raises(arcs.ArcAccessDenied):
-        arcs.append_entry(arc["id"], BATON, {"kind": "FACT", "text": "x", "signoff": True})
-    arcs.update_settings(arc["id"], coordinator=BATON)
+        arcs.append_entry(arc["id"], LEAD, {"kind": "FACT", "text": "x", "signoff": True})
+    arcs.update_settings(arc["id"], coordinator=LEAD)
     with pytest.raises(arcs.ArcAccessDenied):
         arcs.append_entry(arc["id"], TENON, {"kind": "FACT", "text": "x", "signoff": True})
     with pytest.raises(arcs.ArcError):
         arcs.append_entry(
-            arc["id"], BATON, {"kind": "DONE", "text": "x", "link": "https://x", "signoff": True}
+            arc["id"], LEAD, {"kind": "DONE", "text": "x", "link": "https://x", "signoff": True}
         )
     assert arcs.read_arc(arc["id"])["milestone_index"] == 0
 
@@ -201,8 +201,8 @@ def test_the_coordinator_must_be_a_member():
 def test_ask_by_role_or_coordinator():
     arc = _arc()
     assert (
-        arcs.append_entry(arc["id"], TENON, {"kind": "ASK", "text": "q", "to": "baton"})["to"]
-        == BATON
+        arcs.append_entry(arc["id"], TENON, {"kind": "ASK", "text": "q", "to": "reviewer"})["to"]
+        == LEAD
     )
     assert (
         arcs.append_entry(arc["id"], TENON, {"kind": "ASK", "text": "q", "to": "Atelier"})["to"]
@@ -210,10 +210,10 @@ def test_ask_by_role_or_coordinator():
     )
     with pytest.raises(arcs.ArcError):
         arcs.append_entry(arc["id"], TENON, {"kind": "ASK", "text": "q", "to": "coordinator"})
-    arcs.update_settings(arc["id"], coordinator=BATON)
+    arcs.update_settings(arc["id"], coordinator=LEAD)
     assert (
-        arcs.append_entry(arc["id"], TENON, {"kind": "ASK", "text": "q", "to": "coordinator"})["to"]
-        == BATON
+        arcs.append_entry(arc["id"], TENON, {"kind": "ASK", "text": "q", "to": "reviewer"})["to"]
+        == LEAD
     )
     with pytest.raises(arcs.ArcError):
         arcs.append_entry(arc["id"], TENON, {"kind": "ASK", "text": "q", "to": "nobody"})
@@ -223,26 +223,26 @@ def test_reply_to_accepts_the_short_id():
     arc = _arc()
     ask = arcs.append_entry(arc["id"], TENON, {"kind": "ASK", "text": "q", "to": "owner"})
     reply = arcs.append_entry(
-        arc["id"], BATON, {"kind": "FACT", "text": "a", "reply_to": ask["id"][:11]}
+        arc["id"], LEAD, {"kind": "FACT", "text": "a", "reply_to": ask["id"][:11]}
     )
     assert reply["reply_to"] == ask["id"]
     assert arcs.open_asks(arc["id"]) == []
     with pytest.raises(arcs.ArcError):
         arcs.append_entry(
-            arc["id"], BATON, {"kind": "FACT", "text": "a", "reply_to": "ae_ffffffff"}
+            arc["id"], LEAD, {"kind": "FACT", "text": "a", "reply_to": "ae_ffffffff"}
         )
     with pytest.raises(arcs.ArcError):
-        arcs.append_entry(arc["id"], BATON, {"kind": "FACT", "text": "a", "reply_to": "ae_1"})
+        arcs.append_entry(arc["id"], LEAD, {"kind": "FACT", "text": "a", "reply_to": "ae_1"})
 
 
 def test_fact_carries_a_ruling_up_to_300_characters():
     arc = _arc()
-    arcs.append_entry(arc["id"], BATON, {"kind": "FACT", "text": "r" * 300})
+    arcs.append_entry(arc["id"], LEAD, {"kind": "FACT", "text": "r" * 300})
     with pytest.raises(arcs.ArcError):
-        arcs.append_entry(arc["id"], BATON, {"kind": "FACT", "text": "r" * 301})
+        arcs.append_entry(arc["id"], LEAD, {"kind": "FACT", "text": "r" * 301})
     with pytest.raises(arcs.ArcError):
         arcs.append_entry(
-            arc["id"], BATON, {"kind": "CLAIM", "text": "r" * 101, "step": "s", "checked": ["x"]}
+            arc["id"], LEAD, {"kind": "CLAIM", "text": "r" * 101, "step": "s", "checked": ["x"]}
         )
 
 
@@ -252,7 +252,7 @@ def test_brief_names_the_coordinator_and_shows_short_ids():
     assert "Questions for the owner" not in arc_brief.render_brief(
         arcs.read_arc(arc["id"]), ATELIER
     )
-    arcs.update_settings(arc["id"], coordinator=BATON)
+    arcs.update_settings(arc["id"], coordinator=LEAD)
     brief = arc_brief.render_brief(arcs.read_arc(arc["id"]), ATELIER)
-    assert "ASK to=coordinator (Baton)" in brief
+    assert "ASK to=coordinator (Reviewer)" in brief
     assert arc_brief.entry_line(arc, entry).startswith(f"[FACT {entry['id'][:11]}]")

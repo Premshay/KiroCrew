@@ -8,7 +8,7 @@ turn into.
 
 Codex `native-compaction-live.jsonl` and `native-notice-live.jsonl` were
 measured with adapter 2.3.0, Codex 0.164.0 and SDK 2.0.2 in
-[the clean-runner capture](https://github.com/Premshay/KiroCrew/actions/runs/42119886591).
+a clean Linux runner capture at revision 99f3bf711349.
 Both slices use the session that negotiated compaction and notices: an
 acknowledgement followed by `/compact` emitted native start/completion and a
 model-metadata warning. The model was a loopback SSE stub in generated private

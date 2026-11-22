@@ -1324,14 +1324,14 @@ class TestCleanBindingForkContracts:
         binding = _clean_binding(
             {
                 "acp_backend": "claude",
-                "extra_env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8484"},
+                "extra_env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8080"},
                 "model": "fast",
                 "model_switch_method": "session_set_model",
             }
         )
         assert binding == {
             "acp_backend": "claude",
-            "extra_env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8484"},
+            "extra_env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8080"},
             "model": "fast",
             "model_switch_method": "session_set_model",
         }
@@ -1542,7 +1542,7 @@ class TestResolveClientBindingForkContracts:
             assert _resolve_client_binding() == ({}, "")
 
     def test_binding_is_returned_with_no_warning(self):
-        class NexusProviderRegistry:
+        class ExampleProviderRegistry:
             def agent_client_binding(self, agent_name):
                 assert agent_name == "kirocrew-knowledge"
                 return {
@@ -1552,7 +1552,7 @@ class TestResolveClientBindingForkContracts:
 
         with patch(
             "kiro_crew.platform.context.current_context",
-            return_value=_ctx_with(NexusProviderRegistry()),
+            return_value=_ctx_with(ExampleProviderRegistry()),
         ):
             binding, unbound = _resolve_client_binding()
         assert unbound == ""
@@ -1562,36 +1562,36 @@ class TestResolveClientBindingForkContracts:
         }
 
     def test_registry_with_no_binding_for_this_agent_is_named(self):
-        class NexusProviderRegistry:
+        class ExampleProviderRegistry:
             def agent_client_binding(self, agent_name):
                 return None
 
         with patch(
             "kiro_crew.platform.context.current_context",
-            return_value=_ctx_with(NexusProviderRegistry()),
+            return_value=_ctx_with(ExampleProviderRegistry()),
         ):
-            assert _resolve_client_binding() == ({}, "NexusProviderRegistry")
+            assert _resolve_client_binding() == ({}, "ExampleProviderRegistry")
 
     def test_registry_predating_the_seam_is_named(self):
         # An older companion has no agent_client_binding at all. It must be
         # reported, not crashed on.
-        class NexusProviderRegistry:
+        class ExampleProviderRegistry:
             pass
 
         with patch(
             "kiro_crew.platform.context.current_context",
-            return_value=_ctx_with(NexusProviderRegistry()),
+            return_value=_ctx_with(ExampleProviderRegistry()),
         ):
-            assert _resolve_client_binding() == ({}, "NexusProviderRegistry")
+            assert _resolve_client_binding() == ({}, "ExampleProviderRegistry")
 
     def test_raising_lookup_cannot_silently_change_the_execution_seat(self):
-        class NexusProviderRegistry:
+        class ExampleProviderRegistry:
             def agent_client_binding(self, agent_name):
                 raise RuntimeError("bad engine map")
 
         with patch(
             "kiro_crew.platform.context.current_context",
-            return_value=_ctx_with(NexusProviderRegistry()),
+            return_value=_ctx_with(ExampleProviderRegistry()),
         ):
             with pytest.raises(RuntimeError, match="bad engine map"):
                 _resolve_client_binding()
@@ -1682,7 +1682,7 @@ class TestWorkerAppliesBindingForkContracts:
         with (
             patch(
                 "kiro_crew.knowledge.llm_pool._resolve_client_binding",
-                return_value=({}, "NexusProviderRegistry"),
+                return_value=({}, "ExampleProviderRegistry"),
             ),
             patch("kiro_crew.knowledge.llm_pool.AcpClient") as client_cls,
         ):
@@ -1691,7 +1691,7 @@ class TestWorkerAppliesBindingForkContracts:
                 await worker.start()
 
         warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-        assert any("NexusProviderRegistry" in m and "kirocrew-knowledge" in m for m in warnings)
+        assert any("ExampleProviderRegistry" in m and "kirocrew-knowledge" in m for m in warnings)
         # No binding to apply: the client is built exactly as it was before.
         assert set(client_cls.call_args.kwargs) == {
             "agent",

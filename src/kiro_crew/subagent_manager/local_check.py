@@ -1,6 +1,6 @@
 """Local-first with a machine check: a local run's work is kept only when a check passes.
 
-Fork (Nexus). ``spawn.route`` may send a model-less spawn to the local fleet
+``spawn.route`` may send a model-less spawn to the local fleet
 (``local/subagent`` CPU, ``local/agent`` GPU). A local model is free but weaker,
 so its output is accepted on evidence, not on its own say-so:
 
@@ -81,8 +81,7 @@ LOCAL_HARNESS_OVERHEAD_TOKENS: dict[str, int] = {"subagent": 4050, "agent": 2498
 LOCAL_FIRST_TURN_TARGET_TOKENS: dict[str, int] = {"subagent": 12000}
 
 #: The KiroCrew context a session injects ahead of the request (memory,
-#: lessons, project, skills index) when any include_* flag is on. Median of the
-#: November local-fleet first messages (n=9: 7,808-40,011).
+#: lessons, project, skills index) when any include_* flag is on.
 INJECTED_CONTEXT_TOKENS = 20797
 
 #: Characters per token for a brief, measured at the 10th percentile of

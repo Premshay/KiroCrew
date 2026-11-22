@@ -81,6 +81,10 @@ class ProviderRegistry(Protocol):
         """Return declared routing identities and eligibility, or defer to legacy routing."""
         ...
 
+    def fleet_status_url(self) -> str | None:
+        """Return the local fleet health endpoint when the companion provides one."""
+        ...
+
     def agent_runtime_policy(self, engine_identity: str) -> dict[str, Any] | None:
         """Return advisory catalog metadata, or None in the public edition.
 

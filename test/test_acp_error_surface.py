@@ -754,11 +754,11 @@ class TestConnectionErrorClassification:
         "text",
         [
             "fetch failed",
-            "connect ECONNREFUSED 127.0.0.1:8484",
+            "connect ECONNREFUSED 127.0.0.1:8080",
             "Connection error.",
             "socket hang up",
             "read ECONNRESET",
-            "connect ETIMEDOUT 127.0.0.1:8484",
+            "connect ETIMEDOUT 127.0.0.1:8080",
             "getaddrinfo EAI_AGAIN fleet-router",
             "write EPIPE",
         ],
@@ -792,8 +792,8 @@ class TestConnectionErrorClassification:
     @pytest.mark.parametrize(
         "data",
         [
-            "Monthly usage limit has been reached. connect ECONNREFUSED 127.0.0.1:8484",
-            "AccessDeniedException after connect ETIMEDOUT 127.0.0.1:8484",
+            "Monthly usage limit has been reached. connect ECONNREFUSED 127.0.0.1:8080",
+            "AccessDeniedException after connect ETIMEDOUT 127.0.0.1:8080",
         ],
     )
     def test_terminal_branches_keep_precedence_over_connection(self, data):
@@ -812,7 +812,7 @@ class TestConnectionErrorClassification:
         from kiro_crew.acp.client import _format_acp_error
         from kiro_crew.llm_helpers import is_transient_backend_error
 
-        error = {"code": -32603, "message": "connect ECONNREFUSED 127.0.0.1:8484", "data": ""}
+        error = {"code": -32603, "message": "connect ECONNREFUSED 127.0.0.1:8080", "data": ""}
         formatted = _format_acp_error(error)
         assert "Could not reach the model backend" in formatted
         assert is_transient_backend_error(formatted)

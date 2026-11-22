@@ -827,7 +827,7 @@ class TestReviewAgentSelection(unittest.TestCase):
             {
                 "load": classmethod(
                     lambda cls: type(
-                        "C", (), {"agents": {"crew-headless-atlas": {}, "crew-bound": {}}}
+                        "C", (), {"agents": {"crew-headless-example": {}, "crew-bound": {}}}
                     )()
                 )
             },
@@ -842,7 +842,7 @@ class TestReviewAgentSelection(unittest.TestCase):
                 rp, "runtime_client_binding", side_effect=lambda n: bindings.get(n, {})
             ),
         ):
-            return rp.known_review_agents(), rp.is_known_review_agent("crew-headless-atlas")
+            return rp.known_review_agents(), rp.is_known_review_agent("crew-headless-example")
 
     def test_seats_mapped_to_a_runtime_sage_cannot_drive_are_refused(self):
         """Described by the edition but unbound = a non-ACP engine: the spawn would
@@ -851,13 +851,13 @@ class TestReviewAgentSelection(unittest.TestCase):
         names, known = self._roster_with_edition(
             policies={
                 "crew-headless": headless,
-                "crew-headless-atlas": headless,
+                "crew-headless-example": headless,
                 "crew-bound": {"runtime": "ACP"},
             },
             bindings={"crew-bound": {"acp_backend": "claude"}},
         )
         self.assertNotIn("crew-headless", names)  # same-named spec exists
-        self.assertNotIn("crew-headless-atlas", names)  # config crew, no spec
+        self.assertNotIn("crew-headless-example", names)  # config crew, no spec
         self.assertFalse(known)
         self.assertIn("crew-bound", names)  # mapped AND bound
         self.assertIn("plain-spec", names)  # edition says nothing
@@ -865,7 +865,7 @@ class TestReviewAgentSelection(unittest.TestCase):
     def test_an_edition_that_describes_no_agents_refuses_none(self):
         names, known = self._roster_with_edition(policies={}, bindings={})
         self.assertEqual(
-            names, ["crew-bound", "crew-headless", "crew-headless-atlas", "plain-spec"]
+            names, ["crew-bound", "crew-headless", "crew-headless-example", "plain-spec"]
         )
         self.assertTrue(known)
 

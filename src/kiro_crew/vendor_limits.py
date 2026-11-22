@@ -29,7 +29,7 @@ Sources
 - Codex: the ``limit_id: "codex"`` row of the rollout logs
   (``dashboard/handlers/codex_usage.py``).
 - Antigravity: ``antigravity_quota.json`` under the data home, written by the
-  Nexus companion: ``{as_of, models: {<id>: {remaining_fraction, reset_time, group}}}``.
+  Companion: ``{as_of, models: {<id>: {remaining_fraction, reset_time, group}}}``.
 - Local: ``GET /fleet/status`` of the fleet router (a role's lane is up). Lanes,
   not a subscription window, so it has no quota shape.
 - Quota outs: a run that HIT its vendor's quota marks it out until its reset at
@@ -62,8 +62,6 @@ logger = logging.getLogger(__name__)
 CLAUDE_RATE_LIMIT_META = "_claude/rateLimit"
 STORE_NAME = "vendor_limits.json"
 ANTIGRAVITY_QUOTA_NAME = "antigravity_quota.json"
-#: The fleet router's status route; ``KIROCREW_FLEET_STATUS_URL`` overrides it.
-FLEET_STATUS_URL = "http://127.0.0.1:8484/fleet/status"
 FLEET_TIMEOUT_S = 1.5
 #: The default "low" threshold, kept for callers of the old name. The thresholds in
 #: force are :func:`kiro_crew.quota_rules.rules` (``decisions.quota_limits``).
@@ -406,12 +404,25 @@ def local_health(status: Mapping[str, Any] | None = None) -> dict[str, Any]:
 
 
 def _fleet_status() -> Any:
-    import urllib.request
+    import httpx
 
-    url = os.environ.get("KIROCREW_FLEET_STATUS_URL") or FLEET_STATUS_URL
     try:
-        with urllib.request.urlopen(url, timeout=FLEET_TIMEOUT_S) as resp:  # noqa: S310 - loopback
-            return json.loads(resp.read(1 << 20))
+        url = os.environ.get("KIROCREW_FLEET_STATUS_URL")
+        if not url:
+            from kiro_crew.platform.context import current_context
+
+            getter = getattr(current_context().providers, "fleet_status_url", None)
+            url = getter() if callable(getter) else None
+        if not url:
+            return None
+        with httpx.stream("GET", url, timeout=FLEET_TIMEOUT_S, follow_redirects=False) as response:
+            response.raise_for_status()
+            body = bytearray()
+            for chunk in response.iter_bytes(chunk_size=64 * 1024):
+                body.extend(chunk)
+                if len(body) > 1 << 20:
+                    return None
+            return json.loads(body)
     except Exception:
         logger.debug("vendor_limits: fleet status unreachable", exc_info=True)
         return None
