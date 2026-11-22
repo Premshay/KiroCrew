@@ -254,6 +254,22 @@ class RunEventCoordinator(ManagerComponent):
             from ..subagent import _context_groups_of
             from . import local_check as _local_check
 
+            start_vendor = None
+            if info.runtime_agent:
+                start_vendor = await asyncio.to_thread(
+                    _spawn_route.vendor_of_seat, info.runtime_agent
+                )
+                if start_vendor == "local":
+                    # The caller picked a managed local role. Its seat selects the model.
+                    return None
+            elif info.delegation.get(_spawn_route.INHERITED_BACKEND_ERROR):
+                start_vendor = ""
+            elif info.backend is not None:
+                start_vendor = await asyncio.to_thread(_spawn_route.vendor_of_seat, info.backend)
+            elif info.crew:
+                start_vendor = await asyncio.to_thread(_spawn_route.vendor_of_seat, info.crew)
+                start_vendor = start_vendor or None
+
             routed = await _spawn_route.routed_spawn(
                 info.task,
                 agent=agent or "",
@@ -265,6 +281,8 @@ class RunEventCoordinator(ManagerComponent):
                 # the pinned ones); ``_run_inner`` applies the trim it returns.
                 context_groups=_context_groups_of(info),
                 pinned_groups=_local_check.pinned_groups(info),
+                start_vendor=start_vendor,
+                execution=info.execution_context,
             )
         except asyncio.CancelledError:
             raise

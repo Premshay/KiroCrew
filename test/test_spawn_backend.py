@@ -339,18 +339,35 @@ class TestTheParentsCreatedHarnessIsInherited:
         self, selectable, monkeypatch
     ):
         from kiro_crew import members
+        from kiro_crew.decisions.points.spawn_route import pins_vendor
 
         members.note_session_backend_pick("w", "claude")
         mgr = await self._spawn(monkeypatch, {})
-        assert mgr.spawn.call_args.kwargs["backend"] == "claude"
+        info = SimpleNamespace(**mgr.spawn.call_args.kwargs)
+        assert info.backend == "claude"
+        assert not pins_vendor(info)
 
     @pytest.mark.asyncio
     async def test_the_childs_own_backend_wins(self, selectable, monkeypatch):
         from kiro_crew import members
+        from kiro_crew.decisions.points.spawn_route import pins_vendor
 
         members.note_session_backend_pick("w", "claude")
         mgr = await self._spawn(monkeypatch, {"backend": "kiro"})
         assert mgr.spawn.call_args.kwargs["backend"] == ""
+        assert pins_vendor(SimpleNamespace(**mgr.spawn.call_args.kwargs))
+
+    @pytest.mark.asyncio
+    async def test_an_unavailable_inherited_backend_allows_admission(self, selectable, monkeypatch):
+        from kiro_crew import members
+        from kiro_crew.decisions.points.spawn_route import INHERITED_BACKEND_ERROR, pins_vendor
+
+        members.note_session_backend_pick("w", "pi")
+        mgr = await self._spawn(monkeypatch, {})
+        info = SimpleNamespace(**mgr.spawn.call_args.kwargs)
+        assert info.backend is None
+        assert not pins_vendor(info)
+        assert info.delegation[INHERITED_BACKEND_ERROR] == "pi"
 
     @pytest.mark.asyncio
     async def test_a_parent_with_no_pick_hands_down_nothing(self, selectable, monkeypatch):
@@ -617,9 +634,11 @@ class TestManager:
         assert info is not None and info.backend is None
 
     def test_a_queued_spawn_starts_on_its_backend(self):
+        from kiro_crew.decisions.points.spawn_route import INHERITED_BACKEND, pins_vendor
+
         mgr = _mgr()
         mgr._should_stagger_queue = MagicMock(return_value=(True, False))  # type: ignore[method-assign]
-        mgr.spawn("validate this finding", backend="claude")
+        mgr.spawn("validate this finding", backend="claude", delegation={INHERITED_BACKEND: "true"})
         assert mgr._queue[0]["backend"] == "claude"
         captured: dict[str, object] = {}
         mgr.spawn = lambda **kw: captured.update(kw)  # type: ignore[method-assign]
@@ -628,12 +647,15 @@ class TestManager:
         mgr._spawn_stagger_secs = 0.0
         mgr._drain_queue()
         assert captured["backend"] == "claude"
+        assert not pins_vendor(SimpleNamespace(**captured))
 
 
 # ── The run hands it to the factory ───────────────────────────────────────────
 
 
-def _run(backend: str | None, runtime_agent: str = "", agents=None) -> tuple[dict, AsyncMock]:
+def _run(
+    backend: str | None, runtime_agent: str = "", agents=None, delegation=None
+) -> tuple[dict, AsyncMock]:
     from kiro_crew.config.loader import AgentConfig, KiroCrewConfig
     from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
     from kiro_crew.subagent import SubagentInfo, SubagentManager
@@ -668,6 +690,7 @@ def _run(backend: str | None, runtime_agent: str = "", agents=None) -> tuple[dic
         parent_session_key="parent-key",
         backend=backend,
         runtime_agent=runtime_agent,
+        delegation=dict(delegation or {}),
     )
     runner._log_spawned(info)
     sessions.is_session_sharing_eligible = MagicMock(return_value=True)
@@ -691,6 +714,39 @@ class TestRun:
     def test_no_backend_passes_nothing(self):
         captured, _ = _run(None)
         assert "backend_override" not in captured
+
+    @pytest.mark.parametrize("selected", [False, True])
+    def test_inherited_backend_is_used_only_as_the_fallback(self, monkeypatch, selected):
+        from kiro_crew import subagent_persistence
+        from kiro_crew.decisions.points import spawn_route
+
+        routed = (
+            {"backend": "codex", "native_backend": "codex", "vendor": "codex", "model": "gpt-test"}
+            if selected
+            else None
+        )
+        decide = AsyncMock(return_value=routed)
+        monkeypatch.setattr(spawn_route, "routed_spawn", decide)
+        marker = {spawn_route.INHERITED_BACKEND: "true"}
+        captured, _ = _run("claude", delegation=marker)
+        assert decide.await_args.kwargs["cross_vendor"] is True
+        assert decide.await_args.kwargs["start_vendor"] == "claude"
+        expected = "codex" if selected else "claude"
+        assert captured["backend_override"] == expected
+        record = subagent_persistence.read_state("sub1")
+        assert record["backend"] == expected
+        assert spawn_route.INHERITED_BACKEND not in record["delegation"]
+
+    def test_missing_fallback_cannot_start_the_gateway_default(self, monkeypatch):
+        from kiro_crew.decisions.points import spawn_route
+
+        monkeypatch.setattr(spawn_route, "routed_spawn", AsyncMock(return_value=None))
+        delegation = {
+            spawn_route.INHERITED_BACKEND: "true",
+            spawn_route.INHERITED_BACKEND_ERROR: "claude",
+        }
+        with pytest.raises(RuntimeError, match="inherited backend 'claude' cannot start"):
+            _run(None, delegation=delegation)
 
     def test_sharing_is_ruled_out_by_a_backend(self):
         from kiro_crew.config.loader import AgentConfig, KiroCrewConfig

@@ -621,7 +621,8 @@ async def api_spawn(request: web.Request) -> web.Response:
         seats = await asyncio.to_thread(declared_execution_seats)
     except ValueError as exc:
         return web.json_response({"error": str(exc), "code": "execution_seats_invalid"}, status=409)
-    requested_backend = cleaned.get("backend") or _inherited_backend_name(
+    explicit_backend = cleaned.get("backend")
+    requested_backend = explicit_backend or _inherited_backend_name(
         asked_parent, member=bool(cleaned.get("crew") or cleaned.get("target_member"))
     )
     seat = seats.get(requested_backend) if isinstance(requested_backend, str) else None
@@ -629,7 +630,8 @@ async def api_spawn(request: web.Request) -> web.Response:
     backend, failover_from, backend_refusal = await _requested_backend(
         None if seat else requested_backend
     )
-    if backend_refusal is not None:
+    inherited_backend_pick = bool(requested_backend and not explicit_backend)
+    if backend_refusal is not None and (not inherited_backend_pick or cleaned.get("model")):
         if seats and backend_refusal.status == 400 and backend_refusal.text is not None:
             import json
 
@@ -875,7 +877,15 @@ async def api_spawn(request: web.Request) -> web.Response:
 
     _card_seen = bool(parent_session) and card_turn_seen(request, parent_session)
     # Imported here: this handler runs on the messaging facade's globals.
+    from kiro_crew.decisions.points.spawn_route import INHERITED_BACKEND, INHERITED_BACKEND_ERROR
     from kiro_crew.subagent_manager.local_check import spawn_delegation
+
+    delegation = spawn_delegation(body, str(cleaned.get("check") or ""))
+    if inherited_backend_pick:
+        run_delegation = delegation.setdefault("delegation", {})
+        run_delegation[INHERITED_BACKEND] = "true"
+        if backend_refusal is not None:
+            run_delegation[INHERITED_BACKEND_ERROR] = requested_backend
 
     with admitted_scope(child_admission):
         info = await _spawn_on_loop(
@@ -898,7 +908,7 @@ async def api_spawn(request: web.Request) -> web.Response:
             # The check and the include_* groups the body pinned explicitly,
             # kept in ``delegation`` so they survive the queue, a restart and a
             # successor exactly as the rest of the delegation does.
-            **spawn_delegation(body, str(cleaned.get("check") or "")),
+            **delegation,
             approval_mode=approval_mode or None,
             silent=silent,
             batch_id=batch_id,

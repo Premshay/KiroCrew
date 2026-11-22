@@ -628,6 +628,46 @@ class TestRoutedAcrossVendors:
         asyncio.run(sr.routed_spawn("x", agent="crew-claude", session_key="s1", cross_vendor=False))
         assert {c["vendor"] for c in oracle.states[0]["candidates"]} == {"claude"}
 
+    def test_explicit_transport_sets_the_vendor_instead_of_the_template(self, routed_env):
+        oracle = routed_env(_Oracle("codex/large/0"))
+        got = asyncio.run(
+            sr.routed_spawn(
+                "x", agent="crew-claude", session_key="s1", cross_vendor=False, start_vendor="codex"
+            )
+        )
+        assert got["vendor"] == "codex"
+        assert {candidate["vendor"] for candidate in oracle.states[0]["candidates"]} == {"codex"}
+
+    def test_member_candidates_exclude_transports_without_capabilities(
+        self, routed_env, monkeypatch
+    ):
+        from kiro_crew.agent_sdk import backend_install
+        from kiro_crew.execution_seats import ExecutionSeatError
+
+        def refuse(agent, execution):
+            raise ExecutionSeatError("worker kit unavailable")
+
+        monkeypatch.setattr(
+            backend_install,
+            "probe_backend",
+            lambda backend: SimpleNamespace(
+                installed=backend_install.INSTALLED, restart_required=False
+            ),
+        )
+        monkeypatch.setattr("kiro_crew.execution_seats.validate_member_execution_seat", refuse)
+        oracle = routed_env(_Oracle("codex/large/0"))
+        got = asyncio.run(
+            sr.routed_spawn(
+                "x",
+                agent="crew-claude",
+                session_key="s1",
+                start_vendor="claude",
+                execution=SimpleNamespace(member_id="member"),
+            )
+        )
+        assert got["vendor"] == "codex"
+        assert {c["vendor"] for c in oracle.states[0]["candidates"]} == {"claude", "codex"}
+
 
 class TestApply:
     def _info(self, **kw):
@@ -670,14 +710,25 @@ class TestApply:
         assert sr.apply_route_backend(info, {"backend": "codex", "native_backend": "codex"})
         assert info.backend == "codex"
 
+    def test_routed_seat_replaces_inherited_backend(self):
+        info = self._info(
+            backend="claude", agent="worker", delegation={sr.INHERITED_BACKEND: "true"}
+        )
+        assert sr.apply_route_backend(info, {"backend": "other", "runtime_agent": "other"})
+        assert (info.backend, info.runtime_agent, info.delegation) == (None, "other", {})
+
+    def test_same_vendor_keeps_inherited_backend(self):
+        info = self._info(backend="claude", delegation={sr.INHERITED_BACKEND: "true"})
+        assert sr.apply_route_backend(info, {"backend": ""})
+        assert info.backend == "claude"
+        assert not sr.pins_vendor(info)
+
     @pytest.mark.parametrize(
         "pin",
         [
             {"backend": "claude"},
             {"backend": ""},
             {"runtime_agent": "x"},
-            {"crew": "derrick"},
-            {"agent": "crew-codex"},
             {"conversation_key": "k"},
         ],
     )
@@ -693,6 +744,9 @@ class TestApply:
     def test_own_worker_pins(self):
         assert sr.pins_vendor(self._info(), own_worker=True) is True
         assert sr.pins_vendor(self._info()) is False
+
+    def test_names_for_identity_leave_the_transport_open(self):
+        assert not sr.pins_vendor(self._info(crew="member", agent="template"))
 
 
 class TestCompanionSeats:

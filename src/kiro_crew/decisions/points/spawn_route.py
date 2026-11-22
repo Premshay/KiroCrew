@@ -25,8 +25,8 @@ vendor that is out or low.
 Never behind the caller's back
 ------------------------------
 A per-spawn ``model`` is the parent's answer to this question and is never
-overridden; a per-spawn ``backend``, execution seat, crew or named agent pins
-the vendor, so the route stays within it (``cross_vendor=False``). No model id is hardcoded (``model-selection.md``): a candidate is
+overridden. A per-spawn backend or execution seat pins the vendor. An inherited
+backend is the fallback when routing makes no selection. No model id is hardcoded (``model-selection.md``): a candidate is
 always an id the adapter advertised to this account, or one the owner pinned. The
 point runs only with the Decisions keystone consented, like every other point.
 
@@ -56,6 +56,8 @@ logger = logging.getLogger(__name__)
 
 POINT = "spawn.route"
 QUESTION_ID = "spawn"
+INHERITED_BACKEND = "inherited_backend"
+INHERITED_BACKEND_ERROR = "inherited_backend_unavailable"
 
 #: The vendors a seat name can carry and the tiers the owner may pin per vendor.
 VENDORS: tuple[str, ...] = ("claude", "codex", "deepseek", "local", "antigravity")
@@ -555,9 +557,8 @@ def all_candidates(
 ) -> list[dict[str, str]]:
     """The parent's vendor's tiers on its own seat, then every other runnable vendor's.
 
-    Without *cross_vendor* (a pinned backend, seat, crew or agent) only the
-    parent's vendor is offered, exactly as before 2026-11-20. A parent on the
-    local fleet is offered its roles on its own seat.
+    Without *cross_vendor*, only the starting transport's vendor is offered.
+    A local default is offered its available roles.
     """
     cands: list[dict[str, str]] = []
     if parent_vendor == "local":
@@ -790,6 +791,8 @@ async def routed_spawn(
     has_check: bool = False,
     context_groups: frozenset[str] | None = None,
     pinned_groups: frozenset[str] = frozenset(),
+    start_vendor: str | None = None,
+    execution: Any = None,
 ) -> dict[str, Any] | None:
     """The model -- and, for another vendor, the backend -- a model-less spawn should run on.
 
@@ -811,12 +814,16 @@ async def routed_spawn(
     started = time.monotonic()
     route_id = uuid.uuid4().hex[:16]
     try:
-        vendor = vendor_of_seat(agent, parent_model)
-        if not vendor:
+        vendor = start_vendor
+        if vendor is None:
+            vendor = vendor_of_seat(agent) or vendor_of_seat("", parent_model)
+        if not vendor and not cross_vendor:
             return None
         backends = {}
         if cross_vendor or vendor == "local":
             backends = await asyncio.to_thread(route_backends, "" if vendor == "local" else vendor)
+            if execution is not None:
+                backends = await asyncio.to_thread(_eligible_route_backends, backends, execution)
         cands = await asyncio.to_thread(
             all_candidates, vendor, config, cross_vendor=cross_vendor, backends=backends
         )
@@ -992,6 +999,8 @@ async def reroute_after_quota(
     config: Any | None = None,
     context_groups: frozenset[str] | None = None,
     pinned_groups: frozenset[str] = frozenset(),
+    start_vendor: str | None = None,
+    execution: Any = None,
 ) -> dict[str, Any] | None:
     """Where a routed run whose vendor ran out continues, or ``None`` when every vendor is out.
 
@@ -1011,6 +1020,8 @@ async def reroute_after_quota(
         exclude_vendors=exclude_vendors,
         context_groups=context_groups,
         pinned_groups=pinned_groups,
+        start_vendor=start_vendor,
+        execution=execution,
     )
     if routed and routed.get("vendor") not in set(exclude_vendors):
         return routed
@@ -1018,10 +1029,12 @@ async def reroute_after_quota(
     try:
         from kiro_crew import vendor_limits as _vl
 
-        vendor = vendor_of_seat(agent, parent_model)
-        if not vendor:
-            return None
+        vendor = start_vendor
+        if vendor is None:
+            vendor = vendor_of_seat(agent) or vendor_of_seat("", parent_model)
         backends = await asyncio.to_thread(route_backends, "" if vendor == "local" else vendor)
+        if execution is not None:
+            backends = await asyncio.to_thread(_eligible_route_backends, backends, execution)
         cands = await asyncio.to_thread(
             all_candidates, vendor, config, cross_vendor=True, backends=backends
         )
@@ -1069,20 +1082,60 @@ async def reroute_after_quota(
     }
 
 
+def inherited_backend(info: Any) -> bool:
+    return (getattr(info, "delegation", None) or {}).get(INHERITED_BACKEND) == "true"
+
+
+def clear_inherited_backend(info: Any) -> None:
+    if inherited_backend(info):
+        info.backend = None
+        info.delegation.pop(INHERITED_BACKEND)
+        info.delegation.pop(INHERITED_BACKEND_ERROR, None)
+
+
 def pins_vendor(info: Any, *, own_worker: bool = False) -> bool:
     """Whether the spawn already chose its vendor, so the route stays within it.
 
-    A per-spawn ``backend`` or execution seat, a ``crew`` (another crewmate runs
-    on its own harness), a named ``agent``, a crewmate's own worker (its kit is
-    checked against its harness before this point) and a continuation (it keeps
-    the transport its record has) all pin it.
+    An explicit backend or seat pins the vendor. Member workers keep the
+    harness that carries their kit. A continuation keeps its recorded transport.
     """
-    if own_worker or getattr(info, "backend", None) is not None:
+    if own_worker or (getattr(info, "backend", None) is not None and not inherited_backend(info)):
         return True
-    return any(
-        bool(getattr(info, name, ""))
-        for name in ("runtime_agent", "crew", "agent", "conversation_key")
-    )
+    return bool(getattr(info, "runtime_agent", "") or getattr(info, "conversation_key", ""))
+
+
+def _validate_route_transport(routed: Mapping[str, Any], execution: Any) -> None:
+    from kiro_crew.agent_sdk.backends import ACP_BACKENDS_MEMBER_CAPABILITIES
+    from kiro_crew.execution_seats import ExecutionSeatError, validate_member_execution_seat
+
+    if routed.get("runtime_agent"):
+        if execution is not None:
+            validate_member_execution_seat(routed["runtime_agent"], execution)
+    elif getattr(execution, "member_id", None) is not None:
+        native = routed.get("native_backend") or routed.get("native")
+        if native not in ACP_BACKENDS_MEMBER_CAPABILITIES:
+            raise ExecutionSeatError("selected backend cannot carry member capabilities")
+
+
+def _eligible_route_backends(
+    backends: dict[str, dict[str, Any]], execution: Any
+) -> dict[str, dict[str, Any]]:
+    from kiro_crew.agent_sdk.backend_install import MISSING, probe_backend
+    from kiro_crew.execution_seats import ExecutionSeatError
+
+    compatible = {}
+    for key, transport in backends.items():
+        native = transport.get("native")
+        if native:
+            availability = probe_backend(native)
+            if availability.installed == MISSING or availability.restart_required:
+                continue
+        try:
+            _validate_route_transport(transport, execution)
+        except ExecutionSeatError:
+            continue
+        compatible[key] = transport
+    return compatible
 
 
 def apply_route_backend(info: Any, routed: Mapping[str, Any], execution: Any = None) -> bool:
@@ -1100,17 +1153,15 @@ def apply_route_backend(info: Any, routed: Mapping[str, Any], execution: Any = N
     if pins_vendor(info):
         return False
     try:
-        if routed.get("runtime_agent"):
-            if execution is not None:
-                from kiro_crew.execution_seats import validate_member_execution_seat
-
-                validate_member_execution_seat(routed["runtime_agent"], execution)
-            info.runtime_agent = routed["runtime_agent"]
-            return True
+        _validate_route_transport(routed, execution)
+        runtime_agent = routed.get("runtime_agent")
         native = routed.get("native_backend")
-        if isinstance(native, str) and native:
-            info.backend = native
-            return True
+        if not runtime_agent and (not isinstance(native, str) or not native):
+            return False
+        clear_inherited_backend(info)
+        info.runtime_agent = runtime_agent or ""
+        info.backend = native if not runtime_agent else None
+        return True
     except Exception:
         logger.info(
             "spawn.route: %s cannot carry this run; keeping the seat's own model",

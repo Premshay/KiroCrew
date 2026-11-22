@@ -474,7 +474,7 @@ class SubagentInfo:
     routed_tier: str = ""
     # Quota fall-through (``subagent_manager.quota_switch``, fork, operator
     # ruling 2026-11-20). ``quota_routable``: the start named no model,
-    # backend, seat, crew or agent, so a quota hit may move it to another
+    # backend or seat and has no fixed worker kit, so quota can move it to another
     # vendor (``None`` until the start decides; read as pinned). ``route_tier``:
     # the tier ``spawn.route`` ran it at. ``quota_chain``: the vendors earlier
     # runs of this task already ran out on. ``quota_origin_task``: the task as

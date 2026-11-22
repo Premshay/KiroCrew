@@ -534,6 +534,10 @@ async def persist_spawn_records(
     _spawn_model = _sa._resolved_model_of(client)
     if _spawn_model:
         info.resolved_model = _spawn_model
+    # A running conversation resumes on the transport it actually opened.
+    from kiro_crew.decisions.points.spawn_route import INHERITED_BACKEND
+
+    info.delegation.pop(INHERITED_BACKEND, None)
     # Persist provenance to disk BEFORE the spawn event so a gateway restart
     # in the window between the event and the later session_id state write
     # cannot lose it — orphan recovery reads these from disk. Off-loop and
@@ -561,6 +565,9 @@ async def persist_spawn_records(
                 # a routed tier), and the effort.
                 pinned_model=info.model,
                 reasoning_effort=info.reasoning_effort,
+                backend=info.backend,
+                runtime_agent=info.runtime_agent,
+                delegation=dict(info.delegation),
             )
             if _wrote:
                 break

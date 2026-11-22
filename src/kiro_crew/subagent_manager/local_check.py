@@ -21,7 +21,7 @@ so its output is accepted on evidence, not on its own say-so:
    * it ended cleanly with no check -> nothing: no check, no auto-commit.
 
 3. ``local_check_failed`` / ``local_unusable`` on a ROUTED run (no model,
-   backend, seat, crew or agent pin; ``info.quota_routable``) falls through
+   backend or seat pin, or fixed worker kit; ``info.quota_routable``) falls through
    ONCE to the next cloud candidate on the quota-switch successor path
    (:func:`quota_switch.spawn_successor`): same cwd, memory identity unchanged,
    a handoff brief with the task, the failed run's tail, the check output and
@@ -827,6 +827,8 @@ async def _fall_through(
             session_key=info.parent_session_key or None,
             exclude_vendors=chain,
             tier=sr.FALLBACK_TIER,
+            start_vendor="local",
+            execution=info.execution_context,
             **qs._local_scope(info),
         )
         if not routed:

@@ -277,9 +277,12 @@ async def _run_inner_impl(
             resources=f"subagent_id={info.id},inherited_agent={agent}",
         )
     effective_cwd = info.cwd or str(getattr(self._manager._sessions, "_pool_cwd", "") or "")
+    from kiro_crew.decisions.points import spawn_route as _spawn_route
     from kiro_crew.mate_worker import is_own_worker_execution
 
     own_worker = not info.agent and is_own_worker_execution(execution)
+    if own_worker:
+        _spawn_route.clear_inherited_backend(info)
     if own_worker and not info.runtime_agent:
         # The worker's spec lives in the crewmate folder, which the agent roster
         # does not list, so it is not looked up by name; what it needs is a
@@ -349,12 +352,10 @@ async def _run_inner_impl(
         info, child_aws_profile=await self._resolve_child_aws_profile(info)
     )
     eff_model = plan.eff_model
-    from kiro_crew.decisions.points import spawn_route as _spawn_route
-
     if info.quota_routable is None:
         # Decided once, before the route below writes a backend onto the run: a
         # quota fall-through (``quota_switch``) moves only a start that named no
-        # model, backend, seat, crew or agent. A successor keeps its own value.
+        # model or transport and has no fixed worker kit. A successor keeps its value.
         info.quota_routable = not (
             info.model or _spawn_route.pins_vendor(info, own_worker=own_worker)
         )
@@ -380,6 +381,12 @@ async def _run_inner_impl(
                 from kiro_crew.subagent_manager import local_check as _local_check
 
                 _local_check.apply_trim(info, routed["trim"])
+    unavailable = info.delegation.get(_spawn_route.INHERITED_BACKEND_ERROR)
+    if unavailable:
+        raise RuntimeError(
+            f"backend_unavailable: inherited backend {unavailable!r} cannot start; "
+            "the router found no usable seat. Choose a backend for this spawn."
+        )
     # Fork: a start on a vendor (or Antigravity model group) a run already
     # proved out fails now, before its session exists, instead of being sent
     # and refused; the ending then switches or reports it (``quota_switch``).
