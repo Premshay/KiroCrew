@@ -466,6 +466,25 @@ def candidates_for(
     return out
 
 
+def _advertised_max_variants(cands: list[dict[str, str]], config: Any) -> list[dict[str, str]]:
+    """Offer named variants separately so each original rung keeps its default."""
+    codex = [c for c in cands if c["vendor"] == "codex"]
+    if not codex:
+        return []
+    from kiro_crew import model_registry
+
+    pinned = tier_map(config).get("codex", {})
+    advertised = set(model_registry.advertised_models(ADVERTISED_NAMESPACE["codex"]))
+    variants = []
+    for c in codex:
+        model = _EFFORT_SUFFIX.sub("", c["model"]) + "[max]"
+        if not pinned.get(c["tier"]) and model != c["model"] and model in advertised:
+            variants.append(
+                {**c, "key": f"{c['key']}-max", "model": model, "default_for": c["key"]}
+            )
+    return variants
+
+
 def local_candidates(backends: Mapping[str, Mapping[str, str]]) -> list[dict[str, str]]:
     """The local fleet as its router roles, one per role that has a backend (``local/<role>``)."""
     out = []
@@ -794,6 +813,7 @@ async def routed_spawn(
     pinned_groups: frozenset[str] = frozenset(),
     start_vendor: str | None = None,
     execution: Any = None,
+    allow_default_effort: bool = True,
 ) -> dict[str, Any] | None:
     """The model -- and, for another vendor, the backend -- a model-less spawn should run on.
 
@@ -843,6 +863,8 @@ async def routed_spawn(
         )
         if not cands:
             return None
+        if allow_default_effort:
+            cands += await asyncio.to_thread(_advertised_max_variants, cands, config)
         state = build_state(
             brief,
             agent=agent,
@@ -1002,6 +1024,7 @@ async def reroute_after_quota(
     pinned_groups: frozenset[str] = frozenset(),
     start_vendor: str | None = None,
     execution: Any = None,
+    allow_default_effort: bool = True,
 ) -> dict[str, Any] | None:
     """Where a routed run whose vendor ran out continues, or ``None`` when every vendor is out.
 
@@ -1023,6 +1046,7 @@ async def reroute_after_quota(
         pinned_groups=pinned_groups,
         start_vendor=start_vendor,
         execution=execution,
+        allow_default_effort=allow_default_effort,
     )
     if routed and routed.get("vendor") not in set(exclude_vendors):
         return routed

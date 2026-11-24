@@ -226,7 +226,12 @@ def _stop_in_progress(info: SubagentInfo) -> bool:
 
 class RunEventCoordinator(ManagerComponent):
     async def _route_spawn_model(
-        self, info: SubagentInfo, agent: str, *, cross_vendor: bool = False
+        self,
+        info: SubagentInfo,
+        agent: str,
+        *,
+        cross_vendor: bool = False,
+        allow_default_effort: bool = True,
     ) -> dict | None:
         """``spawn.route`` for a model-less spawn: the routed answer plus ``line``, or ``None``.
 
@@ -286,6 +291,7 @@ class RunEventCoordinator(ManagerComponent):
                 pinned_groups=_local_check.pinned_groups(info),
                 start_vendor=start_vendor,
                 execution=info.execution_context,
+                allow_default_effort=allow_default_effort,
             )
         except asyncio.CancelledError:
             raise

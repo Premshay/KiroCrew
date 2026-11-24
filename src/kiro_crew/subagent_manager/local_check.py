@@ -829,6 +829,7 @@ async def _fall_through(
             tier=sr.FALLBACK_TIER,
             start_vendor="local",
             execution=info.execution_context,
+            allow_default_effort=not info.reasoning_effort,
             **qs._local_scope(info),
         )
         if not routed:

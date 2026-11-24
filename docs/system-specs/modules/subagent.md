@@ -716,7 +716,10 @@ becomes unavailable or the execution plan changes while the row waits. The plan
 can change when a parent closes, sharing turns off, a role pin is set, or an
 opted-in `spawn.route` decision selects a model. A routed model updates the
 execution plan to dedicated and preserves the per-spawn model field, so
-continuations retain the distinction between an explicit pin and routing. A
+continuations retain the distinction between an explicit pin and routing.
+The decision can select an advertised Max variant of a Codex model when
+neither the rung nor the effective reasoning effort is pinned. The regular
+rung choice remains available for each model. A
 `backend` inherited from the parent is a fallback for a fresh helper. The
 decider can choose a compatible seat across vendors. An explicit spawn backend
 or seat limits candidates to that transport. An explicitly named vendor
