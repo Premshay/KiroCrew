@@ -365,7 +365,9 @@ async def _run_inner_impl(
         # Fork (spawn.route v2): a spawn that did not pick its vendor may be
         # routed to another one's backend; the route is dropped whole when that
         # backend cannot carry the run, so the seat's default stands.
-        routed = await self._route_spawn_model(info, agent, cross_vendor=not vendor_pinned)
+        routed = await self._route_spawn_model(
+            info, agent, cross_vendor=not vendor_pinned, allow_default_effort=not plan.eff_effort
+        )
         if routed and await asyncio.to_thread(
             _spawn_route.apply_route_backend, info, routed, captured_execution
         ):

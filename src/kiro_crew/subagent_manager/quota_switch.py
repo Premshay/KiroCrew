@@ -384,6 +384,7 @@ async def _fall_through(manager: Any, info: Any, hit: QuotaHit, now: float | Non
             tier=info.route_tier,
             start_vendor=hit.vendor,
             execution=info.execution_context,
+            allow_default_effort=not info.reasoning_effort,
             **_local_scope(info),
         )
         if not routed:
@@ -477,6 +478,7 @@ async def spawn_successor(
         max_turns=info.max_turns,
         cwd=info.cwd,
         model=routed["model"],
+        reasoning_effort=info.reasoning_effort,
         backend=native or None,
         runtime_agent=routed.get("runtime_agent") or "",
         approval_mode=info.approval_mode or None,

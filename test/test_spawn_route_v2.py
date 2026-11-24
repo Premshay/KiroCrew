@@ -569,6 +569,45 @@ def routed_env(monkeypatch):
 
 
 class TestRoutedAcrossVendors:
+    @pytest.mark.parametrize(
+        "route_kwargs,pinned,expected",
+        [
+            ({}, {}, "max"),
+            ({"allow_default_effort": False}, {}, "medium"),
+            ({}, {"codex": {"small": ["gpt-6.1-terra[medium]"]}}, "medium"),
+        ],
+    )
+    def test_advertised_max_is_a_separate_option_for_an_unpinned_route(
+        self, routed_env, monkeypatch, route_kwargs, pinned, expected
+    ):
+        from kiro_crew import model_registry
+
+        model = "gpt-6.1-terra"
+        offered_max = expected == "max"
+        oracle = routed_env(_Oracle("codex/small/0-max" if offered_max else "codex/small/0"))
+        monkeypatch.setattr(sr, "effective_tiers", lambda *args: {"small": [f"{model}[medium]"]})
+        monkeypatch.setattr(sr, "tier_map", lambda config: pinned)
+        monkeypatch.setattr(
+            model_registry,
+            "advertised_models",
+            lambda namespace: [f"{model}[medium]", f"{model}[max]"],
+        )
+        got = asyncio.run(
+            sr.routed_spawn(
+                "Build task for Plumb.",
+                agent="crew-codex",
+                start_vendor="codex",
+                cross_vendor=False,
+                **route_kwargs,
+            )
+        )
+        assert got is not None and got["model"] == f"{model}[{expected}]"
+        candidates = oracle.states[0]["candidates"]
+        assert candidates[0]["model"] == f"{model}[medium]"
+        assert [c["default_for"] for c in candidates[1:]] == (
+            ["codex/small/0"] if offered_max else []
+        )
+
     def test_generic_tombstone_rate_limit_does_not_block_a_vendor(self, routed_env, monkeypatch):
         oracle = routed_env(_Oracle("claude/small/0"))
         monkeypatch.setattr(
