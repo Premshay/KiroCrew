@@ -63,7 +63,7 @@ async def test_start_task_plan_definition_delegates_to_taskrunner_without_python
 
 
 async def test_disabled_task_runner_app_refuses_a_saved_task_plan(tmp_path) -> None:
-    # Task Runner plans and runs a saved task plan, so its Library switch applies.
+    # The former built-in record applies until the new setting is written.
     library = WorkflowDefinitionLibrary(tmp_path)
     saved = library.create(
         source="agents:\n  test:\n    prompt: run tests\n",
@@ -80,12 +80,12 @@ async def test_disabled_task_runner_app_refuses_a_saved_task_plan(tmp_path) -> N
 
     with patch(
         "kiro_crew.apps.manager._read_installed",
-        return_value=SimpleNamespace(enabled=False),
+        return_value=SimpleNamespace(origin="builtin", enabled=False),
     ) as read:
         started = await svc.start_definition(saved["slug"], input_text="from slash")
 
     assert started == {
-        "error": "Task Runner is disabled. Enable it in Library to start tasks.",
+        "error": "Task Runner is turned off. Turn it on in Settings > Display > View to start tasks.",
         "app_disabled": True,
     }
     read.assert_called_once_with("projects")

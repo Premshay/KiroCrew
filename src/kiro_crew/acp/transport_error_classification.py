@@ -28,6 +28,7 @@ from kiro_crew.acp.compaction_errors import (  # noqa: F401 - re-exported via th
     compaction_failure_detail,
     compaction_failure_is_transient,
 )
+from kiro_crew.acp.delegate_launch_signatures import DELEGATE_LAUNCH_FAILURE_MESSAGE
 from kiro_crew.acp.image_dimension_wedge import (  # noqa: F401 - facade/message compatibility surface
     format_many_image_dimension_message,
     is_many_image_dimension,
@@ -833,49 +834,6 @@ def is_sandbox_init_failure_output(haystack: str) -> bool:
         if classified is not None and classified[0] == "no_backend":
             return True
     return False
-
-
-# The POSIX ``kiro-cli`` launcher execs a SIBLING ``kiro-cli-chat`` for ``acp``
-# and ``chat``; when that sibling is absent, empty or version-skewed (a stale
-# symlink pointing at a removed binary is the field case) the launcher
-# itself answers ``--version``/``whoami`` but the exec fails with this line and
-# the child never starts. Classified for the same reason as the sandbox-init and
-# auth signatures: the condition is DETERMINISTIC, so the reconnect ladder's
-# respawn reproduces it exactly, and without this the operator gets the generic
-# "process exited (rc=None/rc=1)" card -- which points at retry or model-switch,
-# neither of which can fix an install problem -- instead of the one line that
-# names the fix (reinstall/repair Kiro CLI).
-#
-# Anchored on the ``kiro-cli-chat`` launch token specifically. A bare
-# ``failed to launch`` or a generic spawn error is ordinary output for an
-# unrelated death a respawn legitimately fixes, so matching either alone would
-# latch a permanent wrong verdict; requiring the delegate name costs no coverage
-# because the launcher always names the sibling it could not exec.
-_RE_DELEGATE_LAUNCH_FAILURE = re.compile(
-    r"failed\s+to\s+launch\s+kiro-cli-chat",
-    re.IGNORECASE,
-)
-
-
-def is_delegate_launch_failure_output(haystack: str) -> bool:
-    """True when *haystack* (a child's stderr) shows the ``kiro-cli-chat`` delegate failing to launch.
-
-    Shared by both ACP transports for the same anti-drift reason
-    :func:`is_sandbox_init_failure_output` and :func:`is_auth_failure_output`
-    are each a single function: the two transports must not come to disagree
-    about what the signature IS.
-    """
-    return bool(_RE_DELEGATE_LAUNCH_FAILURE.search(haystack))
-
-
-#: Actionable, non-retryable message for a ``kiro-cli-chat`` delegate that would
-#: not launch. Fixed recovery wording (``user_worded``), naming the install
-#: repair rather than a retry or model switch.
-DELEGATE_LAUNCH_FAILURE_MESSAGE = (
-    "The Kiro CLI chat delegate (kiro-cli-chat) failed to launch. This usually "
-    "means a stale or partial Kiro CLI install (for example a stale symlink "
-    "pointing at a removed binary). Reinstall or repair Kiro CLI and try again."
-)
 
 
 async def sandbox_init_failure(

@@ -10,7 +10,7 @@ import pytest
 from aiohttp.test_utils import make_mocked_request
 
 from kiro_crew import arcs
-from kiro_crew import cli_commands_arc as cli_arc
+from kiro_crew import cli_commands as cli_arc
 
 
 @pytest.fixture(autouse=True)

@@ -977,10 +977,16 @@ class LeaseHostTokenSource:
                 return
             if self._workload:
                 self._hold_workload_refusal(arrived, "HTTP 401")
+            if self._sign_in is not None:
+                # A Crew on its own sign-in has no setting below to fix: only a new sign-in helps.
+                self._stop(
+                    "the lease service refused the Crew's Kiro sign-in (HTTP 401): sign in "
+                    "to Kiro again, then restart Kiro Crew"
+                )
             self._stop(
                 "the lease service refused the Crew's credential (HTTP 401): check that "
                 "tunnel.relay_lease_credential's credential is current and that "
-                "tunnel.relay_lease_token_type matches its kind (a team Crew on a crew API "
+                "tunnel.relay_lease_token_type matches its kind (a Shared Crew on a crew API "
                 "key needs API_KEY, a token from an outside identity provider needs "
                 "EXTERNAL_IDP, and a Kiro sign-in leaves it empty), then restart Remote Control"
                 + self._region_hint()

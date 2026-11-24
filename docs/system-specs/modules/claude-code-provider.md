@@ -82,6 +82,29 @@ plain public build:
   (`agent_sdk.drivers.acp.forget_cached_resolution`), so the search runs once per
   install state and the "not found" message
   names exactly the directories that were searched.
+- The adapter is a Node.js program. An entry the ladder hands back alone (an
+  executable npm bin) runs as-is, so its `#!/usr/bin/env node` line picks the Node.
+  Before every launch, on both drivers, `_refuse_claude_without_node` asks
+  `pi_node.shebang_node_missing` whether that shebang finds any `node` on the PATH
+  the child gets, built as `acp.launch` builds it: the spawn's `extra_env` over the
+  gateway's `PATH`, `augmented_path`, then `append_mcp_path_dirs`, read at launch
+  rather than memoized. A relative or empty PATH entry, which `env` resolves against
+  the child's working directory, makes it answer "cannot tell" and the launch goes
+  ahead. When none is there the launch is refused before any process
+  starts or any settings are seeded, with a non-transient, `user_worded` `AcpError`
+  (`_claude_node_missing_message`) that says Node.js is missing, where to get it, and
+  which directories were searched, and the chat shows that line. Like the pi and
+  Strands Node refusals it is a plain `AcpError`, so `ensure_ready` tries the start
+  once more; no process is started either time. A child started without Node dies
+  at exec (`env: node: No such file or directory`, exit 127) before it answers
+  `initialize`, which the client can report only as `ACP process pipe broken`: the
+  chat would show `Connection lost — retrying…` and then `Session stuck`, naming no
+  cause. A Node the nodejs.org installers or Homebrew put in `/usr/local/bin` or
+  `/opt/homebrew/bin` is found by the next chat; one a version manager (nvm, fnm)
+  installs after the gateway started sits in a per-version directory that
+  `env.node_all_bin_dirs` scans once per process, so it is found after a restart.
+  Presence only: a Node that is too old is not detected here. Pinned by
+  `test/test_claude_node_missing.py`.
 - `_resolve_claude_code_executable()` finds the `claude` CLI and the adapter's
   `apply_spawn_env` exports it as `CLAUDE_CODE_EXECUTABLE` when the caller has not
   set one. The adapter
@@ -320,6 +343,23 @@ and effort selection, the full `session/request_permission` flow) works. So
   entry deliberately left unreferenced — the shape every `opt_in` grant uses, and
   what a hand-narrowed spec looks like — would come alive the moment a session ran
   on CC.
+- **The same `tools` list limits Claude Code's own built-ins** for an agent whose
+  spec Crew does not write (`agent_sdk.spec_builtin_tools._crew_written_agents` is
+  the set left out) and that is not a Bot's worker. A non-empty list with no
+  entry that grants every built-in (`*`, `@builtin`, `@builtin/`, `@builtin/*`)
+  makes the mirror set `SessionProjection.builtin_tools` to the built-ins of the
+  kiro-cli tools it grants
+  (`agent_sdk.claude_worker_tools.claude_agent_builtin_tools`, the worker's
+  `CLAUDE_WORKER_BUILTINS_BY_KIRO_TOOL` read as an include list, with a granted
+  `fs_read` also keeping `Glob`) plus `ToolSearch`, and the client sends it as
+  `session/new`'s and `session/load`'s `tools` option, on a withheld array too; a
+  session on a shared claude process gets the same option from the runtime's
+  projection (`ClaudeHarness.session_meta`'s `builtin_tools`). An entry no row covers
+  grants no built-in and refuses nothing; a built-in outside the table
+  (`TodoWrite`, `AskUserQuestion`, `Skill`, ...) is withheld. Below the
+  session-options floor the session is stopped before its first prompt, as a
+  narrowed worker is. A list that grants every row, `tools: []` (the tool-less
+  session below) and Side Chat keep their own shapes.
 - **kiro-cli's registry filter is SYMMETRIC, and only one half of it is
   reproducible here.** Outside registry mode kiro-cli drops the entries that
   *carry* `type: "registry"`, and that half is mirrored exactly: the marker is on
@@ -419,7 +459,7 @@ and effort selection, the full `session/request_permission` flow) works. So
 - **`toolsSettings` shell and write allowlists are enforced at Crew's gate.**
   claude reads neither `shell.denyByDefault`/`allowedCommands` nor
   `fs_write.fallbackAction: "deny"`/`allowedPaths`, so for a backend in
-  `ACP_BACKENDS_CREW_ENFORCES_SPEC_TOOLS_SETTINGS` (claude only) the client reads
+  `ACP_BACKENDS_CREW_ENFORCES_SPEC_TOOLS_SETTINGS` (claude and opencode) the client reads
   them from the spec `_resolve_session_mcp_servers` projected (or reads the spec
   again when the array is withheld), through `acp/spec_tools_allowlists.py` and the
   KAS readers it wraps, and `_build_permission_event` stamps them on every request
@@ -531,9 +571,15 @@ backend spelled it otherwise: no pin, a pin not advertised, or a cold cache
 (`_substitution_retry_model`). The session runs that model. Without the key the user's own
 `settings.json` still names X, so the retry would be refused the same way. That is
 the state of every install whose pinned model is restricted from its first session,
-because no `session/new` has ever succeeded to warm the cache. A refusal of the model
-the seed already names is not retried, since a retry cannot help; this holds when Y
-equals the pin too, because the pin never reached the refused request. When the
+because no `session/new` has ever succeeded to warm the cache. A pin the seed already
+adopted (in this start or an earlier one, `_adopted_substitute_model`) and the backend
+now refuses is never named again, even when the advertised list still names it: that
+list can be older than the policy, so the retry names Y. Only a refusal of Y itself,
+when the seed already names Y, is not retried, since a retry cannot help; this holds
+when Y equals the pin too, because the pin never reached the refused request. The two
+`test_a_model_adopted_earlier_and_refused_now_falls_back_to_the_offered_one` tests
+(`test/test_acp_client_model_substitution.py`, `test/test_claude_shared_runtime.py`)
+pin this on both paths. When the
 retry named the pin and the backend refuses that too, the start falls back ONCE to
 the model the second advisory offers, as before the pin left the seed: a session on
 the offered model beats one that never starts. So one start sends `session/new` at
@@ -882,6 +928,21 @@ reported version. A handshake that reports a version below the floor on a sessio
 took the exclusion stops that session (`_pin_claude_starting_mode`); the shared
 handshake gains no step.
 
+Each of those refusals records, beside its log line, why the session runs without
+Crew's tools and the one thing to do (`_claude_tools_withheld_reason`): upgrade
+claude-agent-acp with the tested-version notice's own command, choose another permission
+mode than the one it names, remove the file's `hooks` or `sandbox` settings, replace a
+link with a regular file, or work in another folder.
+`settings_withheld_reason` (client and provider, off the loop) answers `""` exactly when
+`settings_withheld_cause` does; another open session's seed and a decline that recorded
+nothing get one clause per cause, defined once beside `SETTINGS_WITHHELD_BY_*`. It
+returns the WHY alone, a fact a model may read; `with_fix=True` appends the remedy, and
+only the chat's seed-declined notice (`_notice_seed_declined`) asks for it, because a
+parent model told to strip a project's hooks could act on it. A sub-agent run records the
+clause as `SubagentInfo.crew_tools_withheld`, says it in its own prompt and on its result
+(subagent spec, "Claims, not proof"), and logs nothing more: the refusal's own warning is
+the one line per session. Pinned by `test/test_settings_withheld_reason.py`.
+
 **A session whose permission surface Crew does not govern gets no `mcpServers`
 array at all.** The array is the only channel Crew has onto the session's MCP
 surface, so delivering it there would hand `spawn_run`, `cron_add`, `send_message`
@@ -979,7 +1040,11 @@ other request on the session. The cards do not change the approval gate: the
 native-crew auto-approve rung (`hooks.auto_approve_subagent_tools` while a crew card
 is open, `tool_approval.py`) skips the claude backend, because a claude request does
 not name the session that sent it, and the rung cannot tell the parent's request
-from a child's. Every request takes the gate it takes with no child running.
+from a child's. The rung runs only on a backend in
+`ACP_BACKENDS_PERMISSION_REQUESTS_NAME_CHILD`
+(`SessionCapabilities.permission_requests_name_child`: kiro-cli and KAS); every
+other backend, an unknown one included, skips it the same way. Every request takes
+the gate it takes with no child running.
 Contract tests: `test_claude_native_subagent_cards.py`.
 
 A Stop on a child's card (`DELETE /api/spawn/native:<child sessionId>`) stops that

@@ -124,6 +124,21 @@ def _server_id(key: str) -> str:
     return key[len(_KEY_PREFIX) :][:_SERVER_ID_CHARS]
 
 
+#: A refused key's last segment is named in the refusal only when it has this
+#: shape, so an engine/gateway kind mismatch shows in gateway.log while an
+#: arbitrary key (which could carry anything) is never echoed.
+_KIND_LABEL_RE = re.compile(r"\A[a-z][a-z0-9-]{0,31}\Z")
+
+
+def _namespace_refusal(key: str) -> SecretStorageRefused:
+    """The refusal for a *key* outside the namespace, naming its kind when safe."""
+    if key.startswith(_KEY_PREFIX):
+        kind = key.rsplit(".", 1)[-1]
+        if _KIND_LABEL_RE.match(kind) is not None:
+            return SecretStorageRefused(f"key kind {kind!r} is outside the MCP sign-in namespace")
+    return SecretStorageRefused("key is outside the MCP sign-in namespace")
+
+
 def _is_tokens_key(key: str) -> bool:
     return key.endswith("." + _TOKENS_KIND)
 
@@ -178,13 +193,17 @@ class McpGrantStore:
         await asyncio.to_thread(self._assert_unlinked)
         return await self._vault.set_with_revision(key, value)
 
-    async def delete(self, key: str, revision: str | None = None) -> None:
-        """Delete *key*; with *revision*, only while the entry still has it."""
+    async def delete(self, key: str, revision: str | None = None) -> bool:
+        """Delete *key*; with *revision*, only while the entry still has it.
+
+        ``False`` when *revision* does not name the stored entry; ``True``
+        otherwise, which without a revision does not mean an entry existed.
+        """
         await asyncio.to_thread(self._assert_unlinked)
         if revision is None:
             await self._vault.delete(key)
-        else:
-            await self._vault.delete_if_revision(key, revision)
+            return True
+        return await self._vault.delete_if_revision(key, revision)
 
 
 def default_grant_store() -> McpGrantStore:
@@ -241,7 +260,7 @@ class SecretStorageServer:
         elif _IDP_SESSION_RE.match(key) is not None:
             persisted = True
         else:
-            raise SecretStorageRefused("key is outside the MCP sign-in namespace")
+            raise _namespace_refusal(key)
 
         if persisted:
             async with self._locks.setdefault(key, asyncio.Lock()):
@@ -296,13 +315,25 @@ class SecretStorageServer:
     async def _delete_persisted(self, key: str) -> None:
         if key not in self._seen:
             await self._guarded(self._store.delete(key))
+            outcome = "cleared without a check: this engine never read or saved it"
+        elif (revision := self._seen[key]) is None:
+            outcome = (
+                "clear skipped: this engine holds no saved sign-in (read none, or already cleared)"
+            )
+        elif await self._guarded(self._store.delete(key, revision)):
+            outcome = "cleared: it was the entry this engine last read or saved"
         else:
-            revision = self._seen[key]
-            if revision is not None:
-                await self._guarded(self._store.delete(key, revision))
+            outcome = (
+                "clear skipped: the saved sign-in is no longer the one this engine"
+                " last read or saved (replaced or already cleared)"
+            )
         # After a delete this process holds no copy: a repeat delete, before a
         # new read or write, is a no-op rather than an unconditional delete.
         self._seen[key] = None
+        # The only record of a clear: the branch tells this engine's own clear
+        # from one by an engine that never read the sign-in.
+        if _is_tokens_key(key):
+            logger.info("MCP sign-in for server %s: %s", _server_id(key), outcome)
 
     @staticmethod
     async def _guarded(awaitable: Any) -> Any:

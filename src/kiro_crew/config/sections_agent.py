@@ -23,8 +23,12 @@ from kiro_crew.config.sections_agent_fields import (
     _YOLO_DURATION_SECS,
     DEFAULT_CWD_ALLOWED_ROOTS,
     JAIL_MODE_AUTO,
+    KAS_AUTH_CALLBACK,
+    KAS_AUTH_MODES,
     KAS_BUNDLE_DEFAULT_URL,
     KAS_FAIL_CLOSED_WEB_FETCH_BLOCKED_HELP,
+    KAS_MACHINE_HELP,
+    KAS_MACHINE_TOKEN_PATH_DEFAULT,
     KAS_REFUSE_PLAIN_HTTP_MCP_HEADERS_HELP,
     WORKER_REPORTS_EVERY_TURN,
     WORKER_REPORTS_MODES,
@@ -254,9 +258,9 @@ class AgentConfig:
             "Counts only 'error' and 'timeout': a server asking for OAuth sign-in "
             "is working correctly and is never counted, and one success clears the "
             "count. The server stays mounted, but while its streak is at or over "
-            "this threshold MCP discovery stops spawning it for probes; the count "
-            "survives a gateway restart and holds until it is cleared (the "
-            "dashboard offers a one-click reset). 0 turns it off.",
+            "this threshold MCP discovery stops spawning it for probes; the count survives "
+            "a gateway restart and holds until it is cleared (the dashboard offers a "
+            "one-click reset) or the server's command, args, env or url changes. 0 turns it off.",
         ),
     )
     acp_backend: str = field(
@@ -418,6 +422,46 @@ class AgentConfig:
             "The AWS region the Company SSO sign-in form starts filled in with, "
             "such as us-east-1. Used only together with agent.kas_sso_start_url. "
             "Empty leaves the region field empty.",
+        ),
+    )
+    # Machine mode (``agent_sdk/kas_machine.py``), honoured only while the ``crew_client``
+    # feature preview is on. Every key is read at spawn, so a running engine keeps
+    # the mode it started under until it is replaced.
+    kas_auth: str = field(
+        default=KAS_AUTH_CALLBACK,
+        metadata=_meta(
+            "KAS: engine credential",
+            KAS_MACHINE_HELP["kas_auth"],
+            enum=list(KAS_AUTH_MODES),
+            restart=True,
+        ),
+    )
+    kas_token_path: str = field(
+        default=KAS_MACHINE_TOKEN_PATH_DEFAULT,
+        metadata=_meta("KAS: machine token file", KAS_MACHINE_HELP["kas_token_path"], restart=True),
+    )
+    kas_endpoint: str = field(
+        default="",
+        metadata=_meta("KAS: machine endpoint", KAS_MACHINE_HELP["kas_endpoint"], restart=True),
+    )
+    kas_control_plane_endpoint: str = field(
+        default="",
+        metadata=_meta(
+            "KAS: machine control plane endpoint",
+            KAS_MACHINE_HELP["kas_control_plane_endpoint"],
+            restart=True,
+        ),
+    )
+    kas_region: str = field(
+        default="",
+        metadata=_meta("KAS: machine region", KAS_MACHINE_HELP["kas_region"], restart=True),
+    )
+    kas_machine_env_drop: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "KAS: variables kept from the engine",
+            KAS_MACHINE_HELP["kas_machine_env_drop"],
+            restart=True,
         ),
     )
     native_skill_projection: bool = field(
@@ -808,8 +852,8 @@ class AgentConfig:
             "How long auto-approve (YOLO) lasts when it is enabled AD HOC — from "
             "the dashboard picker, Slack, or the API. Every one of those surfaces "
             "uses this same duration. Accepts 30m / 1h / 6h / 12h / 24h, or "
-            "until_shutdown to keep it on with no timed expiry until Kiro Crew "
-            "restarts. Timed values are capped at 24h. Does NOT apply to a grant "
+            "until_shutdown to keep it on until you stop Kiro Crew (a restart keeps "
+            "any grant). Timed values are capped at 24h. Does NOT apply to a grant "
             "declared via 'dangerously_skip_permissions' above, which persists.",
             enum=["30m", "1h", "6h", "12h", "24h", "until_shutdown"],
         ),
@@ -1018,10 +1062,11 @@ class AgentConfig:
             "Resource Critical Threshold (GB)",
             "Available memory (GB) at or below which the [RESOURCES] context line "
             "escalates to 'critically low' and advises against starting heavy work "
-            "at all. Should be <= resource_pressure_gb. It also arms the host memory guard, "
-            "which on Linux stops the largest Crew tool or test tree at critical memory, or "
-            "at tight memory with PSI full avg10 >= 10. 0 disables the critical tier and "
-            "turns the memory guard off. When the container's memory limit is at or under "
+            "at all. Should be <= resource_pressure_gb. It also arms the host memory guard, which "
+            "on Linux stops the largest Crew tool or test tree at critical memory, or at tight "
+            "memory with PSI full avg10 >= 10, or, with no memory controller in view, when the "
+            "cgroup in view stalls 10% of the time between samples. 0 disables the critical tier "
+            "and turns the memory guard off. When the container's memory limit is at or under "
             "it, the gateway logs one start-up warning naming the settings to lower.",
         ),
     )
@@ -1032,7 +1077,9 @@ class AgentConfig:
             "While available memory is at or below resource_critical_gb, defer scheduled cron "
             "firings to the next tick, and TaskRunner steps and workflow ctx.agent() calls by "
             "admit_wait_secs, until memory frees. Background helper turns (titles, labels, "
-            "summaries, history consolidation) are skipped while it lasts. Subagent "
+            "summaries, history consolidation) are skipped while it lasts. Scheduled "
+            "auto-nudge prompt-loop ticks are held and re-checked every 30 seconds; the loop stays "
+            "on and spends no cycle, and a Fire now press still runs. Subagent "
             "spawns are not gated on this posture; they wait on spawn_min_memory_gb instead. "
             "Manually triggered cron runs and direct chat turns are never gated; an unreadable "
             "probe admits (fail-open). Set false to make the critical posture advisory-only "
@@ -1536,17 +1583,20 @@ class AgentConfig:
         default=False,
         metadata=_meta(
             "Peer Steer Loss Recovery",
-            "Let a steer that is not typed into the session's own composer (another "
-            "session's session_send or session_broadcast steer, or an automation's) "
-            "cut into a running Claude Code, Codex, Goose, Pi or OpenCode turn. "
-            "Those harnesses can drop a steer they accepted, so it counts as "
-            "delivered only when the turn ends cleanly; a turn that is cancelled, "
-            "fails or loses it to a denied approval puts it back as a queue card "
-            "that runs as the next turn, so it can run twice. While it is on, a "
-            "hard stop that drops another session's pending steer, on any harness, "
-            "tells that session the steer may not have run. Off by default: such "
-            "a steer queues for the next turn, and only the composer steers these "
-            "harnesses.",
+            "Off (the default): a session_send or session_broadcast steer into "
+            "a running Claude Code, Codex, Goose, Pi or OpenCode turn is held and "
+            "goes in at that turn's next tool step, or runs as its next turn if "
+            "the turn ends first; an automation's steer is not held. "
+            "On: both cut into the running turn at once. Those "
+            "harnesses can drop a steer they accepted, so with it on the steer "
+            "counts as delivered only when the turn ends cleanly; a turn that is "
+            "cancelled, fails or loses it to a denied approval puts it back as a "
+            "queue card that runs as the next turn, so it can run twice. With it "
+            "on, a hard stop that drops another session's pending steer, on any "
+            "harness, tells that session the steer may not have run. With it off, "
+            "a held steer cannot run twice on Claude Code and Codex; on the other "
+            "harnesses a steer taken just as the turn ended can run once more from "
+            "the queue.",
         ),
     )
     member_dispatch: bool = field(
@@ -1704,6 +1754,18 @@ class AgentConfig:
             "model or effort starts the sub-agent in its own process, as any "
             "per-spawn pin does. Off by default: with it off every spawn picks the "
             "model and effort it always has.",
+        ),
+    )
+    subagent_light_lean_context: bool = field(
+        default=False,
+        metadata=_meta(
+            "Light Sub-agent Lean Context",
+            "While agent.subagent_light_tier is on, start a spawn marked light "
+            "without the lessons and memory blocks, since a search, lookup or "
+            "summarize helper rarely needs them. A spawn that sets include_lessons "
+            "or include_memory to true keeps that block, and a spawn that names an "
+            "agent, a crew or a backend is not changed. Off by default: with it off "
+            "every spawn starts with the context it always has.",
         ),
     )
     subagent_max_turns: int = field(

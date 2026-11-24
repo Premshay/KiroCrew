@@ -94,6 +94,7 @@ import { useOptimizeBeforeSend, usePromptOptimizer, usePromptOptimizerEnabled } 
 import { usePasteTokens } from '../chat-core/composer/pasteEditor'
 import { FilePreviewStrip } from './chat-input/FilePreviewStrip'
 import { RaisedBy, TypingLockBanner } from './chat-input/TypingLockBanner'
+import { AskedBySubagent, ApprovalSubagentTask } from './chat-input/ApprovalSubagent'
 import { useTypingLockKeys } from './chat-input/typingLockKeys'
 import { ComposerAttach } from '../chat-core/composer/Attach'
 import { afterSlide, forgetAfterSlide, slideHeld } from '../utils/panelSlide'
@@ -125,7 +126,7 @@ const VIDEO_ACCEPT = 'video/mp4,video/x-m4v,video/quicktime,video/webm'
 // gate. Extensions align the picker exactly with the verified server allowlist
 // instead of broadening the dialog to neighboring unsupported formats.
 const AUDIO_ACCEPT = '.mp3,.m4a,.wav,.ogg,.oga,.opus,.flac'
-const FILE_ACCEPT = IMAGE_ACCEPT + ',' + VIDEO_ACCEPT + ',' + AUDIO_ACCEPT + ',.txt,.text,.xwiki,.md,.json,.jsonl,.excalidraw,.har,.yaml,.yml,.xml,.drawio,.csv,.tsv,.log,.rem,.ret,.eml,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.php,.sql,.kt,.swift,.cs,.vue,.toml,.pdf,.doc,.docx,.dotx,.xls,.xlsx,.xltx,.ppt,.pptx,.potx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
+const FILE_ACCEPT = IMAGE_ACCEPT + ',' + VIDEO_ACCEPT + ',' + AUDIO_ACCEPT + ',.txt,.text,.xwiki,.md,.json,.jsonl,.excalidraw,.har,.yaml,.yml,.xml,.drawio,.csv,.tsv,.log,.rem,.ret,.eml,.py,.js,.ts,.tsx,.jsx,.html,.htm,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.php,.sql,.kt,.swift,.cs,.vue,.toml,.pdf,.doc,.docx,.dotx,.xls,.xlsx,.xltx,.ppt,.pptx,.potx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz,.tgz'
 
 import ApprovalModePicker, { APPROVAL_MODE_ADJUSTED_LS_KEY } from './ApprovalModePicker'
 // Effort vocabulary lives in lib/effort.ts (mirrors backend effort.py).
@@ -223,6 +224,7 @@ function ChatInput({
   stopState,
   approvalMode,
   approvalModeRemote,
+  approveForMe,
   afterApprovalMode,
   reasoningEffort,
   effortIsDefault = false,
@@ -386,7 +388,7 @@ function ChatInput({
     approvalNotice, setApprovalNotice, approvalNoticeKind, showApprovalError, showApprovalStatus,
     approvalToolInput, approvalIsUnattended,
     approvalDenyRule, approvalDenyDetail, approvalDenyFamily, approvalDenyCommand,
-    approvalLabelRaw, approvalToolCallId, approvalPurpose, approvalTs, approvalLabel, approvalRaisedBy, showGhost, showInChat,
+    approvalLabelRaw, approvalToolCallId, approvalPurpose, approvalTs, approvalLabel, approvalRaisedBy, approvalSubagentTask, approvalAskedBySubagent, showGhost, showInChat,
   } = approval
   const activeSlot = slotId
   // Read the composer-spellcheck preference here rather than as a prop, so every
@@ -464,7 +466,7 @@ function ChatInput({
   const pickerSource = usePickerSource()
   const pickers = useComposerPickers({ source: pickerSource, project, onFileSelect, typedCommandMenus, hiddenCommands, terminalCommands, value, onChange, composerControl, queryClient, slotId, agentName })
   const { anyPickerOpenRef, closePickers, openPickersForText, prefetchSkills } = pickers
-  const { publishLexicalSelection, recordCaret, showDictation, cancelVoiceDrain } = useDictationControls({
+  const { publishLexicalSelection, recordCaret, holdCaret, showDictation, cancelVoiceDrain } = useDictationControls({
     composerControl, value, autoFocusKey, anyPickerOpenRef, voiceCaretRef, voicePendingCaretRef, voiceDictationPanel,
     voiceRecording, voiceDrainCancellable, voiceError, voiceSampleRef, voiceTranscribing, onVoiceCancel, onVoiceToggle,
   })
@@ -593,7 +595,13 @@ function ChatInput({
   // not the callback itself: the handler's identity may change every render
   // and would re-run the effect for nothing.
   const hasAutomation = !!onAutomationClick
-  useEffect(() => { remeasureControlRow() }, [hasAutomation, automation, approvalMode, isMobile, remeasureControlRow])
+  // Not on mount: the row's observer measures it on its first delivery, and a
+  // read here would force a layout inside the commit that opens a session.
+  const controlRowMountedRef = useRef(false)
+  useEffect(() => {
+    if (!controlRowMountedRef.current) { controlRowMountedRef.current = true; return }
+    remeasureControlRow()
+  }, [hasAutomation, automation, approvalMode, isMobile, remeasureControlRow])
   const ime = useImeGuard()
   const resolvedPlaceholder = placeholder || i18nT(terminal.canAdvertise
     ? 'components.chatInput.message_placeholder_terminal'
@@ -810,10 +818,10 @@ function ChatInput({
   const {
     transcribeInFlight, transcribingIsHonest, micHeldElsewhere, micBlocked, micOwnerTitle, micHeldElsewhereLabel,
     setHoldTarget, touchPtt, voiceHoldMode, micIsModeSwitch, voiceSettling, textareaParked, toggleVoiceMode, micLabel, micKeyShortcuts, holdBarLabel,
-    voiceModePlaceholder, sendZone,
+    voiceModePlaceholder, sendZone, setPointerHoldTarget,
   } = useHoldToTalk({
     onVoiceStart, onVoiceStop, onVoiceCancel, voiceCaptureActive, voiceRecording, voiceTranscribeActive, voiceTranscribing, voiceDownload, voiceSubmitOnRelease, voiceSlideToSend, voicePttBinding,
-    voiceBusyElsewhere, voiceBusyElsewhereSession, composerHasDraft, disabled, optimizing, placeholder, showDictation, voiceSendSteers: steerActive && !steerAuto && !terminal.active,
+    voiceBusyElsewhere, voiceBusyElsewhereSession, composerHasDraft, disabled, typingLocked, optimizing, placeholder, showDictation, holdCaret, voiceSendSteers: steerActive && !steerAuto && !terminal.active,
   })
   // The name in the status row is the way there: one click switches to the
   // chat that holds the mic, where the user can end the capture.
@@ -1015,11 +1023,21 @@ function ChatInput({
         onConfirm={terminal.confirm}
         onCancel={terminal.cancelConfirmation}
       />
-      {/* No hand-off: the command draft must survive a failed terminal startup. */}
-      <ErrorNotice message={terminal.failure === 'limit' ? i18nT('components.chatInput.terminal_limit')
-        : terminal.failure === 'failed' ? i18nT('components.chatInput.terminal_failed') : undefined}
-        variant={terminal.failure === 'failed' ? 'inline' : 'block'}
-        onDismiss={terminal.dismissFailure} />
+      {/* No hand-off: the command draft must survive a failed terminal startup.
+          On the dock's glass at the `thick` step, as the Read aloud bar is: the
+          notice alone lets the transcript under the dock show through it. The
+          block one is `nested` on a danger pane; the inline one keeps a plain
+          pane, where its red text holds AA contrast. */}
+      {terminal.failure === 'limit' && (
+        <Glass variant="chip" thickness="thick" radius={8} className="glass-danger mb-1.5 px-3 pb-2.5">
+          <ErrorNotice nested message={i18nT('components.chatInput.terminal_limit')} onDismiss={terminal.dismissFailure} />
+        </Glass>
+      )}
+      {terminal.failure === 'failed' && (
+        <Glass variant="chip" thickness="thick" radius={8} className="mb-1.5 flex px-3 py-1.5">
+          <ErrorNotice message={i18nT('components.chatInput.terminal_failed')} variant="inline" onDismiss={terminal.dismissFailure} />
+        </Glass>
+      )}
       {terminal.active && (
         <div className="flex flex-col gap-1.5" role="group" aria-label={i18nT('components.chatInput.terminal_review')}>
           <div className="text-sm text-muted flex items-center gap-1.5" role="status">
@@ -1153,6 +1171,7 @@ function ChatInput({
                                   <Lock size={12} className="text-warn shrink-0" style={{ marginTop: '3px' }} />
                                   <span className="text-muted break-words min-w-0 line-clamp-2">{approvalLabel}</span><RaisedBy name={approvalRaisedBy} />
                               </div>
+                              <AskedBySubagent name={approvalAskedBySubagent} />
                               <ToolDetails
                                   purpose={approvalPurpose}
                                   pillLabel={approvalLabel}
@@ -1173,10 +1192,11 @@ function ChatInput({
                       </motion.div>
                   )}
               </AnimatePresence>
+              <ApprovalSubagentTask task={approvalSubagentTask} />
               <div className="flex items-center gap-1.5 px-3.5 py-2.5 select-none flex-wrap">
                   {!showGhost && <>
                       <Lock size={12} className="text-warn shrink-0" />
-                      <span className="text-[13px] font-mono text-muted truncate flex-1 min-w-0">{approvalLabel}</span><RaisedBy name={approvalRaisedBy} />
+                      <span className="text-[13px] font-mono text-muted truncate flex-1 min-w-0">{approvalLabel}</span><RaisedBy name={approvalRaisedBy} /><AskedBySubagent name={approvalAskedBySubagent} />
                   </>}
                   {showGhost && <div className="flex-1 min-w-0" />}
                   {showGhost && approvalToolCallId && (
@@ -1437,6 +1457,9 @@ function ChatInput({
             the shape flip slides (`shapeAnimating`); a wrapped line inside the
             two-row shape moves the column at once, like the box around it. */}
         <motion.div
+          // The pointer hold-to-talk gesture binds here, the text column, so one
+          // binding covers both editors (see `useHoldToTalk`).
+          ref={setPointerHoldTarget}
           onKeyDown={promptStashEnabled ? promptStash.onKeyDown : undefined}
           layout={inlineToolbarWhileFits && !reduceMotion && manualHeight === null ? 'position' : false}
           transition={shapeAnimating ? COMPOSER_ROW_SPRING : { duration: 0 }}
@@ -1672,11 +1695,11 @@ function ChatInput({
                 />
               )}
               {!isMobile && approvalMode && (
-                <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} remote={approvalModeRemote} onPicked={focusComposerAfterPick} openSignal={approvalPickerSignal} nudge={approvalNudgeActive} onNudgeDismiss={dismissApprovalNudge} onNudgeHide={hideApprovalNudge} />
+                <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} remote={approvalModeRemote} approveForMe={approveForMe} onPicked={focusComposerAfterPick} openSignal={approvalPickerSignal} nudge={approvalNudgeActive} onNudgeDismiss={dismissApprovalNudge} onNudgeHide={hideApprovalNudge} />
               )}
               {!isMobile && afterApprovalMode}
             {isMobile && approvalMode && (
-              <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} remote={approvalModeRemote} compact onPicked={focusComposerAfterPick} openSignal={approvalPickerSignal} nudge={approvalNudgeActive} onNudgeDismiss={dismissApprovalNudge} onNudgeHide={hideApprovalNudge} />
+              <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} remote={approvalModeRemote} approveForMe={approveForMe} compact onPicked={focusComposerAfterPick} openSignal={approvalPickerSignal} nudge={approvalNudgeActive} onNudgeDismiss={dismissApprovalNudge} onNudgeHide={hideApprovalNudge} />
             )}
               </div>
             </div>
@@ -1832,10 +1855,8 @@ function ChatInput({
             <SessionControlChips sessionControls={sessionControls} shelfCompact={shelfCompact} onSessionControlClick={onSessionControlClick} />
           )}
           {backendControl && <div className="shrink-0 border-r border-border pr-2" data-testid="composer-backend-control">{backendControl}</div>}
-          {/* Keep intrinsic chip widths: overflow belongs to the shelf scroller,
-              not to overlapping controls. Labels collapse before scrolling. */}
           <div className="flex items-center gap-2 flex-auto shrink-0">
-          {!onAgentClick && agentBadge}
+          {agentBadge}
           {onAgentClick && agentName && (
             <AgentChip agentName={agentName} agentLabel={agentLabel} agentIsInheritedDefault={agentIsInheritedDefault} agentMemory={agentMemory} agentSource={agentSource} isRunning={isRunning} shelfCompact={shelfCompact} onAgentClick={onAgentClick} />
           )}

@@ -2,10 +2,12 @@ import { memo, useContext, useState, useRef, useEffect, useMemo, useCallback, ty
 import { ChevronRight } from 'lucide-react'
 import { RowActivityContext, type RowActivityReporter } from './rowActivity'
 import type { DisplayItem, TurnItem } from './types'
+import type { ChatMessage } from '../../types'
 import { uniqueRowKeys } from '../../chat-core/transcript/rowKeys'
 import { useStableMessageKey } from '../../chat-core/transcript/useStableMessageKey'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 import { isJumpTarget, useJumpReveal } from '../../hooks/JumpRevealContext'
+import { MESSAGE_BODY_ATTR } from '../../messageActions/messageText'
 import { attachUserScrollIntent } from '../../utils/searchScroll'
 import { useSearchHighlight } from '../../hooks/SearchHighlightContext'
 import { ExpandStepsContext } from '../../hooks/useToolCallsStartExpanded'
@@ -24,7 +26,7 @@ import { extractSteeringAcks } from '../../app-sdk/protocol/steering'
 import { hasKeepVisibleMarker } from '../../app-sdk/protocol/keepVisibleMarker'
 import { i18nT } from '../../i18n/t'
 import BrowserLiveCard, { browserLiveAnchor, isBrowserToolMessage } from './BrowserLiveCard'
-import { isSpecHooksRunNowhereNotice, useSpecHooksRunNowhereDismissed } from './SpecHooksNotice'
+import { useDismissedSpecHooksNotice } from './SpecHooksNotice'
 import { isToolCallRow } from '../../lib/toolRowContract'
 
 /**
@@ -204,13 +206,14 @@ const isCrewReply = (it: TurnItem) =>
  *  diff card, an answered ask_question row, or a row the caller pins
  *  (`pinnedRows`, see findPinnedRows).
  *  All bypass the collapse pane. */
+// MERGE-REVIEW: Main Sessions keeps replies visible. Shared lists use upstream's step fold.
 const WORKING_NARRATION_RE = /^(?:Let me\b|Working through\b)/i
 const isAssistantReply = (it: TurnItem) =>
   it.kind === 'single' && (it.msg.role === 'assistant' || it.msg.role === 'streaming') &&
   !isSystemNoticeRow(it.msg) && !WORKING_NARRATION_RE.test(it.msg.content.trim())
 const NO_PINNED_ROWS: ReadonlySet<TurnItem> = new Set()
 const isVisibleInline = (it: TurnItem, appToolCallIds: ReadonlySet<string>, pinnedRows = NO_PINNED_ROWS) =>
-  pinnedRows.has(it) || isAssistantReply(it) ||
+  pinnedRows.has(it) ||
   isRenderable(it) || isHandBack(it) || isKeepVisible(it) || isAlwaysVisible(it) || isCrewReply(it) ||
   isWorkflowRunItem(it) || isSpawnRunItem(it) ||
   isSubagentCompletionItem(it) ||
@@ -223,8 +226,8 @@ const LIVE_ACTIVITY_WINDOW = 5
 /** A hidden Approved:/Refused: completion row renders nothing in every host, so it is
  *  never folded and never counted: one call is one step. A notice the user
  *  dismissed draws nothing either, so it is not a step to expand onto. */
-const isCountedRow = (it: TurnItem, noticeDismissed: boolean) =>
-  !isHiddenTool(it) && !(noticeDismissed && it.kind === 'single' && isSpecHooksRunNowhereNotice(it.msg))
+const isCountedRow = (it: TurnItem, isDismissedNotice: (m: ChatMessage) => boolean) =>
+  !isHiddenTool(it) && !(it.kind === 'single' && isDismissedNotice(it.msg))
 
 type FoldMode = 'interim' | 'collapseAll' | 'default'
 
@@ -243,8 +246,8 @@ type FoldMode = 'interim' | 'collapseAll' | 'default'
  * The settled set contains the running set, so completion only ever folds
  * more rows. It never opens a row the window had folded.
  */
-function foldCandidates(items: TurnItem[], appToolCallIds: ReadonlySet<string>, mode: FoldMode, complete: boolean, pinnedRows: ReadonlySet<TurnItem>, noticeDismissed: boolean): number[] {
-  const tools = items.flatMap((it, i) => isTool(it, appToolCallIds) && isCountedRow(it, noticeDismissed) ? [i] : [])
+function foldCandidates(items: TurnItem[], appToolCallIds: ReadonlySet<string>, mode: FoldMode, complete: boolean, pinnedRows: ReadonlySet<TurnItem>, isDismissedNotice: (m: ChatMessage) => boolean, foldAssistantSteps: boolean): number[] {
+  const tools = items.flatMap((it, i) => isTool(it, appToolCallIds) && isCountedRow(it, isDismissedNotice) ? [i] : [])
   const out = new Set(tools.slice(0, Math.max(0, tools.length - LIVE_ACTIVITY_WINDOW)))
   if (complete && mode === 'default') tools.forEach(i => out.add(i))
   if (complete && mode !== 'default') {
@@ -255,10 +258,11 @@ function foldCandidates(items: TurnItem[], appToolCallIds: ReadonlySet<string>, 
     for (let i = 0; i < end; i++) {
       const it = items[i]
       if (wholeTurn && !isWorkingStepRow(it)) continue
-      const followsReply = i > 0 && isAssistantReply(items[i - 1])
+      const keepReply = !foldAssistantSteps && isAssistantReply(it)
+      const followsReply = !foldAssistantSteps && i > 0 && isAssistantReply(items[i - 1])
       const replyRecovery = followsReply && it.kind === 'single' && it.msg.role === 'inject'
         && parseRecoveryMessage(it.msg.content)?.kind === 'refusal'
-      if (isCountedRow(it, noticeDismissed) && !replyRecovery && !isVisibleInline(it, appToolCallIds, pinned)) out.add(i)
+      if (isCountedRow(it, isDismissedNotice) && !keepReply && !replyRecovery && !isVisibleInline(it, appToolCallIds, pinned)) out.add(i)
     }
   }
   return Array.from(out).sort((a, b) => a - b)
@@ -538,7 +542,7 @@ function mergeTurnThinking(items: TurnItem[]): TurnItem[] {
  *  opened, read from its own disclosure map). Without it such a row folds
  *  after a remount, as it always did.
  */
-function TurnBlock({ turn, renderItem, collapseAll = false, appToolCallIds = EMPTY_ID_SET, disclosure, disclosureKey, onDisclosureChange, mayBeLive = NEVER_LIVE, browserLiveSessionKey }: { turn: Extract<DisplayItem, {kind:'turn'}>; renderItem: (item: TurnItem, i: number) => ReactNode; collapseAll?: boolean; appToolCallIds?: ReadonlySet<string>; disclosure?: boolean; disclosureKey?: string; onDisclosureChange?: (key: string, expanded: boolean) => void; mayBeLive?: (it: TurnItem) => boolean;
+function TurnBlock({ turn, renderItem, collapseAll = false, foldAssistantSteps = true, appToolCallIds = EMPTY_ID_SET, disclosure, disclosureKey, onDisclosureChange, mayBeLive = NEVER_LIVE, browserLiveSessionKey }: { turn: Extract<DisplayItem, {kind:'turn'}>; renderItem: (item: TurnItem, i: number) => ReactNode; collapseAll?: boolean; foldAssistantSteps?: boolean; appToolCallIds?: ReadonlySet<string>; disclosure?: boolean; disclosureKey?: string; onDisclosureChange?: (key: string, expanded: boolean) => void; mayBeLive?: (it: TurnItem) => boolean;
   /** The session this turn belongs to. With it, a turn that called the `browser`
    *  tool shows its live-browser card (BrowserLiveCard); without it (a host
    *  that cannot name the session) the turn renders as before. */
@@ -620,10 +624,10 @@ function TurnBlock({ turn, renderItem, collapseAll = false, appToolCallIds = EMP
   const expandSteps = useContext(ExpandStepsContext)
   const mode: FoldMode = turn.interim ? 'interim' : collapseAll && !expandSteps ? 'collapseAll' : 'default'
   // A dismiss drops its notice from the count at once, not on the next flush.
-  const specHooksNoticeDismissed = useSpecHooksRunNowhereDismissed()
+  const isDismissedNotice = useDismissedSpecHooksNotice()
   const candidates = useMemo(
-    () => foldCandidates(items, appToolCallIds, mode, turn.complete, pinnedRows, specHooksNoticeDismissed),
-    [items, appToolCallIds, mode, turn.complete, pinnedRows, specHooksNoticeDismissed],
+    () => foldCandidates(items, appToolCallIds, mode, turn.complete, pinnedRows, isDismissedNotice, foldAssistantSteps),
+    [items, appToolCallIds, mode, turn.complete, pinnedRows, isDismissedNotice, foldAssistantSteps],
   )
   const fold = useMemo(() => {
     const rows = new Set<number>()
@@ -679,9 +683,11 @@ function TurnBlock({ turn, renderItem, collapseAll = false, appToolCallIds = EMP
   useEffect(() => {
     if (!jumpInTurn || !revealTs) return
     const t = setTimeout(() => {
-      // The transcript's own row, not the measuring farm's off-screen copy.
-      const rows = document.querySelectorAll<HTMLElement>('[data-jump-target]')
-      const row = Array.from(rows).find(el => el.dataset.jumpTarget === revealTs && !el.closest('[data-farm-index]'))
+      // The transcript's own row: not the measuring farm's copy, nor one authored in a message.
+      // Searched in this pane's own transcript: split panes can show the same
+      // transcript, so the same timestamp can mark a row in another pane.
+      const rows = (scrollerEl() ?? document).querySelectorAll<HTMLElement>('[data-jump-target]')
+      const row = Array.from(rows).find(el => el.dataset.jumpTarget === revealTs && !el.closest('[data-farm-index]') && !el.closest(`[${MESSAGE_BODY_ATTR}]`))
       if (!row) return
       // The jump's settle poll centres the whole turn each frame; end it first.
       claimScroll()

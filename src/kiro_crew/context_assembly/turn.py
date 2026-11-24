@@ -138,6 +138,7 @@ def post_compaction_parts(
         is_cc=is_cc,
         private_owner=private_owner,
         session_start=False,
+        provider_type=provider_type,
     )
     if _agent_prompt:
         parts.append(f"[AGENT SYSTEM PROMPT]\n{_agent_prompt}\n[END AGENT SYSTEM PROMPT]\n\n")
@@ -797,7 +798,7 @@ def interactive_guidance(
     Every built message carries them. Whether the engine is sent them again is
     the provider's call at the wire (``build_message`` binds the block as the
     turn's delivery envelope): once per engine conversation on a harness whose
-    compaction Kiro Crew sees, every message elsewhere and in a member's chat.
+    compaction Kiro Crew sees (a member's chat included), every message elsewhere.
 
     *producer_is_user_facing* says a person sent this turn on a dashboard
     slot. It defaults to False, the applier's own default, so a caller that

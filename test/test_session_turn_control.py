@@ -20,6 +20,7 @@ from session_helpers import (  # noqa: F401 -- the fixture is requested by name
 
 from kiro_crew.acp.types import ACP_BACKEND_KIRO
 from kiro_crew.session import SessionManager
+from kiro_crew.session_parts import record as session_record
 from kiro_crew.testing.wait import await_until, until_parked
 
 
@@ -144,25 +145,56 @@ class TestStopTurn:
         await mgr.close_all()
 
     @pytest.mark.asyncio
-    async def test_hard_stop_defers_respawn_to_the_next_caller(self, cfg):
-        """The next caller supplies the session's original execution settings."""
+    async def test_eager_respawn_called(self, cfg):
+        """Hard Stop schedules a successor through reset."""
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
         provider, _, _ = await mgr.get_or_create("key1")
         mgr.release("key1")
 
         provider.cancel = AsyncMock(return_value="timeout")
 
-        with patch.object(mgr, "_eager_respawn", new_callable=AsyncMock) as mock_respawn:
-            await mgr.stop_turn("key1")
-            mock_respawn.assert_not_called()
-            assert not mgr.has_session("key1")
+        assert await mgr.stop_turn("key1") == "hard"
+        await await_until(asyncio.gather(*list(mgr._background_tasks)), what="eager respawn")
 
-        await mgr.get_or_create("key1")
-        mgr.release("key1")
         respawned = mgr._sessions.get("key1")
         assert respawned is not None, "the hard stop left no session behind"
         assert respawned.provider is not provider
         assert not respawned.semaphore.locked(), "the respawn kept the turn permit"
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_a_hard_stop_successor_runs_on_the_stopped_sessions_agent(self, cfg):
+        """The chat keeps running on the agent it is set to after a hard Stop."""
+        inner = _mock_provider_factory()
+        built_for: list[str | None] = []
+
+        def factory(session_key=None, agent=None, channel_id=None, **kwargs):
+            built_for.append(agent)
+            provider = inner(session_key, agent, channel_id, **kwargs)
+            provider._agent = agent or "kirocrew"
+            return provider
+
+        mgr = SessionManager(cfg, provider_factory=factory)
+        provider, _, _ = await mgr.get_or_create("key1", agent="my-conductor")
+        mgr.release("key1")
+        provider.cancel = AsyncMock(return_value="timeout")
+
+        assert await mgr.stop_turn("key1") == "hard"
+        await await_until(asyncio.gather(*list(mgr._background_tasks)), what="hard-stop respawn")
+
+        respawned = mgr._sessions.get("key1")
+        assert respawned is not None, "the hard stop left no session behind"
+        assert respawned.provider is not provider
+        assert respawned.agent == "my-conductor"
+        assert respawned.provider._agent == "my-conductor"
+        assert built_for == ["my-conductor", "my-conductor"]
+        assert not respawned.semaphore.locked(), "the respawn kept the turn permit"
+        # Re-armed for the first turn, as a reset successor is: a failed native
+        # resume then replays the history.
+        assert respawned.first_turn in (
+            session_record.FirstTurnState.FRESH,
+            session_record.FirstTurnState.RESUMED,
+        )
         await mgr.close_all()
 
     @pytest.mark.asyncio
@@ -299,21 +331,6 @@ class TestStopTurn:
         assert mgr._sessions["key1"].prev_turn_cancelled is True
         provider.cancel.assert_awaited_once_with(wait_ack_timeout=1.0)
         mgr.release("key1")
-        await mgr.close_all()
-
-    @pytest.mark.asyncio
-    async def test_stop_turn_hard_does_not_respawn_without_original_session_settings(self, cfg):
-        """Hard stop leaves the next real caller to recreate its own provider."""
-        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
-        provider, _, _ = await mgr.get_or_create("key1")
-        mgr.release("key1")
-
-        provider.cancel = AsyncMock(return_value="timeout")
-
-        await mgr.stop_turn("key1")
-
-        assert not mgr.has_session("key1")
-        assert not mgr._background_tasks
         await mgr.close_all()
 
 

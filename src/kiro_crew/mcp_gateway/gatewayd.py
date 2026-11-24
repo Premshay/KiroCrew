@@ -146,6 +146,7 @@ from kiro_crew.mcp_gateway.daemon.audit import (  # noqa: F401
     _audit_pool_rejected,
     _audit_prewarm_spawn,
     _audit_recaller_rejected,
+    _audit_recycle_server,
     _audit_replacement_validated,
     _audit_reserved_stub_prefix_denied,
     _audit_stand_down,
@@ -163,9 +164,11 @@ from kiro_crew.mcp_gateway.daemon.connection import (  # noqa: F401
     _teardown_connection,
 )
 from kiro_crew.mcp_gateway.daemon.control import (  # noqa: F401
+    _RECYCLE_SERVER_NAME_MAX,
     _apply_abort,
     _apply_claim,
     _apply_owner_port,
+    _apply_recycle_server,
     _apply_set_spawn_capacity,
     _apply_stand_down,
     _pong_payload,
@@ -1679,6 +1682,11 @@ def main() -> None:
     # the active credential policy, so it must compose the companion before serving.
     boot_platform(KiroCrewConfig.load())
     _prepare_telemetry()
+    # The gateway's PATH part, for the launch approval fold. Taken out of the
+    # env so no backend inherits it.
+    from kiro_crew.mcp_gateway.hashing import GATEWAY_PATH_ENV, pin_gateway_path
+
+    pin_gateway_path(os.environ.pop(GATEWAY_PATH_ENV, None))
     try:
         # Windows: every spawn on this loop builds its child off-loop.
         rc = asyncio.run(_amain(), loop_factory=gateway_loop_factory())

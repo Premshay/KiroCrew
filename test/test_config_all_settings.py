@@ -462,6 +462,20 @@ def test_a_key_an_edition_locks_is_read_only_and_says_so(monkeypatch) -> None:
 # ── The PATCH route ──
 
 
+async def test_patch_writes_warm_set_cap_and_refuses_negative(tmp_config) -> None:
+    path = "instances.warm_set_cap"
+    assert all_settings.generic_spec(path) is None
+    for value in (0, 30):
+        status, body = await _send({"path": path, "value": value})
+        assert status == 200, body
+        assert _stored(tmp_config)["instances"]["warm_set_cap"] == value
+
+    assert _editable_config_spec(path) == {"type": "int", "min": 0}
+    status, body = await _send({"path": path, "value": -1})
+    assert (status, body.get("error")) == (400, "must be between 0 and 999999")
+    assert _stored(tmp_config)["instances"]["warm_set_cap"] == 30
+
+
 async def test_patch_writes_and_unsets_a_generic_list(tmp_config) -> None:
     status, _ = await _send({"path": "mcp_gateway.keep_alive_servers", "value": ["github"]})
     assert status == 200
@@ -755,7 +769,7 @@ async def test_patch_refuses_a_key_another_route_writes(tmp_config, path, value)
 #: ``/api/security/safety-switches`` route, from Settings -> Security -> Safety switches.
 _SAFETY_SWITCH_LINKS = {
     "mcp.protect_kiro_permission_rules": "security.stop-the-agent-from-editing-its-own-permission-rules",
-    "mcp.honour_auto_approve": "security.ask-me-before-running-tools-an-mcp-server-pre-approves",
+    "mcp.honour_auto_approve": "security.ask-me-before-running-tools-set-to-auto-approve-in-a-tool-server-s-settings",
 }
 
 

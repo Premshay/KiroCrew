@@ -275,8 +275,8 @@ def shared_resources_part(
     absolute entries (:func:`kiro_crew.context._load_seat_resources`).
     """
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
+    from kiro_crew import shared_context_resources as _shared
     from kiro_crew.agent_files import is_kirocrew_default_agent
-    from kiro_crew.context_assembly import shared_resources as _shared
     from kiro_crew.subagent_manager.local_check import is_lean_session
 
     if not _group_included(context_groups, CONTEXT_GROUP_PROJECT):

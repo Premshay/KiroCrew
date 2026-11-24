@@ -283,6 +283,14 @@ class SpawnPlan:
     running, not from the configuration, which may have changed since the spawn.
     """
 
+    machine_auth: Any = field(default=None, kw_only=True)
+    """The KAS machine-mode settings this spawn runs under (``agent_sdk/kas_machine.py``).
+
+    ``None`` for Crew's own sign-in, the only value off the ``crew_client`` preview.
+    The runtime keeps it, so a live session's turn gate judges the token file the
+    running process reads, not the current configuration.
+    """
+
     kiro_cli_internal_sandbox: bool = field(default=False, kw_only=True)
     """kiro-cli's internal sandbox confines this spawn.
 
@@ -448,6 +456,14 @@ class SessionExtras:
     projected worker spec drops or mutes. That spec is read after the stubs were
     selected, so a mute saved in between shows here, and the caller removes those
     stubs from the session-level array. Empty on every other host.
+    """
+
+    shipped_helper_parent: str = ""
+    """The agent this projection mounted Kiro Crew's shipped helper for, or ``""``.
+
+    Host memory only: set from the call that built and appended the helper
+    (``kas_engine_subagents.with_engine_subagents``), never read from an agent
+    entry or file and never sent to the engine. ``""`` on every other host.
     """
 
     withheld_credentials_notice: str = ""
@@ -789,7 +805,9 @@ class HarnessAdapter(LaunchAdapter):
         projection reads it, for the profiles a translated allow meets.
         """
 
-    def record_session_projection(self, handle: Any, custom_agents: Any, active_agent: str) -> None:
+    def record_session_projection(
+        self, handle: Any, custom_agents: Any, active_agent: str, shipped_helper_parent: str = ""
+    ) -> None:
         """Record on a new or resumed session's *handle* what its agent batch grants.
 
         For a host whose PreToolUse hooks Crew runs at the permission request, so
@@ -897,13 +915,15 @@ class HarnessAdapter(LaunchAdapter):
         mcp_servers: list[dict[str, Any]],
         *,
         zero_tools: bool = False,
+        builtin_tools: tuple[str, ...] | None = None,
         stub_token: str = "",
     ) -> dict[str, Any] | None:
         """The ``_meta`` entries this session's request carries, built after its array, or None.
 
         *stub_token* is the token the runtime minted to name THIS session's brokered
         servers, for a host that also hands the session's identity to the tools it
-        runs.
+        runs. *builtin_tools* is the mirror's ``SessionProjection.builtin_tools``, the
+        harness built-ins the session keeps (``None`` for all of them).
         """
         return None
 

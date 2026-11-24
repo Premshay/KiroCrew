@@ -83,7 +83,7 @@ import sys
 import time
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from kiro_crew import platform_compat  # noqa: F401 — preserve the facade surface
 from kiro_crew.platform.context import redact_via_context
@@ -114,6 +114,11 @@ from .benchmark_result import (  # noqa: F401 — preserve the facade surface
 from .environment import TestEnvironment, normalize_test_environment
 from .measurement_settings import normalize_measurement_config, normalize_suite_timeout
 from .pr_recipe import GitHubPRRecipe  # noqa: F401 -- facade export
+
+if TYPE_CHECKING:
+    from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo.measurement_settings import (  # noqa: F401
+        MAX_SUITE_TIMEOUT_SECONDS as MAX_SUITE_TIMEOUT_SECONDS,
+    )
 
 #: The metric's unit. Wall-clock seconds of the repo's own suite — the one number
 #: every Python repo can produce without a profile-specific harness.

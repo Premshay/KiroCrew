@@ -6,6 +6,14 @@ import importlib as _importlib
 import sys as _sys
 
 from kiro_crew import _facade_mirror
+from kiro_crew.acp.delegate_launch_signatures import (  # noqa: F401 - re-exported
+    _RE_DELEGATE_LAUNCH_FAILURE,
+    DELEGATE_LAUNCH_FAILURE_MESSAGE,
+    KIRO_CLI_TOO_OLD_MESSAGE,
+    KIRO_CLI_TOO_OLD_TERMINAL_MESSAGE,
+    delegate_launch_failure_message,
+    is_delegate_launch_failure_output,
+)
 from kiro_crew.acp.proxy_refusal import (  # noqa: F401 - re-exported
     PROXY_REFUSAL_TEXT,
     _is_proxy_refusal,
@@ -30,7 +38,6 @@ from kiro_crew.acp.transport_error_classification import (  # noqa: F401 - facad
     _RE_CONNECTION,
     _RE_CONNECTOR_FAILURE,
     _RE_CONTEXT_WINDOW_OVERFLOW,
-    _RE_DELEGATE_LAUNCH_FAILURE,
     _RE_GENERATE_FAILED,
     _RE_IMAGE_FORMAT_UNSUPPORTED,
     _RE_INVALID_BEARER,
@@ -55,7 +62,6 @@ from kiro_crew.acp.transport_error_classification import (  # noqa: F401 - facad
     ACP_BACKENDS_HOST_AUTH_CALLBACK,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
     DEFAULT_MODEL,
-    DELEGATE_LAUNCH_FAILURE_MESSAGE,
     LAUNCHER_EXIT_PREFIXES,
     MODEL_REGISTRY_UNAVAILABLE_TEXT,
     PROVIDER_ERROR_AUTH,
@@ -108,7 +114,6 @@ from kiro_crew.acp.transport_error_classification import (  # noqa: F401 - facad
     host_auth,
     is_auth_failure_output,
     is_credential_propagation_delay,
-    is_delegate_launch_failure_output,
     is_many_image_dimension,
     is_model_registry_unavailable,
     is_registration_throttle_output,
@@ -153,11 +158,6 @@ _sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
 
 async def delegate_launch_failed(message: str | None) -> AcpDelegateLaunchFailed:
     """Build the delegate-launch error and latch an outdated Kiro CLI."""
-    from kiro_crew.acp.delegate_launch_signatures import (
-        KIRO_CLI_TOO_OLD_MESSAGE,
-        KIRO_CLI_TOO_OLD_TERMINAL_MESSAGE,
-    )
-
     if message == KIRO_CLI_TOO_OLD_MESSAGE:
         from kiro_crew.kiro_prerequisite import mark_registered_cli_too_old
 

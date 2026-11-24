@@ -14,7 +14,7 @@ Instance fields written: ``_answer_tasks``, ``_last_activity``, ``_load_replay_f
 Instance fields read: ``_acp_backend``, ``_announced_children``, ``_announced_overflow``,
 ``_fold_mcp_frame``, ``_kas_host_auth``, ``_launch_cwd_roots``,
 ``_map_launch_cwd_paths``, ``_max_answer_tasks``,
-``_mcp_secret_server``, ``_native_skill_projection``, ``_process``,
+``_mcp_secret_server``, ``_native_skill_projection``, ``_process``, ``_repeated_payloads``,
 ``_session_harness_states``, ``_session_inits_in_flight``, ``_session_queues``, ``_start_collectors``,
 ``_subagent_owner``, ``_subagent_roster_overflow``, ``_subagent_sessions``,
 ``_turn_active_sessions``, ``mcp_connect_progress``, ``recording_allowed``.
@@ -28,12 +28,18 @@ import re
 import time
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.acp import kas_agent_config_error, kas_secret_storage
+from kiro_crew.acp import kas_agent_config_error
+from kiro_crew.acp import kas_mcp_lazy_sign_in as _lazy_sign_in
+from kiro_crew.acp import kas_secret_storage
 from kiro_crew.acp._frame_record import record_frame
 from kiro_crew.acp.elicitation import is_elicitation_request
 from kiro_crew.acp.harness import NotificationAliases
 from kiro_crew.acp.kas_agent_config_error import METHOD_KAS_CUSTOM_AGENT_CONFIG_ERROR
-from kiro_crew.acp.runtime_frame_accounting import _DROP_NO_SESSION, _ROSTER_OVERFLOW_REJECT_REASON
+from kiro_crew.acp.runtime_frame_accounting import (
+    _DROP_NO_SESSION,
+    _ROSTER_OVERFLOW_REJECT_REASON,
+    is_unread_session_start_notice,
+)
 from kiro_crew.acp.runtime_host_requests import _UNREGISTERED_REJECT_REASON
 from kiro_crew.acp.session_handle import AcpFrameTooLarge, AcpModeNotFound, AcpRuntimeError
 from kiro_crew.acp.structured_error_data import OVERSIZE_REPLY_DATA
@@ -676,6 +682,15 @@ async def _reader_loop(self: AcpRuntime) -> None:
                 self._answer_tasks.add(_secret_task)
                 _secret_task.add_done_callback(self._answer_tasks.discard)
                 continue
+            # The end of a mid-session sign-in. It names no session, so it goes
+            # only to the one that was shown the link, never to every session.
+            if (
+                msg.id is None
+                and msg.method == _lazy_sign_in.METHOD_KAS_MCP_OAUTH_COMPLETED
+                and self._harness.opens_external_urls
+            ):
+                await _lazy_sign_in.settle_mid_session_sign_in(self, msg.params)
+                continue
             # Any other request that arrives without a sessionId is
             # unroutable and is answered -32601 by
             # _answer_ownerless_request below, rather than being left to
@@ -748,6 +763,9 @@ async def _reader_loop(self: AcpRuntime) -> None:
                     if msg.is_method(METHOD_AGENT_SWITCHED):
                         self._note_switched_model(session_id, msg.params)
                     self._session_activity_at[session_id] = time.monotonic()
+                    # An idle session holds every frame until its next turn:
+                    # its catalogs share one copy with the frames before it.
+                    self._repeated_payloads.share(msg)
                     await queue.put(msg)
                 elif (
                     _announced_owner is not None
@@ -863,6 +881,10 @@ async def _reader_loop(self: AcpRuntime) -> None:
                     or self._start_collectors
                 ):
                     self._stage_init_frame(msg)
+                elif is_unread_session_start_notice(msg):
+                    # A session-start notice Crew does not read, for a session
+                    # not registered yet: no frame lost, so not counted.
+                    pass
                 else:
                     _replayed = (
                         session_id in self._load_replay_frames
@@ -918,6 +940,10 @@ async def _reader_loop(self: AcpRuntime) -> None:
                     msg.fanout_no_owner = True
                 for queue in _queues:
                     await queue.put(msg)
+            elif is_unread_session_start_notice(msg):
+                # Sent before a fresh runtime's first session is registered,
+                # and read by no session: no frame lost, so not counted.
+                pass
             else:
                 # Same unbounded shape as the unknown-session branch: with
                 # zero registered sessions EVERY global notification lands

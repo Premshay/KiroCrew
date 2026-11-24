@@ -1414,6 +1414,14 @@ _DECLARED_IDENTITY_TESTS: dict[tuple[str, str], str] = {
     "native; kiro-cli's launch record already carries it, a Kiro Cloud sandbox "
     "registers no agent, and no other harness reads that tree",
     (
+        "src/kiro_crew/acp/runtime_session_create.py",
+        "_finish_create_session",
+    ): "wording only: the Kiro CLI harness is the one launch that runs kiro-cli's v2 "
+    "engine, which leaves out of its modes a file kiro-cli lists as the v3 agent "
+    "format, so only its mode refusal may name that format "
+    "(``side_readonly_spec.unavailable_mode_explanation``); the refusal itself is "
+    "raised for every harness alike, and no capability table holds an engine version",
+    (
         "src/kiro_crew/acp/runtime_spawn_entry.py",
         "spawn",
     ): "moving kiro-cli's broken KAS extract aside and retrying is a repair for the "
@@ -1513,7 +1521,9 @@ _DECLARED_IDENTITY_TESTS: dict[tuple[str, str], str] = {
         "load_session",
     ): "KAS alone must have its custom agents re-attached on resume, and no harness "
     "property means 'this host needs its agent re-sent'. Adding one would cost the "
-    "kiro path an awaited step it does not need (H13).",
+    "kiro path an awaited step it does not need (H13). Its mode refusal also asks "
+    "whether the harness is Kiro CLI's, as ``_finish_create_session`` does, for the "
+    "wording alone.",
     (
         "src/kiro_crew/acp/session_handle_turn.py",
         "command_is_native",
@@ -1983,34 +1993,3 @@ def test_advertised_steer_backends_are_steer_members() -> None:
     the first and not the second is dead config that grants nothing.
     """
     assert ACP_BACKENDS_STEER_ADVERTISED <= ACP_BACKENDS_STEER
-
-
-@pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))
-def test_merge_card_kept_prompt_rule_is_kiro_only(backend: str) -> None:
-    """H5: only the Kiro "kept the prompt" contract consumes an unlanded merge card.
-
-    The turn below left before landing after a real ``end_turn``: on kiro-cli
-    and on KAS (the default, which also runs the Kiro CLI pick) the live
-    session kept the prompt, so its card is consumed. No other harness has been
-    checked against that contract, so its card stays queued and a wrong guess
-    sends it twice instead of losing it.
-    """
-    from types import SimpleNamespace
-
-    from kiro_crew.dashboard.chat_runner import STOP_REASON_END_TURN
-    from kiro_crew.dashboard.chat_turn.turn_stats import _merge_cards_reached_the_model
-
-    turn = SimpleNamespace(
-        client=providers_acp.AcpProvider(acp_backend=backend),
-        _turn_lands=False,
-        _empty_verdict_left_prompt_unanswered=False,
-        _compaction_completed=False,
-        _had_empty_response_verdict=False,
-        _recovering_compaction=False,
-        _stop_reason=STOP_REASON_END_TURN,
-        _terminal_synthetic=False,
-        _turn_emitted=True,
-        needs_conversation_discard=False,
-        needs_session_reset=False,
-    )
-    assert _merge_cards_reached_the_model(turn) is (backend in ACP_BACKENDS_KIRO_FAMILY)

@@ -1199,7 +1199,9 @@ class TestAttachedSessionWake:
 
 class TestStatusToolNamesTheCaller:
     def test_status_text_includes_self_and_coordinator(self, monkeypatch) -> None:
-        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:coordinator")
+        monkeypatch.setattr(
+            mcp_core, "_resolve_session_key_strict", lambda: "dashboard:coordinator"
+        )
         monkeypatch.setattr(
             mcp_core,
             "_post",

@@ -595,8 +595,13 @@ class TestRunCheck:
         assert passed
         assert [line for line in output.splitlines() if line] == ["C", "False", "(exit 0)"]
 
-    def test_timeout_is_a_fail(self, tmp_path):
-        ok, out = lc.run_check("sleep 5", str(tmp_path), timeout=0.2)
+    def test_timeout_is_a_fail(self, tmp_path, monkeypatch):
+        def times_out(argv, *, timeout, **_kwargs):
+            assert timeout == lc.CHECK_TIMEOUT_S
+            raise subprocess.TimeoutExpired(argv, timeout)
+
+        monkeypatch.setattr(lc, "run_limited", times_out)
+        ok, out = lc.run_check("python --version", str(tmp_path))
         assert ok is False and "timed out" in out
 
     def test_missing_cwd_is_a_fail(self, tmp_path):

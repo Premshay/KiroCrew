@@ -10,8 +10,8 @@ and a patch of the method on the class or on an instance reaches every caller.
 Instance fields written: ``_claude_inline_settings``,
 ``_claude_local_settings_excluded``, ``_claude_settings_authored``,
 ``_claude_settings_claim_unrevoked``, ``_claude_settings_governed``, ``_claude_settings_shared``,
-``_claude_settings_written``, ``_permission_surface_share_validated``,
-``claude_mode_pinned_notice``.
+``_claude_settings_written``, ``_claude_tools_withheld_reason``,
+``_permission_surface_share_validated``, ``claude_mode_pinned_notice``.
 
 Instance fields read: ``_agent``, ``_model``, ``_permission_mode``, ``_seed_owner``,
 ``_session_key``, ``_work_dir``.
@@ -48,6 +48,14 @@ if TYPE_CHECKING:
 
 #: The client's own logger: this code logged under that name before the split.
 logger = logging.getLogger("kiro_crew.acp.client")
+
+#: Why a session whose ``settings.local.json`` path Crew refuses to touch runs
+#: without Crew's MCP tools, and what the person can do (``settings_withheld_reason``).
+_CLAUDE_WITHHELD_LINK = (
+    "the folder's .claude/settings.local.json is a link, or points at a protected file, "
+    "so Crew leaves it alone",
+    "Replace it with a regular file, or work in another folder, then start a new session.",
+)
 
 
 def _claude_settings_usable(path: Path) -> bool:
@@ -393,11 +401,20 @@ def _substitution_retry_model(self: ClaudeAcpClient, substitute: str) -> str:
     names the pin on the spelling the push sends, and the session keeps it. A pin
     not advertised, no pin, or a cold cache (nothing to check against) adopts
     *substitute*, the model the backend itself said it serves.
+
+    A pin the seed already names (adopted in this start or an earlier one) and the
+    backend refused again is not named twice, whatever the advertised list still
+    says: that list can be older than the policy that now refuses it, so
+    *substitute* is named instead. The result equals the adopted model only when
+    the backend refused *substitute* itself, which no retry can fix.
     """
     if not self._model or self._model == DEFAULT_MODEL:
         return substitute
     namespace = self._model_registry_namespace
     pin = model_registry.resolve_wire_model_id(self._model, namespace)
+    adopted = getattr(self, "_adopted_substitute_model", None)
+    if adopted and adopted in (self._model, pin):
+        return substitute
     return pin if pin in model_registry.advertised_models(namespace) else substitute
 
 
@@ -479,6 +496,7 @@ def _write_claude_local_settings(self: ClaudeAcpClient) -> None:
     self._claude_local_settings_excluded = False
     self._claude_inline_settings = None
     self.claude_mode_pinned_notice = ""
+    self._claude_tools_withheld_reason = None
     if not _claude_settings_usable(local_settings):
         # A symlink, or a sensitive resolved target: creating the file would
         # follow the link and write Crew's settings through it. Left entirely
@@ -491,6 +509,7 @@ def _write_claude_local_settings(self: ClaudeAcpClient) -> None:
             "session-scoped settings.",
             local_settings,
         )
+        self._claude_tools_withheld_reason = _CLAUDE_WITHHELD_LINK
         self._permission_surface_share_validated = False
         self._invalidate_session_mcp_projection()
         return
@@ -1073,8 +1092,12 @@ def _adopt_project_permission_governance(
     self: ClaudeAcpClient, local_settings: Path, payload: str
 ) -> bool:
     """Use a project-owned file when its permission block matches this session's."""
+    from kiro_crew.acp.client_claude_session import _CLAUDE_PROJECT_UNCARRIED_GUARD_KEYS
+
     readable, document, fingerprint = _settings_path_document_fingerprint(local_settings)
-    if not readable or document is None or fingerprint is None:
+    if not readable or not document or fingerprint is None:
+        return False
+    if any(document.get(key) for key in _CLAUDE_PROJECT_UNCARRIED_GUARD_KEYS):
         return False
     # A Crew-owned file needs a reader lease. A stale record whose digest
     # differs from this snapshot describes a file the project has replaced.

@@ -159,8 +159,13 @@ from kiro_crew.config.sections_agent_fields import (  # noqa: F401
     JAIL_MODE_AUTO,
     JAIL_MODE_OFF,
     JAIL_MODE_ON,
+    KAS_AUTH_CALLBACK,
+    KAS_AUTH_MACHINE,
+    KAS_AUTH_MODES,
     KAS_BUNDLE_DEFAULT_URL,
     KAS_FAIL_CLOSED_WEB_FETCH_BLOCKED_HELP,
+    KAS_MACHINE_HELP,
+    KAS_MACHINE_TOKEN_PATH_DEFAULT,
     KAS_REFUSE_PLAIN_HTTP_MCP_HEADERS_HELP,
     MEMBER_APPROVAL_MODE_UNSET_EFFECTIVE,
     MEMBER_APPROVAL_MODES,
@@ -215,6 +220,7 @@ from kiro_crew.config.sections_browser import (  # noqa: F401
     RECORDING_MB_MIN,
     RECORDING_SESSION_MB_DEFAULT,
     RECORDING_TOTAL_MB_DEFAULT,
+    RUN_MAX_MINUTES_CAP,
     RUN_MAX_OPS_CAP,
     RUN_MAX_REPEATS_CAP,
     BrowserConfig,
@@ -222,6 +228,7 @@ from kiro_crew.config.sections_browser import (  # noqa: F401
     BrowserLiveConfig,
     BrowserRecordingConfig,
     BrowserRunConfig,
+    _spelled_int,
     _validated_choice,
     _validated_isolation,
     _validated_max_fps,
@@ -607,6 +614,12 @@ _sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
 __all__ = sorted(name for name in set(globals()) | set(_EXPORTS) if not name.startswith("_"))
 
 if TYPE_CHECKING:  # the owner-defined names this module serves, for type checkers
+    from kiro_crew.config.sections_decisions import (  # noqa: F401
+        QUOTA_LIMITS_DEFAULT,
+        QUOTA_LOW_PCT_DEFAULT,
+        QUOTA_OUT_PCT_DEFAULT,
+        coerce_quota_limits,
+    )
     from kiro_crew.config.sections_stt import (  # noqa: F401
         _LAST_WARNED_TRANSCRIBE_LANGUAGES,
         _LAST_WARNED_TRANSCRIBE_VOCABULARY,

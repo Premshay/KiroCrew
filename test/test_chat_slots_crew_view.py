@@ -123,9 +123,3 @@ async def test_crew_all_and_an_agents_read_keep_a_mates_sessions(
 def test_a_session_whose_mate_thread_is_closed_stays_in_a_persons_list() -> None:
     rows = [{"key": "chat-4-4", crew_mode.MATE_ROOT_FIELD: "dm-gone"}, dict(PLAIN)]
     assert crew_mode.list_view(rows, "", agent=False) == rows
-
-
-def test_a_pinned_mate_session_stays_in_a_persons_list() -> None:
-    pinned = {**MATE_CHILD, "pinned": True}
-    rows = [{"key": "dm-ada", "mode": "member"}, pinned]
-    assert crew_mode.list_view(rows, "", agent=False) == rows

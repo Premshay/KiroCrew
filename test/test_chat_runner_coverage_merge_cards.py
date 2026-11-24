@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -30,8 +31,10 @@ from chat_runner_coverage_helpers import (
 
 from kiro_crew.acp.client import AcpConversationBindingMismatch
 from kiro_crew.acp.types import EVENT_TEXT_CHUNK
+from kiro_crew.agent_sdk.backends import ACP_BACKENDS_KIRO_FAMILY, ACP_BACKENDS_KNOWN
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
+from kiro_crew.providers import acp as providers_acp
 from kiro_crew.providers.base import LLMEvent
 from kiro_crew.testing.wait import await_until
 
@@ -875,6 +878,36 @@ class TestVerbatimReplayMergeCards:
         # The landed replay consumed the card's context: nothing is left for a later turn.
         assert slot._pending_context == []
         assert slot._inflight_merge_contexts == []
+
+
+@pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))
+def test_merge_card_kept_prompt_rule_is_kiro_only(backend: str) -> None:
+    """H5: only the Kiro "kept the prompt" contract consumes an unlanded merge card.
+
+    The turn below left before landing after a real ``end_turn``: on kiro-cli
+    and on KAS (the default, which also runs the Kiro CLI pick) the live
+    session kept the prompt, so its card is consumed. No other harness has been
+    checked against that contract, so its card stays queued and a wrong guess
+    sends it twice instead of losing it.
+    """
+
+    from kiro_crew.dashboard.chat_runner import STOP_REASON_END_TURN
+    from kiro_crew.dashboard.chat_turn.turn_stats import _merge_cards_reached_the_model
+
+    turn = SimpleNamespace(
+        client=providers_acp.AcpProvider(acp_backend=backend),
+        _turn_lands=False,
+        _empty_verdict_left_prompt_unanswered=False,
+        _compaction_completed=False,
+        _had_empty_response_verdict=False,
+        _recovering_compaction=False,
+        _stop_reason=STOP_REASON_END_TURN,
+        _terminal_synthetic=False,
+        _turn_emitted=True,
+        needs_conversation_discard=False,
+        needs_session_reset=False,
+    )
+    assert _merge_cards_reached_the_model(turn) is (backend in ACP_BACKENDS_KIRO_FAMILY)
 
     @pytest.mark.asyncio
     async def test_a_failed_replay_keeps_the_card_for_the_next_landed_turn(self, tmp_path):

@@ -1010,7 +1010,7 @@ describe('App routing', () => {
     await waitFor(() => expect(store.getState().dashboard.slotsLoaded).toBe(true))
     act(() => { store.dispatch(markSlotUnread({ slot: 'background', ts: '2026-01-01T00:00:05Z' })) })
 
-    const badge = await screen.findByLabelText('1 unread conversations')
+    const badge = await screen.findByLabelText('1 unread conversation')
     expect(badge.className).not.toContain('absolute')
     expect(badge.parentElement).toBe(chord.parentElement)
     expect(chord.compareDocumentPosition(badge) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
@@ -1044,11 +1044,8 @@ describe('App routing', () => {
     // fix above), so a bare "1" pill beside a bare bot glyph and "2" has to be
     // tellable apart without a screen reader. Both carry the label as `title`.
     //
-    // The title is the label ALONE, deliberately: the labels are plural phrases,
-    // so reusing the aria string would render a visible "1 unread conversations"
-    // at count 1. The count is already in the pill, so the title does not repeat
-    // it — asserted below, or the grammar defect returns the moment someone
-    // "helpfully" switches these back to ariaLabel.
+    // The title is the label ALONE, deliberately: the count is already in the
+    // pill, so the title does not repeat it — asserted below.
     localStorage.setItem('mc-nav', '0')
     const store = createTestStore()
 
@@ -1058,7 +1055,7 @@ describe('App routing', () => {
     act(() => { store.dispatch(markSlotUnread({ slot: 'background', ts: '2026-01-01T00:00:05Z' })) })
     act(() => { store.dispatch(sseSubagentQueued({ slot: 'background', queued: 2 })) })
 
-    const badge = await screen.findByLabelText('1 unread conversations')
+    const badge = await screen.findByLabelText('1 unread conversation')
     const activity = await screen.findByLabelText('2 subagents in flight')
     expect(badge).toHaveAttribute('title', 'unread conversations')
     expect(activity).toHaveAttribute('title', 'subagents in flight')
@@ -1223,17 +1220,20 @@ describe('App routing', () => {
     expect(trigger.style.width).toBe('')
     // Header children, in order: left group · centre cell · actions group. The
     // three-track grid depends on that being exactly three in-flow children.
-    const centre = trigger.parentElement!
+    // The trigger's HoverTip wrapper is the cell's item and takes the track.
+    expect(trigger.parentElement).toHaveClass('flex-1')
+    const centre = trigger.parentElement!.parentElement!
     const header = centre.parentElement!
     const flow = [...header.children].filter(el => !el.className.includes('absolute'))
     expect(flow[0]).toHaveClass('tb-left')
     expect(flow[1]).toBe(centre)
     expect(flow[2]).toHaveClass('tb-right')
-    // The centre cell holds the trigger and the focus-mode toggle, and nothing
-    // else: a third control there is what website/AUTOSDE.yaml's
-    // max-two-buttons-per-row rule forbids.
+    // The centre cell holds the trigger and the focus-mode toggle (each inside
+    // its hint's wrapper), and nothing else: a third control there is what
+    // website/AUTOSDE.yaml's max-two-buttons-per-row rule forbids.
     expect([...centre.children]).toHaveLength(2)
-    expect(centre.children[1]).toBe(screen.getByTestId('focus-mode-toggle'))
+    expect(centre.children[1]).toBe(screen.getByTestId('focus-mode-toggle').parentElement)
+    expect(centre.children[1]).toHaveAttribute('data-hover-tip')
     return shellSettled()
   })
 

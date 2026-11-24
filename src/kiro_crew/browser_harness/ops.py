@@ -8,7 +8,7 @@ through ``/api/browser/op``), and it reaches the browser only two ways:
   daemon's IPC (``goto``, ``click``, ``type_text``, ``press_key``, ``scroll``,
   ``mouse_move``, ``drag``, ``screenshot``, ``page_info``, ``wait_for_load``,
   ``new_tab``, ``switch_tab``, ``list_tabs``, ``js``, ``upload``'s ``set_files``,
-  and the ``reflex`` op's ``page_clock``);
+  ``chooser_files`` and ``drop_files``, and the ``reflex`` op's ``page_clock``);
 * the ``js`` helper with :data:`WALKER_SOURCE` -- the page-side half of this
   module (``snapshot_walker.js``) -- so every read or write these ops make in the
   page is a method on that one script. The ``js``, ``cdp`` and ``http_get`` ops
@@ -88,6 +88,8 @@ OPS: tuple[str, ...] = (
     "cdp",
     "http_get",
     "iframe_target",
+    "set_appearance",
+    "resize",
     # Served by the gateway route itself (``dashboard/handlers/browser_ask.py``):
     # it needs the live card, which this module never sees. ``run_op`` refuses it.
     "ask",
@@ -221,8 +223,9 @@ class OpContext:
     in_control: Callable[[], Any] = lambda: False
     agent_targets: Callable[[], list[str]] = list
     #: The navigate gate, applied to the URL a navigation COMMITTED on (after every
-    #: redirect), not only to the one the agent asked for. The route wires the same
-    #: predicate the shim applies before the op (``browser_harness.url_gate``).
+    #: redirect), not only to the one the agent asked for. The route wires the
+    #: predicate the shim applies before the op (``browser_harness.url_gate``), plus
+    #: the origins only the gateway knows it serves under.
     url_allowed: Callable[[str], bool] = lambda _url: True
     screenshot_dir: Path = field(default_factory=lambda: Path(os.getcwd()))
     sleep: _SleepFn = _no_sleep
@@ -255,6 +258,23 @@ class OpContext:
     #: a leaf no sandboxed agent can read or write (the hidden IPC leaf). ``None``
     #: refuses ``upload`` (``not_available``).
     upload_dir: Path | None = None
+    #: The host whose act site grant lets ``upload`` run with no card (``""``: on
+    #: the card). Such an upload sends nothing under the strict sandbox's hidden
+    #: folders and re-reads the tab's host right before the files go.
+    upload_grant_host: str = ""
+    #: The files an ``upload`` card expanded its entries to and the person allowed
+    #: (``upload.preview``'s groups and skip count), or ``None``. When set, the op
+    #: sends exactly these and never expands the entries again, so a file added to a
+    #: folder after the card is never sent.
+    upload_groups: tuple[list[Any], int] | None = None
+    #: Whether the governance ceiling lets this caller read a path (``filesystem.read``).
+    #: ``upload`` asks it for every file a folder or glob expands to: the tool gate
+    #: judged only the entries as written.
+    read_allowed: Callable[[str], bool] = lambda _path: True
+    #: Sends one Emulation override ``(target_id, method, params)`` on the relay's own
+    #: session of an agent tab (``CdpRelay.emulate``), for ``set_appearance`` and
+    #: ``resize``. ``None`` refuses them (``not_available``).
+    emulate: Callable[[str, str, dict[str, Any]], Awaitable[Any]] | None = None
 
 
 def screenshot_dir(home: Path) -> Path:
@@ -708,9 +728,10 @@ async def _refuse_committed_url(ctx: OpContext, url: str) -> dict[str, Any] | No
         logger.debug("navigate: could not leave the refused page", exc_info=True)
     return refusal(
         "redirect_refused",
-        f"the page redirected to {url[:120]}, which is not a public http(s) URL or a "
-        "loopback origin the user listed (or, for an app's own session, not one of the "
-        "pages the app may browse); the tab was moved to about:blank",
+        f"the page redirected to {url[:120]}, which is not a public http(s) URL other "
+        "than this dashboard or a loopback origin the user listed (or, for an app's own "
+        "session, not one of the pages the app may browse); the tab was moved to "
+        "about:blank",
     )
 
 
@@ -1107,7 +1128,7 @@ async def _press_key(ctx: OpContext, args: dict[str, Any]) -> dict[str, Any]:
     from kiro_crew.browser_harness import keys
 
     if not keys.known_key(key):
-        return refusal("bad_key", f"unknown key: {key!r} (named keys or a single character)")
+        return refusal("bad_key", keys.unknown_key_error(key))
     if key == "Space":
         key = " "
     modifiers = keys.modifier_mask(args.get("modifiers"))
@@ -1692,6 +1713,16 @@ def _raw_op(name: str) -> Callable[[OpContext, dict[str, Any]], Awaitable[dict[s
     return run
 
 
+def _emulation_op(name: str) -> Callable[[OpContext, dict[str, Any]], Awaitable[dict[str, Any]]]:
+    """``browser_harness.emulation.<name>``, resolved at call time: it imports this module."""
+
+    async def run(ctx: OpContext, args: dict[str, Any]) -> dict[str, Any]:
+        module = importlib.import_module("kiro_crew.browser_harness.emulation")
+        return await getattr(module, name)(ctx, args)  # type: ignore[no-any-return]
+
+    return run
+
+
 async def _ask_elsewhere(_ctx: OpContext, _args: dict[str, Any]) -> dict[str, Any]:
     """``ask`` needs the live card; the op route serves it and never calls here."""
     return refusal("not_available", "ask is served by the gateway's op route")
@@ -1786,6 +1817,8 @@ _HANDLERS: dict[str, Callable[[OpContext, dict[str, Any]], Awaitable[dict[str, A
     "cdp": _raw_op("cdp"),
     "http_get": _raw_op("http_get"),
     "iframe_target": _raw_op("iframe_target"),
+    "set_appearance": _emulation_op("set_appearance"),
+    "resize": _emulation_op("resize"),
     "ask": _ask_elsewhere,
     "pick": _pick,
     "locate": _locate,
@@ -1817,6 +1850,8 @@ async def run_op(op: str, args: dict[str, Any], ctx: OpContext) -> dict[str, Any
             "page_info",
             "wait_for_load",
             "set_files",
+            "chooser_files",
+            "drop_files",
             "fill_input",
             "dispatch_key",
             "wait_for_element",

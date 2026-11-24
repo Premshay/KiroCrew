@@ -47,7 +47,7 @@ from aiohttp.test_utils import TestServer, make_mocked_request
 from fake_pool_mcp_server import recorded
 from mcp_resource_subscription_helpers import INIT_PARAMS, StubProcess, running_daemon, spawn_stub
 
-from kiro_crew import cli_commands_gateway_api, cli_resource_subs
+from kiro_crew import cli_commands, cli_resource_subs
 from kiro_crew import platform_compat as pc
 from kiro_crew.config.integration_sections import McpResourceSubscriptionsConfig
 from kiro_crew.dashboard.handlers import resource_subscriptions as routes
@@ -791,7 +791,7 @@ def _send_without_the_peer_proof(monkeypatch: pytest.MonkeyPatch) -> None:
     def plain_send(req: Any, _port: int, timeout: float, _operation: str) -> Any:
         return loopback_urlopen(req, timeout=timeout)
 
-    monkeypatch.setattr(cli_commands_gateway_api, "_gateway_send", plain_send)
+    monkeypatch.setattr(cli_commands, "_gateway_send", plain_send)
 
 
 @pytest.mark.asyncio
@@ -851,7 +851,7 @@ def _patch_gateway_request(monkeypatch: pytest.MonkeyPatch, result: bytes | Base
         response = MagicMock()
         response.__enter__.return_value.read.return_value = result
         opener = MagicMock(return_value=response)
-    monkeypatch.setattr(cli_commands_gateway_api, "_gateway_send", opener)
+    monkeypatch.setattr(cli_commands, "_gateway_send", opener)
 
 
 @pytest.mark.asyncio

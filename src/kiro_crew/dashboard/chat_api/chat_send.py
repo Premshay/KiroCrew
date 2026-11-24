@@ -19,6 +19,7 @@ if TYPE_CHECKING:
         _CREW_PERSON_STEER,
         CHAT_BANNER_META_KEY,
         HUMAN_TURN_META_KEY,
+        PASTES_META_KEY,
         RESERVED_ROW_META_KEYS,
         STEER_REQUEUED,
         STEER_STEERED,
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
         _ChatSlot,
         _deny_app_session_settings,
         _emit_agent_assignment,
+        _forwards_harness_command,
         _history_key_for,
         _loading_refusal,
         _maybe_auto_title,
@@ -44,8 +46,6 @@ if TYPE_CHECKING:
         _record_explicit_agent_selection,
         _redact_meta,
         _run_chat,
-        _send_binds_agent,
-        _send_harness_command,
         _send_writes_persona,
         _start_next_queued_turn,
         _wake_pending_reset_retry,
@@ -62,6 +62,7 @@ if TYPE_CHECKING:
         effective_session_key,
         fork_title_pending,
         hold_crew_steer,
+        is_claude_code,
         is_registered_agent_name,
         knowledge_meta,
         load_window_off_loop,
@@ -74,6 +75,7 @@ if TYPE_CHECKING:
         message_required_error,
         normalize_send_id,
         normalize_theme_consent_sha,
+        paste_meta,
         pin_private_agent_store,
         queue_for_next_turn,
         queued_text_for_display,
@@ -139,6 +141,28 @@ def _sweep_stale_permissions(slot: "_ChatSlot") -> None:
             source="turn_start_sweep",
             resources=cls.get("request_id", ""),
         )
+
+
+def _send_binds_agent(agent: str, slot: Any) -> bool:
+    """Whether a ``POST /api/chat`` naming *agent* writes it onto *slot*."""
+    return bool(agent) and slot.agent in (None, "")
+
+
+async def _send_harness_command(message: str, state: DashboardState, slot: _ChatSlot) -> str:
+    """The harness slash command *message* opens with, or ``""`` for plain text.
+
+    The same predicate the runner forwards on (``_forwards_harness_command``), so
+    what this refuses is exactly what would reach the harness as a command. The
+    config is read only for a first word that starts with ``/``.
+    """
+    first_word = message.split()[0] if message.strip() else ""
+    if not first_word.startswith("/"):
+        return ""
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
+    cc_provider = is_claude_code(cfg.agent.provider)
+    key = effective_session_key(slot)
+    forwarded = await _forwards_harness_command(state, key, first_word, cc_provider=cc_provider)
+    return first_word if forwarded else ""
 
 
 def _send_id_of(user_meta: dict | None) -> str:
@@ -1208,6 +1232,7 @@ async def _api_chat_send(request: web.Request) -> web.StreamResponse:
             quote=quote_meta(user_meta).get("quote"),
             banner=banner,
             knowledge=knowledge_meta(user_meta),
+            pastes=paste_meta(user_meta, message),
             # The receipt travels whichever way the send went, including the one
             # case where the two disagree: `auto` answered steer and the steer was
             # UNAVAILABLE, so this path runs with a record saying steer. That is the
@@ -1310,6 +1335,8 @@ async def _api_chat_send(request: web.Request) -> web.StreamResponse:
         _hold_meta.update(quote_meta(user_meta))
         _hold_knowledge = knowledge_meta(user_meta)
         _hold_meta.update(_hold_knowledge)
+        if _hold_pastes := paste_meta(user_meta, message):
+            _hold_meta[PASTES_META_KEY] = _hold_pastes
         if banner:
             _hold_meta[CHAT_BANNER_META_KEY] = banner
         if request_app or cron_creator or _agent_origin:
@@ -1349,7 +1376,7 @@ async def _api_chat_send(request: web.Request) -> web.StreamResponse:
         _sc_entry.stamp_queued_work(slot, qid, _held_admission)
         _send_race.commit_request(request, message_id=qid)
         _redacted = queued_text_for_display(message, user_origin=_person_send)
-        _hold_durable = warn_if_not_durable(slot._queue, qid, slot.key)
+        _hold_durable = warn_if_not_durable(slot.durable_source(), qid, slot.key)
         # Start the durable write here too, not only in the busy-slot branch.
         # This branch holds an IDLE slot, so no drain is coming to write the
         # prompt's transcript row and no turn-end flush is scheduled: the queue
@@ -1804,19 +1831,18 @@ async def _api_chat_send(request: web.Request) -> web.StreamResponse:
         # The turn task inherits its sender as initiator, so a turn running
         # outside admitted work is still found and stopped when the owner
         # removes that person (``access_set.stop_work``).
+        from kiro_crew.shared_crew import turn_gate as _turn_gate
         from kiro_crew.shared_crew.admission_gate import actor_budget as _turn_actor_budget
-        from kiro_crew.shared_crew.turn_gate import initiated_by as _turn_initiated_by
-        from kiro_crew.shared_crew.turn_gate import note_admission_ended
 
         def _admission_ended() -> None:
             # Expired or refused before it ran: end the cycle and hand off the queue.
-            note_admission_ended(slot, turn_admission)
+            _turn_gate.note_admission_ended(slot, turn_admission)
             state.push_slots_update()
 
         # Opened here so the turn task's copied context carries the record.
         turn_timing.begin(slot.key, "ws" if ws_mode else "sse", _timing_t0)
         turn_timing.mark("dispatched")
-        with _turn_initiated_by("" if request_app else _turn_actor_budget(request)):
+        with _turn_gate.initiated_by("" if request_app else _turn_actor_budget(request)):
             task = spawn_guarded_turn(
                 state,
                 slot,
@@ -1828,6 +1854,7 @@ async def _api_chat_send(request: web.Request) -> web.StreamResponse:
                     ),
                     still_live=lambda: slot_is_live(state, slot),
                     on_ended=_admission_ended,
+                    stop_count=_turn_gate.session_stop_count(state, slot),
                 ),
             )
         turn_dispatched = True

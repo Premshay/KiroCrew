@@ -1050,6 +1050,20 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "configKey": "teams.tenant_id"
   },
   {
+    "id": "channels.tracked-channels-slack",
+    "label": "Tracked channels (Slack)",
+    "labelKey": "pages.settings.slackPanel.tracked_channels",
+    "labelSuffix": "Slack",
+    "description": "Channels the agent can post, react and read in. Applies when you save.",
+    "hint": "Slack channel IDs, starting with C or G. In Slack, open the channel's details: the ID is at the bottom. You can also add channels in Slack with /kirocrew channels, where you also set each channel's activation mode and agent.",
+    "tab": "channels",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "channel": "slack"
+    }
+  },
+  {
     "id": "channels.webex-bot-token-webex",
     "label": "Webex bot token (Webex)",
     "labelKey": "pages.settings.webexPanel.webex_bot_token",
@@ -1628,6 +1642,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "chat.pin-forks-of-pinned-sessions",
+    "label": "Pin forks of pinned sessions",
+    "labelKey": "pages.settings.chatPanel.pin_forks_of_pinned_sessions",
+    "description": "A fork of a pinned session is pinned too, so it stays beside the original.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "sessions"
+    }
+  },
+  {
     "id": "chat.pin-summary-in-side-panel",
     "label": "Pin Summary in Side Panel",
     "labelKey": "pages.settings.chatPanel.side_panel_pin_summary",
@@ -1839,7 +1865,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.send-follow-ups-with-one-click",
     "label": "Send follow-ups with one click",
     "labelKey": "pages.settings.chatPanel.followup_start_sends",
-    "hint": "For follow-up suggestion cards only. When this is on, Start becomes Run and sends the card's prompt to the new session at once. When it is off, Start opens the new session with the prompt in its message box, and nothing is sent until you press send.",
+    "hint": "For follow-up suggestion cards only. When this is on, Start becomes Run and sends the card's prompt to the new session at once. When it is off, Start opens the new session with the prompt in its message box.",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1884,6 +1910,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
       "sub": "sessions"
     },
     "configKey": "session.max_per_creator"
+  },
+  {
+    "id": "chat.show-all-bots-in-my-sessions",
+    "label": "Show all bots in my Sessions",
+    "labelKey": "pages.membersPage.bot_sessions_all_switch",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "sessions"
+    },
+    "configKey": "dashboard.show_bot_sessions_in_list"
   },
   {
     "id": "chat.show-context-percentage",
@@ -1981,6 +2019,20 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "chat.since-you-left-briefs",
+    "label": "Since you left briefs",
+    "labelKey": "pages.settings.chatPanel.warm_task_brief",
+    "description": "When you return to a conductor mode chat or a bot thread after 30 minutes away, post a catch-up brief.",
+    "hint": "Off: a return posts no brief. Takes effect on your next return.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "sessions"
+    },
+    "configKey": "dashboard.warm_task_brief"
+  },
+  {
     "id": "chat.soft-stop-budget-seconds",
     "label": "Soft-stop budget (seconds)",
     "labelKey": "pages.settings.chatPanel.soft_stop_budget_seconds",
@@ -2076,6 +2128,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1,
     "params": {
       "sub": "models"
+    }
+  },
+  {
+    "id": "chat.swipe-to-open-and-close-side-panel",
+    "label": "Swipe to Open and Close Side Panel",
+    "labelKey": "pages.settings.chatPanel.side_panel_swipe",
+    "hint": "On a desktop, a two-finger sideways trackpad swipe over a chat or the Bots page opens and closes the side panel. Turn this off to stop it; the panel button and keyboard shortcut still work. This setting does not apply on a phone.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "sidepanel"
     }
   },
   {
@@ -2445,7 +2509,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "developer.connected-computers",
     "label": "Connected computers",
     "labelKey": "connectedComputers.preview.label",
-    "description": "Chats on this server can work in a folder on your own computer. Nothing is shared until you approve it on that computer.",
+    "description": "Chats on this server can work in a folder on your own computer.",
     "hint": "Your computer connects to this server and shares only the folder you approve. Turning this off stops sharing and never deletes files. Remote Crew is the reverse: it lets you use this server from another device.",
     "tab": "developer",
     "type": "toggle",
@@ -2517,6 +2581,19 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "settingId": "developer.jev-api-key",
     "label": "Jev API key",
     "description": "Kept in this dashboard's secret store on the machine that runs Kiro Crew, never in config.json, and never shown again once you save it."
+  },
+  {
+    "id": "developer.kas-sub-agents",
+    "label": "KAS sub-agents",
+    "labelKey": "pages.developer.featurePreviewsTab.kas_subagents",
+    "description": "On KAS, the default agent runs quick sub-agents inside the engine, and some agent permissions are read the way kiro-cli reads them, in chats and sub-agents started after you switch this.",
+    "hint": "On, in KAS chats: the default agent hands quick tasks to its built-in helper or to up to 8 of your own agents inside its turn, held to the chat agent's rules and stopped with the turn; a sub-agent that spawn_run starts on another agent runs without asking only what the chat that started it runs without asking; a denyByDefault command list holds even when the agent pre-approves the shell; and an agent that excludes the sub-agent tool, or uses one of three deniedCommands forms, is read as kiro-cli reads it, which the chat says when it starts. Off: Kiro Crew starts the default agent's sub-agents as sessions of their own that you can open and stop in the Subagents panel.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "developer.let-agents-control-your-other-sessions",
@@ -2601,7 +2678,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Remote dispatch",
     "labelKey": "pages.developer.featurePreviewsTab.remote_dispatch",
     "description": "Runs conductor mode tasks on connected machines.",
-    "hint": "Lets conductor mode chats run tasks on machines you've connected under Remote Crew. Nothing is sent until a machine is connected.",
+    "hint": "Lets conductor mode chats run tasks on machines you've connected under Remote Crew.",
     "tab": "developer",
     "type": "toggle",
     "occurrence": 1,
@@ -2666,6 +2743,19 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Shared Crew",
     "labelKey": "sharedCrew.preview_title",
     "description": "People tab, invites and shared sessions",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
+  },
+  {
+    "id": "developer.use-your-company-s-sign-in",
+    "label": "Use your company's sign-in",
+    "labelKey": "pages.developer.featurePreviewsTab.crew_client",
+    "description": "Uses your company's own sign-in for its portal.",
+    "hint": "Some companies install Kiro Crew with their own company sign-in. Turn this on to use it. While you're signed in with it, you can't chat with the agent on this computer, and the sign-in form says so first. Otherwise nothing changes.",
     "tab": "developer",
     "type": "toggle",
     "occurrence": 1,
@@ -3191,6 +3281,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "display.touch-screen-layout",
+    "label": "Touch screen layout",
+    "labelKey": "pages.settings.displayPanel.touch_layout",
+    "hint": "Use this if your browser has no Request desktop site option. Automatic follows the browser's mobile or desktop site mode. The desktop layout applies from 768px up; below that the phone layout stays. Saved on this browser only.",
+    "tab": "display",
+    "type": "select",
+    "occurrence": 1,
+    "params": {
+      "sub": "view"
+    }
+  },
+  {
     "id": "display.translucent-panels",
     "label": "Translucent panels",
     "labelKey": "pages.settings.displayPanel.translucent_panels",
@@ -3233,6 +3335,14 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "hint": "When on, opening the web app connects every crew automatically, and reconnects them when you come back to the tab. Turn off to connect a crew only when you switch to it.",
     "tab": "instances",
     "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "instances.crews-kept-loaded",
+    "label": "Crews kept loaded",
+    "labelKey": "pages.settings.remoteCrewPanel.warm_cap",
+    "tab": "instances",
+    "type": "stepper",
     "occurrence": 1
   },
   {
@@ -3407,6 +3517,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "notifications.play-sounds-only-during-set-hours",
+    "label": "Play sounds only during set hours",
+    "labelKey": "pages.settings.notificationsPanel.sound_hours",
+    "hint": "Choose, for each day of the week, the hours notifications may make a sound. Outside them, notifications still arrive, without sound.",
+    "tab": "notifications",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "sound"
+    }
+  },
+  {
     "id": "notifications.sound-category-agent",
     "params": {
       "sub": "percategory"
@@ -3539,7 +3661,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Authenticates coding-activity sync when WakaTime is enabled."
   },
   {
-    "id": "security.ask-me-before-running-tools-an-mcp-server-pre-approves",
+    "id": "security.ask-me-before-running-tools-set-to-auto-approve-in-a-tool-server-s-settings",
     "labelKey": "pages.settings.securityPanel.safetySwitches.ask_label",
     "tab": "security",
     "type": "toggle",
@@ -3548,8 +3670,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
       "section": "safety"
     },
     "configKey": "mcp.honour_auto_approve",
-    "label": "Ask me before running tools an MCP server pre-approves",
-    "description": "Tools you set to Always allow still run without asking."
+    "label": "Ask me before running tools set to auto-approve in a tool server's settings",
+    "description": "Tools you set to Always allow, on an approval card or in MCP Servers, still run without asking."
   },
   {
     "id": "security.denied-commands",
@@ -3632,7 +3754,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     },
     "configKey": "mcp.protect_kiro_permission_rules",
     "label": "Stop the agent from editing its own permission rules",
-    "description": "On: the agent's file-editing tools can't change the rules that let tools run without asking you. Off: they can. Commands the agent runs in a terminal can change these rules either way."
+    "description": "On: the agent's file-editing tools can't change the rules that let tools run without asking you. Off: they can."
   },
   {
     "id": "security.trust-every-third-party-app",
@@ -3903,6 +4025,24 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "type": "input",
     "occurrence": 1,
     "configKey": "stt.custom_model_sha256"
+  },
+  {
+    "id": "voice.hold-the-message-box-to-talk",
+    "label": "Hold the message box to talk",
+    "labelKey": "pages.settings.sttSettings.pointer_enabled",
+    "hint": "Turn this off and a press on the message box only places the cursor.",
+    "tab": "voice",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "voice.hold-time",
+    "label": "Hold time",
+    "labelKey": "pages.settings.sttSettings.pointer_hold_time",
+    "hint": "How long the button stays down before dictation starts. Shorter starts sooner; longer keeps a slow click from starting it.",
+    "tab": "voice",
+    "type": "stepper",
+    "occurrence": 1
   },
   {
     "id": "voice.how-the-key-works",

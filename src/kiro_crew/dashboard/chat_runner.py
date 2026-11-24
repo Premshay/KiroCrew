@@ -125,6 +125,7 @@ from kiro_crew.context import (
 )
 from kiro_crew.crew_log import emit as crew_log_emit
 from kiro_crew.dashboard import chat_turn as _chat_turn
+from kiro_crew.dashboard import deferred_steer as _deferred_steer
 from kiro_crew.dashboard import directive_queue
 from kiro_crew.dashboard import engine_fallback as _engine_fallback
 from kiro_crew.dashboard import git_repo_touches as _git_repo_touches
@@ -252,6 +253,7 @@ from kiro_crew.dashboard.chat_turn.queue_drain import (  # noqa: F401
 from kiro_crew.dashboard.chat_turn.recipient import (  # noqa: F401
     MIRROR_ECHO_OWED_META_KEY,
     _authorize_recipient,
+    _mirror_upload_roots,
     _recipient_principal,
     _resolve_channel_target,
     _resolve_mirror_target,
@@ -266,11 +268,14 @@ from kiro_crew.dashboard.chat_turn.regenerate_swap import (  # noqa: F401
     release_regenerate_on_done,
 )
 from kiro_crew.dashboard.chat_turn.segment_flush import (
+    _commit_reveals,
     _flush_segment,
+    _redact_segment_text,
     _turn_settle_answer,
 )
 from kiro_crew.dashboard.chat_turn.session_events import (
     _finish_harness_notices,
+    _keep_cleared_turns,
     _on_agent_switched,
     _on_clear_status,
     _on_compaction_status,
@@ -313,7 +318,7 @@ from kiro_crew.dashboard.chat_turn.tool_approval import (  # noqa: F401
     _operator_confirms_call,
     _slot_is_trusted,
 )
-from kiro_crew.dashboard.chat_turn.tool_results import _on_tool_result
+from kiro_crew.dashboard.chat_turn.tool_results import _on_child_tool_finished, _on_tool_result
 from kiro_crew.dashboard.chat_turn.tool_rows import (
     _MAX_TCID_SOURCES,
     _on_tool_call,
@@ -584,7 +589,7 @@ from kiro_crew.slack.code_channels.binding import (
 )
 from kiro_crew.slack.code_channels.worker_approvals import finish as finish_worker_approval
 from kiro_crew.slack.code_channels.worker_approvals import start as start_worker_approval_relay
-from kiro_crew.slack.handler import post_linked_approval
+from kiro_crew.slack.handler import _reply_by_voice, post_linked_approval
 from kiro_crew.start_priority import StartPriority
 from kiro_crew.tracing import turns as trace_turns
 from kiro_crew.trust_patterns import (  # noqa: F401 -- compatibility re-export
@@ -1072,6 +1077,15 @@ async def _run_chat(
     # the mirror does not quote it there again. Stamped by ``api_chat`` and carried
     # through the queue by the entry's ``promptOnChannel`` meta.
     _prompt_on_channel: bool = False,
+    # A Bot's Heartbeat wake (``mate_welcome.dispatch_hidden_turn``): a linked thread
+    # or channel gets only the final reply -- no "Thinking…" placeholder, no task
+    # stream, and no outcome line for a quiet end.
+    _mirror_reply_only: bool = False,
+    # The Slack message this turn answers, routed from its linked thread
+    # (``route_linked_thread``): the thread's session key, the sender, and whether
+    # it was a voice memo. The mirror speaks the answer there as an unlinked
+    # thread's is spoken. None (every other turn) keeps the mirror text-only.
+    _slack_voice: tuple[str, str, bool] | None = None,
     # Who caused this turn, from the dispatch that knows -- a consumed queue
     # entry's enqueue-time ``kind`` tag, or an injector calling this runner
     # directly. Recorded in the session's log, so it must not be derivable from
@@ -1123,6 +1137,8 @@ async def _run_chat(
         _recovery_echo_owed=_recovery_echo_owed,
         _card_origin=_card_origin,
         _prompt_on_channel=_prompt_on_channel,
+        _mirror_reply_only=_mirror_reply_only,
+        _slack_voice=_slack_voice,
         _turn_actor=_turn_actor,
         regenerate_hint=regenerate_hint,
         _on_consumed=_on_consumed,
@@ -1385,6 +1401,11 @@ async def _run_chat(
                 await _on_tool_result(turn, event)
                 # A peer interrupt held while this tool ran may steer now.
                 await retry_after_tool_result(turn.state, turn.slot)
+                # A tool call just finished: the next model step is the boundary a
+                # held peer steer is injected at. A task, not an await: this loop is
+                # also the reader of the steer's acknowledgement.
+                if slot._deferred_steers:
+                    _deferred_steer.schedule_flush(state, slot)
             elif event.kind == EVENT_PERMISSION_REQUEST:
                 _flow = await _on_permission_request(turn, event)
                 if _flow is _Flow.CONTINUE:
@@ -1408,7 +1429,9 @@ async def _run_chat(
             elif event.kind == EVENT_COMPACTION_STATUS:
                 await _on_compaction_status(turn, event)
             elif event.kind == EVENT_CLEAR_STATUS:
-                await _on_clear_status(turn, event)
+                _clear_is_ours = await _on_clear_status(turn, event)
+                if _clear_is_ours:
+                    await _keep_cleared_turns(turn)
                 _replay_pending = turn._replay_pending
             elif event.kind == EVENT_AGENT_SWITCHED:
                 _flow = await _on_agent_switched(turn, event)
@@ -1436,6 +1459,7 @@ async def _run_chat(
                 await _on_subagent_list(turn, event)
             elif event.kind == EVENT_SUBAGENT_ACTIVITY:
                 await _on_subagent_activity(turn, event)
+                await _on_child_tool_finished(turn, event)
             elif event.kind == EVENT_COMPLETE:
                 await _settle_echo_hold(turn)
                 _flow = await _on_complete(turn, event)

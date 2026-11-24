@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
+from skills_helpers import _settled
 
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import KiroCrewAgentConfig
@@ -120,9 +121,12 @@ async def world(monkeypatch, tmp_path, close_skills_loaders):
         encoding="utf-8",
     )
     log = ConversationLog()
-    builder = ContextBuilder(
-        conversation_log=log, skills=SkillsLoader(skill_root, install_builtins=False)
-    )
+    # Settled before any turn: a cold catalog waits only ``_COLD_CATALOG_WAIT_SECS``
+    # for its first walk and then serves ``[]``. A walk that outlasts it (a loaded
+    # Windows runner) leaves WORKFLOW_SKILL_MARKER out of the first prompts, so
+    # ``complete`` raises and ``ctx.parallel`` turns both calls into ``None``.
+    skills = await asyncio.to_thread(_settled, SkillsLoader(skill_root, install_builtins=False))
+    builder = ContextBuilder(conversation_log=log, skills=skills)
     builder.memory.init()
     stores = {}
     for member in ("alice", "bob"):

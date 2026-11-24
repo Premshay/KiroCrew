@@ -139,7 +139,7 @@ def context_tokens(groups: frozenset[str] | None, role: str = "") -> int:
     kept = _ALL_GROUPS if groups is None else groups
     base = KEPT_CONTEXT_TOKENS - (LEAN_CONTRACT_SAVED_TOKENS if role in LEAN_CONTRACT_ROLES else 0)
     if "project" in kept and role not in LEAN_CONTRACT_ROLES:
-        from kiro_crew.context_assembly.shared_resources import (
+        from kiro_crew.shared_context_resources import (
             configured_shared_resources,
             load_shared_resources,
         )

@@ -365,6 +365,15 @@ def test_heartbeat_default_deliver_invalid_falls_back_to_slack():
     assert cfg.heartbeat.default_deliver == "slack"
 
 
+def test_heartbeat_keep_backoff_is_off_by_default():
+    assert _load_from_dict({}).heartbeat.keep_backoff is False
+
+
+def test_heartbeat_keep_backoff_reads_true_and_ignores_junk():
+    assert _load_from_dict({"heartbeat": {"keep_backoff": True}}).heartbeat.keep_backoff is True
+    assert _load_from_dict({"heartbeat": {"keep_backoff": "soon"}}).heartbeat.keep_backoff is False
+
+
 class TestKnowledgeAutoIngest:
     """The auto-add / project-docs / budget / dedup-cadence keys."""
 
@@ -741,10 +750,10 @@ class TestOrchestratorWatchdogThemeAreParsed:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """ACP factories and companion mappings share gateway path resolution."""
-        monkeypatch.setattr(loader_module, "default_overlay_dir", lambda: Path("/run/kiro/overlay"))
-        monkeypatch.setattr(
-            loader_module, "default_socket_path", lambda: Path("/run/kiro/gateway.sock")
-        )
+        from kiro_crew.mcp_gateway import rewriter
+
+        monkeypatch.setattr(rewriter, "default_overlay_dir", lambda: Path("/run/kiro/overlay"))
+        monkeypatch.setattr(rewriter, "default_socket_path", lambda: Path("/run/kiro/gateway.sock"))
         cfg = _load_from_dict(
             {
                 "mcp_gateway": {

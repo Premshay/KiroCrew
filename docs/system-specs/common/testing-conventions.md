@@ -1,5 +1,8 @@
 # Testing Conventions
 
+<!-- docs-lint: defines soft_deadline_secs, grace_period_s, log_budget_ms, test_bad_spec_does_not_disable_memory_tools_for_other_agents, trace_home, ExpiresAt -->
+<!-- docs-lint: wrong-on-purpose test_policy -->
+
 ## Framework
 
 - `pytest` with `pytest-asyncio` for async tests
@@ -136,6 +139,13 @@ promise-sleep, `waitForTimeout`); a deliberate one says why with
 - **D10. Loopback only.** Stub the network at the seam the product calls; no test
   depends on a host other than `127.0.0.1` / `::1`. The rootdir network floor reports a
   test that reaches past loopback; one that must is marked `@pytest.mark.real_network`.
+  A UNC path (`\\host\share\x`, `//host/share/x`) is a network host too, and the floor
+  does not see it: on Windows `os.path.realpath`, `Path.resolve`, `stat` and `exists` on
+  one open an SMB connection to `host`, and the answer (WinError 53, 64 or 67, or a
+  stall) depends on the runner's network. `realpath` swallows 53 and 67 but raises 64.
+  A test whose data is a UNC path makes the resolve lexical at the seam the product
+  calls (`test_an_absolute_workspace_folder_keeps_the_whole_config` patches
+  `os.path.realpath` for UNC input only) or asserts a result no resolve reaches.
   [Side effects](#side-effects-what-a-full-run-does-to-the-host-and-how-to-see-it).
 - **D11. Process globals change only through `monkeypatch`**, and an autouse fixture's
   only through `_floor_monkeypatch`. Never `importlib.reload` a shared module in-process:
@@ -984,6 +994,22 @@ for (const step of steps) {
 - **Prove both directions in the PR.** Make the bug in the product file and show the
   test red; add a legal new member without touching the test and show it green.
 
+Bad, a split-time list compared both ways with a class's live members, so a new
+member fails until it adds a line:
+
+```python
+assert sorted(present ^ set(_MEMBERS)) == []
+```
+
+Good, the snapshot may only lose entries, and the rules every member must keep are
+read off the class (`test/test_acp_bindings.py`):
+
+```python
+assert sorted(set(_MEMBERS) - present) == []       # no split member was lost
+assert _placement_gaps(AcpProvider, OWNERS) == []  # each lives in its owner, same name
+assert _rebound_names(_facade_class()) == []       # the class body binds each name once
+```
+
 What stays, and why:
 
 | Kind | Example | Why it stays |
@@ -991,7 +1017,7 @@ What stays, and why:
 | Ratchet | `test/wait_discipline_baseline.txt`, `_ALLOWED_DROPS`, per-site bypass baselines | It may only shrink; a new bad site is what it refuses ([Merge-safe ratchets and counts](#merge-safe-ratchets-and-counts)) |
 | Review list | the [whole-tree registration pins](#a-whole-tree-registration-pin-not-selected-by-diff-relevance) for link screens and port verdicts | A new dangerous site is meant to make a person look |
 | Contract | wire protocol values, a telemetry schema, persisted settings values, a platform fact | Adding or dropping one silently is a defect. Say which contract in a one-line comment |
-| Frozen snapshot | the names a facade served when its file was split | Nobody edits it again |
+| Frozen snapshot | the names a facade served when its file was split | Nobody edits it again. It checks the snapshot is still a subset of the live set, never equal to it, or every new member edits it |
 
 Enforced by the flake-pattern ratchet: K22 counts, in a Python test, an `assert` or
 `assertEqual` that pins a public ALL-CAPS name imported from `kiro_crew` (or read
@@ -1063,6 +1089,13 @@ over budget.
   (`test_updates_handlers_facade.py`), or a doc that must be reachable from its
   directory's index (`scripts/docs_lint.py`): when two changes leave the merged tree
   inconsistent, the tree is wrong. Fix the tree; do not loosen the check.
+- **A check that arrives with a snapshot of the live tree regenerates it on current
+  `main` right before it merges.** A baseline generated from what is registered or
+  present today (`.github/route-access-baseline.txt`) is stale the moment another
+  change adds a member, and git sees no conflict. Rebase onto current `main`,
+  regenerate the snapshot and let CI run again before merging. When that window was
+  missed, the late members get the real fix (a label, a rule), not a baseline row
+  ([route access § The baseline](../modules/route-access.md#the-baseline)).
 - **Prove it with a two-branch merge.** In a scratch clone, cut two branches from one
   base, make one change of the counted class on each (different files) and update the
   record exactly as the failure message says, then merge both and run the test. It is
@@ -1943,11 +1976,11 @@ measures, never above.
   (`metrics/provider.py`): once per `_CONSENT_RECHECK_SECS`, `get_recorder()` -- on the
   path of `skills`, `session`, `context`, `hooks` and every metric helper -- hands a
   consent re-read to a daemon thread whose `KiroCrewConfig.load()` reaches
-  `config_dir()` and `mkdir`s whatever `KIROCREW_HOME` names at that instant. The
-  recorder is process-global and nothing resets it between tests, so the read lands a
-  few milliseconds later under the NEXT test's pin and creates that test's data home
-  from a thread it never started. The Windows fingerprint of that race is a
-  `\\?\`-prefixed path: `os.path.realpath` keeps the prefix when the directory above a
+  `config_dir()`. Resolved on that thread, the home was whatever `KIROCREW_HOME` named
+  at that instant: the recorder is process-global and nothing resets it between tests,
+  so the read landed a few milliseconds later under the NEXT test's pin and created
+  that test's data home from a thread it never started. The Windows fingerprint of
+  that race is a `\\?\`-prefixed path: `os.path.realpath` keeps the prefix when the directory above a
   not-yet-existing path appears between its two lookups, which is how
   `test_pathres_loop_starvation.py::test_the_inline_anchors_are_the_bounded_anchors`
   saw `\\?\...\<n>-kirocrew-home\diag` in one build of the sensitive-target set and not
@@ -1958,6 +1991,14 @@ measures, never above.
   creator of a home that was not the running test's own. The rootdir teardown hook
   joins it (`_join_telemetry_consent_worker`, bounded by `_EXECUTOR_JOIN_SECS`) beside
   the receipt-worker join, and fails the test that left one wedged past the bound.
+  The first rule closes the rest: `_schedule_consent_check_locked` resolves the home
+  and the thread runs through `config.paths.run_with_data_home` (and
+  `consent_pins.bind_env_pins`, for `KIROCREW_TELEMETRY` and the other consent pins),
+  so the worker never reads either variable. A late worker reads its scheduling test's home, and a gap INSIDE
+  one test body cannot send it to the real default home: `patch.dict(os.environ)`
+  restores by clearing the environment before it refills it, and a body can pin
+  `KIROCREW_HOME` empty (#40975, #41249). The join stays, for the module state a late
+  worker would still change.
   When you see a per-test directory appear with no test writing it, list the threads
   first: `threading.enumerate()` names the lazy resolver, the filesystem never will.
 
@@ -2697,6 +2738,13 @@ tests; the classes below are what the rest was made of.
   one layer up: the caller resolves the home on ITS thread and hands it in
   (`SessionManager._cleanup_deps` → `cleanup_stale_sandbox_profiles(data_home=...)`).
   When a job goes onto a pool, ask what it resolves lazily; the answer must be "nothing".
+  When the job reaches the home through code too deep to thread a parameter through (a
+  sandbox wrap, a crew-log fold), the worker runs it through
+  `config.paths.run_with_data_home(home, target, ...)` with the home its dispatcher
+  resolved: the node compile-cache prewarm thread starts on it, the crew-log eager fold
+  worker reads the home off each wake and folds each home's share through it, and the
+  crew-log cold-cell prime (`crew_log.slot_prime`) resolves it in `schedule` on the
+  caller's thread and submits `_run` through it (#41332).
   The `mc-maint` pool is the gateway's own, so `_join_test_loop_executor` (which joins
   the TEST LOOP's default executor at teardown) cannot reach it; the caller-resolves rule
   is the fix there. The loop's executor is covered: a cache write-through in
@@ -3623,6 +3671,30 @@ while not observed():
 Where a test wants a timeout to *expire*, set it to `0` rather than a small value: the
 same branch is reached with no clock dependency at all.
 
+**A mocked "now" is a calendar date, so anchor it to the real clock.** A test that
+mocks `Date.now` to a fixed literal (`Date.parse('<some day>')`) stamps whatever it
+writes with that day. A store that prunes by age against the real clock, or keeps its
+stamps in module memory across tests, then treats those stamps as that many days old,
+and the test starts failing on the day the literal falls past the TTL, on every branch
+at once. `ChatPageDrafts.test.tsx` mocked its steer take-back clock to a fixed day; the
+chat drafts store stamped `slot-a` under it and kept the stamp in module memory, and a
+later test's `slot-a` draft came back `''` once that day was 30 days old. Fix: mock
+`now` relative to the real clock (`const NOW = Date.now()`, then `NOW + offset`), and
+reset each module-level store between tests (`__resetForTests` in `beforeEach`). A
+fixed literal is right only when the date itself is the input under test, such as
+formatting or a time-zone edge, and then nothing that ages by the real clock may read it.
+
+```ts
+// WRONG: expires on a fixed day once the literal is older than the TTL
+const NOW = Date.parse('2025-01-01T00:00:00Z')
+// RIGHT: the same distance from the real clock on every run
+const NOW = Date.now() // flake-ok: read once, then pinned with vi.spyOn(Date, 'now')
+```
+
+The flake-pattern ratchet counts a bare `Date.now()` in a test file as
+`J3-unpinned-date`, so the line that reads the real clock once carries a
+`flake-ok:` reason naming where the value is pinned.
+
 **A request budget the test spends in real seconds measures the runner.** A 3 s recall
 deadline with a 1 s `time.sleep` "burn" left the judge's wait at the mercy of every
 cold step before it (store, pool, embedding): on loaded Windows runners the remaining
@@ -3946,6 +4018,21 @@ publishes itself, then `rt._answer_tasks` draining for the answers those frames 
 For state published on the way to a broadcast, the frame arriving on the owner's queue IS
 the barrier — the demux snapshots before it broadcasts, so the frame proves the snapshot
 ran.
+
+**A scripted stream that ends at once races any task its events start.** The stream
+loop schedules a held peer steer's boundary flush as a TASK on a tool result
+(`deferred_steer.schedule_flush`), and that task hops to threads to warm the gate
+(`prewarm_enabled_check`) before it steers. A real model step after a tool result runs
+for seconds, so production always injects first. A script of
+`[tool_call, tool_result, complete]` ends the turn in the same few loop steps: on a
+loaded macOS runner the turn's hand-off queued the steer before the flush reached the
+client, and `test_a_tool_result_in_a_running_stream_injects_a_held_steer` failed with
+"Expected steer to have been awaited once. Awaited 0 times." on five pull requests in
+twelve hours, never on Linux or Windows. When an event starts a task and the assertion
+is about what that task does INSIDE the turn, the script's next event waits on that
+task's own signal (`await await_until(steered)` in an async generator, set by the
+mock's `side_effect`), the way a real model step outlasts it. A barrier after `_drive`
+cannot help: by then the turn is over.
 
 **A negative assertion is only as strong as the barrier in front of it.**
 `assert qa.empty() and qb.empty()` after a turn budget passes for the trivial reason if
@@ -5089,15 +5176,19 @@ measured an hour earlier is not a baseline.
    suite-wide win came from.
 2. **Function-scoped construction of an immutable, expensive thing.** Real `git`
    repos are the worst offender here: seeding one costs ~1–1.6s in subprocesses, paid
-   per test. Build it **once** in a `scope="session"` fixture and `shutil.copytree` it
-   per test. This is safe only if the template is never handed to a test: copy from
-   it rather than yielding it, so nothing one test does can reach another's. Re-point any
-   absolute path the tool recorded (e.g. `git remote set-url`) in the copy. On Windows
-   the copy also needs a `git reset --hard HEAD`: the copied files get fresh inode and
-   ctime values, git's index stat cache no longer matches, and the copy reads as having
-   "unstaged changes" -- `git rebase` refuses outright (MEASURED in `test_push_guard`
-   when its repo pair moved to a session template). Nothing in a template is
-   uncommitted, so the reset changes no content; it only re-stats the index.
+   per test. Build it **once** and copy it per test with `copy_repo` from
+   `test/git_repo_templates.py`: from a `scope="session"` fixture of your own, or through
+   the `repo_templates` fixture when the repo is built under the test's own git
+   environment (it keeps one template per builder, key and git identity). This is safe
+   only if the template is never handed to a test: copy from it rather than yielding it,
+   so nothing one test does can reach another's. Do not follow the copy with git:
+   `copy_repo` re-points every absolute path git recorded (a remote URL, a worktree's
+   pointers, `alternates`) at the copy and gives each copied index the copied files'
+   stat data, in process. Each of those cost a git spawn per test, about 0.26 s on the
+   Windows runner (`git remote set-url`, and the `git reset --hard HEAD` a copied
+   checkout needed because its files' new inode and ctime read as "unstaged changes").
+   The first copy of every template is checked with `git diff-files`, so a platform
+   where the in-process form does not hold fails the test.
 3. **A production timeout or poll the test never asserts on.** Fake fixtures are often
    small enough to trip a real retry heuristic, then pay its full budget every test.
    `monkeypatch` the interval to `0`: the branch still executes, only the waiting
@@ -5269,9 +5360,11 @@ the comparison must keep one test harness.
 ### Shard balance
 
 `ci.yml` assigns the backend suite to eight whole-file shards on Linux and Windows
-using `scripts.ci_file_shards`. Ownership is SHA-256 of the root-relative POSIX
-path, not a duration or test-count balance. Other shards skip the file before
-import, while discovery patterns and platform ignores remain pytest's own.
+using `scripts.ci_file_shards`. The default owner is SHA-256 of the root-relative
+POSIX path, not a duration or test-count balance; the pin files and a
+`--file-shard-targets` list (below) override it by measured time. Other shards
+skip the file before import, while discovery patterns and platform ignores remain
+pytest's own.
 
 The Linux full-suite run adds `--file-shard-pins scripts/ci_file_shard_pins.txt`:
 every file with a measured weight gets a fixed shard, placed so the eight shards'
@@ -5321,9 +5414,29 @@ different sets could each leave a file to another. No shard can see another's
 list, so each prints `file-shard targets: <N> file(s), sha256 <digest>; shard
 <i>/<n> owns <k>` in its terminal summary; the counts and digests of one run's
 shards must match. `--file-shard-targets-sha256=<digest>` turns that into a
-refusal: a shard whose list has another digest stops before collecting. No
-workflow passes it yet, because the reduced scope computes its list on each
-shard; passing one digest computed once per run is what closes the gap.
+refusal: a shard whose list has another digest stops before collecting, and so
+does one given a value that is not a digest (an empty one means the run named
+none).
+
+`ci.yml` passes it with every list. The `changes` job runs once per run, and is
+not repeated when one failed shard is re-run, so its step "Digest the selected
+backend test lists" names the digest each list must have: the leaf corpus gates
+(one list on Linux and Windows), the reduced scope on Linux, the reduced scope
+on Windows (`scripts/ci-surface-tests.py --for-windows`, the Linux list without
+`test/windows-collect-ignore.txt`) and the docs contract readers. The selector's
+Windows list does not depend on the host that computes it: it matches test file
+names whatever their case by name, not through the host's glob, and prints UTF-8. The reduced
+scope and the docs readers are still worked out on each shard; the digest is
+what holds those copies to one list. Three outcomes fail a shard instead of
+falling back to the full suite, because the other shards have already left it
+its share of the list: its list has another digest, the run named no digest for
+a list it holds, or it holds no list (its selector failed or found nothing)
+while the run named one. When the selector fails in the `changes` job and on
+every shard, no list exists anywhere and the full suite runs, as before.
+`test/test_ci_shard_list_digest.py` executes those steps. Not covered: the
+Windows leaf budget in "Select test scope", which each Windows shard decides
+from the run's leaf outputs and the checkout, and which sends the shard to the
+full suite with no list.
 
 Before the Linux and Windows full-suite test step, `scripts/ci_rewrite_prewarm.py`
 writes pytest's assertion-rewrite pyc for the shard's test files (same hash and

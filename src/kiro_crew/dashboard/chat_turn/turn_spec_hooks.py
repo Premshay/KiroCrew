@@ -7,13 +7,12 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import hashlib
-import json
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.agent_files import is_kirocrew_default_agent
 from kiro_crew.agent_sdk.backends import ACP_BACKENDS_CREW_ENFORCES_SPEC_TOOLS_SETTINGS
 from kiro_crew.agent_sdk.kas_engine import discards_mcp_oauth
+from kiro_crew.agent_sdk.kas_telemetry_notice import notice_gets_row
 from kiro_crew.agent_sdk.spec_hooks import (
     _MAX_SPEC_HOOKS,
     CRON_SESSION_KEY_PREFIX,
@@ -46,13 +45,16 @@ from kiro_crew.dashboard.chat_utils import (
     is_synthetic_recovery_item,
     mint_options_token,
     remember_slack_options,
+    slack_mirror_is_paused,
 )
 from kiro_crew.dashboard.chat_utils_injected_rows import (
     MCP_SIGN_IN_UNSUPPORTED_NOTICE_KIND,
     SPEC_HOOKS_RUN_NOWHERE_NOTICE,
+    project_hook_files_notice_meta,
 )
 from kiro_crew.dashboard.engine_fallback import hook_session_model
-from kiro_crew.dashboard.session_notice_marks import _session_notice_is_new
+from kiro_crew.dashboard.session_notice_marks import _session_notice_is_new, notice_row_shown
+from kiro_crew.dashboard.slack_reconnect_wait import slack_reply_client, wait_for_slack_reconnect
 from kiro_crew.dashboard.state import (
     DENY_CAUSE_POLICY,
     HOOK_CONTINUATION_RECOVERY_PREFIX,
@@ -100,6 +102,7 @@ if TYPE_CHECKING:
         _deliver_cross_surface_reply,
         _local_file_name,
         _retire_mirror_thinking,
+        _speak_linked_reply,
         cross_surface_withheld,
         slack_publication_withheld,
     )
@@ -221,8 +224,8 @@ async def _prepare_spec_hooks(
     entries, and one where nothing applies the spec's ``toolsSettings``
     (``spec_tools_settings_applied_nowhere``) gets one naming what of it goes
     unapplied, and one that drops a remote MCP server's ``oauth`` block gets one
-    naming those servers, and a claude one that leaves the spec's `tools` or `model`
-    unapplied gets one naming them. None of them runs silently.
+    naming those servers, and a claude one that leaves the spec's `model` pin
+    unapplied gets one naming it. None of them runs silently.
     """
     # Resource notices run after context preparation: member essentials may
     # carry files that the backend does not read from the spec itself.
@@ -698,29 +701,27 @@ async def _surface_withheld_project_hook_files(
     except Exception:  # noqa: BLE001 - a notice must never fail a turn
         logger.debug("could not check %s for project hook files", project_dir, exc_info=True)
         return
-    if names and _project_hook_files_notice_is_new(slot, project_dir, names):
+    meta = project_hook_files_notice_meta(project_dir, names) if names else None
+    if meta and _project_hook_files_notice_is_new(slot, meta["project_hook_files_mark"]):
         append_and_surface(
             state,
             slot,
             "notice",
             _redact_display_text(_project_hook_files_notice()),
             "msg msg-info",
-            meta={"kind": SPEC_HOOKS_NOTICE_KIND},
+            meta=meta,
         )
 
 
-def _project_hook_files_notice_is_new(
-    slot: "_ChatSlot", project_dir: str, names: list[str]
-) -> bool:
-    """Whether *slot*'s chat has yet to show the hook-files notice for these files.
+def _project_hook_files_notice_is_new(slot: "_ChatSlot", mark: str) -> bool:
+    """Whether *slot*'s chat has yet to show the hook-files notice with this *mark*.
 
     Every new backend session of a chat (a reconnect, a reload, a restart) would
     show it again, and nothing in the chat changes the files, so the chat shows it
     once. It shows again only for another folder or another set of file names. The
-    mark is saved on the chat's metadata line, as ``_telemetry_notice_is_new``'s is.
+    mark is saved on the chat's metadata line, as ``notice_gets_row``'s is.
+    The row carries the same mark, which the dashboard's per-folder Dismiss hides by.
     """
-    key = json.dumps([project_dir, names])
-    mark = hashlib.sha256(key.encode()).hexdigest()[:16]
     if slot._project_hook_files_notice_shown == mark:
         return False
     slot._project_hook_files_notice_shown = mark
@@ -877,13 +878,16 @@ def _notice_steer_upgrade(state: "DashboardState", slot: "_ChatSlot", client: An
     pi or deepseek adapter is outside its tested range: the chat runs, and each row names the installed version, the
     tested one and the command that installs it. One more on a session whose MCP
     servers start without part of their env or headers, naming each server and the
-    key names it lost, never a value. One more on a KAS session told to turn telemetry
-    off, since Crew cannot confirm the engine applied it; a chat shows that one once
-    (``_telemetry_notice_is_new``). One more on a claude session that runs in Default
-    instead of the Auto it asked for, naming the ways back. One more on a codex
+    key names it lost, never a value. One more on a KAS session whose folder's telemetry
+    opt-out was not applied, once per chat; the notice that Crew cannot confirm KAS
+    turned telemetry off is a row only when it follows another telemetry row in the
+    chat, since the bell carries it once per install (``notice_gets_row``). One more
+    on a claude session that runs in Default instead of the Auto it asked for, naming
+    the ways back. One more on a codex
     session whose spec declares ``"tools": []``, which Crew enforces only at the
     permission request. One more on a session whose adapter release has a known
     problem a newer release fixes (``KNOWN_LIMITATIONS``)."""
+    folder = getattr(client, "cwd", "")
     for name in (
         "steer_upgrade_notice",
         "agent_prompt_upgrade_notice",
@@ -899,66 +903,38 @@ def _notice_steer_upgrade(state: "DashboardState", slot: "_ChatSlot", client: An
         notice = getattr(client, name, "")
         if not (isinstance(notice, str) and notice):
             continue
-        if name == "telemetry_unconfirmed_notice" and not _telemetry_notice_is_new(slot, notice):
+        text = _redact_display_text(notice)
+        if name == "telemetry_unconfirmed_notice":
+            if not notice_gets_row(slot, notice):
+                continue
+        elif not _session_notice_is_new(slot, text, folder) and notice_row_shown(slot, text):
             continue
-        append_and_surface(state, slot, "notice", _redact_display_text(notice), "msg msg-info")
-
-
-def _telemetry_notice_is_new(slot: "_ChatSlot", notice: str) -> bool:
-    """Whether *slot*'s chat has yet to show telemetry *notice*; marks it shown.
-
-    Every KAS session a chat creates or reloads carries the notice, and nothing the
-    user does in the chat ends it, so the chat shows it once. It shows again only
-    when the text differs from the last one shown: the opt-out stopped applying to
-    this chat, or applies again. The mark is saved on the chat's metadata line, so
-    a restart does not repeat the notice.
-    """
-    mark = hashlib.sha256(notice.encode()).hexdigest()[:16]
-    if slot._telemetry_notice_shown == mark:
-        return False
-    slot._telemetry_notice_shown = mark
-    return True
-
-
-#: Notice text per ``settings_withheld_cause`` answer (see ``LLMProvider``).
-_SEED_DECLINED_NOTICES = {
-    "session": (
-        "ℹ Crew's tools are off in this session. Another open Crew session in this "
-        "folder uses a different model or permission mode, and its "
-        ".claude/settings.local.json is in use here. To get the tools back, close "
-        "that session, then start a new session here."
-    ),
-    "project": (
-        "ℹ Crew's tools are off in this session. This folder's own "
-        ".claude/settings.local.json controls tool approvals here, and Crew could "
-        "not safely set it aside. The gateway log names the reason."
-    ),
-}
+        append_and_surface(state, slot, "notice", text, "msg msg-info")
 
 
 async def _notice_seed_declined(state: "DashboardState", slot: "_ChatSlot", client: Any) -> None:
     """One notice row on a new session whose MCP tools are withheld by a settings file.
 
-    Reads the live governed state off the client, the same predicate that
-    withholds the array, so the row shows exactly when the tools are off and
-    names whose file holds the path. Best-effort: a client without the read, or
-    a read that fails, renders no row rather than failing the turn.
+    Reads the client's own answer (``settings_withheld_reason``), which follows the
+    same live predicate that withholds the array, so the row shows exactly when the
+    tools are off and says why, with the remedy, since only a person reads this row.
+    Best-effort: a client without the read, or a read that fails, renders no row
+    rather than failing the turn.
     """
-    read = getattr(client, "settings_withheld_cause", None)
+    read = getattr(client, "settings_withheld_reason", None)
     if not callable(read):
         return
     try:
-        cause = await asyncio.to_thread(read)
+        reason = await asyncio.to_thread(read, with_fix=True)
     except Exception:  # noqa: BLE001 - an informational row must never fail a turn
-        logger.debug("settings-withheld cause could not be read for the notice", exc_info=True)
+        logger.debug("settings-withheld reason could not be read for the notice", exc_info=True)
         return
-    notice = _SEED_DECLINED_NOTICES.get(cause) if isinstance(cause, str) else None
-    if notice:
+    if isinstance(reason, str) and reason:
         append_and_surface(
             state,
             slot,
             "notice",
-            notice,
+            f"ℹ Crew's tools are off in this session because {reason}",
             "msg msg-info",
             meta={"kind": SEED_DECLINED_NOTICE_KIND},
         )
@@ -1199,9 +1175,9 @@ async def _fire(
                             "text": f"Hook {r.hook_name} BLOCKED (no verdict): {detail[:100]}",
                         },
                     )
-                elif r.stderr:
+                else:
                     # Non-zero, non-block on a non-gating event: warn only.
-                    logger.warning("Hook %s warning: %s", r.hook_name, r.stderr[-200:])
+                    logger.warning("Hook %s (%s) failed: %s", r.hook_name, event, detail)
     except Exception as exc:
         if event == HOOK_EVENT_PRE_TOOL_USE:
             logger.warning("Hook fire error during blocking event %s: %s", event, exc)
@@ -1427,13 +1403,19 @@ async def _turn_stop_hook(turn: _ChatTurn) -> None:
         # asks nothing, so no options control is minted from it.
         _mirror_reply_text = turn._terminal_directive_text
         _mirror_final_segment = ""
+    _mirror_paused_in_wait = False
+    if _mirror_reply_text and _mirror_thread and _mirror_chan and not state.slack_client:
+        # A reconnect took the client: wait for it, then re-read the pause as turn start does.
+        await wait_for_slack_reconnect(state)
+        _mirror_paused_in_wait = slack_mirror_is_paused(state, session_key)
     if (
         _mirror_reply_text
-        and state.slack_client
         and _mirror_thread
         and _mirror_chan
         and not cross_surface_withheld(state, slot)
         and not slack_publication_withheld(state, slot, _mirror_chan, _mirror_thread)
+        and not _mirror_paused_in_wait
+        and slack_reply_client(state, session_key, _mirror_chan, turn=turn)
     ):
         try:
             from kiro_crew.slack.format import (  # circular: slack.format -> dashboard.state -> chat
@@ -1551,6 +1533,8 @@ async def _turn_stop_hook(turn: _ChatTurn) -> None:
                         # moved on. Narrowed to OUR ts so a control the new
                         # owner recorded meanwhile survives.
                         await expire_slack_options(state, _owner, ts=_mirror_ts)
+            # A turn answering a message routed from this thread speaks there too.
+            await _speak_linked_reply(turn, _mirror_body)
         except Exception:
             # WARNING, not DEBUG: a swallowed failure here loses the turn's
             # reply on the linked thread with no other trace, and the lost

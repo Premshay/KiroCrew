@@ -88,6 +88,8 @@ CAPABILITY_FIELDS = (
     "honors_remote_mcp_oauth",
     "native_workflows",
     "refines_tool_call_titles",
+    "permission_requests_name_child",
+    "writes_crew_readable_transcript",
 )
 
 

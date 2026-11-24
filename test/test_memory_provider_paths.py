@@ -331,10 +331,10 @@ def test_provider_recall_honours_kind_and_time_and_names_a_silent_provider(serve
 
 
 def test_the_cli_calls_the_gateway_and_refuses_while_replaced(monkeypatch, capsys) -> None:
-    from kiro_crew import cli_commands_gateway_api, cli_memory_provider, loopback_http
+    from kiro_crew import cli_commands, cli_memory_provider, loopback_http
 
-    monkeypatch.setattr(cli_commands_gateway_api, "_client_port", lambda port: 1)
-    monkeypatch.setattr(cli_commands_gateway_api, "_internal_secret", lambda port: "s")
+    monkeypatch.setattr(cli_commands, "_client_port", lambda port: 1)
+    monkeypatch.setattr(cli_commands, "_internal_secret", lambda port: "s")
 
     class Answer(io.BytesIO):
         def __enter__(self):

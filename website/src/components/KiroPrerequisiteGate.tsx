@@ -25,6 +25,7 @@ import { safeGetItem, safeRemoveItem, safeSetItem } from '../utils/safeStorage'
 import { Btn, Card, SendBtn } from './ui'
 import ErrorNotice from './ErrorNotice'
 import KasLoginGate from './KasLoginGate'
+import FirstRunSignInHold, { useFirstRunSignInHold } from './FirstRunSignInHold'
 import RelockNotice, { BARE_LOGIN_COMMAND } from './KiroPrerequisiteRelockNotice'
 import { KiroUnzipPrerequisite } from './KiroUnzipPrerequisite'
 import RemoteCrewSetupSkip from './RemoteCrewSetupSkip'
@@ -787,10 +788,13 @@ function KiroInstallCommands({ platform, unzipMissing }: { platform: string; unz
 /**
  * "Use other coding agents": a collapsed alternative to Kiro CLI, modelled on
  * Settings → Agent Harness (same probe, same config key, same install commands).
- * Opened by default only when the config names a non-Kiro agent: then this
- * section, not the Kiro cards (which set up Kiro CLI and the KAS default), is
- * what stands between the user and the app. Choosing an agent writes the config,
- * and the gate opens the dashboard once that agent is usable. Nothing installs here.
+ * Opened by default when the config names a non-Kiro agent: then this section,
+ * not the Kiro cards (which set up Kiro CLI and the KAS default), is what stands
+ * between the user and the app. Also opened when the configured Kiro Agent
+ * cannot start because the host has no sandbox, unless the pod hint already
+ * says so: its notice here is then the only text saying why, and installing
+ * Kiro CLI gives the host no sandbox. Choosing an agent writes the config, and
+ * the gate opens the dashboard once that agent is usable. Nothing installs here.
  */
 function OtherCodingAgents({
   status,
@@ -810,7 +814,14 @@ function OtherCodingAgents({
   const qc = useQueryClient()
   const others = otherCodingAgents(backends)
   const configuredOther = configured !== KIRO_BACKEND ? configured : ''
-  const [open, setOpen] = useState(() => !KIRO_HARNESS_BACKENDS.includes(configured))
+  const configuredProbe = backends.find(b => b.id === configuredOther)
+  // Taken once at mount (the gate holds until the backends probe answers); a
+  // later reason change or probe retry does not reopen it.
+  const [open, setOpen] = useState(() => !KIRO_HARNESS_BACKENDS.includes(configured)
+    || (configured === ACP_BACKEND_KAS && !!configuredProbe
+      && !configuredBackendCanStart(status, configuredProbe)
+      && notReadyReason(status, configuredProbe) === 'sandbox_blocked'
+      && !workloadPodNoSandbox(status, configuredProbe.id)))
   const [picked, setPicked] = useState<string | null>(null)
   // Resolved every render, like Settings → Agent Harness's highlight: the list arrives
   // after first paint, so seeding state would pin the choice to a guess.
@@ -821,7 +832,6 @@ function OtherCodingAgents({
         ? configuredOther
         : (others.find(b => configuredBackendCanStart(status, b))?.id ?? others[0]?.id ?? '')
   const shown = others.find(b => b.id === shownId)
-  const configuredProbe = backends.find(b => b.id === configuredOther)
 
   const switchMut = useMutation({
     mutationFn: (value: string) => api.patchConfig(ACP_BACKEND_CONFIG_KEY, value),
@@ -1225,6 +1235,7 @@ export default function KiroPrerequisiteGate({ children }: { children: ReactNode
   const ltsLocked = statusQuery.data?.lts_login_required === true
   const signInOnly = statusQuery.data?.lts_sign_in_only === true
   const kiroNotReady = !!statusQuery.data && !statusQuery.data.ready && !ltsLocked
+  const signInHold = useFirstRunSignInHold(statusQuery.data, ltsLocked || signInOnly)
   const configQuery = useQuery<{ agent?: { acp_backend?: string } }>({
     queryKey: CONFIG_QUERY_KEY,
     queryFn: () => api.kirocrewConfig(),
@@ -1330,9 +1341,17 @@ export default function KiroPrerequisiteGate({ children }: { children: ReactNode
   // long as the gateway's two kiro-cli subprocesses take to answer.
   // Any admission after the first status answer counts, a failed read included;
   // a lock found before that answer must not leave the app mounted.
-  const app = (extra?: ReactNode) => {
+  // Every admission goes through the first-run Kiro sign-in hold, so the app keeps
+  // one tree position whether or not the hold is on. The hold asks the gateway
+  // only from a resolved admission: not while the status is pending, and not
+  // while the agent is still `unresolved`.
+  const app = (extra?: ReactNode, unresolved = false) => {
     if (!statusQuery.isPending) appShown.current = true
-    return <>{children}{extra}</>
+    return (
+      <FirstRunSignInHold hold={signInHold} resolved={!statusQuery.isPending && !unresolved}>
+        {children}{extra}
+      </FirstRunSignInHold>
+    )
   }
   if (statusQuery.isPending) {
     // A browser that never finished setup gets the sign-in screen as soon as a
@@ -1349,17 +1368,15 @@ export default function KiroPrerequisiteGate({ children }: { children: ReactNode
   // A relock of an app already in use keeps that app mounted and visible, and
   // tells the user to sign in again beside it.
   const relockStatus = ltsLocked && appShown.current ? statusQuery.data : undefined
+  // Through `app`, so the app keeps the tree position it had before the relock.
   const unlessRelocked = (screen: ReactNode) => (relockStatus
-    ? (
-      <>
-        {children}
-        <RelockNotice
-          owner={relockStatus.setup_allowed !== false}
-          command={relockStatus.lts_sign_in_command}
-          exactCommandElsewhere={relockStatus.bundled_cli === true
-            || (!!relockStatus.login_command && relockStatus.login_command !== BARE_LOGIN_COMMAND)}
-        />
-      </>
+    ? app(
+      <RelockNotice
+        owner={relockStatus.setup_allowed !== false}
+        command={relockStatus.lts_sign_in_command}
+        exactCommandElsewhere={relockStatus.bundled_cli === true
+          || (!!relockStatus.login_command && relockStatus.login_command !== BARE_LOGIN_COMMAND)}
+      />,
     )
     : <>{screen}</>)
   const prerequisite = statusQuery.data
@@ -1468,7 +1485,7 @@ export default function KiroPrerequisiteGate({ children }: { children: ReactNode
   // Which agent will run is still unknown: same rule as the pending status
   // above — an unresolved check never paints setup chrome.
   if (!ltsLocked && (configQuery.isPending || (otherBackendConfigured && backendsQuery.isPending))) {
-    return app()
+    return app(undefined, true)
   }
   if (otherBackendReady) {
     // Admitted to the dashboard. If the automatic marker write failed, this is

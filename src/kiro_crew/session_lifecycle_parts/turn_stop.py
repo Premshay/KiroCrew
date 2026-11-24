@@ -601,8 +601,9 @@ async def _eager_respawn(self: SessionLifecycleService, key: str) -> None:
 async def _respawn_as(self: SessionLifecycleService, key: str, identity: dict[str, Any]) -> None:
     """Start a successor for *key* under *identity* and release its lease.
 
-    The reset's counterpart of :meth:`_eager_respawn`: registration adopts the
-    entries the reset parked, and the release wakes their channels' drains.
+    The reset's and the hard Stop's counterpart of :meth:`_eager_respawn`:
+    registration adopts the entries the reset parked, and the release wakes
+    their channels' drains.
     The successor's first-turn observation belongs to the first queued turn,
     not to this call: a non-speculative creator registers its session with
     nothing armed and keeps the observation for itself, so it is re-armed

@@ -411,12 +411,7 @@ def _write_config(agent: dict[str, Any]) -> Path:
 
 
 def test_the_config_keys_reach_the_live_plan(tmp_path: Path, monkeypatch) -> None:
-    class HostPath(type(Path())):
-        @classmethod
-        def home(cls):
-            return cls(tmp_path / "host")
-
-    monkeypatch.setattr(sandbox, "Path", HostPath)
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "host"))
     drive = tmp_path / "drive"
     docs = drive / "Users" / "me" / "Documents"
     docs.mkdir(parents=True)

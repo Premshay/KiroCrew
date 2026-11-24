@@ -1108,9 +1108,7 @@ class TestAcpWorkerZeroToolConfirmation:
         assert worker._client is client
 
     @pytest.mark.asyncio
-    async def test_kiro_with_a_shadowed_spec_refuses_to_start_and_sends_nothing(
-        self, tmp_path
-    ):
+    async def test_kiro_with_a_shadowed_spec_refuses_to_start_and_sends_nothing(self, tmp_path):
         """A project-level spec of the same name that carries tools shadows the
         installed zero-tool one on kiro, which resolves ``--agent`` against the
         workspace first. Nothing native confirms the ban there, so the worker
@@ -1126,7 +1124,9 @@ class TestAcpWorkerZeroToolConfirmation:
             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client) as mk,
         ):
             worker = AcpWorker(acp_backend=ACP_BACKEND_KIRO)
-            with pytest.raises(KnowledgeSpecUnconfirmed, match="kirocrew-knowledge.*zero-tool spec"):
+            with pytest.raises(
+                KnowledgeSpecUnconfirmed, match="kirocrew-knowledge.*zero-tool spec"
+            ):
                 await worker.send_message("untrusted document text")
         assert mk.call_count == 1
         client.shutdown.assert_awaited_once()
