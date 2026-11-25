@@ -46,6 +46,8 @@ import pytest
 from kiro_crew.agent_sdk import backend_cards as cards_mod
 from kiro_crew.agent_sdk import backends as sdk_backends
 from kiro_crew.agent_sdk.backends import (
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
@@ -727,3 +729,24 @@ def test_the_payload_is_json_native() -> None:
     for backend in sorted(sdk_backends.ACP_BACKENDS_KNOWN):
         payload = cards_mod.card_payload(backend)
         assert json.loads(json.dumps(payload)) == payload, backend
+
+
+@pytest.mark.parametrize(
+    "backend, available",
+    [
+        (ACP_BACKEND_KIRO, True),
+        (ACP_BACKEND_CLAUDE, True),
+        (ACP_BACKEND_CODEX, True),
+        (ACP_BACKEND_DEEPSEEK, True),
+        (ACP_BACKEND_KAS, True),  # KAS receives the whole saved spec over the wire
+    ],
+)
+def test_the_member_saved_agent_line_follows_the_confirming_backends(backend, available):
+    """The card line a user reads to learn whether an enrolled member runs with its
+    saved spec is on for every backend that loads or confirms that spec at spawn. It is
+    a detail line, so it is read from the card's details rather than its core lines."""
+    from kiro_crew.agent_sdk.backend_cards import LINE_MEMBER_SAVED_AGENT, card_for
+
+    card = card_for(backend)
+    lines = {line.id: line for line in (*card.capabilities, *card.details)}
+    assert lines[LINE_MEMBER_SAVED_AGENT].available is available

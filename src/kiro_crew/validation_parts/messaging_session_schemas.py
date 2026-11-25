@@ -725,6 +725,7 @@ SESSION_HANDOFF_SCHEMA = ToolSchema(
     fields=[
         FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
         FieldSpec("to", str, required=True, max_len=MAX_SHORT_STRING),
+        FieldSpec("bind", bool, required=False),
     ],
 )
 

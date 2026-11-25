@@ -166,6 +166,10 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         code_review_sage_call_allowed,
     )
     from kiro_crew.validation_parts.arc_schemas import (  # noqa: F401
+        _ARC_ID,
+        _ARC_ID_FIELD,
+        _ENTRY_FIELDS,
+        _ENTRY_KINDS,
         ARC_BOARD_GREP_SCHEMA,
         ARC_BOARD_READ_SCHEMA,
         ARC_BOARD_WRITE_SCHEMA,
@@ -586,6 +590,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         JSONRPC_PARSE_ERROR,
         JsonRpcEnvelopeError,
         McpTextContent,
+        TextWithImage,
         build_tool_response,
         validate_api_body,
         validate_jsonrpc_request,

@@ -227,7 +227,7 @@ class TestUpdateCheckGitGuard:
 
 
 def test_boot_update_refuses_repo_driver_before_fetch(monkeypatch, tmp_path, capsys):
-    from kiro_crew import cli_server_update
+    from kiro_crew import cli_server, cli_server_update
     from kiro_crew.platform import update_governance, update_provider
     from kiro_crew.platform.update_capability import MANAGED_BY_GIT
 
@@ -242,7 +242,7 @@ def test_boot_update_refuses_repo_driver_before_fetch(monkeypatch, tmp_path, cap
     monkeypatch.setattr(update_provider, "resolve_provider", lambda: None)
     monkeypatch.setattr(update_provider, "apply_policy_update", AsyncMock(return_value=None))
     monkeypatch.setattr(
-        cli_server_update,
+        cli_server,
         "derive_capability",
         lambda **_kwargs: SimpleNamespace(managed_by=MANAGED_BY_GIT),
     )

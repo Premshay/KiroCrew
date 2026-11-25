@@ -20,7 +20,8 @@ Instance fields written: ``_background_launches``, ``_between_turn_credits``,
 ``_mcp_ref_spec``, ``_mcp_report``, ``_mcp_report_frame_floor``,
 ``_member_stub_allowlist``, ``_mimocode_governed_stop``, ``_oauth_emitted_servers``,
 ``_pending_oauth_requests``, ``_pi_mcp_handoff``,
-``_pi_mcp_server_names``, ``_pid``, ``_process``, ``_process_adapter``, ``_process_instance``,
+``_pi_mcp_server_names``, ``_pi_worker_stub_names``, ``_pid``, ``_process``,
+``_process_adapter``, ``_process_instance``,
 ``_process_tree_confirmed_dead``, ``_prompt_capabilities``, ``_prompt_capability_stale``,
 ``_prompt_or_tool_seen``, ``_resume_session_id``, ``_resumed``, ``_sandbox_cleanup``,
 ``_session_agent_spec``, ``_session_harness_deny_rules``, ``_session_id``, ``_session_key``,
@@ -59,6 +60,7 @@ from kiro_crew.acp.delegate_launch_signatures import delegate_launch_failure_mes
 from kiro_crew.acp.liveness import LivenessOracle, _consume_future_exception
 from kiro_crew.acp.mcp_session_report import McpSessionReport
 from kiro_crew.acp.runtime_process_tree import ChildRecord
+from kiro_crew.acp.runtime_tree_kill import kill_ending_session_leftovers
 from kiro_crew.acp.stale_compaction import clear_stale_compaction_state
 from kiro_crew.acp.transport_errors import (
     AcpDelegateLaunchFailed,
@@ -711,6 +713,7 @@ def _reset_state(self: AcpClient) -> None:
     self._session_mcp_snapshot = None
     self._session_agent_spec = None
     self._member_stub_allowlist = None
+    self._pi_worker_stub_names = frozenset()
     self._loaded_capability_template = ""
     self._capability_projection_gaps = ()
     # Per SESSION, not per spawn: a replacement process' session is judged on its
@@ -1052,11 +1055,22 @@ async def shutdown(self: AcpClient) -> None:
     # `_kill_process` in a function that takes only that keyword, and a gateway
     # stop closes these sessions in batches inside one time budget, where a
     # wait per session could leave the later ones unclosed.
+    #
+    # What the root left in its session outside its tree is ended once the kill
+    # has returned or raised (`kill_ending_session_leftovers`).
     try:
+        process = self._process
         if self._is_kiro:
-            await self._kill_process(force=True, exit_grace=_EOF_EXIT_GRACE_SECS)
+            kill = functools.partial(
+                self._kill_process, force=True, exit_grace=_EOF_EXIT_GRACE_SECS
+            )
         else:
-            await self._kill_process(force=True)
+            kill = functools.partial(self._kill_process, force=True)
+        await kill_ending_session_leftovers(
+            process.pid if process is not None and process.returncode is None else None,
+            getattr(self, "_start_time", None),
+            kill,
+        )
     finally:
         await self._discard_bound_workspace()
         # `finally` for the same reason the kill above has one: `_reset_state`

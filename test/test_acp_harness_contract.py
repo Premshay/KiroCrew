@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from kas_agents_helpers import without_own_agents_deny
 
 from kiro_crew import agent as agent_mod
 from kiro_crew import sandbox as sandbox_mod
@@ -232,9 +233,7 @@ def test_every_override_accepts_the_base_signature(backend):
         missing = declared.keys() - provided.keys()
         if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in provided.values()):
             missing = {
-                name
-                for name in missing
-                if declared[name].kind != inspect.Parameter.KEYWORD_ONLY
+                name for name in missing if declared[name].kind != inspect.Parameter.KEYWORD_ONLY
             }
         if missing:
             narrowed.append(f"{seam} drops {sorted(missing)}")
@@ -491,13 +490,14 @@ def test_client_capabilities_are_the_shared_constants():
 
 
 def test_kas_capabilities_open_only_settings_external_urls_and_user_input():
-    """KAS's extra capabilities are the settings channel, ``openExternalUrl`` and
-    ``userInput``.
+    """KAS's extra capabilities are the settings channel, ``openExternalUrl``,
+    ``userInput`` and ``approveForMeOption``.
 
     Any other ``_meta.kiro`` capability would invite a request with no handler
     (``secretStorage`` would make Crew the MCP token store). ``userInput`` is served
-    by ``acp/elicitation.py``. The settings channel carries only ``codeIntelligence``
-    here; the runtime adds the rest at spawn.
+    by ``acp/elicitation.py``; ``approveForMeOption`` only lists a session option,
+    which ``acp/kas_approve_for_me.py`` sets. The settings channel carries only
+    ``codeIntelligence`` here; the runtime adds the rest at spawn.
     """
     kas = harness_for(ACP_BACKEND_KAS).client_capabilities
     assert kas["_meta"] == {
@@ -505,6 +505,7 @@ def test_kas_capabilities_open_only_settings_external_urls_and_user_input():
             "settings": {"codeIntelligence": {"enabled": True}},
             "openExternalUrl": True,
             "userInput": True,
+            "approveForMeOption": True,
         }
     }
     assert harness_for(ACP_BACKEND_KAS).opens_external_urls is True
@@ -559,7 +560,7 @@ async def test_kas_projects_the_agent_spec(kas_projection_stubbed, monkeypatch, 
         lambda d, a, spec, *, stub_server_names, member_dispatch, crew_panel=False, session_key="", **_kw: projected,
     )
     extras = await harness_for(ACP_BACKEND_KAS).session_extras("a", work_dir=str(tmp_path))
-    assert extras.custom_agents == projected
+    assert [without_own_agents_deny(a) for a in extras.custom_agents] == projected
 
 
 @pytest.mark.asyncio
@@ -811,7 +812,7 @@ async def test_kas_projection_survives_an_unreadable_overlay(
     monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", _build)
 
     extras = await harness_for(ACP_BACKEND_KAS).session_extras("a", work_dir=str(tmp_path))
-    assert extras.custom_agents == [{"name": "a"}]
+    assert [without_own_agents_deny(a) for a in extras.custom_agents] == [{"name": "a"}]
     assert seen == [frozenset()]
 
 
@@ -1735,6 +1736,7 @@ def test_a_missing_self_served_binary_names_its_install_command(
     import asyncio
 
     from kiro_crew.acp import client as acp_client
+    from kiro_crew.acp import launch as launch_mod
     from kiro_crew.acp.harness import process_adapter_for
     from kiro_crew.acp.transport_errors import AcpError
     from kiro_crew.agent_sdk.backends import launch_for
@@ -1745,6 +1747,9 @@ def test_a_missing_self_served_binary_names_its_install_command(
     monkeypatch.delenv(launch.bin_env_var, raising=False)
     monkeypatch.setattr(acp_client, "_mise_which", lambda _name: None)
     monkeypatch.setattr(acp_client, "augmented_path", lambda _path: str(empty))
+    # A host whose sandbox floor passes: a harness that applies the floor before the
+    # binary lookup would otherwise refuse with the floor sentence where no backend exists.
+    monkeypatch.setattr(launch_mod, "_sandbox_preflight", lambda backend, mode: ())
     # ``tmp_path`` is its own repo, so the Copilot config walk stops there, not in the
     # host's home, where a real ``.mcp.json`` would refuse the spawn.
     (tmp_path / ".git").mkdir()

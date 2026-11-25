@@ -18,6 +18,7 @@ from unittest.mock import patch
 import pytest
 
 import kiro_crew.agent as agent_mod
+from kiro_crew import shared_context_resources as shared_mod
 from kiro_crew.acp.types import PROVIDER_LABEL_CODEX
 from kiro_crew.agent_sdk.provider_identity import PROVIDER_ACP, PROVIDER_CLAUDE_CODE
 from kiro_crew.config import paths as paths_mod
@@ -26,7 +27,6 @@ from kiro_crew.config.sections import ContextConfig
 from kiro_crew.context import _MULTIBYTE_TABLE, ContextBuilder
 from kiro_crew.context_assembly import inclusion
 from kiro_crew.context_assembly import member as member_mod
-from kiro_crew.context_assembly import shared_resources as shared_mod
 from kiro_crew.learn import LessonStore
 from kiro_crew.memory import MemoryStore
 from kiro_crew.skills import SkillsLoader

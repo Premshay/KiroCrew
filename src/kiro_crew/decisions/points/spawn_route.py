@@ -402,6 +402,9 @@ def _run_agy_models() -> list[str]:
     import shutil
     import subprocess
 
+    from kiro_crew.sandbox import SandboxUnavailableError
+    from kiro_crew.sandbox_spawn import sandboxed_spawn_argv
+
     command = (
         os.environ.get("ANTIGRAVITY_CLI")
         or shutil.which("agy")
@@ -409,17 +412,28 @@ def _run_agy_models() -> list[str]:
     )
     if not Path(command).is_file():
         return []
+    cleanup: str | None = None
     try:
+        argv, env, cleanup = sandboxed_spawn_argv([command, "models"], strip_python_env=True)
         done = subprocess.run(
-            [command, "models"],
+            argv,
+            env=env,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=AGY_MODELS_TIMEOUT_S,
             check=False,
         )
-    except Exception:
+    except (OSError, subprocess.SubprocessError, SandboxUnavailableError):
         logger.debug("spawn.route: agy models failed", exc_info=True)
         return []
+    finally:
+        if cleanup is not None:
+            try:
+                Path(cleanup).unlink(missing_ok=True)
+            except OSError:
+                logger.debug("spawn.route: agy models sandbox cleanup failed", exc_info=True)
     if done.returncode != 0:
         return []
     ids: list[str] = []

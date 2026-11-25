@@ -51,6 +51,7 @@ from kiro_crew.apps.registry_pipeline.git_targets import (
     _git_transport_env,
     _git_url_host,
     _is_ssh_git_url,
+    _lfs_endpoint_pin_argv,
     _loggable_git_transport_output,
     _looks_like_git_url,
     _ssh_method_list_closes,
@@ -280,7 +281,7 @@ async def _fetch_app_manifest(
         # HTTP fetch and needs no agent.
         if owner_designated:
             clone_env = minimal_env()
-            sandbox_mode = _context_clone_sandbox_mode(git_url)
+            sandbox_mode = await asyncio.to_thread(_context_clone_sandbox_mode, git_url)
             _sel_credential_grant("fetch_app_manifest", git_url)
         else:
             clone_env = anonymous_git_env()
@@ -348,6 +349,7 @@ async def _fetch_app_manifest(
             clone_cmd = [
                 "git",
                 *_HOOKS_NEUTRALIZER_ARGV,
+                *_lfs_endpoint_pin_argv(git_url),
                 "clone",
                 "--depth",
                 "1",

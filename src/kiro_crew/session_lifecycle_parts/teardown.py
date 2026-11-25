@@ -463,14 +463,9 @@ async def reset(
             await owner.release_subagent_runtime(key)
         except Exception:
             logger.debug("Reset %s: subagent runtime cleanup failed", key, exc_info=True)
-    if rescued and session is not None:
-        # Nothing else starts a successor for a key whose turn just failed: the
-        # next message might never come, and the end-of-turn drain of the failed
-        # turn finds no live session. The respawn registers one, which adopts
-        # the parked entries, and its release wakes their channels' drains.
-        # It starts under the popped session's own identity: a later claim
-        # takes a live session as-is, so a default-agent successor would run
-        # every follow-up, and every message after them, as the wrong agent.
+    # MERGE-REVIEW: Reset owns the successor for both a hard Stop and a
+    # rescued queue. Either can require a start under the popped session's identity.
+    if session is not None and not ends_conversation and (rescued or stop_shared_children):
         task = asyncio.create_task(self._respawn_as(key, allocation_identity(owner, key, session)))
         owner._background_tasks.add(task)
         task.add_done_callback(owner._background_tasks.discard)

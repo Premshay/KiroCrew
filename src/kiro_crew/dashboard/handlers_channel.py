@@ -140,6 +140,20 @@ async def _json_object(request: web.Request) -> dict:
     return body
 
 
+async def _refuse_non_teammate(request: web.Request, operation: str) -> web.Response | None:
+    """The owner gate every channel route asks first, audited under *operation*.
+
+    A channel's agents run in the owner's sessions, so a dashboard session that is
+    neither the owner nor an admitted teammate is refused; a teammate is refused only
+    where ``shared_crew.teammate_access`` keeps the route the owner's. App and
+    internal callers stay under the controls that already govern them.
+    """
+    # Body-scope import, for the reason ``_json_object`` gives.
+    from kiro_crew.dashboard.handlers._shared import require_owner_for_dashboard_caller
+
+    return await require_owner_for_dashboard_caller(request, operation)
+
+
 def _closed_under_us(ch) -> bool:
     """Whether *ch* was closed while this request waited for its lock.
 
@@ -204,14 +218,23 @@ async def api_channel_presets(request: web.Request) -> web.Response:
     the read is cached on config.json's stat signature, so a changed file is
     re-read on the next call.
     """
+    denied = await _refuse_non_teammate(request, "channels.presets")
+    if denied is not None:
+        return denied
     return web.json_response({"presets": _load_presets()})
 
 
 async def api_channels_list(request: web.Request) -> web.Response:
+    denied = await _refuse_non_teammate(request, "channels.list")
+    if denied is not None:
+        return denied
     return web.json_response({"channels": _mgr(request).list_channels()})
 
 
 async def api_channel_get(request: web.Request) -> web.Response:
+    denied = await _refuse_non_teammate(request, "channels.get")
+    if denied is not None:
+        return denied
     ch = _mgr(request).get(request.match_info["id"])
     if not ch:
         return web.json_response({"error": "not found"}, status=404)
@@ -227,6 +250,9 @@ async def api_channel_get(request: web.Request) -> web.Response:
 
 
 async def api_channel_create(request: web.Request) -> web.Response:
+    denied = await _refuse_non_teammate(request, "channels.create")
+    if denied is not None:
+        return denied
     body = await _json_object(request)
     raw_topic = body.get("topic", "")
     if not isinstance(raw_topic, str):
@@ -342,6 +368,9 @@ async def api_channel_close(request: web.Request) -> web.Response:
     the two, so the clear's write lands before the delete rather than the delete landing
     first and the write recreating the file for `_load_all` to restore.
     """
+    denied = await _refuse_non_teammate(request, "channels.close")
+    if denied is not None:
+        return denied
     channel_id = request.match_info["id"]
     ch = _mgr(request).get(channel_id)
     if not ch:
@@ -397,6 +426,9 @@ def _attach_slot(
 
 async def api_channel_attach_session(request: web.Request) -> web.Response:
     """Attach one live dashboard session to an existing channel."""
+    denied = await _refuse_non_teammate(request, "channels.attach_session")
+    if denied is not None:
+        return denied
     ch, body = await _get_channel_body(request)
     member, error = _attach_slot(
         request, ch, body.get("slot"), body.get("role"), body.get("listen", "all")
@@ -413,6 +445,9 @@ async def api_channel_resolve_attach_request(request: web.Request) -> web.Respon
     user's click is the grant, so this route must never join the session-bound
     MCP surface.
     """
+    denied = await _refuse_non_teammate(request, "channels.resolve_attach_request")
+    if denied is not None:
+        return denied
     ch, body = await _get_channel_body(request)
     action = body.get("action")
     if action not in {"approve", "decline"}:
@@ -658,6 +693,9 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
 
 
 async def api_channel_post(request: web.Request) -> web.Response:
+    denied = await _refuse_non_teammate(request, "channels.post")
+    if denied is not None:
+        return denied
     ch, body = await _get_channel_body(request)
     raw_content = body.get("content", "")
     if not isinstance(raw_content, str):
@@ -722,6 +760,9 @@ def _agent_field_error(error: str, code: str) -> web.Response:
 
 
 async def api_channel_add_agent(request: web.Request) -> web.Response:
+    denied = await _refuse_non_teammate(request, "channels.add_agent")
+    if denied is not None:
+        return denied
     ch, body = await _get_channel_body(request)
 
     role = body.get("role", "Agent")
@@ -776,6 +817,9 @@ async def api_channel_add_agent(request: web.Request) -> web.Response:
 
 
 async def api_channel_update_agent(request: web.Request) -> web.Response:
+    denied = await _refuse_non_teammate(request, "channels.update_agent")
+    if denied is not None:
+        return denied
     ch, body = await _get_channel_body(request)
     agent = ch.members.get(request.match_info["aid"])
     if not agent:
@@ -809,6 +853,9 @@ async def api_channel_update_agent(request: web.Request) -> web.Response:
 
 
 async def api_channel_dismiss_agent(request: web.Request) -> web.Response:
+    denied = await _refuse_non_teammate(request, "channels.dismiss_agent")
+    if denied is not None:
+        return denied
     ch = _mgr(request).get(request.match_info["id"])
     if not ch:
         return web.json_response({"error": "not found"}, status=404)
@@ -818,6 +865,9 @@ async def api_channel_dismiss_agent(request: web.Request) -> web.Response:
 
 
 async def api_channel_wake_agent(request: web.Request) -> web.Response:
+    denied = await _refuse_non_teammate(request, "channels.wake_agent")
+    if denied is not None:
+        return denied
     ch = _mgr(request).get(request.match_info["id"])
     if not ch:
         return web.json_response({"error": "not found"}, status=404)
@@ -849,6 +899,9 @@ async def api_channel_wake_agent(request: web.Request) -> web.Response:
 
 
 async def api_channel_approve_agent(request: web.Request) -> web.Response:
+    denied = await _refuse_non_teammate(request, "channels.approve_agent")
+    if denied is not None:
+        return denied
     ch = _mgr(request).get(request.match_info["id"])
     if not ch:
         return web.json_response({"error": "not found"}, status=404)
@@ -1189,6 +1242,9 @@ async def api_channel_clear_context(request: web.Request) -> web.Response:
     that member is REFUSED rather than cleared. The future is not cancelled here either way --
     it is owned by the agent task spawned by run_channel_agent.
     """
+    denied = await _refuse_non_teammate(request, "channels.clear_context")
+    if denied is not None:
+        return denied
     ch = _mgr(request).get(request.match_info["id"])
     if not ch:
         sel().log_api_access(

@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import kiro_crew.dashboard.handlers.usage as usage
-import kiro_crew.llm_helpers_parts.turn_stream as collector
+from kiro_crew import llm_helpers as collector
 from kiro_crew.agent_sdk.drivers.acp_turn_vocab import TurnUsage
 from kiro_crew.llm_helpers import TURN_FALLBACK_ATTR, TurnNotCompleted
 from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent

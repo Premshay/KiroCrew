@@ -852,6 +852,15 @@ variables and let `write_env_file` overwrite the file it could not read.
 `write_env_file` writes a UTF-8 mark back when the file had one, so a
 non-ASCII value keeps decoding as UTF-8 after a merge rather than falling to
 the locale decode.
+`read_env_file` answers `{}` for a file it cannot read, on purpose, for boot
+and display. `write_env_file` does not merge onto that answer: it reads its
+base strictly (`_read_env_bytes_for_write`). A missing file starts empty; the
+read goes through `atomic_write.read_bytes_with_retry`, which rides out a
+Windows sharing hold, and any read failure left after that raises `PodError`
+before anything is written. Merging onto `{}` would
+publish only the update and drop `CHECKOUT`, `PORT`, `SEED` and `APPROVAL`, and
+a dropped `APPROVAL` boots the pod on auto-approve. `pod up`, `pod restart` and
+the checkout pin stop with that message, and the operator runs them again.
 `_parse_env_text` also drops a leading mark, for `runtime_ports._read_peer_env`,
 which decodes the bytes itself, and Dev Fleet's strict pin reader does the same.
 
@@ -922,6 +931,15 @@ pin names a different checkout, carries no verifiable `CHECKOUT`, or is absent
 while a unit under that name is active. A matching pin proceeds, and so does no
 pin with no live unit. Every refusal is about identity: acting on a basename
 collision would stop another repository's pod or delete its HOME.
+
+A pod name becomes the pod's home directory, its env file and the branch
+`feat/<name>`. The verbs that create a pod's state, `pod up` and `pod provision`,
+check it with `validate_new_name`: on every host it also refuses a name whose
+lower-cased part before the first dot is a Windows device stem
+(`constants.WINDOWS_DEVICE_STEMS`: `nul`, `con`, `com1`, ...), with the same
+`invalid pod name` error, before the user-bus check or the worktree lookup. The
+verbs on an existing pod keep `validate_name`, so a pod made under such a name
+earlier can still be stopped, restarted and pruned.
 
 A missing checkout is attributed only by git's retained worktree record for this
 repository. `repository._find_retained_worktree_path` includes a `prunable`

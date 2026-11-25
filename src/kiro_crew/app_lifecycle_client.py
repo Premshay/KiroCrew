@@ -29,6 +29,11 @@ from kiro_crew.terminal_safe import safe_terminal_line
 # backend health checks, and another 30 s in the default onEnable hook. Leave
 # enough headroom for registration and capability dependency resolution.
 _ACTION_TIMEOUT_SECS = 300
+# A config read or write is one small file on the gateway's side.
+_CONFIG_TIMEOUT_SECS = 30
+# The credential mint waits as long as `kirocrew token` does for the same request:
+# a gateway that is up but busy can take more than a few seconds to answer it.
+_MINT_TIMEOUT_SECS = 20
 
 
 class AppGatewayError(RuntimeError):
@@ -170,45 +175,10 @@ def _post_lifecycle_action(
     *route* is the dashboard path, *action* names the verb in progress and error
     text, and *subject* names what it acts on (an app name, or a source path).
     """
-    port, _evidence_backed = resolve_client_port_ex(None)
-    # This request travels the owner-only Unix SOCKET (unix_socket_urlopen below),
-    # not TCP loopback -- the http://127.0.0.1 base is only the nominal URL on the
-    # request line. So the credential is NOT paired to a dialled TCP address: pass
-    # no dial_host and read the port-keyed secret. Threading a dial_host here would
-    # make read_local_secret demand a listener sidecar for a TCP family the gateway
-    # need never publish (a bind to a specific interface or ``::`` has no
-    # 127.0.0.1 entry), returning "" for a live socket and silently dropping
-    # uninstall to its file-only path while the backend keeps running.
-    secret = read_local_secret(port)
-    if not secret:
+    opened = _open_gateway()
+    if opened is None:
         return None
-
-    socket_path = dashboard_socket_path(port)
-    verify_peer = _gateway_peer_check(port)
-    base = "http://127.0.0.1:%d" % port
-    mint = urllib.request.Request(
-        f"{base}/api/token/local?ttl=2m", headers={"X-Local-Secret": secret}
-    )
-    try:
-        with unix_socket_urlopen(
-            mint, timeout=5, socket_path=socket_path, verify_peer=verify_peer
-        ) as response:
-            minted = _read_json(response)
-    except AppGatewayError:
-        raise
-    except urllib.error.HTTPError as exc:
-        raise _gateway_error(exc) from exc
-    except Exception as exc:  # noqa: BLE001 — peer bytes must not crash the CLI
-        if isinstance(exc, OSError) and _socket_unavailable(exc):
-            return None
-        detail = exc.reason if isinstance(exc, urllib.error.URLError) else exc
-        raise AppGatewayError(f"could not mint local dashboard credential: {detail}") from exc
-
-    credential = minted.get("token") if isinstance(minted, dict) else None
-    if not isinstance(credential, str) or not credential:
-        raise AppGatewayError("gateway returned an empty local dashboard credential")
-
-    encoded_credential = urllib.parse.quote(credential, safe="")
+    base, encoded_credential, socket_path, verify_peer = opened
     # Read BEFORE the action: the credential lives two minutes and an action can
     # take five, so a read after a slow one would always come back unknown.
     gateway_version = (
@@ -236,6 +206,92 @@ def _post_lifecycle_action(
     if gateway_version:
         result["gatewayVersion"] = gateway_version
     return result
+
+
+def app_config_request(
+    app_name: str, method: str, *, config: object = None, if_match: str = ""
+) -> tuple[object, str] | None:
+    """GET or PUT ``/api/apps/<app_name>/config`` through the owner-only dashboard socket.
+
+    Returns ``None`` when no gateway received the request, else the parsed answer and
+    its ``ETag`` (``""`` when absent; a tuple, so an answer that is JSON ``null`` is
+    never read as "no gateway"). A PUT sends *config* as its JSON body, which the
+    caller has already proved serializable, and a non-empty *if_match* as its
+    ``If-Match``. The answer gets none of the lifecycle checks: a config may hold any
+    JSON, a top-level ``ok`` included.
+    """
+    opened = _open_gateway()
+    if opened is None:
+        return None
+    base, encoded_credential, socket_path, verify_peer = opened
+    encoded_name = urllib.parse.quote(app_name, safe="")
+    body = json.dumps(config).encode() if method == "PUT" else None
+    headers = {"Content-Type": "application/json"} if body is not None else {}
+    if body is not None and if_match:
+        headers["If-Match"] = if_match
+    request = urllib.request.Request(
+        f"{base}/api/apps/{encoded_name}/config?token={encoded_credential}",
+        method=method,
+        data=body,
+        headers=headers,
+    )
+    return _send_request(
+        request,
+        socket_path,
+        verify_peer,
+        timeout=_CONFIG_TIMEOUT_SECS,
+        timeout_text=f"the gateway did not answer within {_CONFIG_TIMEOUT_SECS} s",
+        dropped_text="the gateway stopped answering before it replied",
+    )
+
+
+def _open_gateway() -> tuple[str, str, Path, Callable[..., None]] | None:
+    """Mint a short-lived dashboard credential over the owner-only socket.
+
+    Returns ``None`` when no gateway can receive a request (no local secret, or no
+    socket at the mint), else the nominal base URL, the URL-encoded credential, the
+    socket path and the peer check every request on it must pass.
+    """
+    port, _evidence_backed = resolve_client_port_ex(None)
+    # This request travels the owner-only Unix SOCKET (unix_socket_urlopen below),
+    # not TCP loopback -- the http://127.0.0.1 base is only the nominal URL on the
+    # request line. So the credential is NOT paired to a dialled TCP address: pass
+    # no dial_host and read the port-keyed secret. Threading a dial_host here would
+    # make read_local_secret demand a listener sidecar for a TCP family the gateway
+    # need never publish (a bind to a specific interface or ``::`` has no
+    # 127.0.0.1 entry), returning "" for a live socket and silently dropping
+    # uninstall to its file-only path while the backend keeps running.
+    secret = read_local_secret(port)
+    if not secret:
+        return None
+
+    socket_path = dashboard_socket_path(port)
+    verify_peer = _gateway_peer_check(port)
+    base = "http://127.0.0.1:%d" % port
+    mint = urllib.request.Request(
+        f"{base}/api/token/local?ttl=2m", headers={"X-Local-Secret": secret}
+    )
+    try:
+        with unix_socket_urlopen(
+            mint, timeout=_MINT_TIMEOUT_SECS, socket_path=socket_path, verify_peer=verify_peer
+        ) as response:
+            minted = _read_json(response)
+    except AppGatewayError:
+        raise
+    except urllib.error.HTTPError as exc:
+        raise _gateway_error(exc) from exc
+    except Exception as exc:  # noqa: BLE001 — peer bytes must not crash the CLI
+        if isinstance(exc, OSError) and _socket_unavailable(exc):
+            return None
+        detail = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+        raise AppGatewayError(f"could not mint local dashboard credential: {detail}") from exc
+
+    credential = minted.get("token") if isinstance(minted, dict) else None
+    if not isinstance(credential, str) or not credential:
+        raise AppGatewayError("gateway returned an empty local dashboard credential")
+
+    encoded_credential = urllib.parse.quote(credential, safe="")
+    return base, encoded_credential, socket_path, verify_peer
 
 
 # The actions whose answer names the serving gateway's version. An install or update
@@ -295,30 +351,19 @@ def _send_action(
     verify_peer: Callable[..., None],
 ) -> dict[str, object]:
     """Send the lifecycle *request* and return the gateway's answer, or raise its refusal."""
-    try:
-        with unix_socket_urlopen(
-            request,
-            timeout=_ACTION_TIMEOUT_SECS,
-            socket_path=socket_path,
-            verify_peer=verify_peer,
-        ) as response:
-            result = _read_json(response)
-    except AppGatewayError:
-        raise
-    except urllib.error.HTTPError as exc:
-        raise _gateway_error(exc) from exc
-    except Exception as exc:  # noqa: BLE001 — peer bytes must not crash the CLI
-        if deadline_expired(exc):
-            raise AppGatewayTimeout(
-                f"the gateway did not finish {action} for {subject} within "
-                f"{_ACTION_TIMEOUT_SECS} s; it may still be applying it. Check "
-                f"`kirocrew app list` or the dashboard before re-running the command, "
-                f"because re-running while it is still in progress applies it twice"
-            ) from exc
-        raise AppGatewayError(
-            "gateway stopped answering before the action completed; check the dashboard"
-        ) from exc
-
+    result, _etag = _send_request(
+        request,
+        socket_path,
+        verify_peer,
+        timeout=_ACTION_TIMEOUT_SECS,
+        timeout_text=(
+            f"the gateway did not finish {action} for {subject} within "
+            f"{_ACTION_TIMEOUT_SECS} s; it may still be applying it. Check "
+            f"`kirocrew app list` or the dashboard before re-running the command, "
+            f"because re-running while it is still in progress applies it twice"
+        ),
+        dropped_text="gateway stopped answering before the action completed; check the dashboard",
+    )
     if not isinstance(result, dict):
         raise AppGatewayError("gateway returned an invalid app lifecycle response")
     if result.get("ok") is False:
@@ -333,6 +378,41 @@ def _send_action(
             code=response_code if isinstance(response_code, str) else "",
         )
     return result
+
+
+def _send_request(
+    request: urllib.request.Request,
+    socket_path: Path,
+    verify_peer: Callable[..., None],
+    *,
+    timeout: float,
+    timeout_text: str,
+    dropped_text: str,
+) -> tuple[object, str]:
+    """Send one authenticated *request* through the dashboard socket.
+
+    Returns the parsed answer and its ``ETag`` (``""`` when absent); raises the
+    gateway's refusal, *timeout_text* on a deadline, else *dropped_text*.
+    """
+    try:
+        with unix_socket_urlopen(
+            request,
+            timeout=timeout,
+            socket_path=socket_path,
+            verify_peer=verify_peer,
+        ) as response:
+            result = _read_json(response)
+            headers = getattr(response, "headers", None)
+            etag = headers.get("ETag", "") if headers is not None else ""
+    except AppGatewayError:
+        raise
+    except urllib.error.HTTPError as exc:
+        raise _gateway_error(exc) from exc
+    except Exception as exc:  # noqa: BLE001 — peer bytes must not crash the CLI
+        if deadline_expired(exc):
+            raise AppGatewayTimeout(timeout_text) from exc
+        raise AppGatewayError(dropped_text) from exc
+    return result, etag
 
 
 def print_result(action: str, app_name: str, result: dict[str, object]) -> None:

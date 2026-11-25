@@ -25,8 +25,7 @@ from aiohttp import web
 from kiro_crew import arc_brief, arc_metrics, arcs
 from kiro_crew.dashboard.arc_delivery import deliver_entry
 from kiro_crew.dashboard.chat_utils import effective_session_key
-from kiro_crew.dashboard.handlers._shared_access import require_owner_dashboard_request
-from kiro_crew.dashboard.handlers._shared_request_body import read_bounded_json
+from kiro_crew.dashboard.handlers._shared import read_bounded_json, require_owner_dashboard_request
 from kiro_crew.dashboard.handlers.arcs import (
     _error_response,
 )

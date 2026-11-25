@@ -38,7 +38,6 @@ from kiro_crew.config.loader_builders import (
 from kiro_crew.config.loader_credentials import (
     _JIRA_TOKEN_RE,
     CREDENTIAL_KEYS,
-    EnvFileWideEncodingError,
     _shadow_checked_env_keys,
     _warned_env_keys,
     adopt_env_owned_keys_from_reexec,
@@ -1344,7 +1343,9 @@ class KiroCrewConfig:
             enforce_env_permissions(ep)
             try:
                 env_text = read_env_text(ep)
-            except EnvFileWideEncodingError as exc:
+            except UnicodeDecodeError as exc:
+                # A UTF-16/UTF-32 save, or a byte invalid in the active encoding:
+                # empty with one warning, as the live watcher reads it.
                 warn_undecodable_env(ep, exc)
                 env_text = ""
             creds.update(parse_env_lines(env_text))
@@ -1490,8 +1491,6 @@ class KiroCrewConfig:
 
     def mcp_gateway_provider_kwargs(self) -> dict[str, Any]:
         """Return the config-owned MCP gateway values for an ACP provider."""
-        from kiro_crew.config import loader
-
         gateway = self.mcp_gateway
         if not gateway.stub_servers:
             return {
@@ -1499,9 +1498,11 @@ class KiroCrewConfig:
                 "mcp_gateway_socket": None,
                 "mcp_gateway_claude_servers": [],
             }
+        from kiro_crew.mcp_gateway.rewriter import default_overlay_dir, default_socket_path
+
         return {
-            "mcp_gateway_overlay": gateway.overlay_dir or str(loader.default_overlay_dir()),
-            "mcp_gateway_socket": gateway.socket_path or str(loader.default_socket_path()),
+            "mcp_gateway_overlay": gateway.overlay_dir or str(default_overlay_dir()),
+            "mcp_gateway_socket": gateway.socket_path or str(default_socket_path()),
             "mcp_gateway_claude_servers": gateway.claude_session_servers,
         }
 

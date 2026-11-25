@@ -256,7 +256,7 @@ def test_the_cli_reaches_the_lesson_routes_with_a_recognized_session(monkeypatch
     import contextlib
     import io
 
-    from kiro_crew import cli_commands_gateway_api, cli_memory_provider, loopback_http
+    from kiro_crew import cli_commands, cli_memory_provider, loopback_http
 
     sent = {}
 
@@ -267,8 +267,8 @@ def test_the_cli_reaches_the_lesson_routes_with_a_recognized_session(monkeypatch
         yield io.BytesIO(b'{"ok": true}')
 
     monkeypatch.setattr(loopback_http, "loopback_urlopen", fake_open)
-    monkeypatch.setattr(cli_commands_gateway_api, "_client_port", lambda port: 5555)
-    monkeypatch.setattr(cli_commands_gateway_api, "_internal_secret", lambda port: "s")
+    monkeypatch.setattr(cli_commands, "_client_port", lambda port: 5555)
+    monkeypatch.setattr(cli_commands, "_internal_secret", lambda port: "s")
     assert cli_memory_provider._call("POST", "/api/lessons", {"rule": "x"}, None) == {"ok": True}
     assert sent["headers"]["X-session-key"] == "dashboard:ui"
     assert sent["url"] == "http://127.0.0.1:5555/api/lessons"

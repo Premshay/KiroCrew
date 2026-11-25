@@ -17,6 +17,17 @@ RESTART_FAILED_TEXT = (
 )
 
 
+def _session_agent_kwargs(agent_name: str) -> dict[str, Any]:
+    """Resolve a channel member's agent template and crew identity off the loop."""
+    if not agent_name:
+        return {"agent": None}
+    from kiro_crew.cli_chat import _resolve_cli_agent
+    from kiro_crew.config import KiroCrewConfig
+
+    kiro_agent, crew_agent, _model, _store = _resolve_cli_agent(KiroCrewConfig.load(), agent_name)
+    return {"agent": kiro_agent, "crew_agent": crew_agent}
+
+
 async def session_after_account_check(
     sessions: Any,
     agent: Any,

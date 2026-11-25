@@ -319,6 +319,17 @@ def _register_config_watch(
         if change.touched("apps"):
             state.push_refresh("config")
 
+    def _push_bot_session_listing(change: ConfigChange) -> None:
+        # Each Bot thread's row carries whether its sessions are listed
+        # (``crew_mode.stamp_rows``: the global switch, else the Bot's own), so a
+        # flip of either from any writer re-sends the slot list and refreshes the
+        # roster and config, and every dashboard's lists and switches follow it.
+        per_bot = any(p.endswith(".show_sessions_in_list") for p in change.under("agents"))
+        if not per_bot and not change.touched("dashboard.show_bot_sessions_in_list"):
+            return
+        state.push_slots_update()
+        state.push_refresh("agents")
+
     # The workflow-run ceiling and the channel caps are not registered here:
     # WorkflowService and ChannelManager bind their own setters in their
     # constructors (``live.bind``), the rule for an applier a long-lived object owns.
@@ -341,6 +352,11 @@ def _register_config_watch(
         from kiro_crew import crewmate_harness_notice
 
         await crewmate_harness_notice.deliver(state, change.new)
+
+    async def _apply_voice_reply(change: ConfigChange) -> None:
+        from kiro_crew.slack.handler import apply_voice_reply_change
+
+        await apply_voice_reply_change(change)
 
     subs = [
         live.subscribe(
@@ -393,6 +409,14 @@ def _register_config_watch(
         ),
         live.subscribe("apps", callback=_push_app_settings, name="apps"),
         live.subscribe(
+            "dashboard.show_bot_sessions_in_list",
+            callback=_push_bot_session_listing,
+            name="dashboard.show_bot_sessions_in_list",
+        ),
+        live.subscribe(
+            "agents", callback=_push_bot_session_listing, name="agents.show_sessions_in_list"
+        ),
+        live.subscribe(
             "dashboard.command_bar_enabled",
             callback=_push_command_bar,
             name="dashboard.command_bar_enabled",
@@ -402,6 +426,9 @@ def _register_config_watch(
             callback=_push_channels_switch,
             name="dashboard.channels_enabled",
         ),
+        # Slack's live voice state follows the file, so a CLI or hand edit of
+        # voice_reply (enabled above all) reaches a running gateway.
+        live.subscribe("voice_reply", callback=_apply_voice_reply, name="voice_reply"),
         live.subscribe(
             "dashboard.terminal.enabled",
             callback=_apply_terminal_enabled,

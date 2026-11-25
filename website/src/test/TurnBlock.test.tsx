@@ -1,10 +1,15 @@
 import { describe, it, expect } from 'vitest'
+import type { ComponentProps } from 'react'
 import { render, screen, fireEvent } from '@testing-library/react'
-import TurnBlock from '../pages/chat/TurnBlock'
+import TranscriptTurnBlock from '../pages/chat/TurnBlock'
 import { groupDisplayItems } from '../pages/chat/groupDisplayItems'
 import type { DisplayItem, TurnItem } from '../pages/chat/types'
 import type { ChatMessage } from '../types'
 import { isHiddenInvisibleAssistantRow } from '../utils/invisibleText'
+
+function TurnBlock(props: ComponentProps<typeof TranscriptTurnBlock>) {
+  return <TranscriptTurnBlock foldAssistantSteps={false} {...props} />
+}
 
 function makeTurn(items: TurnItem[], complete = true): Extract<DisplayItem, {kind:'turn'}> {
   return { kind: 'turn', items, complete }

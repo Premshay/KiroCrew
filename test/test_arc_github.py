@@ -228,9 +228,7 @@ def test_reply_to_accepts_the_short_id():
     assert reply["reply_to"] == ask["id"]
     assert arcs.open_asks(arc["id"]) == []
     with pytest.raises(arcs.ArcError):
-        arcs.append_entry(
-            arc["id"], LEAD, {"kind": "FACT", "text": "a", "reply_to": "ae_ffffffff"}
-        )
+        arcs.append_entry(arc["id"], LEAD, {"kind": "FACT", "text": "a", "reply_to": "ae_ffffffff"})
     with pytest.raises(arcs.ArcError):
         arcs.append_entry(arc["id"], LEAD, {"kind": "FACT", "text": "a", "reply_to": "ae_1"})
 

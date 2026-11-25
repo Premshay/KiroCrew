@@ -104,6 +104,7 @@ POOL_DECISIONS: frozenset[str] = frozenset(
         "bypass_backend_override",
         "bypass_effort",
         "bypass_crew_oauth_bridge",
+        "bypass_parent_denies",
         "bypass_model_at_launch",
         "disabled",
         "other",

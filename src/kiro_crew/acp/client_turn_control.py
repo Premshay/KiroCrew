@@ -32,8 +32,11 @@ from kiro_crew import mediated_request_capability
 from kiro_crew import sel as sel_module
 from kiro_crew.acp import batch_guard, launch_tuning, pi_steer_turn, transport_framing
 from kiro_crew.acp._dispatch import redact_text
-from kiro_crew.acp.client_claude_session import (
+from kiro_crew.acp.client_claude_session import (  # noqa: F401 -- CLAUDE_ACP_TESTED_VERSION
     CLAUDE_ACP_STEERING_MIN_VERSION,
+    CLAUDE_ACP_TESTED_INSTALL,
+    CLAUDE_ACP_TESTED_RANGE,
+    CLAUDE_ACP_TESTED_VERSION,
     _adapter_version_at_least,
 )
 from kiro_crew.acp.client_timeouts import (
@@ -169,12 +172,12 @@ def steer_version_issue(backend: str, agent_version: str) -> str:
 
 
 #: The goose release Crew's goose contract was recorded on: the goose capture README
-#: (``test/fixtures/acp_frames/goose/README.md``) names 1.50.1 for every capture but
-#: ``effort-live.jsonl`` (1.54.0, effort only), ``handshake-live.jsonl`` reports it,
-#: and ``agent_sdk/backends.py`` declares the VERIFIED RANGE 1.50.x (the range
-#: ``GOOSE_VERIFIED_VERSION_PREFIX`` logs against). Steer and effort were also measured
-#: on 1.54.0, but the routing contract was not. Lower bound inclusive, upper
-#: exclusive. goose is not in the real-adapter lane, so nothing measures another line.
+#: (``test/fixtures/acp_frames/goose/README.md``) names 1.50.1 for every capture,
+#: ``handshake-live.jsonl`` reports it, and ``agent_sdk/backends.py`` declares the
+#: VERIFIED RANGE 1.50.x (the range ``GOOSE_VERIFIED_VERSION_PREFIX`` logs against).
+#: Steer was also measured on 1.54.0, but the routing contract was not. Lower bound
+#: inclusive, upper exclusive. ``test_real_adapter_fixture_pins.py`` holds every goose
+#: capture to the lane pin.
 GOOSE_TESTED_VERSION = "1.50.1"
 GOOSE_TESTED_RANGE = ((1, 50, 0), (1, 51, 0))
 
@@ -183,12 +186,6 @@ GOOSE_TESTED_RANGE = ((1, 50, 0), (1, 51, 0))
 #: it. codex-acp numbers its releases by semver, so the tested range is its major.
 CODEX_ACP_TESTED_VERSION = "2.3.0"
 CODEX_ACP_TESTED_RANGE = ((2, 0, 0), (3, 0, 0))
-
-#: The claude-agent-acp release the Real Adapter Contract lane pins in
-#: ``test/real_adapters/package.json``, which the live claude captures report. Its
-#: releases are 0.x, where each minor line can break, so the tested range is 0.94.x.
-CLAUDE_ACP_TESTED_VERSION = "0.94.0"
-CLAUDE_ACP_TESTED_RANGE = ((0, 94, 0), (0, 95, 0))
 
 #: The pi-acp release the same lane pins (spawning pi 1.4.0), which the live pi captures
 #: report. It is 0.0.x, where each patch can break, so the range is that release.
@@ -227,11 +224,7 @@ _TESTED_VERSION_RANGES: dict[str, tuple[tuple[tuple[int, int, int], tuple[int, i
         f"npm i -g {ACP_BACKEND_NODE_ADAPTER_PACKAGES[ACP_BACKEND_CODEX]}"
         f"@{CODEX_ACP_TESTED_RANGE[0][0]}",
     ),
-    ACP_BACKEND_CLAUDE: (
-        CLAUDE_ACP_TESTED_RANGE,
-        f"npm i -g {ACP_BACKEND_NODE_ADAPTER_PACKAGES[ACP_BACKEND_CLAUDE]}"
-        f"@{CLAUDE_ACP_TESTED_VERSION}",
-    ),
+    ACP_BACKEND_CLAUDE: (CLAUDE_ACP_TESTED_RANGE, CLAUDE_ACP_TESTED_INSTALL),
     ACP_BACKEND_PI: (
         PI_ACP_TESTED_RANGE,
         f"npm i -g {ACP_BACKEND_NODE_ADAPTER_PACKAGES[ACP_BACKEND_PI]}@{PI_ACP_TESTED_VERSION}",
@@ -765,7 +758,19 @@ async def _steer_via_steering_request(self: AcpClient, text: str) -> bool:
         self._last_steer_monotonic = time.monotonic()
         self._release_held_steers()
         return True
-    return await self._send_steering_request(aimed_at, text) is True
+    # Registered before the write, as for a held steer: a turn that ends while the
+    # write is in flight finds the text in :attr:`held_steers_possibly_delivered`.
+    possibly_delivered = self._held_steer_writes()
+    possibly_delivered.add(text)
+    try:
+        delivered = await self._send_steering_request(aimed_at, text)
+    except Exception as exc:
+        if getattr(exc, "ambiguous_delivery", False) is not True:
+            possibly_delivered.discard(text)
+        raise
+    if delivered is not None:
+        possibly_delivered.discard(text)
+    return delivered is True
 
 
 def _held_steers(self: AcpClient) -> list[tuple[int, str]]:
@@ -789,6 +794,17 @@ def _held_steer_writes(self: AcpClient) -> set[str]:
         writes = set()
         self._held_steers_unanswered = writes
     return writes
+
+
+def _held_steer_unsent(self: AcpClient) -> set[str]:
+    """The held steers of this turn the adapter never took: dropped from the buffer
+    unwritten, or written and refused (:attr:`held_steers_unsent`). Created on first
+    use so a client built without ``__init__`` (test doubles) has one."""
+    unsent = getattr(self, "_held_steers_unsent", None)
+    if unsent is None:
+        unsent = set()
+        self._held_steers_unsent = unsent
+    return unsent
 
 
 def _release_held_steers(self: AcpClient) -> None:
@@ -819,7 +835,9 @@ async def _send_held_steers(self: AcpClient) -> None:
     consumed, so the caller queues each. A steer whose write is in flight,
     stalled, unanswered, or answered ``injected`` after its turn ended stays in
     :attr:`held_steers_possibly_delivered` until the next turn starts, so the
-    caller queues it as possibly delivered rather than as fresh text.
+    caller queues it as possibly delivered rather than as fresh text. A dropped
+    steer, and one not written or refused, is named in
+    :attr:`held_steers_unsent` instead: it never reached the turn.
     """
     while held := self._held_steers():
         steer = held[0]
@@ -830,6 +848,7 @@ async def _send_held_steers(self: AcpClient) -> None:
             or self._cancelled
             or getattr(self, "_stdin_stalled", False)
         ):
+            self._held_steer_unsent().update(text for _, text in held)
             held.clear()
             return
         if self._active_tool_calls.possibly_open or self._parked_on_permission:
@@ -846,9 +865,13 @@ async def _send_held_steers(self: AcpClient) -> None:
             logger.debug("held steer not sent: %s", type(exc).__name__)
             if getattr(exc, "ambiguous_delivery", False) is not True:
                 possibly_delivered.discard(text)
+                self._held_steer_unsent().add(text)
         else:
             if delivered is not None:
                 possibly_delivered.discard(text)
+            if delivered is False:
+                # Not written, or refused: the adapter runs nothing of it.
+                self._held_steer_unsent().add(text)
         # Read again: a turn that ended during the send started a new list.
         current = self._held_steers()
         if current and current[0] == steer:
@@ -957,10 +980,14 @@ def _release_accepted_steers(self: AcpClient, req_id: int, reason: str, refusal:
     stops taking steers here, before its terminal is yielded, so a steer
     answered after this point is not accepted into a turn that has ended. A
     steer still held here was never sent, so it is dropped and queued the same
-    way.
+    way, and named in :attr:`held_steers_unsent`.
     """
     accepted = getattr(self, "_steers_accepted", None) or []
     self._steers_accepted = []
+    unresolved = self._held_steer_writes()
+    self._held_steer_unsent().update(
+        text for _, text in self._held_steers() if text not in unresolved
+    )
     self._steers_held = []
     if self._steering_turn_req == req_id:
         self._steering_turn_req = None

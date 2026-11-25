@@ -43,7 +43,7 @@ from kiro_crew.config.loader import (
 )
 from kiro_crew.context import ContextBuilder
 from kiro_crew.dashboard import chat_handlers, chat_runner
-from kiro_crew.dashboard.chat_persistence import _rehydrate_slot_from_history
+from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
 from kiro_crew.dashboard.handlers.agent_capabilities import _SERVICE
 from kiro_crew.dashboard.routes.agents import register
 from kiro_crew.history import ConversationLog
@@ -361,7 +361,13 @@ async def test_dashboard_template_keeps_namespace_through_real_manager(
                 {"agent": world.template, "project": str(world.project)},
             )
             state = world.new_state(supported=supported)
-            slot = _rehydrate_slot_from_history(state, "template-chat")
+            # The production restore path, which commits its tab-id backfill
+            # before returning: left in flight, that replace overlaps the
+            # turn's admission reads below.
+            slot = await await_until(
+                asyncio.ensure_future(rehydrate_slot_from_history_async(state, "template-chat")),
+                what="template-chat slot rehydrated",
+            )
             assert slot is not None
             assert slot.agent == world.template
         if entry == "eager":
@@ -379,6 +385,10 @@ async def test_dashboard_template_keeps_namespace_through_real_manager(
 
         # Assert what the real allocation boundary gave the external process,
         # not just the agent argument that chat_runner gave SessionManager.
+        assert world.made, (
+            f"{entry}: no provider was allocated for selected template {world.template!r}; "
+            "the turn ended before allocation (see the captured log)"
+        )
         assert [provider.template for provider in world.made] == [world.template], (
             f"{entry}: real manager substituted default A's enrolled generation "
             f"{world.prepared['template']!r} for selected template {world.template!r}"
@@ -1840,27 +1850,6 @@ def test_nonmember_claude_does_not_read_member_capability_state(tmp_path, monkey
     client._confirm_member_projection(None)
     read.assert_not_called()
     assert client.loaded_capability_template == ""
-
-
-@pytest.mark.parametrize(
-    "backend, available",
-    [
-        (ACP_BACKEND_KIRO, True),
-        (ACP_BACKEND_CLAUDE, True),
-        (ACP_BACKEND_CODEX, True),
-        (ACP_BACKEND_DEEPSEEK, True),
-        (ACP_BACKEND_KAS, True),  # KAS receives the whole saved spec over the wire
-    ],
-)
-def test_the_member_saved_agent_line_follows_the_confirming_backends(backend, available):
-    """The card line a user reads to learn whether an enrolled member runs with its
-    saved spec is on for every backend that loads or confirms that spec at spawn. It is
-    a detail line, so it is read from the card's details rather than its core lines."""
-    from kiro_crew.agent_sdk.backend_cards import LINE_MEMBER_SAVED_AGENT, card_for
-
-    card = card_for(backend)
-    lines = {line.id: line for line in (*card.capabilities, *card.details)}
-    assert lines[LINE_MEMBER_SAVED_AGENT].available is available
 
 
 @pytest.mark.asyncio

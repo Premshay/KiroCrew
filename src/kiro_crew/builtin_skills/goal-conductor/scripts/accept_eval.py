@@ -24,7 +24,9 @@ stdin (JSON):
                                      "exists": true}},
         {"id": "item-4", "accept": {"kind": "human_approval"}},
         {"id": "item-5", "accept": {"kind": "edition_check",
-                                     "check": "name", "ref": "ID-1"}}
+                                     "check": "name", "ref": "ID-1"}},
+        {"id": "item-6", "accept": {"kind": "git_commit", "repo": "/abs/repo",
+                                     "branch": "feat/x", "base": "<sha>"}}
     ]}
 
 Kinds:
@@ -36,6 +38,14 @@ Kinds:
     file            a path exists (or, with ``"exists": false``, does not).
     human_approval  never machine-evaluated; always ``pending``.
     edition_check   an installed edition answers a named check (below).
+    git_commit      a local branch carries at least one commit that its base
+                    commit does not (``git rev-list --count``); none yet, or no
+                    such branch yet, is pending. ``repo`` must be an absolute
+                    path (a relative one is refused), ``branch`` a branch name,
+                    ``base`` the commit's hex id. Read-only and offline: only
+                    ``rev-parse`` and ``rev-list``, in an environment that
+                    refuses every transport, so a partial clone's missing
+                    object is an error, never a fetch.
 
 ``edition_check`` asks an installed edition. It runs
 ``kirocrew acceptance-check --json <check> <ref>``, which the public build

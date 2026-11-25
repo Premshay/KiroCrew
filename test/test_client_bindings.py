@@ -138,9 +138,11 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_harness_session_mcp_servers": ("function", False, "7eb96c2fda05", "client_class"),
     "_harness_session_meta": ("function", False, "ab37557cb48c", "client_class"),
     "_held_steer_task": ("data", False, "", ""),
+    "_held_steer_unsent": ("function", False, "67a56d539800", "client_turn_control"),
     "_held_steer_writes": ("function", False, "67a56d539800", "client_turn_control"),
     "_held_steers": ("function", False, "f7ad662c995f", "client_turn_control"),
     "_held_steers_unanswered": ("annotation", False, "", ""),
+    "_held_steers_unsent": ("annotation", False, "", ""),
     "_idle_read_loop": ("function", True, "b60c5fea256e", "client_transport"),
     "_idle_reader": ("data", False, "", ""),
     "_idle_reader_installed": ("data", False, "", ""),
@@ -343,6 +345,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "has_pending_agent_turn": ("function", False, "a6632a57e602", "client_transport"),
     "has_unfinished_turn": ("function", False, "a6632a57e602", "client_turn_control"),
     "held_steers_possibly_delivered": ("property", False, "602c14087aa8", "client_class"),
+    "held_steers_unsent": ("property", False, "602c14087aa8", "client_class"),
     "initialize_result": ("property", False, "44dc9acb7120", "client_class"),
     "is_process_alive": ("function", False, "a6632a57e602", "client_class"),
     "is_ready": ("property", False, "a6632a57e602", "client_class"),
@@ -375,6 +378,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "set_model": ("function", True, "bcd0cd3aa159", "client_model_selection"),
     "set_resume_session_id": ("function", False, "df97aaea4e38", "client_lifecycle"),
     "settings_withheld_cause": ("function", False, "bb418bb7ece8", "client_class"),
+    "settings_withheld_reason": ("function", False, "e5abe83e2f2f", "client_class"),
     "shutdown": ("function", True, "b60c5fea256e", "client_lifecycle"),
     "spec_zero_tools": ("property", False, "a6632a57e602", "client_class"),
     "steer": ("function", True, "19314a5fce4a", "client_turn_control"),
@@ -585,6 +589,7 @@ _CLAUDE_MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "new_conversation": ("function", True, "b60c5fea256e", "client_new_conversation"),
     "release_settings_seed_claim": ("function", False, "b60c5fea256e", "client_seed_ownership"),
     "settings_withheld_cause": ("function", False, "bb418bb7ece8", "client_seed_ownership"),
+    "settings_withheld_reason": ("function", False, "e5abe83e2f2f", "client_seed_ownership"),
 }
 
 #: ``GooseAcpClient``'s own members: what only a goose session does, bound from the goose

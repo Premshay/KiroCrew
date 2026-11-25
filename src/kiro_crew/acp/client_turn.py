@@ -1117,6 +1117,7 @@ async def _dispatch_events(
     self._steers_accepted = []
     self._steers_held = []
     self._held_steers_unanswered = set()
+    self._held_steers_unsent = set()
     self._steering_turn_req = (
         None if extract_agent_from_result or req_id == _AGENT_STARTED_REQUEST_ID else req_id
     )

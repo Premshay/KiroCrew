@@ -21,6 +21,7 @@ import pytest
 from kiro_crew import agent_sdk, folder_steering
 from kiro_crew.acp import skill_projection as projection
 from kiro_crew.acp.types import (
+    PROVIDER_LABEL_ANTIGRAVITY,
     PROVIDER_LABEL_BY_BACKEND,
     PROVIDER_LABEL_CODEX,
     PROVIDER_LABEL_DEEPSEEK,
@@ -730,6 +731,7 @@ def test_crew_loads_spec_steering_names_exactly_the_harnesses_handed_no_spec():
     """kiro-cli and KAS load the trees themselves; the others have no path yet."""
     labels = set(PROVIDER_LABEL_BY_BACKEND.values())
     assert {label for label in labels if acp_driver.crew_loads_spec_steering(label)} == {
+        PROVIDER_LABEL_ANTIGRAVITY,
         PROVIDER_CLAUDE_CODE,
         PROVIDER_LABEL_CODEX,
         PROVIDER_LABEL_OPENCODE,

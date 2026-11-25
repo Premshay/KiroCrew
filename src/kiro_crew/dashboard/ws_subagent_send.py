@@ -11,11 +11,19 @@ import json
 from typing import Any
 
 from kiro_crew.dashboard import redaction_audience
+from kiro_crew.dashboard.chat_utils_slots import subagent_event_slot
 
 # Reconnect replay: more subagent frames than this collapse into ONE
 # subagent_snapshot_batch frame (scale plumbing — a per-agent burst at
 # 60-100 agents saturates the socket the moment a client reconnects).
 SUBAGENT_REPLAY_BATCH_THRESHOLD = 8
+
+
+def _replay_record_slot(record: dict) -> str:
+    """Resolve the owning slot from a folded record or a parent session key."""
+    return str(record.get("slot") or "") or subagent_event_slot(
+        str(record.get("parent_session") or "")
+    )
 
 
 def _subagent_replay_has_owner(frame: object) -> bool:

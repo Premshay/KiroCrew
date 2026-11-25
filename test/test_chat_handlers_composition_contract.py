@@ -289,6 +289,7 @@ _BASE_ROUTES = (
     ("POST", "/api/chat/slots/{slot}/turn-timeout", "api_chat_slot_turn_timeout"),
     ("POST", "/api/chat/slots/{slot}/ultracode", "api_chat_slot_ultracode"),
     ("POST", "/api/chat/slots/{slot}/fast", "api_chat_slot_fast_mode"),
+    ("POST", "/api/chat/slots/{slot}/approve-for-me", "api_chat_slot_approve_for_me"),
     ("POST", "/api/chat/slots/{slot}/workspace", "api_chat_slot_workspace"),
     ("PUT", "/api/chat/slots/{slot}/queue/order", "api_chat_slot_queue_reorder"),
 )
@@ -671,10 +672,10 @@ slot_settings | _turn_timeout_payload | async function
 slot_settings | api_chat_slot_turn_timeout | async function
 slot_settings | api_chat_slot_color | async function
 chat_send | _sweep_stale_permissions | function
-chat_send_policy | _send_binds_agent | function
-chat_send_policy | _send_harness_command | async function
-chat_send_policy | steer_is_auto | function
-chat_send_policy | decided_message_handling | async function
+chat_send | _send_binds_agent | function
+chat_send | _send_harness_command | async function
+send_decision | steer_is_auto | function
+send_decision | decided_message_handling | async function
 chat_send | api_chat | async function
 sse_write | write_sse_or_abort | async function
 app_admission | _app_slot_acquisition_denial | async function
@@ -1443,7 +1444,7 @@ _GUARDED_CONSTRUCT_HOMES: dict[str, frozenset[str]] = {
     r"safety_override\(\)\.activate": frozenset({"slot_approval"}),
     r"\._queue\.clear\(\)": frozenset({"turn_stop"}),
     r'_turn_kwargs\["_turn_actor"\]': frozenset({"chat_send"}),
-    r"warn_if_not_durable\(slot\._queue, qid, slot\.key\)": frozenset({"chat_send"}),
+    r"warn_if_not_durable\(slot\.durable_source\(\), qid, slot\.key\)": frozenset({"chat_send"}),
     r"(?m)^def _unblock_pending_waits\(": frozenset({"chat_handlers"}),
     r"(?m)^async def _reset_slot_session\(": frozenset({"chat_handlers"}),
     r"(?m)^def _orphan_in_current_turn\(": frozenset({"chat_handlers"}),

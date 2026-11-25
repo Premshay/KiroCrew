@@ -236,13 +236,7 @@ class TestTheSandboxShowsTheCacheReadOnly:
     @pytest.fixture(autouse=True)
     def _pinned_sandbox_host(self, _floor_monkeypatch, tmp_path):
         """Keep the scratch cache outside this host's credential-mask roots."""
-
-        class HostPath(type(Path())):
-            @classmethod
-            def home(cls):
-                return cls(tmp_path / "host")
-
-        _floor_monkeypatch.setattr(sandbox, "Path", HostPath)
+        _floor_monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "host"))
         _floor_monkeypatch.setattr(sandbox, "_ssh_supports_accept_new", lambda: True)
 
     def test_an_lts_sandbox_shows_the_cache(self, lts):
@@ -355,7 +349,7 @@ class TestTheSandboxShowsTheCacheReadOnly:
         plan = sandbox._spawn_plan(
             sandbox_plan.BACKEND_NAMESPACE, mode, extra_visible_dirs=(_cache_target(),)
         )
-        home = str(sandbox.Path.home())
+        home = str(Path.home())
 
         assert _cache_target() in plan.readonly
         assert _cache_target() not in plan.sensitive_dirs
@@ -366,7 +360,7 @@ class TestTheSandboxShowsTheCacheReadOnly:
     def test_macos_keeps_the_write_deny_and_the_secret_read_denies(self, mode):
         cache = _cache_target()
         profile = sandbox._build_seatbelt_profile(mode, extra_visible_dirs=(cache,))
-        home = str(sandbox.Path.home())
+        home = str(Path.home())
 
         assert f'(deny file-write* (subpath "{cache}"))' in profile
         assert f'(deny file-read* (subpath "{cache}"))' not in profile

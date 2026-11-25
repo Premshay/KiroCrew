@@ -66,6 +66,7 @@ function readPanel(file: string): string {
  * an unlisted file fails, so the choice is always conscious.
  */
 const UNMAPPED_PANELS: Record<string, string> = {
+  'remoteCrewTunnelError.tsx': "a Remote Crew row's connect-failure text (one sentence, the raw error folded under it); zero controls, no setting",
   'BrowserEngineSection.tsx': "the Browser tab's Engine row under More (Harness and Chromium versions) with a Redownload action; status and one action, no setting of its own",
   'BrowserStatusCard.tsx': "the Browser tab's main card (browser, status dot, one state-dependent Install / Retry / Allow / Connect / Disconnect action); it reports the engine and holds no setting",
   'KiroHarnessFallbackNote.tsx': 'informational note ChatPanel mounts above the fallback pickers on a Kiro harness, zero controls',
@@ -281,11 +282,14 @@ const WAIVED_BARE_CONTROLS: Record<string, { counts: BareCounts; reason: string 
       'right now (manual: notifications.sources)',
   },
   'NotificationsPanel.tsx': {
-    counts: { Toggle: 1, Select: 1, input: 1 },
+    counts: { Toggle: 2, Select: 1, input: 1, SimpleSelect: 1 },
     reason:
       'per-channel mute Toggle + priority Select render runtime-fetched rows ' +
       '(manual: notifications.sources); the volume range input has no slider ' +
-      'primitive (manual: notifications.volume)',
+      'primitive (manual: notifications.volume); the per-day sound-hours Toggle and ' +
+      'its from/until SimpleSelect (one HourSelect) render once per weekday, reached ' +
+      'through the sound-hours switch the extractor indexes ' +
+      '(notifications.play-sounds-only-during-set-hours), which reveals them',
   },
   'PortabilityTab.tsx': {
     counts: { input: 6, SimpleSelect: 1 },

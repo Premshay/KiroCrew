@@ -9,6 +9,7 @@ import functools
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew import turn_timing
+from kiro_crew.agent_sdk.kas_telemetry_notice import deliver as deliver_kas_telemetry_note
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.config.loader import normalize_agent_model
 from kiro_crew.context import discard_memory_prefetch
@@ -92,6 +93,7 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_turn.model_fallback import (
         _app_allocation_kwargs,
         _inherited_default_model,
+        _live_session_off_slot_agent,
         _live_session_off_slot_backend,
         _settle_session_model,
         _slot_backend_allocation_kwargs,
@@ -729,6 +731,14 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
             from kiro_crew.dashboard.member_rebind_notice import surface_rebind_notice
 
             await surface_rebind_notice(state, slot, session_key, loaded_cfg, bindings)
+            if bindings.selection_kind == "member":
+                # A chat running a Bot keeps its own harness; it says so once
+                # when the Bot's own chat runs another.
+                from kiro_crew.dashboard.member_harness_notice import surface_harness_notice
+
+                await surface_harness_notice(
+                    state, slot, session_key, loaded_cfg, execution_context
+                )
         elif bindings.selection_kind == "member":
             execution_context = resolve_member_execution(
                 loaded_cfg,
@@ -930,8 +940,12 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
             )
             arm_model_switch_reset(state, slot)
     # A slot created on a harness whose live session runs another one takes the
-    # same reset, and the claim below starts it on its pick.
+    # same reset, and the claim below starts it on its pick. So does a slot whose
+    # live session runs another agent than this turn resolved, so the chat runs
+    # on the agent it is set to.
     if _live_session_off_slot_backend(state, slot):
+        arm_model_switch_reset(state, slot)
+    if _live_session_off_slot_agent(state, slot, kiro_agent or slot.agent):
         arm_model_switch_reset(state, slot)
     # A model pick the picker took while a turn ran on this session, not yet
     # landed: normally the end of that turn lands it (``_end_turn_tail``), and
@@ -1422,6 +1436,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     turn._spec_hooks_cwd = _spec_hooks_cwd
     if is_new:
         _notice_steer_upgrade(state, slot, client)
+        await deliver_kas_telemetry_note(state, client)
         await _notice_seed_declined(state, slot, client)
         await _notice_unresolved_control_plane(state, slot, client)
     # A member DM's first turn carries the four-layer member section as

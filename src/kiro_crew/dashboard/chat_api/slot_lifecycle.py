@@ -1143,6 +1143,7 @@ async def _close_slot(
                         transcript=slot_history_key(slot),
                         closed_at=closed_at,
                         created_at=str(getattr(slot, "_disk_meta_created_at", "") or ""),
+                        slot=slot,
                     )
                     if (
                         owed_now is not None
@@ -1798,6 +1799,7 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
                             transcript=slot_history_key(removed),
                             closed_at=closed_at,
                             created_at=str(getattr(removed, "_disk_meta_created_at", "") or ""),
+                            slot=removed,
                         )
                         if (
                             owed_now is not None

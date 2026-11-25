@@ -11,7 +11,7 @@ import sys
 import time
 from collections.abc import Collection
 from contextvars import copy_context
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from aiohttp import WSCloseCode, WSMsgType, web
 
@@ -82,6 +82,7 @@ from kiro_crew.dashboard.ws_snapshot_hold import (
 )
 from kiro_crew.dashboard.ws_subagent_send import (  # noqa: F401 (re-exported)
     SUBAGENT_REPLAY_BATCH_THRESHOLD,
+    _replay_record_slot,
     _send_subagent_replay,
     _subagent_replay_has_owner,
     send_subagent_replay_done,
@@ -252,25 +253,6 @@ def fold_subagent_outcome(outcome: str, reason: str) -> tuple[str, str, bool]:
     if outcome == "failed":
         return "failed", reason, False
     return "failed", reason or _ORPHANED_UNKNOWN, False
-
-
-def _replay_record_slot(record: dict) -> str:
-    """The slot a durable panel record routes to, from whichever key it carries.
-
-    The two durable sources name the owning conversation differently, and the gate
-    that reads this cannot tell which one it is holding. A folded record carries
-    ``slot`` outright, because its unit id is an ACP session id a slot cannot be
-    derived from. A folder record carries ``parent_session``, the raw session key,
-    which :func:`subagent_event_slot` maps -- the same mapping the live frames use,
-    and not a prefix-strip, which tags a card with a slot no tab reads.
-
-    ``""`` only when the record names no conversation at all, which both gates
-    refuse. Reading an absent key as an empty slot would refuse every record from
-    the source that uses the other name.
-    """
-    return str(record.get("slot") or "") or subagent_event_slot(
-        str(record.get("parent_session") or "")
-    )
 
 
 def crew_log_panel_units(slot_names: Collection[str]) -> list[tuple[str, str]]:
@@ -1471,6 +1453,7 @@ async def _serve_ws(
                                                 "task": _r(str(native["task"])),
                                                 "agent": _r(str(native["agent"])),
                                                 "result": _r(str(native["result"])),
+                                                **cast(dict, native.get("frame_extras", {})),
                                             },
                                         }
                                     )
@@ -1486,6 +1469,7 @@ async def _serve_ws(
                                                 "streaming": _r(str(native["streaming"])),
                                                 "last_tool": _r(str(native["last_tool"])),
                                                 "started": native["started"],
+                                                **cast(dict, native.get("frame_extras", {})),
                                                 **(
                                                     {"controllable": False}
                                                     if native.get("controllable") is False
@@ -1535,6 +1519,7 @@ async def _serve_ws(
                                                 or f"subagent:{a.id}",
                                                 "elapsed": a.elapsed,
                                                 "credits": a.credits,
+                                                "cost_usd": a.cost_usd,
                                                 "error": _r(a.error) if a.error else None,
                                                 "stopped": a.user_stopped,
                                                 "outcome": a.outcome,

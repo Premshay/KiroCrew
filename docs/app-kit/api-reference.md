@@ -920,11 +920,12 @@ window's side panel, which an app page does not have.
 ## Issue Search
 
 `POST /api/source/issues` lists or searches the issues of one GitHub repository
-(`owner/repo`), GitLab project (`group/sub/project`), Jira project (`PROJ`) or Linear
-team (`ENG`), through the gateway's own `gh`/`glab` sign-in, the Jira API token in
-`dashboard.jira_auth` (the one the Issues panel reads Jira with), or a Linear personal
-API key stored in Settings > Secrets as `LINEAR_API_KEY` (without one, the answer is a
-503 `provider_error` that says to add it). It answers the owner's dashboard session only: an app token is
+(`owner/repo`), GitLab project (`group/sub/project`), Jira project (`PROJ`), Linear
+team (`ENG`) or ServiceNow table (`incident`), through the gateway's own `gh`/`glab`
+sign-in, the Jira API token in `dashboard.jira_auth` (the one the Issues panel reads
+Jira with), a Linear personal API key stored in Settings > Secrets as `LINEAR_API_KEY`,
+or a ServiceNow API key (see [ServiceNow](#servicenow); without a stored key, either
+answer is a 503 `provider_error` that says to add it). It answers the owner's dashboard session only: an app token is
 refused (403) whatever its manifest declares, as for `/api/source/pull-request`. On an
 app page, `useAppApi()` allows the path only when the manifest declares
 `/api/source/issues` in `permissions.api`. The grant is separate from
@@ -937,10 +938,10 @@ The request and response types are `IssueSearchRequest` and `IssueSearchResponse
 
 | Field | Meaning |
 |---|---|
-| `provider`, `scope` | Required. `github`, `gitlab`, `jira` or `linear` |
-| `host` | A GitHub Enterprise or self-managed GitLab host on the gateway's allowlist (`dashboard.github_hosts`, `dashboard.gitlab_hosts`); defaults to github.com / gitlab.com. Required for Jira: a `*.atlassian.net` site or a `dashboard.jira_hosts` entry, with credentials in `dashboard.jira_auth` (a Jira served under a context path such as `/jira` is not searchable yet). Omitted for Linear |
-| `state`, `assignee`, `author`, `labels`, `text` | Structured filters; `assignee: 'me'` is the signed-in user. A Jira `assignee`/`author` is an account ID on Cloud and a username on Server/Data Center. A Linear person is `me`, an email address or a display name |
-| `raw` | GitHub search qualifiers, a GitLab filter string (`labels=bug&milestone=v1`), Jira JQL or a Linear `IssueFilter` JSON object (`{"priority":{"eq":1}}`). Replaces the structured filters. GitHub's cannot name another repo, org, user or owner, or use `OR`/`AND`/`NOT` or parentheses; GitLab's cannot set paging, ordering or `scope`; JQL is ANDed, in parentheses, with `project = <scope>`, so its parentheses must balance, and it cannot use `ORDER BY`. A Linear filter may use `or`/`and`, and is ANDed under the team, so nothing in it can reach another team |
+| `provider`, `scope` | Required. `github`, `gitlab`, `jira`, `linear` or `servicenow` |
+| `host` | A GitHub Enterprise or self-managed GitLab host on the gateway's allowlist (`dashboard.github_hosts`, `dashboard.gitlab_hosts`); defaults to github.com / gitlab.com. Required for Jira: a `*.atlassian.net` site or a `dashboard.jira_hosts` entry, with credentials in `dashboard.jira_auth` (a Jira served under a context path such as `/jira` is not searchable yet). Omitted for Linear. Required for ServiceNow: the instance its stored key belongs to |
+| `state`, `assignee`, `author`, `labels`, `text` | Structured filters; `assignee: 'me'` is the signed-in user. A Jira `assignee`/`author` is an account ID on Cloud and a username on Server/Data Center. A Linear person is `me`, an email address or a display name, and a ServiceNow one `me` (the user the stored API key runs as), a user name or an email address. ServiceNow refuses `labels` (400): its records have none |
+| `raw` | GitHub search qualifiers, a GitLab filter string (`labels=bug&milestone=v1`), Jira JQL or a Linear `IssueFilter` JSON object (`{"priority":{"eq":1}}`). Replaces the structured filters. GitHub's cannot name another repo, org, user or owner, or use `OR`/`AND`/`NOT` or parentheses; GitLab's cannot set paging, ordering or `scope`; JQL is ANDed, in parentheses, with `project = <scope>`, so its parentheses must balance, and it cannot use `ORDER BY`. A Linear filter may use `or`/`and`, and is ANDed under the team, so nothing in it can reach another team. A ServiceNow encoded query is ANDed after the structured filters instead of replacing them (see [ServiceNow](#servicenow)) |
 | `sort`, `order`, `limit`, `cursor`, `refresh` | `updated`/`created`, `desc`/`asc`, 1 to 100 (25), the previous page's `nextCursor`, and a cache bypass (results are kept 30 seconds) |
 
 Each `IssueSummary` carries a url built from the validated scope, a display `key`,
@@ -951,12 +952,55 @@ report one (Jira Cloud and Linear never do); GitHub search and Linear stop at a
 search API returns no count, and a Linear `commentCount` is `0` because its list API
 reports none.
 
+### ServiceNow
+
+The gateway reads ServiceNow's Table API itself, read-only, with an inbound REST API
+key (ServiceNow's Washington DC release and later) sent as the `x-sn-apikey` header.
+The owner stores the key in Settings > Secrets as `SERVICENOW_API_KEY` and the
+instance it belongs to as `SERVICENOW_INSTANCE` (`acme.service-now.com`, or that host
+after `https://`). Both are vault-only: never read from `.env` or the environment,
+never logged or returned. No other sign-in is supported. An access policy on the
+instance can limit the key to the Table API and `GET`.
+
+- **One instance.** `host` must be a `<name>.service-now.com` host (no port, path or
+  userinfo; letter case and a trailing dot are ignored), and exactly the stored
+  `SERVICENOW_INSTANCE`. Any other host is refused (400) before any call, so an app
+  cannot send the key to another instance, and a redirect is never followed. Only
+  standard `*.service-now.com` instance domains are supported: a custom domain in
+  front of an instance, or another ServiceNow cloud's domain, is refused.
+- **One table.** `scope` is `incident`, `problem`, `change_request`, `sc_req_item` or
+  `sc_task`; anything else is refused. The gateway fixes the field list, ordering
+  (`sort`, `order`) and paging.
+- **`raw`** is an encoded query, ANDed after the structured filters (including the
+  default `state: 'open'`; send `state: 'all'` for closed records too). Each term is
+  `<field><operator><value>` with a lower-case column of the table itself (no
+  dot-walking, which would filter on another table's records) and one of
+  `=`, `!=`, `<`, `<=`, `>`, `>=`, `LIKE`, `NOT LIKE` (or `NOTLIKE`), `STARTSWITH`, `ENDSWITH`, `IN`,
+  `NOT IN`, `ISEMPTY`, `ISNOTEMPTY`, `BETWEEN`. It cannot use `^OR` (use `IN`),
+  `^NQ`, `^EQ`, `ORDERBY`, `GROUPBY`, related-list or sub-queries, `DYNAMIC`, a
+  `javascript:` value, `%`, or an empty term; a field starting with `or`, `nq`,
+  `eq`, `ir_` or `goto` (such as `order`) is refused for the same reason.
+- **Rows.** `key` is the record number (`INC0010001`) and `number` its digits;
+  `title` is `short_description`; open or closed is `active`, which means the same
+  on all five tables, and `statusLabel` is the `state` display value; `priority`
+  is its display value; `assignees` is `assigned_to`, `author` is `opened_by`;
+  `excerpt` is from `description`. `labels` is always `[]`, `commentCount` is `0`
+  (the Table API reports none) and `total` comes from `X-Total-Count`. The `url` is
+  `https://<instance>/<table>.do?sys_id=<sys_id>`, built by the gateway.
+- **One record.** `POST /api/source/issue` reads that same URL form. Other forms
+  (`nav_to.do?uri=...`, `/now/nav/ui/classic/...`, Workspace and Service Portal
+  links, extra query parameters) are not supported. Its comments section is empty
+  and listed in `partialSections`: comments and work notes are not read.
+- **Errors** are the gateway's own text, never ServiceNow's.
+- **Validation.** This provider is tested against a mocked Table API only, not
+  yet against a live instance.
+
 ## Issue List
 
 `useIssues`, `IssueList` and `IssueCard` show the issues [Issue Search](#issue-search)
 returns, through one query (`IssueSearchRequest`) and one result shape
-(`IssueSummary`). The views draw all four providers the route serves (GitHub, GitLab,
-Jira and Linear) from that shape. They need
+(`IssueSummary`). The views draw all five providers the route serves (GitHub, GitLab,
+Jira, Linear and ServiceNow) from that shape. They need
 `APP_SDK_LEVEL >= 6` and `/api/source/issues` in your manifest's `permissions.api`.
 Without the declaration, or outside an app, the components render a refusal naming
 the path and send nothing; the hook reports an `AppApiPermissionError`. Declaring
@@ -990,15 +1034,16 @@ page.
 |---|---|---|---|
 | `query` | `IssueSearchRequest` | yes | What to list; a new query replaces the filter bar's edits |
 | `view` | `'condensed' \| 'expanded'` | no | One row per issue (default) or one card |
-| `showFilters` | `boolean` | no | State, assignee (`me` included), labels and search text; hidden while `query.raw` is set, since a raw query replaces those filters |
+| `showFilters` | `boolean` | no | State, assignee (`me` included), labels and search text; hidden while `query.raw` is set, since a raw query replaces those filters, except on ServiceNow, where `raw` is ANDed with them; the labels box is left out for ServiceNow |
 | `onSelect` | `(issue: IssueSummary) => void` | no | Makes each row a button; without it a row links out |
 | `emptyText` | `string` | no | Replaces the empty-state text |
 
 `IssueCard` takes `issue`, `view` and `onSelect` and renders one issue on its own.
-The condensed row shows the provider mark, the key (`#4821`, `CREW-142`), the title,
+The condensed row shows the provider mark (a neutral link mark for ServiceNow, which
+has no bundled logo), the key (`#4821`, `CREW-142`), the title,
 up to two labels (hidden when narrow), the provider's `statusLabel` and the updated
 time. The expanded card adds the project, a three-line excerpt, priority, every
-label, the first assignee, the author, the comment count (left out for Jira and Linear, whose searches return none) and linked-change count, and an
+label, the first assignee, the author, the comment count (left out for Jira, Linear and ServiceNow, whose searches return none) and linked-change count, and an
 **Open in &lt;provider&gt;** link. Every provider string is rendered as text, links
 open only `http(s)` urls in a new tab with `rel="noopener noreferrer"`, and an avatar
 loads only from an `http(s)` url.
@@ -1051,7 +1096,11 @@ it.
 list holds them, live, and the acts a person takes on one from there: reply or steer it,
 approve or reject the tool it waits on, and start a new session without leaving your page.
 Each session reads as its sidebar row does (title, agent, running, message count, newest
-message, a pending approval). It needs `APP_SDK_LEVEL >= 8`, and since a host can report 8
+message, a pending approval). `needsFullChat` is true while the session waits on something
+`ChatEmbed` cannot show or answer: a change card, a guide offer, or a browser sign-in or
+other `ask`. Send the person to the session for those, with
+`useChatLauncher().openChat({ slotKey })`. A page reading `/api/chat/slots` itself finds the
+same answer in each slot's `needs_full_chat`. It needs `APP_SDK_LEVEL >= 8`, and since a host can report 8
 before it has this hook, read it off a namespace import:
 
 ```tsx
@@ -1098,6 +1147,52 @@ session's messages, the cron list or the subagent list through `useAppApi()`
 A built-in page gets every member as the dashboard has it; outside an app every member
 refuses.
 
+## Browser Sites
+
+`useBrowserSites()` reads the pages your app's own agent may browse and lets your page
+ask the owner to change that list. It needs `APP_SDK_LEVEL >= 13` and no
+`permissions.api` entry: it reads and writes your app's own
+`/api/apps/<name>/browser-sites`.
+
+```tsx
+import * as sdk from '@kirocrew/app-sdk'
+
+const { sites, active, loading, error, refresh, requestAdd, requestRemove, requestDisable } = sdk.useBrowserSites()
+// sites:  [{ site: 'https://music.example.net/song/*', source: 'owner', status: 'approved' }, ...]
+// active: the sites the agent may open right now
+const result = await requestAdd('https://music.example.net/song/*')
+if (!result.ok && result.code === 'declined') { /* the owner pressed Cancel */ }
+```
+
+Each row has `site`, `source` (`app`: your manifest's `permissions.browserSites`
+declares it; `owner`: the owner added it) and `status` (`approved`, `pending`: declared
+and not yet approved, `disabled`: the owner turned it off, or `removed`: a declared site
+the owner removed, listed so it can be added back and never in force).
+
+- `requestAdd(site)` widens the list: a new site, a turned-off or removed one back on, or a
+  declared one still waiting. The dashboard shows its own dialog with the site and what the agent
+  may then do, and sends the change only when the owner presses **Allow site**. A new
+  site follows the `permissions.browserSites` entry rules: an `https://` origin with a
+  path pattern; no bare `*`, wildcard host, IP, `localhost`, port or public suffix.
+- `requestRemove(site)` and `requestDisable(site)` only shrink the list, so they apply at
+  once. The agent's next browser step is refused on that site, and a tab on it is blanked.
+  Neither acts on a `removed` row (`not_listed`).
+
+Each resolves `{ ok: true, sites, active }`, or `{ ok: false, code, error }` with `code`
+one of `declined`, `bad_site`, `too_many`, `not_listed`, `bad_action`, `not_found`,
+`app_token_forbidden`, `dashboard_session_required`, `owner_only` or `request_failed`.
+
+Your backend and your agent read the same list with
+`GET /api/apps/<name>/browser-sites` (the app token reaches it), which answers
+`{ sites, active }`. Only the owner's dashboard may change it: the `POST` refuses your
+app token, an agent's tools and every other session. A browser step your agent takes off
+the list is refused with `site_not_allowed`, and the message names the sites in force.
+
+The dialog is a guardrail, not a security boundary: your page runs in the dashboard's
+document with the owner's session, and a backend that mints an owner token through the
+local owner mint reaches the `POST` too, as it reaches `/enable` (see the
+[trust model](../architecture/app-platform-trust-model.md)).
+
 ## Browser Media
 
 `useBrowserMedia(sessionKey, { pollMs })` gives your page play, pause, seek and volume
@@ -1117,10 +1212,10 @@ const { media, error, busy, play, pause, seek, setVolume } = sdk.useBrowserMedia
 
 | Member | Does |
 |---|---|
-| `media` | the playing element's state: `kind`, `paused`, `ended`, `currentTime`, `duration` (null when unknown), `volume` (0 to 1), `muted`; null before the first answer |
+| `media` | the playing element's state: `kind`, `paused`, `ended` (true once the tab counted an ending, also one the site answered by taking the source away, until something plays), `currentTime`, `duration` (null when unknown), `volume` (0 to 1), `muted`; null before the first answer |
 | `error` | the last refusal's code: `no_tab` (no tab open for that session yet), `no_media` (no `<video>` or `<audio>` on the page), `redirect_refused` (the page left your approved sites; it was moved to `about:blank`), `not_app_browser`, `not_declared`, `policy_denied` |
 | `play()`, `pause()`, `seek(seconds)`, `setVolume(0..1)`, `refresh()` | one request each: a `POST` per button; `refresh`, the first read and each poll are a `GET` that changes nothing |
-| `onEnded(media)` (option) | called once each time an answer first shows `ended: true`; again only after the element plays and ends anew. A song that has already ended when the page mounts counts once |
+| `onEnded(media)` (option) | called once for each ending the tab counted; again only after something plays and ends anew. A song that has already ended when the page mounts counts once |
 
 For continuous play, poll and let the ending pick the next song:
 
@@ -1162,9 +1257,18 @@ async def on_media_ended(ctx, event):
 The gateway calls it once per ending, whether or not your page is open: after your
 agent's first successful `browser` op in a slot, it reads that tab's media state every 3
 seconds (the read `useBrowserMedia` makes, skipped while the browser is busy or the
-person has taken the tab over) and calls your hook when an element newly shows
-`ended`. The same ending is not reported twice; a new song that plays and ends is a new
-call. The hook runs in the gateway like your other hooks, with the same `ctx`; an async
+person has taken the tab over) and calls your hook for each new ending the tab counted.
+The same ending is not reported twice; a new song that plays and ends is a new call.
+
+The tab counts an ending as it happens, so neither the page nor the gateway has to read
+at that moment: the element's `ended` event, or its source going away within 2 seconds
+of the end (YouTube removes the source when a song ends, leaving the element paused at
+0 with no duration, and `duration` in the event is then `null`). An ending counts once
+nothing plays on the same page for 3 seconds after it, so an advert that hands over to
+the video on the same page is not one, and the reports arrive up to that much later.
+The page moving on to another address and playing there (the site's own autoplay) counts
+at once. Only the page's largest media element is followed, so a small preview ending
+is not one, and media already ended when the tab is first read counts once. The hook runs in the gateway like your other hooks, with the same `ctx`; an async
 hook gets 30 seconds before the gateway stops waiting for it. Keep it short: turning
 your app off or uninstalling it waits for a hook that is still running, and
 withdrawing its trust fails until the hook returns. Nothing of the page is
@@ -1228,6 +1332,10 @@ import * as sdk from '@kirocrew/app-sdk'
 | `state` | `idle` before the slot has browsed, else `live`, `in_control`, `waiting_allow`, `login_needed`, `done` or `error` |
 | `url`, `title` | the page's address and title |
 | `claim()`, `release(note?)` | take over, hand back; `false` when refused or not allowed |
+
+Below the picture the view lists what the Bot did this turn (the chat card's step
+strip): the latest five actions, newest last, behind a toggle that counts them all
+and that the person may fold. It needs no prop and no change in your app.
 
 `useBrowserCoords(slot)` answers `toPage(x, y)` (view point to frame pixels, `null` outside
 the picture) and `toView(x, y)` (frame pixels to view point), for the `BrowserView` of that
@@ -1479,10 +1587,12 @@ answer (a `dict`, or a `list` of dicts) unless the row says otherwise. No
 TypeScript client ships, so `GatewayStatus`, `CronJob` and their siblings are
 response-shape names rather than importable types.
 
-When `app_name` is set and no explicit auth is provided, the Python client uses
-the app secret the Gateway gave its backend at spawn (`KIROCREW_PROXY_SECRET`, when
-`KIROCREW_APP_NAME` names the same app). Only with a Gateway older than that does it
-fall back to `~/.kiro/crew/apps/{name}/.app_secret`. Code that runs in the Gateway
+When `app_name` is set and no explicit auth or `app_secret` is provided, the Python
+client uses the app secret the Gateway gave its backend at spawn
+(`KIROCREW_PROXY_SECRET`, when `KIROCREW_APP_NAME` names the same app). Only with a
+Gateway older than that does it fall back to `~/.kiro/crew/apps/{name}/.app_secret`.
+A self-managed app passes the secret its registration returned as `app_secret=`.
+Code that runs in the Gateway
 process, an app's `backend.hooks`, has no secret: pass `base_url=ctx.gateway_origin()`,
 `token=await ctx.app_token()` and `on_auth_expired=ctx.app_token`, and build no client
 when `ctx.gateway_origin()` returns `""` (see
@@ -1809,6 +1919,21 @@ the log directly, so treat `app:<name>` as "which app said this", not as proof.
 `operation` is namespaced the same way, so two apps cannot collide on a bare
 `"publish"`. No permission gates it: an app cannot obtain anything with it, only
 state what it did.
+
+**From a spawned backend.** A backend process does not run your hooks and never holds
+the log's signing key, so it asks the gateway to write the row:
+`POST /api/apps/<name>/_sel` with your app token (from `POST /api/apps/<name>/token`)
+and a JSON body of exactly `{"method": "log_api_access", "kwargs": {...}}`. `kwargs`
+takes `operation` and `outcome` (both required strings), and optionally `resources`
+and `error` (strings) and `critical` (a boolean); any other field, including
+`caller`, `source` or `session_key`, is a 400. The gateway writes the row as
+`app:<name>` with source `app`, and prefixes `operation` with `<name>.` when it does
+not already start with it. The route is in your own namespace, so it needs no
+`permissions.api` entry, and a token for another app gets `403 app_token_required`.
+A success is `204` with no body. A refusal is a fixed `{"error", "code"}` that never
+echoes your body: `sel_invalid_body` (400, a wrong shape or an `operation` over 200
+characters), `sel_body_too_large` (413, over 16 KiB), `sel_rate_limited` (429, past
+50 rows a second with a burst of 200, per app) or `sel_write_failed` (500).
 
 ### Background agents (`ctx.spawn`)
 
@@ -2443,7 +2568,8 @@ shared embedder's batch members (`ctx.embed.embed_batch`, see
 adds the page's [`BrowserView`, `useBrowserView` and `useBrowserCoords`](#browser-view) and the
 dashboard's `appWebOriginStatus(name)`, and level 12 adds
 `permissions.kiroOperations` with its route and `ctx.kiro_call` ([Kiro calls](#kiro-calls)) and the dashboard's
-[`SessionChanges` and `DiffView`](#session-changes-and-diff-view); each level
+[`SessionChanges` and `DiffView`](#session-changes-and-diff-view), and level 13 adds
+[`useBrowserSites`](#browser-sites) and `/api/apps/<name>/browser-sites`; each level
 includes every level below it. Several seams share level 7, three share level 8, and
 level 10 is shared by the seams of the batch it opens, so an app that needs one
 feature-detects it, never the level alone. Read it
@@ -2799,9 +2925,9 @@ The request body of `POST /api/chat/slots/{slot}/context` is
 
 `POST /api/chat/slots/{slot}/note` drops a short declarative line into a chat that is both visible in the transcript immediately and known to the agent on the user's next message — without firing an LLM turn. Context injection alone is silent; a transcript append alone is invisible to the model, because a live provider forwards only the new user message. The note endpoint does both writes against one slot.
 
-Body: `{ content, source?, maxAge?, ephemeral? }`. A note always does both writes -- there is no visible-only or context-only mode. The visible line is appended as `role: "inject"` with `cls: "reconcile-note"`, and its content is redacted (credentials, inside URLs too) before it reaches the transcript. A credential-shaped `content` seats no context half, because the context half is model-visible pending context (see the boundary under Context Injection): the redacted visible line is still written and `contextSkipped` is true. The bubble's author pill comes from the authenticated app identity, never from the body's `source`. A dashboard user's note has no pill, and neither does a note from an app whose name is over 64 characters or contains a control character. The body's `source` is only the label of the context frame. `maxAge` defaults to 24h for the context half when the key is omitted, so a note nobody follows up on expires instead of attaching to an unrelated message later. An explicit null means no expiry, the same as it does on `/context` — the two endpoints share the field and do not give it opposite meanings. The same `source`/`maxAge`/`content` constraints above apply.
+Body: `{ content, source?, maxAge?, ephemeral? }`. A note always asks for both writes -- there is no visible-only or context-only mode; the visible line is written alone only in the `contextSkipped` cases below. The visible line is appended as `role: "inject"` with `cls: "reconcile-note"`, and its content is redacted (credentials, inside URLs too) before it reaches the transcript. A credential-shaped `content` seats no context half, because the context half is model-visible pending context (see the boundary under Context Injection): the redacted visible line is still written and `contextSkipped` is true. The bubble's author pill comes from the authenticated app identity, never from the body's `source`. A dashboard user's note has no pill, and neither does a note from an app whose name is over 64 characters or contains a control character. The body's `source` is only the label of the context frame. `maxAge` defaults to 24h for the context half when the key is omitted, so a note nobody follows up on expires instead of attaching to an unrelated message later. An explicit null means no expiry, the same as it does on `/context` — the two endpoints share the field and do not give it opposite meanings. The same `source`/`maxAge`/`content` constraints above apply.
 
-Returns `{ ok, appended, visibleDeferred, deliveryConditional, contextSkipped, pending }`. `contextSkipped` is true whenever the context half is refused but the visible line is still written: the source's per-source context cap is full, the whole 50-entry pending-context queue has no seat, **or** the content is credential-shaped. The request is **not** rejected in any of these cases, because the caps and the credential check protect the context queue rather than the transcript. The full-queue refusal is checked at admission on both arms — an immediate note (`append_pending_context` returns false) and a note held during a running turn (`has_pending_context_seat()` is false) — so a held note never acknowledges a context half the turn-end flush would then drop. Merge-card contexts being read by a running turn count toward both the per-source cap and the 50-entry ceiling until that turn ends. If a turn is already running the note is held until that turn ends -- `appended` is false and `visibleDeferred` is true -- so that it lands on the next turn rather than the one it was written during. Ordering is preserved, and `deliveryConditional` is true whenever a note is held -- because a hold is delivered only if the slot still routes to the SAME session when the turn ends. An unbound slot can acquire a foreign binding while the note waits (a cron result or workflow injection claims an empty `linked_session_key` with no running gate), and both the transcript path and the next turn's session resolve that binding at flush time rather than at the POST. When that happens BOTH halves of the note are dropped rather than retargeted, because writing them would surface content authorized for one conversation inside another; the drop is recorded in the security-event log. So a 200 with `visibleDeferred: true` promises ordering against the running turn, not that the note will certainly be written. `pending` counts held entries as well as queued ones.
+Returns `{ ok, appended, visibleDeferred, deliveryConditional, contextSkipped, pending }`. `contextSkipped` is true whenever the context half is refused but the visible line is still written: the source's per-source context cap is full, the whole 50-entry pending-context queue has no seat, the content is credential-shaped, **or** the session is linked or mirrored to a channel (a linked thread, an outbound mirror, the channel a conversation started in), even while that link is paused. That channel never shows the note's line, so the note is not queued for the agent's next turn, whose reply the channel would read. A later session reset that replays the transcript still carries the line, as it does for any note. The request is **not** rejected in any of these cases, because each of them guards the context half rather than the transcript. The full-queue refusal is checked at admission on both arms — an immediate note (`append_pending_context` returns false) and a note held during a running turn (`has_pending_context_seat()` is false) — so a held note never acknowledges a context half the turn-end flush would then drop. Merge-card contexts being read by a running turn count toward both the per-source cap and the 50-entry ceiling until that turn ends. If a turn is already running the note is held until that turn ends -- `appended` is false and `visibleDeferred` is true -- so that it lands on the next turn rather than the one it was written during. Ordering is preserved, and `deliveryConditional` is true whenever a note is held -- because a hold is delivered only if the slot still routes to the SAME session when the turn ends. An unbound slot can acquire a foreign binding while the note waits (a cron result or workflow injection claims an empty `linked_session_key` with no running gate), and both the transcript path and the next turn's session resolve that binding at flush time rather than at the POST. When that happens BOTH halves of the note are dropped rather than retargeted, because writing them would surface content authorized for one conversation inside another; the drop is recorded in the security-event log. So a 200 with `visibleDeferred: true` promises ordering against the running turn, not that the note will certainly be written. `pending` counts held entries as well as queued ones.
 
 **A 200 for a held note is a durable acknowledgement — for a slot that has a durable identity.** The hold is persisted verbatim (both halves, the silent context included) into the slot's own session metadata *before* the 200 is returned and replayed by both slot-restore paths after a gateway restart. A plain note retires when the save commits its delivered row. A merge card's context is consumed once a turn has sent it in a prompt kiro-cli kept, whether or not that turn completes; a turn whose prompt never went out, was stopped before its reply finished, or was re-queued after an empty response puts that context back at the queue front. Consumption is not retirement: the card's hold is retired only by a later full save that proves its row, either because that save's window carries the row or because the entry carries the delivered mark described next. A consumed card whose row has left every live window and carries no delivered mark keeps its hold inert until a restart restores and re-flushes its row without replaying context; a later full save can then retire it. The card row and a delivered mark commit atomically, so a restart before the consumption stamp lands re-queues the context without writing a second card row even after the row rotates out of the live transcript. A note accepted with `visibleDeferred: true` therefore survives a restart and is delivered, unaltered, on the first turn after it. An immediate note posted to that slot before then delivers the restored hold first, so the older note keeps its place ahead of the newer one. Two edges keep the original gateway-lifetime meaning instead: a memory-only deployment (no conversation log at all), and a slot that has never been persisted (no metadata line to attach the hold to -- such a tab does not itself survive a restart, so there is no restored slot the note could outlive). Do **not** re-post a held note after a restart; the restored hold delivers it, and a re-post would put the same line in the transcript twice. Three boundary refusals protect that promise: a note posted during a running turn is capped at 4,000 characters (`413`, code `deferred_note_too_large` -- shorten it or wait for the turn to end), a slot whose durable hold is full answers `429 deferred_notes_full` until its rows are saved, and a slot that is rebound to another session while the hold is persisting answers the endpoint's uniform `404` -- the note was neither delivered nor made durable (a note the turn-end flush drops at that same rebind seam takes this `404` too; the 200 stands only when the note observably exists in a delivered row or the durable hold). The one retry-the-same-request signal is a `503` with code `deferred_note_persist_failed`, which means the durable write itself failed and the note was **not** accepted. The queued context of an *immediate* (non-held) note still behaves exactly as `/context`'s queue always has -- in memory, for this gateway lifetime. Note the retention consequence of durability: a HELD note's context half -- the trusted-caller channel, which is deliberately not redacted -- lives on disk in the session metadata until delivery or retirement, while an immediate note's context lives only in memory.
 
@@ -2848,6 +2974,7 @@ KiroCrewClient(
     base_url="",              # default: http://localhost:{KIROCREW_PORT or 5476}
     token="",                 # optional for localhost
     app_name="",              # app-scoped storage and secret lookup
+    app_secret="",            # the app's secret, used with app_name
     timeout=30,               # request timeout seconds
     max_retries=3,            # retry count
     retry_base_delay=1.0,     # base delay for backoff
@@ -2857,8 +2984,8 @@ KiroCrewClient(
 )
 ```
 
-With `app_name` set and no `token` or `on_auth_expired`, the client takes the
-app secret from `KIROCREW_PROXY_SECRET` when `KIROCREW_APP_NAME` is that app (a
+With `app_name` set and no `app_secret`, `token` or `on_auth_expired`, the client
+takes the app secret from `KIROCREW_PROXY_SECRET` when `KIROCREW_APP_NAME` is that app (a
 backend the Gateway started). An older Gateway kept it at
 `$KIROCREW_HOME/apps/{name}/.app_secret`, which the client reads only as a fallback.
 In an app's hooks, which run in the Gateway process, pass `base_url=ctx.gateway_origin()`,
@@ -2867,12 +2994,18 @@ last one after a 401 or 403,
 which is how an expired token is renewed. When `ctx.gateway_origin()` returns `""`,
 build no client, because an empty `base_url` falls back to `KIROCREW_PORT` or 5476.
 
+A self-managed app passes the secret its registration returned as `app_secret=`,
+together with the Gateway's `base_url`: the default dials `KIROCREW_PORT` or 5476,
+which can be another Gateway. The client exchanges that secret for its token and
+again after a 401 or 403. `app_secret` is ignored without `app_name`. An explicit
+`on_auth_expired` still renews the token instead.
+
 For a remote Gateway, pass `token=...` or call `await client.authenticate()`
 after entering the context. Local loopback requests need no token. Setting
-`app_name` alone only locates the app secret; it does not authenticate during
-`__aenter__`. The client sends `token` as the session cookie, so it must be an
-app token or a session the Gateway issued: a sign-in link (`kirocrew token`) is
-refused there until it is traded for a session with one
+`app_name`, with or without `app_secret`, does not authenticate during
+`__aenter__`. The client sends `token` as the session cookie, so
+it must be an app token or a session the Gateway issued: a sign-in link
+(`kirocrew token`) is refused there until it is traded for a session with one
 `GET /api/status?token=<link>` (redirects off; keep the `mc_token_<port>`
 `Set-Cookie` value).
 
@@ -2986,7 +3119,7 @@ await mc.send_message("slot-1", "hello")
 
 The standalone package exports `KiroCrewClient`, `KiroCrewError`, `ErrorCode`,
 `WsClient`, `WsEvent` and `GATEWAY_CONFIG_KEYS`. It does not export
-`AppManifest`, `AppLifecycle`, `GatewayManager` or proxy-auth helpers. Validate
+`AppManifest`, `AppLifecycleSDK`, `GatewayManager` or proxy-auth helpers. Validate
 manifests through the main package's install path, manage the Gateway with the `kirocrew` CLI, and use
 `kiro_crew.apps.proxy_auth` only from a backend that can import the main package.
 
@@ -3018,6 +3151,33 @@ try:
 except KiroCrewError as e:
     print(e.code, str(e), e.status)
 ```
+
+### Permission refusals
+
+An app token may call its own namespace (`/apps/<name>/...` and
+`/api/apps/<name>/...`), `/api/ws`, `/api/notifications/push`, and the `/api/`
+paths its approved `permissions.api` entries cover. Any other `/api/` path answers
+403 with a body that names the cause and the fix, so `str(e)` is enough to act on:
+
+| `code` | Cause | Fix |
+|--------|-------|-----|
+| `app_disabled` | The app is turned off, or was uninstalled, while its token is still valid. None of its entries apply. | The owner opens the app's page (`/apps/detail/<name>`) and clicks **Enable**. |
+| `app_permission_not_approved` | The installed version declares an entry that covers the path, but the owner has not approved it yet. An update that adds an entry leaves it this way. | The owner opens the app's page (`/apps/detail/<name>`) and clicks **Approve new permissions**. The call works within 30 seconds of the approval. |
+| `app_permission_not_declared` | No entry in the installed `app.json` covers the path. | Add the path, or a pattern covering it, to `permissions.api`, install that version (`kirocrew app update <name>`, or register the new manifest again for an app that registers itself), then have the owner approve the new entry. |
+| `app_permission_unavailable` | The app's permissions could not be read, or an update of the app is in progress. | Retry. If it persists, check the app with `kirocrew app info <name>`. |
+
+```json
+{
+  "error": "App \"Ledger Lens\" cannot call /api/memory/search yet. Its installed version asks for the new API permission \"/api/memory/*\", which the dashboard owner has not approved. To fix this, the dashboard owner opens the app's page (Apps, Library, then Details on Ledger Lens, or /apps/detail/ledger-lens) and clicks \"Approve new permissions\". ...",
+  "code": "app_permission_not_approved",
+  "pending_approval": ["/api/memory/*"]
+}
+```
+
+`pending_approval` lists the held-back entries that cover the path and is empty
+for the other two codes. A route can also refuse an app token for its own reasons
+after this check passes, for example `403 owner_only`; a `permissions.api` entry
+does not change those.
 
 ---
 
@@ -3067,14 +3227,14 @@ dashboard, app, or internal credential; a bare `curl` request is not authenticat
 | POST | `/api/apps/registry/install-stream` | Install from registry with an SSE progress stream (owner only) |
 | GET | `/api/apps/{name}` | Get app details, including cached `update` state |
 | GET | `/api/apps/{name}/manifest` | Get app manifest |
-| GET/PUT | `/api/apps/{name}/config` | Read/write app config (PUT from a dashboard subject: owner only) |
+| GET/PUT | `/api/apps/{name}/config` | Read/write app config (PUT from a dashboard subject: owner only). A GET carries the file's `ETag`, and a PUT with `If-Match` is written only while the file still has that tag, else 412 `config_changed` |
 | POST | `/api/apps/{name}/update` | Update installed app (owner only) |
 | POST | `/api/apps/{name}/uninstall` | Uninstall app (owner only) |
 | POST | `/api/apps/{name}/enable` | Enable app (owner only) |
 | POST | `/api/apps/{name}/disable` | Disable app (owner only) |
 | POST | `/api/apps/{name}/dev` | Toggle dev mode (live reload) — body `{"enabled": bool}` |
 | POST | `/api/apps/{name}/open` | Launch app via openCommand (owner only) |
-| GET | `/apps/{name}/ui/{path}` | Serve app UI bundle files |
+| GET | `/apps/{name}/ui/{path}` | Serve app UI bundle files. `{path}` is a forward-slash relative path: one holding `..`, a backslash or a colon, or starting with `/`, answers 400 `invalid path` before any file-system call |
 | * | `/apps/{name}/api/{path}` | Reverse proxy to app backend (HMAC-signed). An ordinary response is bounded at 30s total. A `text/event-stream` response has no total, but must emit an event or a `:` comment at least every 60s, or it is cut |
 
 "Owner only" routes answer 403 `owner_only` to a dashboard subject that is not
@@ -3378,7 +3538,8 @@ Security and lifecycle:
   app's folder. An app installed before this keeps working once its secret is handed over
   again: the old `.app_secret` file is never accepted, the next backend start stores a NEW
   secret and passes it here, and a self-managed app gets one in the response of its next
-  registration. A backend left running across the upgrade has no secret until it restarts.
+  registration (pass it to the Python client as `app_secret=`). A backend left running
+  across the upgrade has no secret until it restarts.
 - A backend that runs in the gateway process (`backend.hooks`, no `entryPoint`) gets no
   secret and needs none: [`ctx.app_token()`](#app-token-ctxapp_token) returns its app
   token and `ctx.gateway_origin()` the origin to call. The first load of its hooks after the upgrade stores a new secret and removes

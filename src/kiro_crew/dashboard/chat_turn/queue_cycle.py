@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from kiro_crew.dashboard.chat_utils import SYNTHESIS_HELD, SYNTHESIS_UNKNOWN
 from kiro_crew.dashboard.slot_queue_repository import RESTORED_QUEUE_KEY, RESTORED_SEND_CHOSEN_KEY
 from kiro_crew.dashboard.state import SUBAGENT_FINAL_COMPLETION_NOTE, SUBAGENT_SYNTHESIS_PROMPT
+from kiro_crew.messaging.driver import strip_steering_markers
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
@@ -567,8 +568,19 @@ async def _hand_off_queue(
 
     # Whatever comes next is not the work-ledger watch's turn, whether or not it bound.
     trace_work.end_patrol_turn()
+    # Close steer admission for this turn before the hand-off's first await, held
+    # steers or not: a peer steer sent while the hand-off awaits takes the queue.
+    slot._deferred_steer_ended_gen = slot._turn_generation
+    # Steers still held for a tool boundary this turn never reached join the queue
+    # first, so the drain below starts the next turn on them in this same call.
+    if slot._deferred_steers:
+        from kiro_crew.dashboard import deferred_steer
+
+        await deferred_steer.requeue_all(state, slot)
     # Steers outrank queued messages, so they go to the head before the drain.
     _requeue_unconsumed_steers(state, slot)
+    slot._deferred_steer_delivered.clear()
+    slot._deferred_steer_injected.clear()
     if drain and slot._queue:
         # A user message drained at a turn's end ends an armed synthesis's
         # batch only when no child of it is still out (running, delivering,
@@ -1059,7 +1071,8 @@ async def _turn_record_outcome(turn: _ChatTurn) -> None:
             "reply_flushed": turn._turn_flushed_visible_text,
             "nudge_turn": _directive_self_wake and turn._turn_landed,
         },
-        quiet_end=turn._terminal_directive_applied and not _turn_full_reply_text(turn)[0].strip(),
+        quiet_end=turn._terminal_directive_applied
+        and not strip_steering_markers(_turn_full_reply_text(turn)[0]).strip(),
     )
     # Every turn end rewrites this, so it describes the newest turn: one that
     # took the arming result and ended successfully on reply text written

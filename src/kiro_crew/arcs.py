@@ -21,7 +21,7 @@ from typing import Any, Iterator
 
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import data_home
-from kiro_crew.platform_compat import release_lock, try_acquire_lock
+from kiro_crew.platform_compat import open_create_or_existing, release_lock, try_acquire_lock
 from kiro_crew.session_ledger import ledger_key
 
 KINDS = ("CLAIM", "FACT", "FAIL", "ASK", "DONE")
@@ -86,7 +86,7 @@ def _arc_dir(arc_id: str) -> Path:
 def _locked(dir_path: Path) -> Iterator[None]:
     if not dir_path.is_dir():
         raise ArcNotFound(f"arc {dir_path.name!r} was not found")
-    fd = os.open(str(dir_path / ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    fd = open_create_or_existing(dir_path / ".lock", os.O_RDWR)
     try:
         deadline = time.monotonic() + _LOCK_TIMEOUT_SECS
         while not try_acquire_lock(fd, exclusive=True):

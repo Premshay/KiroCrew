@@ -134,11 +134,11 @@ def _review_settings_lock():
     """Serialize config read-modify-write across gateway workers and processes."""
     lock_path = store.data_dir() / "review-settings.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with _SETTINGS_LOCK:
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-        try:
-            from kiro_crew import platform_compat
+    from kiro_crew import platform_compat
 
+    with _SETTINGS_LOCK:
+        fd = platform_compat.open_create_or_existing(lock_path, os.O_RDWR)
+        try:
             with platform_compat.file_lock(fd, exclusive=True):
                 yield
         finally:

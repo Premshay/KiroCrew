@@ -25,7 +25,7 @@ from typing import Any, Callable, Iterator
 from kiro_crew import session_ledger
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import data_home
-from kiro_crew.platform_compat import release_lock, try_acquire_lock
+from kiro_crew.platform_compat import open_create_or_existing, release_lock, try_acquire_lock
 from kiro_crew.session_ledger import ledger_key
 
 SCHEMA_VERSION = 1
@@ -200,7 +200,7 @@ def _archive_dir(dir_path: Path) -> Path:
 def _locked(dir_path: Path) -> Iterator[None]:
     """Acquire one coordinator's lock with a bounded wait."""
     dir_path.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(dir_path / _LOCK_FILE), os.O_CREAT | os.O_RDWR, 0o600)
+    fd = open_create_or_existing(dir_path / _LOCK_FILE, os.O_RDWR)
     try:
         deadline = time.monotonic() + _LOCK_TIMEOUT_SECS
         while not try_acquire_lock(fd, exclusive=True):
