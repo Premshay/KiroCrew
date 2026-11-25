@@ -57,6 +57,43 @@ async def _session_new_options(client: AcpClient, tmp_path: Path, monkeypatch) -
             {"Read", "Glob", "ToolSearch", *CLAUDE_WORKER_BUILTINS_BY_KIRO_TOOL["execute_bash"]},
         ),
         (["read", "use_subagent"], {"Read", "Grep", "Glob", "Task", "Agent", "ToolSearch"}),
+        (
+            ["fs_read", "claude_artifact", "claude_design_sync"],
+            {
+                "Read",
+                "Glob",
+                "Artifact",
+                "ArtifactComments",
+                "ArtifactData",
+                "DesignSync",
+                "ToolSearch",
+            },
+        ),
+        (["claude_design_sync"], {"DesignSync", "ToolSearch"}),
+        (
+            [*CLAUDE_WORKER_BUILTINS_BY_KIRO_TOOL, "claude_artifact"],
+            {
+                "Read",
+                "Glob",
+                "Grep",
+                "WebFetch",
+                "WebSearch",
+                "Task",
+                "Agent",
+                "Write",
+                "Edit",
+                "MultiEdit",
+                "NotebookEdit",
+                "Bash",
+                "Monitor",
+                "PowerShell",
+                "TaskStop",
+                "Artifact",
+                "ArtifactComments",
+                "ArtifactData",
+                "ToolSearch",
+            },
+        ),
         (["use_aws", "@kirocrew-core"], {"ToolSearch"}),
     ],
 )
@@ -105,7 +142,12 @@ async def test_a_list_that_limits_nothing_keeps_the_whole_preset(
 
 @pytest.mark.parametrize("backend", sorted(set(MIRRORS) - {ACP_BACKEND_CLAUDE}))
 def test_no_other_backend_projects_built_ins(agents_dir, backend):
-    _write_spec(agents_dir, servers={}, tools=["read"], name="probe")
+    _write_spec(
+        agents_dir,
+        servers={},
+        tools=["read", "claude_artifact", "claude_design_sync"],
+        name="probe",
+    )
     mirror = mirror_for(backend)
     assert mirror is not None
     projection = mirror.session_projection("probe", permission_surface_owned=True)
