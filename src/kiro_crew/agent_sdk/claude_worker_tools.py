@@ -100,6 +100,12 @@ def claude_worker_builtin_tools(excluded: Iterable[str]) -> tuple[str, ...] | No
 #: ``fs_read`` also lists a directory, which claude's ``Read`` cannot.
 _AGENT_GRANT_EXTRAS: dict[str, tuple[str, ...]] = {"fs_read": ("Glob",)}
 
+# A bare tool name cannot select an MCP server named "builtin".
+_AGENT_CLAUDE_GRANTS: dict[str, tuple[str, ...]] = {
+    "claude_artifact": ("Artifact", "ArtifactComments", "ArtifactData"),
+    "claude_design_sync": ("DesignSync",),
+}
+
 
 def claude_agent_builtin_tools(tools: object) -> tuple[str, ...] | None:
     """The claude built-ins a named agent whose spec ``tools`` is *tools* keeps, or ``None``.
@@ -107,15 +113,18 @@ def claude_agent_builtin_tools(tools: object) -> tuple[str, ...] | None:
     ``None`` when the value limits no built-in: a missing or non-list value, ``[]``
     (the zero-tool session, which keeps none), a list with no string entry, one
     with an entry that grants every built-in (``*``, ``@builtin``, ``@builtin/``,
-    ``@builtin/*``), or one that grants every row. Otherwise every listed built-in
-    of the rows the list grants, then :data:`CLAUDE_WORKER_KEPT_BUILTINS`. An entry
-    no row covers (``@server``, ``use_aws``) grants no built-in.
+    ``@builtin/*``), or one that grants every Kiro row without any Claude grant.
+    Otherwise return the built-ins selected by the Kiro rows and explicit Claude
+    grants, then :data:`CLAUDE_WORKER_KEPT_BUILTINS`.
     """
     entries = [t.strip() for t in tools if isinstance(t, str)] if isinstance(tools, list) else []
     if not entries or any(t == "*" or t in _ALL_BUILTINS_REFS for t in entries):
         return None
     granted = {row for entry in entries for row in excluded_builtin_rows(entry)}
-    if granted >= CLAUDE_WORKER_BUILTINS_BY_KIRO_TOOL.keys():
+    explicit = tuple(
+        tool for ref, names in _AGENT_CLAUDE_GRANTS.items() if ref in entries for tool in names
+    )
+    if not explicit and granted >= CLAUDE_WORKER_BUILTINS_BY_KIRO_TOOL.keys():
         return None
     kept = (
         tool
@@ -123,4 +132,4 @@ def claude_agent_builtin_tools(tools: object) -> tuple[str, ...] | None:
         if row in granted
         for tool in (*row_tools, *_AGENT_GRANT_EXTRAS.get(row, ()))
     )
-    return tuple(dict.fromkeys((*kept, *CLAUDE_WORKER_KEPT_BUILTINS)))
+    return tuple(dict.fromkeys((*kept, *explicit, *CLAUDE_WORKER_KEPT_BUILTINS)))
