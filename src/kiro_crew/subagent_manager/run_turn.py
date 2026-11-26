@@ -1440,7 +1440,16 @@ async def _run_inner_impl(
             # Diagnostic pointer is written for BOTH origins — orphan
             # recovery must see child activity too; only the turn
             # increment is parent-scoped.
-            info.last_tool = event.title or ""
+            # The name the card shows. A harness whose permission request names
+            # only the call id (dsh sends ``toolCall: {toolCallId}``, so the
+            # event's title is ``unknown``) keeps the name its own ``tool_call``
+            # frame put on the card for the same id, instead of overwriting the
+            # row with ``unknown``. Display only: the approval ladder judges
+            # ``event`` itself, title included, exactly as before.
+            _card_title = event.title or ""
+            if _card_title in ("", "unknown") and event.tool_call_id:
+                _card_title = _pending_tools.get(event.tool_call_id, "") or _card_title
+            info.last_tool = _card_title
             info.last_tool_call_id = event.tool_call_id or ""
             self._manager._note_tool_dispatch(info, event, _harness, _harness_servers())
             _card_titles.note_call(event)
@@ -1451,7 +1460,7 @@ async def _run_inner_impl(
             # cancellation lands.
             try:
                 await self._manager._write_state_off_loop(
-                    info, "diagnostics", turns=turns, last_tool=event.title or ""
+                    info, "diagnostics", turns=turns, last_tool=_card_title
                 )
             except Exception:
                 # Diagnostics only: a failed write must not stop the tool event.
@@ -1460,7 +1469,7 @@ async def _run_inner_impl(
                 "subagent_tool",
                 info,
                 {
-                    "tool": _redact(event.title or ""),
+                    "tool": _redact(_card_title),
                     "tool_kind": event.tool_kind,
                     "turns": info.turns,
                     "tool_count": info.tool_count,
