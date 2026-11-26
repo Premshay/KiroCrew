@@ -106,6 +106,23 @@ if TYPE_CHECKING:
     )
 
 
+def _permission_display_title(turn: _ChatTurn, event) -> str:
+    """The name the approval card and its rows show for *event*.
+
+    The event's own title, unless the request named none (``""`` or the parser's
+    ``unknown`` sentinel): then the name the call's own ``tool_call`` row stated
+    for the same id, which the turn keeps in ``_pending_tools``. Never fed back
+    into ``event``: this is presentation, and every decision reads the event.
+    """
+    title = event.title or ""
+    if title not in ("", "unknown"):
+        return title
+    call_id = getattr(event, "tool_call_id", "") or ""
+    pending = getattr(turn, "_pending_tools", None) or {}
+    stated = pending.get(call_id, "") if call_id else ""
+    return stated or title
+
+
 async def _on_permission_prompt(
     turn: _ChatTurn, event
 ) -> Literal[_Flow.BREAK, _Flow.CONTINUE] | None:
@@ -121,9 +138,15 @@ async def _on_permission_prompt(
     session_key = turn.session_key
     slot = turn.slot
     state = turn.state
+    # The name every card, row and audit line below shows. dsh asks with a
+    # permission request naming only the call id, so its event title is
+    # ``unknown``; the turn's own ``tool_call`` row already holds the name for
+    # that id (``_pending_tools``). Presentation only: ``event`` is passed on
+    # unchanged, so the gate, the trust tiers and every grant read what they did.
+    _shown_title = _permission_display_title(turn, event)
     # The title is model-written and can carry a secret the log filter's narrow
     # patterns miss, so every log line below uses this redacted copy.
-    _log_title = _redact_display_text(event.title or "")
+    _log_title = _redact_display_text(_shown_title)
     # Auto-reject remaining tools after one rejection in a batch
     if getattr(slot, "_batch_rejected", False):
         _cascade_offer = getattr(turn, "_deny_override", None)
@@ -133,7 +156,7 @@ async def _on_permission_prompt(
             # never the cascade's "User denied" (rfc-deny-session-override.md).
             await _refuse_overridden_call(turn, event, _cascade_offer.reason, why="batch_rejection")
             return _Flow.CONTINUE
-        _title = _redact_display_text(event.title)
+        _title = _redact_display_text(_shown_title)
         _cascade_cause = getattr(slot, "_batch_rejected_cause", "")
         # Audit FIRST, before any wire I/O for this decision (see
         # _reject_hook_blocked): a stalled ACP reader cancels this
@@ -255,7 +278,7 @@ async def _on_permission_prompt(
     # scope therefore comes only from the canonical command in
     # ``tool_input``.  Redaction-changing values are displayed but
     # are not grantable: a user cannot consent to hidden bytes.
-    _safe_title, _ = redact_exfiltration_urls(event.title)
+    _safe_title, _ = redact_exfiltration_urls(_shown_title)
     _safe_title, _ = redact_credentials(_safe_title)
     perm_meta["tool_title"] = _safe_title
     perm_meta["is_shell"] = "1" if event.is_shell else ""
@@ -506,7 +529,7 @@ async def _on_permission_prompt(
                 _approval_thread,
                 event.request_id,
                 session_key,
-                (f"{_child_lf_warning}{event.title}" if _child_lf_warning else event.title),
+                (f"{_child_lf_warning}{_shown_title}" if _child_lf_warning else _shown_title),
                 event.tool_input or "",
                 # The identity as the event carries it: the Slack card names the
                 # server only when the flag proves the pair.
@@ -593,7 +616,7 @@ async def _on_permission_prompt(
             session_key,
             event.request_id,
             # The same title the linked card carries, warning included.
-            (f"{_child_lf_warning}{event.title}" if _child_lf_warning else event.title),
+            (f"{_child_lf_warning}{_shown_title}" if _child_lf_warning else _shown_title),
             event.tool_input or "",
             fut,
             perm_meta=perm_meta,
@@ -1128,7 +1151,7 @@ async def _on_permission_prompt(
                 # Written only once the transport took the approval: the line says
                 # a call ran with a security rule stepped aside.
                 _note_override_used(slot, _override_offer)
-            _approved_title = _redact_display_text(event.title)
+            _approved_title = _redact_display_text(_shown_title)
             slot.append(
                 "tool",
                 tool_row("approved", _approved_title),
@@ -1164,7 +1187,7 @@ async def _on_permission_prompt(
         if _safety_reason:
             _safety_reason, _ = redact_exfiltration_urls(_safety_reason)
             _safety_reason, _ = redact_credentials(_safety_reason)
-        _safe_reject_title, _ = redact_exfiltration_urls(event.title)
+        _safe_reject_title, _ = redact_exfiltration_urls(_shown_title)
         _safe_reject_title, _ = redact_credentials(_safe_reject_title)
         # Audit FIRST, before the rejection goes on the wire (see
         # _reject_hook_blocked): a stalled ACP reader cancels this
