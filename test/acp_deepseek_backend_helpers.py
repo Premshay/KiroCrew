@@ -91,7 +91,7 @@ class _DeepseekLaunchRig:
             _record("seal")
             return self.SEALED
 
-        def _patch(extension_path):
+        def _patch(extension_path, *_a):
             _record("patch", extension_path)
             return self.PATCH
 

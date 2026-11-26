@@ -928,6 +928,43 @@ def test_the_patch_pins_the_tool_presentation_to_native() -> None:
     assert "mode: native" in body
 
 
+def test_dsh_022_pins_the_native_executor_instead_of_the_removed_mode() -> None:
+    """dsh-tools 0.2.2 made ``mode`` ``z.never()``: the row would fail dsh's boot.
+
+    From 0.2.2 the patch keeps the stock native executor mounted and the PTC
+    executor (the ``run_code`` transport) disabled, and never writes ``tools.mode``.
+    """
+    from kiro_crew.acp import client as client_module
+
+    sealed = client_module._seal_deepseek_gate_extension()
+    body = open(
+        client_module._write_deepseek_gate_patch(sealed, "0.2.2-rc.1"), encoding="utf-8"
+    ).read()
+    assert "mode: native" not in body
+    assert "id: tools\n" not in body
+    assert "- id: tool-executor-native\n  name: '@deepseek-ai/dsh-tool-executor-native'\n  disabled: false\n" in body
+    assert "- id: tool-executor-ptc\n  name: '@deepseek-ai/dsh-tool-executor-ptc'\n  disabled: true\n" in body
+
+
+@pytest.mark.parametrize(
+    ("version", "executor"),
+    [
+        ("", False),
+        ("unknown", False),
+        ("0.2.0-rc.2", False),
+        ("0.2.1-rc.5", False),
+        ("0.2.2-alpha.2", True),
+        ("0.2.2-rc.1", True),
+        ("0.2.3-alpha.2", True),
+        ("0.3.0", True),
+    ],
+)
+def test_executor_rows_start_at_dsh_022(version: str, executor: bool) -> None:
+    from kiro_crew.acp.harness import deepseek
+
+    assert deepseek._dsh_selects_executor(version) is executor
+
+
 def test_the_patch_reasserts_the_approval_service_and_acp_bridge() -> None:
     """The final overlay repairs mutable row fields and read-back catches replacements.
 
@@ -1017,7 +1054,7 @@ def _deepseek_readback_spawn(tmp_path, monkeypatch, *, readback):
         deepseek_mod, "_seal_deepseek_gate_extension", lambda: str(tmp_path / "sealed.mjs")
     )
     monkeypatch.setattr(
-        deepseek_mod, "_write_deepseek_gate_patch", lambda _ext: str(tmp_path / "patch.json")
+        deepseek_mod, "_write_deepseek_gate_patch", lambda _ext, *_a: str(tmp_path / "patch.json")
     )
 
     # The probe's wrap answers; the real child's wrap is where this spawn stops.

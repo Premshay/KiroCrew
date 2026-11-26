@@ -126,7 +126,20 @@ function approvalRouting(ctx) {
  */
 function toolsSnapshot(ctx) {
   const mode = ctx.tools?.defaultMode;
-  return { mode: typeof mode === "string" ? mode : null };
+  if (typeof mode === "string") return { mode };
+  // dsh 0.2.2 removed `tools.mode`: the presentation is whichever executor plugin
+  // mounted at the root scope (`tools.setExecutor`). Read that executor back and
+  // name it; anything but the stock native executor reports its own class name,
+  // which Kiro Crew refuses just as it refuses a non-native mode.
+  try {
+    const executor = ctx.tools?.selectExecutor?.();
+    const kind = executor?.constructor?.name;
+    if (kind === "NativeToolExecutor") return { mode: "native" };
+    if (typeof kind === "string" && kind) return { mode: `executor:${kind}` };
+  } catch {
+    // No executor selected (or the API is absent): unknown, refused below.
+  }
+  return { mode: null };
 }
 
 /**

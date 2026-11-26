@@ -115,7 +115,7 @@ _DSH_GATE_MARKER_MAX_BYTES = 64 * 1024
 # Same seal, same reason, for the DeepSeek Harness gate plugin. Pinned by
 # ``test_acp_deepseek_backend``, so editing the plugin is a deliberate two-file
 # edit.
-DEEPSEEK_GATE_EXTENSION_SHA256 = "6a9ac9cf23ed7478ec61125840a8aa278690a7021a3b18f29c53681f6cd71ce7"
+DEEPSEEK_GATE_EXTENSION_SHA256 = "35eed81b681c75e412f6805df38db5c0e7eab8bfb8145a32168d95f49eecb6c5"
 
 # ── deepseek (ACP_BACKEND_DEEPSEEK) ──
 # DeepSeek Harness is a plugin host, and ACP is one of the profiles it boots. So the
@@ -260,7 +260,39 @@ def _seal_deepseek_gate_extension() -> str:
     )
 
 
-def _write_deepseek_gate_patch(sealed_extension: str) -> str:
+#: The pre-0.2.2 presentation pin: ``tools.mode`` selects native tool schemas.
+_DSH_MODE_ROW = "- id: tools\n  config:\n    mode: native\n"
+
+#: The 0.2.2+ presentation pin. dsh-tools 0.2.2 removed ``mode`` (its schema is
+#: ``z.never()``: "Mount a native or PTC tool executor instead"), so the same
+#: security guarantee is made by keeping the stock native executor mounted and the
+#: PTC executor -- the ``run_code`` transport the gate cannot read into -- disabled.
+#: The ``name`` fields are the same match guard as the approval and acp rows.
+_DSH_EXECUTOR_ROWS = (
+    "- id: tool-executor-native\n"
+    "  name: '@deepseek-ai/dsh-tool-executor-native'\n"
+    "  disabled: false\n"
+    "- id: tool-executor-ptc\n"
+    "  name: '@deepseek-ai/dsh-tool-executor-ptc'\n"
+    "  disabled: true\n"
+)
+
+
+def _dsh_selects_executor(version: str) -> bool:
+    """Whether dsh *version* selects its tool presentation by executor plugin.
+
+    True from 0.2.2 (prereleases included), where ``tools.mode`` was removed;
+    False for older releases and for an unread version (``""``), which keeps the
+    long-tested ``tools.mode`` row. Either way the gate's own marker reports the
+    presentation it observed and the read-back refuses anything but native.
+    """
+    match = re.match(r"^\s*v?(\d+)\.(\d+)\.(\d+)", version or "")
+    if not match:
+        return False
+    return tuple(int(part) for part in match.groups()) >= (0, 2, 2)
+
+
+def _write_deepseek_gate_patch(sealed_extension: str, dsh_version: str = "") -> str:
     """Write the per-launch patch that composes *sealed_extension*, and return its path.
 
     Four rows in the same owner-only gate artifact directory the sealed plugin lives
@@ -297,8 +329,8 @@ def _write_deepseek_gate_patch(sealed_extension: str) -> str:
     artifact_dir = pi_mod._pi_gate_artifact_dir()
     body = (
         f"- insert:\n    - id: kiro-crew-tool-gate\n      name: {json.dumps(sealed_extension)}\n"
-        "- id: tools\n  config:\n    mode: native\n"
-        "- id: approval\n"
+        + (_DSH_EXECUTOR_ROWS if _dsh_selects_executor(dsh_version) else _DSH_MODE_ROW)
+        + "- id: approval\n"
         "  name: '@deepseek-ai/dsh-user-approval'\n"
         "  disabled: false\n"
         "  config:\n"
@@ -746,7 +778,11 @@ class DeepseekLaunch(ProcessAdapter):
         # names no marker path, and the plugin skips the write when none is named.
         # Off-loop: file reads and writes.
         extension_path = await asyncio.to_thread(_seal_deepseek_gate_extension)
-        gate_patch = await asyncio.to_thread(_write_deepseek_gate_patch, extension_path)
+        gate_patch = await asyncio.to_thread(
+            _write_deepseek_gate_patch,
+            extension_path,
+            session.harness_installed_version or "",
+        )
         self._nonce = uuid.uuid4().hex
         # The nonce the permission-frame tripwire keys on, recorded on the session
         # whose frames it judges.
