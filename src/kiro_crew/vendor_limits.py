@@ -223,17 +223,33 @@ def note_usage_meta(update: object) -> None:
 # ---------------------------------------------------------------------------
 
 
+def is_claude_overage_window(window: object) -> bool:
+    """Whether *window* is an overage bucket, not a base subscription window.
+
+    ``seven_day_overage_included: rejected`` says no extra paid usage is left; the
+    base window beside it can still allow requests. Only base windows judge out.
+    """
+    return isinstance(window, str) and "overage" in window
+
+
+def _base_windows(windows: Mapping[str, Any]) -> dict[str, Any]:
+    return {w: r for w, r in windows.items() if not is_claude_overage_window(w)}
+
+
 def claude_quota() -> dict[str, Any]:
-    """Claude's readings in the normalized shape: every account's windows as kept."""
+    """Claude's readings in the normalized shape: every account's base windows as kept.
+
+    Overage buckets stay in the store but are left out here (:func:`is_claude_overage_window`).
+    """
     with _lock:
         store = _load()
         accounts: dict[str, Any] = {}
         default = store.get("claude")
-        if isinstance(default, dict) and default:
-            accounts[DEFAULT_ACCOUNT] = {"windows": json.loads(json.dumps(default))}
+        if isinstance(default, dict) and _base_windows(default):
+            accounts[DEFAULT_ACCOUNT] = {"windows": json.loads(json.dumps(_base_windows(default)))}
         for acct, windows in ((store.get(ACCOUNTS_KEY) or {}).get("claude") or {}).items():
-            if isinstance(windows, dict) and windows:
-                accounts[str(acct)] = {"windows": json.loads(json.dumps(windows))}
+            if isinstance(windows, dict) and _base_windows(windows):
+                accounts[str(acct)] = {"windows": json.loads(json.dumps(_base_windows(windows)))}
     return {"source": "claude_rate_limit_event", "accounts": accounts} if accounts else {}
 
 
