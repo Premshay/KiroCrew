@@ -232,8 +232,74 @@ def is_claude_overage_window(window: object) -> bool:
     return isinstance(window, str) and "overage" in window
 
 
+#: Claude model families that can hold a weekly window of their own
+#: (``seven_day_opus``, ``seven_day_sonnet``, ``seven_day_fable`` ...).
+CLAUDE_MODEL_FAMILIES = ("fable", "opus", "sonnet", "haiku")
+
+
+def claude_window_family(window: object) -> str:
+    """The model family a Claude window holds (``seven_day_fable`` -> ``fable``); ``""`` = whole account."""
+    if not isinstance(window, str) or is_claude_overage_window(window):
+        return ""
+    for family in CLAUDE_MODEL_FAMILIES:
+        if window.endswith("_" + family):
+            return family
+    return ""
+
+
+def claude_model_family(model: object) -> str:
+    """The family of a Claude model id (``fable``, ``claude-opus-5-5`` -> ``opus``); ``""`` = unknown."""
+    m = model.lower() if isinstance(model, str) else ""
+    return next((f for f in CLAUDE_MODEL_FAMILIES if f in m), "")
+
+
 def _base_windows(windows: Mapping[str, Any]) -> dict[str, Any]:
-    return {w: r for w, r in windows.items() if not is_claude_overage_window(w)}
+    """The windows that hold the whole account: no overage bucket, no model window."""
+    return {
+        w: r
+        for w, r in windows.items()
+        if not is_claude_overage_window(w) and not claude_window_family(w)
+    }
+
+
+def claude_model_outs(now: float | None = None) -> dict[str, dict[str, Any]]:
+    """Claude model families out on their own window: ``{family: {until, window, status}}``. Never raises.
+
+    A refused ``seven_day_fable`` stops Fable only; Opus, Sonnet and Haiku still
+    run on the account's base windows. A family is out only when every account
+    that has read that family's window has it out, and only until its reset.
+    """
+    try:
+        now = float(time.time() if now is None else now)
+        rule_set = qr.rules()
+        with _lock:
+            store = _load()
+            tables = [store.get("claude")]
+            tables += list(((store.get(ACCOUNTS_KEY) or {}).get("claude") or {}).values())
+            tables = [json.loads(json.dumps(t)) for t in tables if isinstance(t, dict)]
+        seen: dict[str, int] = {}
+        outs: dict[str, list[dict[str, Any]]] = {}
+        for windows in tables:
+            for window, reading in windows.items():
+                family = claude_window_family(window)
+                if not family or not isinstance(reading, dict):
+                    continue
+                resets = _finite(reading.get("resets_at"))
+                if resets is not None and resets <= now:
+                    continue
+                seen[family] = seen.get(family, 0) + 1
+                if resets is not None and rule_set.reading_out(reading):
+                    outs.setdefault(family, []).append(
+                        {"until": resets, "window": window, "status": reading.get("status")}
+                    )
+        return {
+            f: min(rows, key=lambda r: r["until"])
+            for f, rows in outs.items()
+            if len(rows) == seen.get(f)
+        }
+    except Exception:
+        logger.debug("vendor_limits: claude model outs unreadable", exc_info=True)
+        return {}
 
 
 def claude_quota() -> dict[str, Any]:
@@ -621,6 +687,16 @@ def quota_out(
     """
     try:
         now = time.time() if now is None else now
+        if vendor == "claude" and model:
+            family_out = claude_model_outs(now).get(claude_model_family(model))
+            if family_out:
+                return {
+                    "until": family_out["until"],
+                    "as_of": now,
+                    "model": model,
+                    "detail": f"rate_limit_event {family_out['window']} {family_out['status']}",
+                    "account": account or DEFAULT_ACCOUNT,
+                }
         whole, per_model, accounts = _covering(vendor, now)
         found: list[dict[str, Any]] = []
         for acct in [account] if account else sorted(accounts):
@@ -678,6 +754,10 @@ def quota_outs(now: float | None = None) -> dict[str, dict[str, Any]]:
                 out[vendor] = state
     except Exception:
         logger.debug("vendor_limits: quota outs unreadable", exc_info=True)
+    # A Claude model window out reads as that family's model being out, keyed by family.
+    for family, row in claude_model_outs(now).items():
+        models = out.setdefault("claude", {}).setdefault("models", {})
+        models[family] = max(float(models.get(family) or 0), float(row["until"]))
     return out
 
 

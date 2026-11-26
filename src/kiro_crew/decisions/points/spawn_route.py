@@ -801,8 +801,16 @@ def drop_quota_outs(
         mark = outs.get(v) or {}
         if mark.get("until"):
             continue
-        if c.get("model", "") in (mark.get("models") or {}):
+        models = mark.get("models") or {}
+        if c.get("model", "") in models:
             continue
+        # Claude model windows are keyed by family (``fable``), not by model id.
+        if v == "claude" and models:
+            from kiro_crew.vendor_limits import claude_model_family
+
+            family = claude_model_family(c.get("model", ""))
+            if family and family in models:
+                continue
         kept.append(dict(c))
     return kept
 
