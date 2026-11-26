@@ -1249,8 +1249,7 @@ class AcpClient:
         return False, None
 
     def _note_worker_builtin_tools(self, builtin_tools: tuple[str, ...] | None) -> None:
-        """Keep the built-ins a worker's or a named agent's projection allows: this backend has
-        no option that carries them."""
+        """Accept the projection's native-tool denials on backends that carry them."""
 
     def _worker_settings_lag(self, spec: dict[str, Any] | None) -> bool:
         """Whether this worker's settings lack a rule *spec* asks for: they cannot here."""

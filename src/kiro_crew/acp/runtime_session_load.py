@@ -240,7 +240,7 @@ async def load_session(
     session_work_dir = str(await self._session_work_dir(cwd))
     denied_tools: frozenset[tuple[str, str]] = frozenset()
     zero_tools = False
-    builtin_tools: tuple[str, ...] | None = None
+    denied_builtin_tools: tuple[str, ...] | None = None
     mirrored_snapshot: Any = None
     consumed_spec: Any = None
     ref_spec: Any = None
@@ -278,7 +278,7 @@ async def load_session(
         stub_token = mirrored.stub_token
         denied_tools = mirrored.denied_tools
         zero_tools = mirrored.zero_tools
-        builtin_tools = mirrored.builtin_tools
+        denied_builtin_tools = mirrored.denied_builtin_tools
         mirrored_snapshot = mirrored.derived_spec_snapshot
         consumed_spec = mirrored.agent_spec
         ref_spec = mirrored.ref_spec
@@ -530,7 +530,7 @@ async def load_session(
             harness_state,
             wire_servers,
             zero_tools=zero_tools,
-            builtin_tools=builtin_tools,
+            denied_builtin_tools=denied_builtin_tools,
             stub_token=stub_token,
         )
         if meta is not None:

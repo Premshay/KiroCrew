@@ -11,7 +11,7 @@ and a patch of the method on the class or on an instance reaches every caller.
 
 Instance fields written: ``_claude_held_asks``, ``_claude_held_mcp``, ``_claude_inline_settings``,
 ``_claude_local_settings_excluded``, ``_claude_side_read_denies``, ``_claude_tools_withheld_reason``,
-``_claude_worker_builtin_tools``, ``_last_substitution_model``, ``_model``,
+``_claude_denied_builtin_tools``, ``_last_substitution_model``, ``_model``,
 ``_resolved_model_id``, ``_session_mcp_cache``, ``claude_mode_pinned_notice``.
 
 Instance fields read: ``_agent_version``, ``_agent_version_read``, ``_allowed_tools``,
@@ -499,7 +499,7 @@ def _claude_session_needs_options(self: ClaudeAcpClient) -> bool:
         self._claude_session_excludes_local()
         or getattr(self, "_side_read_only", False)
         or getattr(self, "_spec_zero_tools", False)
-        or getattr(self, "_claude_worker_builtin_tools", None) is not None
+        or getattr(self, "_claude_denied_builtin_tools", None) is not None
     )
 
 
@@ -637,8 +637,8 @@ def _claude_session_meta(self: ClaudeAcpClient) -> dict[str, Any]:
     A Bot's worker session (``members.is_crewmate_worker_session``) gets
     ``strictMcpConfig`` too, so a worker runs only the servers its spec grants.
     One whose crewmate file excludes a native tool, and a named agent whose spec
-    ``tools`` list leaves out a built-in, gets ``tools`` limited to the built-ins
-    of the native tools it keeps (``SessionProjection.builtin_tools``).
+    ``tools`` list leaves out a Kiro row, receives those native tool denials in
+    ``disallowedTools`` alongside Claude Code's preset.
 
     A Side Chat session (``side_read_only``) also gets the read-only shape:
     ``tools`` limited to the read built-ins, ``strictMcpConfig``, bypass off,
@@ -760,13 +760,11 @@ def _claude_session_meta(self: ClaudeAcpClient) -> dict[str, Any]:
         carried_settings["permissions"] = carried_permissions
         options["settings"] = carried_settings
         options["allowDangerouslySkipPermissions"] = False
-    worker_tools = getattr(self, "_claude_worker_builtin_tools", None)
-    if worker_tools is not None:
-        # A worker whose crewmate file excludes a native tool, or a named agent
-        # whose spec ``tools`` list leaves one out, keeps only the built-ins of the
-        # native tools it keeps; a narrower list already set (``"tools": []``)
-        # stays as narrow.
-        options["tools"] = [t for t in options.get("tools", worker_tools) if t in worker_tools]
+    denied_builtin_tools = getattr(self, "_claude_denied_builtin_tools", None)
+    if denied_builtin_tools and not getattr(self, "_side_read_only", False):
+        options["disallowedTools"] = list(
+            dict.fromkeys((*options.get("disallowedTools", ()), *denied_builtin_tools))
+        )
     if getattr(self, "_side_read_only", False):
         # A Side Chat session: only the read built-ins exist, so no allow rule
         # in the user's settings can pre-approve a write. No MCP server either
@@ -957,8 +955,8 @@ async def _pin_claude_starting_mode(self: ClaudeAcpClient, resp: dict) -> None:
     A session whose spec declares ``"tools": []`` is stopped below the same
     floor, since its empty ``tools`` option is what removes the built-ins, but
     is not pinned: it mounts no tool, so its mode approves nothing. A crewmate
-    worker whose native-tool excludes narrow ``tools``, or a named agent whose
-    spec ``tools`` list does (``_claude_worker_builtin_tools``), is stopped below
+    worker whose native-tool excludes require denials, or a named agent whose
+    spec ``tools`` list does (``_claude_denied_builtin_tools``), is stopped below
     the floor for the same reason; above it, its mode is handled as any other
     session's.
 
@@ -977,7 +975,7 @@ async def _pin_claude_starting_mode(self: ClaudeAcpClient, resp: dict) -> None:
     side = getattr(self, "_side_read_only", False)
     zero_tools = getattr(self, "_spec_zero_tools", False)
     depends_on_options = excludes_local or side or zero_tools
-    narrowed = getattr(self, "_claude_worker_builtin_tools", None) is not None
+    narrowed = getattr(self, "_claude_denied_builtin_tools", None) is not None
     pin_inherited = not depends_on_options and resolve_cc_pin_inherited_mode()
     if not (depends_on_options or narrowed or pin_inherited):
         return
@@ -1233,9 +1231,8 @@ def _local_settings_exclusion(self: ClaudeAcpClient) -> tuple[bool, dict[str, An
 def _note_worker_builtin_tools(
     self: ClaudeAcpClient, builtin_tools: tuple[str, ...] | None
 ) -> None:
-    """Keep the built-ins a worker's or a named agent's projection allows, carried as
-    claude's ``tools`` option."""
-    self._claude_worker_builtin_tools = builtin_tools
+    """Keep projected native tool denials for Claude's ``disallowedTools`` option."""
+    self._claude_denied_builtin_tools = builtin_tools
 
 
 async def _reassert_adapter_resolved_model(self: ClaudeAcpClient) -> None:

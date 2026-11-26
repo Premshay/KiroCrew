@@ -33,8 +33,8 @@ from kiro_crew.acp_backends import (
     ACP_BACKENDS_MATE_WORKER_NATIVE_TOOL_LIMITS,
 )
 from kiro_crew.agent_sdk.claude_worker_tools import (
-    claude_agent_builtin_tools,
-    claude_worker_builtin_tools,
+    claude_agent_denied_builtin_tools,
+    claude_worker_denied_builtin_tools,
 )
 from kiro_crew.providers.mirrors.base import (
     RESOURCES_NO_READER,
@@ -286,7 +286,7 @@ class ClaudeCodeMirror(AgentConfigMirror):
             in ACP_BACKENDS_MATE_WORKER_NATIVE_TOOL_LIMITS,
             default_crew_servers=self.backend in ACP_BACKENDS_DEFAULT_CREW_SERVERS_IN_ARRAY,
         )
-        builtin_tools = _session_builtin_tools(
+        denied_builtin_tools = _session_denied_builtin_tools(
             agent, projection.agent_spec, str(kwargs.get("session_key") or "")
         )
         if not permission_surface_owned:
@@ -301,7 +301,7 @@ class ClaudeCodeMirror(AgentConfigMirror):
             return SessionProjection(
                 params={"mcpServers": []},
                 zero_tools=projection.zero_tools,
-                builtin_tools=builtin_tools,
+                denied_builtin_tools=denied_builtin_tools,
             )
         out: list[dict[str, Any]] = list(projection.servers)
         for stub in stub_elements:
@@ -330,21 +330,17 @@ class ClaudeCodeMirror(AgentConfigMirror):
             derived_spec_snapshot=projection.derived_spec_snapshot,
             zero_tools=projection.zero_tools,
             agent_spec=projection.agent_spec,
-            builtin_tools=builtin_tools,
+            denied_builtin_tools=denied_builtin_tools,
         )
 
 
-def _session_builtin_tools(
+def _session_denied_builtin_tools(
     agent: str | None, spec: object, session_key: str
 ) -> tuple[str, ...] | None:
-    """The claude built-ins *agent*'s session keeps (``SessionProjection.builtin_tools``).
+    """Deny excluded worker rows or omitted named-agent rows, even on a withheld array.
 
-    A Bot's worker keeps the built-ins of the native tools its file does not
-    exclude. A named agent whose spec Crew does not write keeps the built-ins of
-    the tools its spec ``tools`` lists (``claude_agent_builtin_tools``). Either
-    rides the session's ``tools`` option, which no settings file can widen, so it
-    holds on a withheld array too. ``None`` for every other session, which keeps
-    claude's whole preset (``tools: []`` has its own zero-tool path).
+    Claude runs its own preset with those denials. The zero-tool path handles
+    ``tools: []`` separately.
     """
     from kiro_crew.agent_sdk.spec_builtin_tools import _crew_written_agents
     from kiro_crew.mate_worker import MATE_WORKER_AGENT
@@ -357,7 +353,7 @@ def _session_builtin_tools(
         excluded = spec.get("excludedTools")
         if not isinstance(excluded, list):
             return None
-        return claude_worker_builtin_tools(ref for ref in excluded if isinstance(ref, str))
+        return claude_worker_denied_builtin_tools(ref for ref in excluded if isinstance(ref, str))
     if agent in _crew_written_agents() or is_crewmate_worker_session(session_key):
         return None
-    return claude_agent_builtin_tools(spec.get("tools"))
+    return claude_agent_denied_builtin_tools(spec.get("tools"))

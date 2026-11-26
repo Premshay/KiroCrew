@@ -193,14 +193,12 @@ built from). claude is also in `ACP_BACKENDS_MATE_WORKER_NATIVE_TOOL_LIMITS` (KA
 claude): a native-tool exclude its built-in table covers (`shell`, `fs_write`,
 `@builtin/<tool>`, a tag such as `write`;
 `agent_sdk.claude_worker_tools.CLAUDE_WORKER_BUILTINS_BY_KIRO_TOOL`) rides the session's
-`tools` option as an allow-list of the built-ins of the native tools the worker
-keeps (`claude_worker_builtin_tools`, carried on `SessionProjection.builtin_tools`),
-so a built-in the table does not list is withheld too, and no settings file can
-add one back. The same option carries a named agent's own `tools` list outside a
-Bot: an agent whose spec Crew does not write and whose list leaves out a row keeps
-only the built-ins of the rows it grants (`claude_agent_builtin_tools`, the same
-table read as an include list), so a spec that lists only `read` runs no shell or
-write built-in on claude either. Any other native entry (`use_aws`, a bare `@builtin`), a wildcard, or a
+`disallowedTools` option as the mapped native tools the worker excludes
+(`claude_worker_denied_builtin_tools`, carried on `SessionProjection.denied_builtin_tools`).
+Outside a Bot, a named agent whose spec Crew does not write denies mapped tools
+from omitted rows (`claude_agent_denied_builtin_tools`). A spec that lists only
+`read` denies the mapped shell and file-write tools. Claude Code supplies the
+rest of its preset. Any other native entry (`use_aws`, a bare `@builtin`), a wildcard, or a
 `disabledTools` that is not a list of tool names (`mate_worker.uncarried_tool_limits_of`)
 is still refused. The captures are `claude/worker-tool-limits-live.jsonl`, where each of the
 three MCP limits kept its tools out of the model's list while their siblings asked

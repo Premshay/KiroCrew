@@ -802,7 +802,7 @@ class ClaudeHarness(MembershipHarness):
         mcp_servers: list[dict[str, Any]],
         *,
         zero_tools: bool = False,
-        builtin_tools: tuple[str, ...] | None = None,
+        denied_builtin_tools: tuple[str, ...] | None = None,
         stub_token: str = "",
     ) -> dict[str, Any] | None:
         """The ``_meta.claudeCode`` envelope the per-session client sends, for this session.
@@ -830,7 +830,7 @@ class ClaudeHarness(MembershipHarness):
         # The built-ins the mirror's projection keeps (a Bot worker's excludes, a named
         # agent's ``tools`` list), carried as the envelope's ``tools`` option as on the
         # per-session client.
-        state._note_worker_builtin_tools(builtin_tools)
+        state._note_worker_builtin_tools(denied_builtin_tools)
         # The array this start sends, which the starting-mode pin reads to tell a
         # session carrying Crew's tools from one with none (on the per-session
         # client, ``_begin_session_report`` records it).

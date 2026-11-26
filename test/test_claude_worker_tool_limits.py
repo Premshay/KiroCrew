@@ -417,34 +417,36 @@ def test_the_captured_tools_are_what_crew_derives_for_the_worker(pixel_worker):
         projection = mirror.session_projection(
             MATE_WORKER_AGENT, permission_surface_owned=owned, session_key=KEY
         )
-        assert projection.builtin_tools == (
-            *meta["options"]["tools"],
-            "Artifact",
-            "ArtifactComments",
-            "ArtifactData",
-            "DesignSync",
-        )
+        assert set(projection.denied_builtin_tools or ()) == {
+            "Bash",
+            "Monitor",
+            "PowerShell",
+            "TaskStop",
+            "Write",
+            "Edit",
+            "MultiEdit",
+            "NotebookEdit",
+        }
     # The MCP excludes alone keep claude's whole preset.
     (pixel_worker / "pixel.json").write_text(json.dumps(MATE), encoding="utf-8")
     projection = mirror.session_projection(
         MATE_WORKER_AGENT, permission_surface_owned=True, session_key=KEY
     )
-    assert projection.builtin_tools is None
+    assert projection.denied_builtin_tools is None
 
 
 def test_the_session_options_carry_the_list_and_keep_a_narrower_one(tmp_path, pixel_worker):
-    meta, _ = _native_capture()
     client = AcpClient(
         work_dir=tmp_path, agent=MATE_WORKER_AGENT, acp_backend=ACP_BACKEND_CLAUDE, session_key=KEY
     )
-    client._claude_worker_builtin_tools = tuple(meta["options"]["tools"])
-    assert client._claude_session_meta()["claudeCode"]["options"]["tools"] == (
-        meta["options"]["tools"]
-    )
+    client._claude_denied_builtin_tools = ("Bash", "Write")
+    options = client._claude_session_meta()["claudeCode"]["options"]
+    assert "tools" not in options
+    assert options["disallowedTools"] == ["Bash", "Write"]
     client._spec_zero_tools = True
     assert client._claude_session_meta()["claudeCode"]["options"]["tools"] == []
     client._spec_zero_tools = False
-    client._claude_worker_builtin_tools = None
+    client._claude_denied_builtin_tools = None
     assert "tools" not in client._claude_session_meta()["claudeCode"]["options"]
 
 
@@ -458,7 +460,7 @@ async def test_a_narrowed_worker_needs_an_adapter_that_honours_its_tools_list(
     client = AcpClient(
         work_dir=tmp_path, agent=MATE_WORKER_AGENT, acp_backend=ACP_BACKEND_CLAUDE, session_key=KEY
     )
-    client._claude_worker_builtin_tools = ("Read", "Grep")
+    client._claude_denied_builtin_tools = ("Bash", "Write")
     sent, killed = _pin_harness(client, monkeypatch)
     client._agent_version_read = True
     client._agent_version = version
@@ -486,7 +488,7 @@ async def test_a_narrowed_worker_needs_an_adapter_that_honours_its_tools_list(
     ],
 )
 def test_a_mapped_native_exclude_is_carried_and_withholds_its_built_ins(ref, withheld):
-    from kiro_crew.agent_sdk.claude_worker_tools import claude_worker_builtin_tools
+    from kiro_crew.agent_sdk.claude_worker_tools import claude_worker_denied_builtin_tools
 
     assert mate_worker.uncarried_tool_limits_of({"excludedTools": [ref]}) == (ref.strip(),)
     assert (
@@ -495,8 +497,7 @@ def test_a_mapped_native_exclude_is_carried_and_withholds_its_built_ins(ref, wit
         )
         == ()
     )
-    kept = claude_worker_builtin_tools([ref])
-    assert kept is not None and not set(kept) & withheld and "ToolSearch" in kept
+    assert set(claude_worker_denied_builtin_tools([ref]) or ()) == withheld
 
 
 def test_native_membership_is_positive():

@@ -7,8 +7,7 @@ named here so it is not dropped silently (R-SPEC-1 in
 advertised-model cache, not the live session's list, so the two can disagree for a
 session whose list moved since. The line echoes no spec text.
 
-The spec's ``tools`` list needs no line: the session's ``tools`` option carries it
-(``claude_worker_tools.claude_agent_builtin_tools``).
+The spec's omitted rows travel in the session's ``disallowedTools`` option.
 
 Notice only: nothing here refuses a spawn.
 """

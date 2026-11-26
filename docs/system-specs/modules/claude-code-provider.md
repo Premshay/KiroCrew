@@ -347,16 +347,12 @@ and effort selection, the full `session/request_permission` flow) works. So
   spec Crew does not write (`agent_sdk.spec_builtin_tools._crew_written_agents` is
   the set left out) and that is not a Bot's worker. A non-empty list with no
   entry that grants every built-in (`*`, `@builtin`, `@builtin/`, `@builtin/*`)
-  makes the mirror set `SessionProjection.builtin_tools` to the built-ins of the
-  kiro-cli tools it grants
-  (`agent_sdk.claude_worker_tools.claude_agent_builtin_tools`, the worker's
-  `CLAUDE_WORKER_BUILTINS_BY_KIRO_TOOL` read as an include list, with a granted
-  `fs_read` also keeping `Glob`) plus `ToolSearch`, and the client sends it as
-  `session/new`'s and `session/load`'s `tools` option, on a withheld array too; a
-  session on a shared claude process gets the same option from the runtime's
-  projection (`ClaudeHarness.session_meta`'s `builtin_tools`). An entry no row covers
-  grants no built-in and refuses nothing; a built-in outside the table
-  (`TodoWrite`, `AskUserQuestion`, `Skill`, ...) is withheld. Below the
+  makes the mirror set `SessionProjection.denied_builtin_tools` from the omitted
+  Kiro rows (`claude_agent_denied_builtin_tools`). A granted `fs_read` also
+  keeps `Glob`. The client sends the denials as `disallowedTools` on
+  `session/new` and `session/load`, including shared Claude sessions and sessions
+  with a withheld MCP array. Unmapped native tools such as `Skill` and
+  `ToolSearch` follow Claude Code's preset. Below the
   session-options floor the session is stopped before its first prompt, as a
   narrowed worker is. A list that grants every row, `tools: []` (the tool-less
   session below) and Side Chat keep their own shapes.
@@ -436,10 +432,9 @@ and effort selection, the full `session/request_permission` flow) works. So
   session, not the base on disk by name
   (`session_mcp_crewmate.crewmate_worker_deny_rules`): each `disabledTools` entry,
   each `@server/tool` in its `excludedTools` and each whole `@server`
-  (`mcp__<server>`). A native tool its crewmate file excludes is not a deny rule:
-  the worker's `session/new` options carry `tools` listing only the built-ins of the
-  native tools it keeps (`agent_sdk.claude_worker_tools.claude_worker_builtin_tools`,
-  captured in `claude/worker-native-tool-limits-live.jsonl`); like a zero-tool
+  (`mcp__<server>`). The worker's `session/new` options carry the built-ins mapped
+  to its native tool exclusions in `disallowedTools`
+  (`agent_sdk.claude_worker_tools.claude_worker_denied_builtin_tools`). Like a zero-tool
   session, it is stopped before its first prompt when the adapter that answered the
   handshake is below the session-options floor or reports no version
   (`_pin_claude_starting_mode`). A worker whose file
