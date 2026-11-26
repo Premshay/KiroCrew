@@ -96,6 +96,12 @@ _ENV_DSH_GATE_SCRUB_NAMES = "KIROCREW_DSH_GATE_SCRUB_NAMES"
 
 _DSH_GATE_SCRUB_CANARY_PREFIX = "kirocrew-dsh-gate-scrub-canary-"
 
+# The dsh built-ins this session's spec leaves out (``agent_sdk.dsh_spec_tools``),
+# ``:``-joined and sorted. The gate plugin denies each at ``tools/pre-execute`` and
+# reports the set it read in the load marker, which the read-back compares with
+# what Crew sent. Set on the probe and on the session's child, empty when none.
+_ENV_DSH_DENIED_TOOLS = "KIROCREW_DSH_DENIED_TOOLS"
+
 # One harness boot, bounded like the pi and opencode read-backs; measured at ~3s
 # for this harness, which boots a plugin host rather than a single binary, plus the
 # plugin's own child spawn for the scrub proof (one ``node -e``, well under a second).
@@ -115,7 +121,7 @@ _DSH_GATE_MARKER_MAX_BYTES = 64 * 1024
 # Same seal, same reason, for the DeepSeek Harness gate plugin. Pinned by
 # ``test_acp_deepseek_backend``, so editing the plugin is a deliberate two-file
 # edit.
-DEEPSEEK_GATE_EXTENSION_SHA256 = "e2b8b43c4212e5c8c673bdf910eae611cc69a2f850196c4323105d19b190d9df"
+DEEPSEEK_GATE_EXTENSION_SHA256 = "eab681bd38770a047285dd673aa10014a60dd27776444e05e60427d35340d278"
 
 # ── deepseek (ACP_BACKEND_DEEPSEEK) ──
 # DeepSeek Harness is a plugin host, and ACP is one of the profiles it boots. So the
@@ -197,6 +203,7 @@ _DEEPSEEK_ENV_CREW_OWNED_NAMES = frozenset(
         _ENV_DSH_GATE_MARKER,
         _ENV_DSH_GATE_SESSION,
         _ENV_DSH_GATE_SCRUB_NAMES,
+        _ENV_DSH_DENIED_TOOLS,
         _ENV_DEEPSEEK_PERMISSION_MODE,
         "DSH_HOME",
         "KIRO_API_KEY",
@@ -587,6 +594,7 @@ def _verify_deepseek_gate(
     nonce: str,
     *,
     child_scrub_names: tuple[str, ...] = (),
+    denied_tools: tuple[str, ...] = (),
 ) -> tuple[str, str]:
     """Boot the harness once with the gate composed and read its load marker back.
 
@@ -649,6 +657,7 @@ def _verify_deepseek_gate(
     # The canaries, set AFTER the scrub above so nothing strips them: the
     # validator already refused any name Crew's own scrub would take.
     env[_ENV_DSH_GATE_SCRUB_NAMES] = ":".join(child_scrub_names)
+    env[_ENV_DSH_DENIED_TOOLS] = ":".join(denied_tools)
     for name in child_scrub_names:
         env[name] = f"{_DSH_GATE_SCRUB_CANARY_PREFIX}{nonce}"
     deadline = time.monotonic() + _DSH_GATE_READBACK_TIMEOUT_S
@@ -719,6 +728,7 @@ def _verify_deepseek_gate(
         pi_mod._same_file_spelling(extension_path),
         nonce,
         child_scrub_names=child_scrub_names,
+        denied_tools=denied_tools,
     )
     if issue:
         return issue, acp_tool_gate.remediation_for(backend)
@@ -736,6 +746,8 @@ class DeepseekLaunch(ProcessAdapter):
         super().__init__()
         # The nonce the probe issued, carried to the session's own child.
         self._nonce = ""
+        # The dsh built-ins the session's spec denies, carried to probe and child alike.
+        self._denied_tools: tuple[str, ...] = ()
 
     async def resolve_spawn(self, ctx: SpawnContext) -> SpawnPlan:
         """Resolve the binary, mask it, compose and seal the gate, and prove it loads."""
@@ -754,6 +766,7 @@ class DeepseekLaunch(ProcessAdapter):
         # (session control and the panel). See ``providers/mirrors/registry`` for
         # the projection this harness declares.
         await session._prepare_session_mcp()
+        self._denied_tools = tuple(getattr(session, "_projection_denied_builtin_tools", None) or ())
         #
         # The refuse-then-mask preflight every ENFORCED harness takes, and FIRST for
         # the reason the pi adapter gives: the read-back below starts a child of this
@@ -905,6 +918,7 @@ class DeepseekLaunch(ProcessAdapter):
                     probe_marker,
                     self._nonce,
                     child_scrub_names=vault_env_names,
+                    denied_tools=self._denied_tools,
                 )
             )
         finally:
@@ -952,6 +966,7 @@ class DeepseekLaunch(ProcessAdapter):
         launch tail, not a refusal here.
         """
         env[_ENV_DEEPSEEK_PERMISSION_MODE] = DEEPSEEK_PERMISSION_MODE
+        env[_ENV_DSH_DENIED_TOOLS] = ":".join(self._denied_tools)
         if self._nonce:
             env[_ENV_DSH_GATE_SESSION] = self._nonce
 

@@ -452,6 +452,9 @@ def _resolve_session_mcp_servers(self: AcpClient) -> list[dict[str, Any]]:
     self._session_harness_deny_rules = projection.harness_deny_rules
     self._spec_zero_tools = projection.zero_tools
     self._note_worker_builtin_tools(projection.denied_builtin_tools)
+    # The same denials for a host whose own launch carries them (dsh's gate plugin);
+    # claude takes them through ``_note_worker_builtin_tools`` above.
+    self._projection_denied_builtin_tools = projection.denied_builtin_tools
     # Kept beside the array it describes, so the post-consume check judges the
     # generation these elements were built from and not a later read of the file.
     self._session_mcp_snapshot = projection.derived_spec_snapshot

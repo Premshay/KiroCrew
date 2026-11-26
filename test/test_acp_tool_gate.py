@@ -203,6 +203,7 @@ def _deepseek_marker(approval: object = None, *, include_approval: bool = True) 
         # The composed tool presentation and the child-env proof, both clean, so
         # these tests judge the approval snapshot alone.
         "tools": {"mode": "native"},
+        "denied_tools": [],
         "composition": {
             "entries": [
                 {

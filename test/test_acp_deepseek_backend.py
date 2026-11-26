@@ -211,6 +211,7 @@ def _good_gate_marker(module: str = "/sealed/gate.mjs", names: tuple[str, ...] =
             ],
         },
         "tools": {"mode": "native"},
+        "denied_tools": [],
         # The stock root rows; the PTC executor row is disabled, so it is not listed.
         "composition": {
             "entries": [
@@ -746,6 +747,8 @@ def test_the_session_writes_no_forensic_marker_of_its_own(monkeypatch, tmp_path)
     assert set(env) == {
         client_module._ENV_DEEPSEEK_PERMISSION_MODE,
         client_module._ENV_DSH_GATE_SESSION,
+        # The spec's denied built-ins (empty here): the plugin enforces them per call.
+        client_module._ENV_DSH_DENIED_TOOLS,
     }, "the session's child names a marker (or the probe's canary list) after all"
     assert not hasattr(rig.client, "_deepseek_gate_marker")
     # The probe's marker is the one that is read: it lives in the probe's OWN window
