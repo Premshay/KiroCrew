@@ -203,6 +203,16 @@ def _deepseek_marker(approval: object = None, *, include_approval: bool = True) 
         # The composed tool presentation and the child-env proof, both clean, so
         # these tests judge the approval snapshot alone.
         "tools": {"mode": "native"},
+        "composition": {
+            "entries": [
+                {
+                    "entry": "tool-executor-native",
+                    "module": "@deepseek-ai/dsh-tool-executor-native",
+                    "state": 2,
+                }
+            ],
+            "tools": None,
+        },
         "child_env": {
             "version": "0.1.5-rc.2",
             "names": [],
@@ -297,6 +307,54 @@ def test_deepseek_marker_refuses_a_missing_approval_routing_field() -> None:
     marker = _deepseek_marker(include_approval=False)
     issue = gate.gate_marker_issue(ACP_BACKEND_DEEPSEEK, marker, "/sealed/gate.mjs", "n1")
     assert "approval-routing snapshot" in issue
+
+
+def _deepseek_routed_marker(entries: object) -> dict:
+    """A marker clean in every field but the composition, which carries *entries*."""
+    marker = _deepseek_marker({"policy": "ask", "answerers": [dict(_DEEPSEEK_BRIDGE)]})
+    marker["composition"] = {"entries": entries, "tools": None}
+    return marker
+
+
+def test_deepseek_marker_with_only_stock_native_rows_is_admitted() -> None:
+    marker = _deepseek_routed_marker(
+        [{"entry": "tool-executor-native", "module": "@deepseek-ai/dsh-tool-executor-native"}]
+    )
+    assert gate.gate_marker_issue(ACP_BACKEND_DEEPSEEK, marker, "/sealed/gate.mjs", "n1") == ""
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        # The root row an operator layer re-enabled.
+        {"entry": "tool-executor-ptc", "module": "@deepseek-ai/dsh-tool-executor-ptc"},
+        # A nested row: the loader's entries() walks subtrees, so a preset group's
+        # own executor row is listed with its group-qualified id.
+        {
+            "entry": "agent-preset/ptc/tool-executor-ptc",
+            "module": "@deepseek-ai/dsh-tool-executor-ptc",
+        },
+        # A subpath export of the same package.
+        {"entry": "ptc-lib", "module": "@deepseek-ai/dsh-tool-executor-ptc/lib/index.js"},
+    ],
+)
+def test_deepseek_marker_refuses_a_ptc_executor_at_any_depth(row: dict) -> None:
+    """Root-only ``tools.mode`` cannot see a scoped executor; the composition can."""
+    marker = _deepseek_routed_marker(
+        [{"entry": "tool-executor-native", "module": "@deepseek-ai/dsh-tool-executor-native"}, row]
+    )
+    issue = gate.gate_marker_issue(ACP_BACKEND_DEEPSEEK, marker, "/sealed/gate.mjs", "n1")
+    assert "PTC tool executor" in issue
+    assert repr(row["entry"]) in issue
+
+
+@pytest.mark.parametrize("entries", [None, "rows", [["tools"]]])
+def test_deepseek_marker_without_a_composition_list_is_refused(entries: object) -> None:
+    """Nothing rules out a nested PTC row when the plugin list is missing or malformed."""
+    issue = gate.gate_marker_issue(
+        ACP_BACKEND_DEEPSEEK, _deepseek_routed_marker(entries), "/sealed/gate.mjs", "n1"
+    )
+    assert "does not list the composed plugins" in issue
 
 
 def test_deepseek_marker_accepts_only_the_stock_acp_bridge() -> None:

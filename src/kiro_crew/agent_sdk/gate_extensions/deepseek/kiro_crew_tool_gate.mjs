@@ -289,6 +289,26 @@ function publishMarker(marker, body) {
   renameSync(staging, marker);
 }
 
+/** The transport name dsh reserves for a PTC program (`register` refuses it). */
+const PTC_TRANSPORT = "run_code";
+
+/**
+ * Why *exec* is a programmatic-tool-calling call Kiro Crew refuses, or `""`.
+ *
+ * `run_code` is the PTC transport; a defined `parent` is the token dsh puts only on
+ * a call a transport program dispatched. Either means the model's action is a
+ * program the gate cannot judge as one call.
+ */
+function ptcCallReason(exec) {
+  if (String(exec?.name ?? "") === PTC_TRANSPORT) {
+    return "Kiro Crew refuses the run_code transport: its program cannot be gated as one call";
+  }
+  if (exec?.parent !== undefined && exec?.parent !== null) {
+    return "Kiro Crew refuses tool calls dispatched from a run_code program";
+  }
+  return "";
+}
+
 export function apply(ctx) {
   // EVERY tool asks. There is no name allowlist, and that is deliberate on two
   // counts. A name list would have to spell this harness's passive reads, and a
@@ -311,9 +331,19 @@ export function apply(ctx) {
   // upgraded to `ask`. Returning `ask` without awaiting would have discarded
   // every later deny listener, turning this harness's own refusal into a call
   // Kiro Crew is merely asked about.
+  //
+  // PTC is refused outright, ahead of every other listener. dsh selects its
+  // executor per scope (`tools.setExecutor` in a preset or agent scope shadows the
+  // root one), and the load marker can only prove the ROOT executor is native. A
+  // scoped PTC executor would present one `run_code` program whose own tool calls
+  // the gate cannot read as a whole. Both of its shapes are denied here: the
+  // reserved `run_code` transport itself, and any call carrying a `parent` token
+  // (dsh sets it only on a transport sub-dispatch). A native call has neither.
   ctx.on(
     "tools/pre-execute",
     async (exec, next) => {
+      const ptc = ptcCallReason(exec);
+      if (ptc) return { kind: "deny", reason: ptc };
       const downstream = await next();
       const kind = downstream && typeof downstream === "object" ? downstream.kind : undefined;
       if (kind !== undefined && kind !== "allow") return downstream;
