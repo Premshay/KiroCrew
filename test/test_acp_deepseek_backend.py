@@ -992,6 +992,9 @@ def test_the_patch_reasserts_the_approval_service_and_acp_bridge() -> None:
     assert "id: approval" in body
     assert "name: '@deepseek-ai/dsh-user-approval'" in body
     assert "policy: ask" in body
+    # A teammate (dsh subagent) inherits ask, so its calls reach the gate instead
+    # of being rejected unasked under the stock delegated policy ``never``.
+    assert "    policy: ask\n    delegatedPolicy: inherit\n" in body
     assert "id: acp" in body
     assert "name: '@deepseek-ai/dsh-acp'" in body
     assert "disabled: false" in body
