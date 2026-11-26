@@ -80,6 +80,10 @@ def deepseek_projection(
         channel_id=channel_id,
         session_token=session_token,
     )
+    # The spec's ``tools`` list, enforced on dsh's own built-ins by Crew's gate plugin
+    # (``agent_sdk.dsh_spec_tools``): the same read the array above consumed.
+    from kiro_crew.agent_sdk.dsh_spec_tools import dsh_session_denied_builtin_tools
+
     return SessionProjection(
         params={"mcpServers": out},
         disabled_servers=projection.disabled_servers,
@@ -88,6 +92,7 @@ def deepseek_projection(
         zero_tools=projection.zero_tools,
         derived_spec_snapshot=projection.derived_spec_snapshot,
         agent_spec=projection.agent_spec,
+        denied_builtin_tools=dsh_session_denied_builtin_tools(agent, projection.agent_spec, session_key),
     )
 
 

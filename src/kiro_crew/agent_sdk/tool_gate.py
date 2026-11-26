@@ -866,6 +866,7 @@ def gate_marker_issue(
     nonce: str,
     *,
     child_scrub_names: Sequence[str] = (),
+    denied_tools: Sequence[str] = (),
 ) -> str:
     """Why *backend*'s gate plugin is not loaded, from the marker it writes on load.
 
@@ -979,6 +980,9 @@ def gate_marker_issue(
         ptc_issue = _deepseek_ptc_executor_issue(marker.get("composition"))
         if ptc_issue:
             return ptc_issue
+        denied_issue = _deepseek_denied_tools_issue(marker.get("denied_tools"), denied_tools)
+        if denied_issue:
+            return denied_issue
         return _deepseek_child_env_issue(marker.get("child_env"), child_scrub_names)
     if backend == ACP_BACKEND_STRANDS:
         # The Strands gate module proves the same property on a child of the local
@@ -990,6 +994,28 @@ def gate_marker_issue(
             mapping="agent.strands_env",
             quote_names=False,
         ) or _strands_keys_route_issue(marker.get("keys"), child_scrub_names)
+    return ""
+
+
+def _deepseek_denied_tools_issue(reported: object, expected: Sequence[str]) -> str:
+    """Why the plugin did not confirm the spec's denied built-ins, or ``""``.
+
+    *expected* is the set Crew handed the harness (``KIROCREW_DSH_DENIED_TOOLS``,
+    from ``agent_sdk.dsh_spec_tools``); *reported* is the list the plugin read back.
+    They must be the same set: a plugin that denies less would run a tool the spec
+    leaves out, one that denies more would refuse a tool the spec grants, and a
+    missing or malformed field confirms nothing.
+    """
+    if not isinstance(reported, list) or not all(isinstance(name, str) for name in reported):
+        return (
+            "the gate's load marker does not report the agent's denied built-in tools, "
+            "so the spec's tool list is not confirmed enforced"
+        )
+    if sorted(set(reported)) != sorted(set(expected)):
+        return (
+            "the gate's load marker reports a different set of denied built-in tools than "
+            "the agent's spec asks for, so the spec's tool list is not enforced as written"
+        )
     return ""
 
 

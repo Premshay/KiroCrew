@@ -62,6 +62,19 @@ const NONCE_ENV = "KIROCREW_DSH_GATE_SESSION";
  */
 const SCRUB_NAMES_ENV = "KIROCREW_DSH_GATE_SCRUB_NAMES";
 
+/**
+ * The dsh built-ins this agent's spec leaves out, `:`-joined; empty when none. Each
+ * is denied at `tools/pre-execute`, and the set is reported in the load marker so
+ * Kiro Crew can confirm the plugin read exactly what it sent.
+ */
+const DENIED_TOOLS_ENV = "KIROCREW_DSH_DENIED_TOOLS";
+
+/** The denied built-in names, sorted and deduplicated; `[]` when unset. */
+function deniedTools() {
+  const raw = process.env[DENIED_TOOLS_ENV] ?? "";
+  return [...new Set(raw.split(":").filter((entry) => entry.length > 0))].sort();
+}
+
 /** Bound on the child-env check, well under Kiro Crew's read-back budget. */
 const CHILD_CHECK_TIMEOUT_MS = 20_000;
 
@@ -310,6 +323,7 @@ function ptcCallReason(exec) {
 }
 
 export function apply(ctx) {
+  const denied = new Set(deniedTools());
   // EVERY tool asks. There is no name allowlist, and that is deliberate on two
   // counts. A name list would have to spell this harness's passive reads, and a
   // scoped tool registered later under one of those names shadows the global one,
@@ -344,6 +358,10 @@ export function apply(ctx) {
     async (exec, next) => {
       const ptc = ptcCallReason(exec);
       if (ptc) return { kind: "deny", reason: ptc };
+      const name = String(exec?.name ?? "");
+      if (denied.has(name)) {
+        return { kind: "deny", reason: `${name} is not in this agent's tool list` };
+      }
       const downstream = await next();
       const kind = downstream && typeof downstream === "object" ? downstream.kind : undefined;
       if (kind !== undefined && kind !== "allow") return downstream;
@@ -376,6 +394,7 @@ export function apply(ctx) {
       approval: approvalRouting(ctx),
       tools: toolsSnapshot(ctx),
       composition: compositionSnapshot(ctx),
+      denied_tools: [...denied].sort(),
       child_env: null,
     };
     void childEnvProof(ctx, scrubNames())

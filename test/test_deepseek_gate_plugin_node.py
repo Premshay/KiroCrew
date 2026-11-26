@@ -123,6 +123,7 @@ def test_the_marker_names_the_root_executor_by_class(tmp_path, executor: str, mo
         },
         "tools": tools,
         "composition": {"entries": [], "tools": None},
+        "denied_tools": [],
         "child_env": {
             "version": "0.2.2-rc.5",
             "names": [],

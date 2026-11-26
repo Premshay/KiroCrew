@@ -670,7 +670,7 @@ def test_the_probe_is_never_handed_a_key(monkeypatch, tmp_path) -> None:
     """
     rig = _DeepseekLaunchRig(monkeypatch, tmp_path, names=("DEEPSEEK_API_KEY",))
     rig.run()
-    assert rig.args_of("verify")[4] == {"child_scrub_names": ("DEEPSEEK_API_KEY",)}
+    assert rig.args_of("verify")[4] == {"child_scrub_names": ("DEEPSEEK_API_KEY",), "denied_tools": ()}
     assert rig.names().index("names") < rig.names().index("verify")
 
 

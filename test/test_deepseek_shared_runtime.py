@@ -172,6 +172,8 @@ def test_the_spawn_composes_the_gate_and_proves_it_in_the_runtimes_environment(
     assert plan.child_env == {
         "DSH_PERMISSION_MODE": deepseek_mod.DEEPSEEK_PERMISSION_MODE,
         "KIROCREW_DSH_GATE_SESSION": launch_seams["nonce"],
+        # The spec's denied built-ins; empty for this unrestricted agent.
+        "KIROCREW_DSH_DENIED_TOOLS": "",
     }
     assert vars(harness) == {}
 
