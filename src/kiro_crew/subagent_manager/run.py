@@ -298,6 +298,17 @@ class RunEventCoordinator(ManagerComponent):
         except Exception:
             log.debug("spawn.route: skipped for %s", info.id, exc_info=True)
             return None
+        if routed and routed.get("refused"):
+            # Every candidate was removed (quota marks, local windows too small):
+            # the caller fails the spawn with this reason instead of starting it.
+            _sel().log_api_access(
+                caller=info.parent_session_key or f"subagent:{info.id}",
+                operation="subagent.spawn_route",
+                outcome="refused",
+                source="subagent",
+                resources=f"subagent_id={info.id},route_id={routed.get('route_id')}",
+            )
+            return {"refused": str(routed["refused"]), "line": str(routed["refused"])}
         if not routed or not routed.get("model"):
             return None
         line = _spawn_route.reason_line(routed)

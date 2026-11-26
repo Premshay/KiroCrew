@@ -384,6 +384,12 @@ async def _run_inner_impl(
         routed = await self._route_spawn_model(
             info, agent, cross_vendor=not vendor_pinned, allow_default_effort=not plan.eff_effort
         )
+        if routed and routed.get("refused"):
+            # Fail before a session exists: the route removed every candidate, so
+            # any session started now would sit on a lane that cannot run it.
+            info.error_code = "no_route"
+            info.route_reason = routed["refused"]
+            raise RuntimeError(f"no_route: {routed['refused']}")
         if routed and await asyncio.to_thread(
             _spawn_route.apply_route_backend, info, routed, captured_execution
         ):

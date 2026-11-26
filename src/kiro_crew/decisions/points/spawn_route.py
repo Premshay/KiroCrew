@@ -285,6 +285,14 @@ EFFORT_STYLE: dict[str, str] = {"antigravity": "dash"}
 #: ``subagent`` is the CPU lane, ``agent`` the GPU lane.
 LOCAL_ROLES: tuple[str, ...] = ("subagent", "agent")
 
+#: The smallest local window a spawned run is ever offered (delegation rule 4:
+#: builds never go to the CPU lane). Every spawn is a tooled agent run, and a
+#: Claude Code tool worker's harness alone is ~51k tokens, so a 32k lane such
+#: as ``subagent`` (the CPU lane) can never carry one: it was picked when every
+#: cloud vendor was out (2026-11-26) and each run hung on the single slot. A
+#: local role with an unknown window is not offered either.
+MIN_LOCAL_SPAWN_CTX = 65536
+
 #: Vendors offered to a parent of ANOTHER vendor. DeepSeek is metered (AGENTS.md:
 #: a metered seat is only ever an explicitly named row), so it is never switched to.
 CROSS_VENDORS: tuple[str, ...] = ("claude", "codex", "antigravity", "local")
@@ -813,6 +821,37 @@ def _apply_quota_outs(
         state["source"] = "quota_hit"
 
 
+def _refusal(
+    route_id: str,
+    offered: Sequence[str],
+    outs: Mapping[str, Mapping[str, Any]],
+    exclude_vendors: Sequence[str],
+    *,
+    too_big: Sequence[str],
+) -> dict[str, Any]:
+    """The answer when candidates existed and every one was removed: ``{refused, route_id}``.
+
+    ``refused`` names why each offered vendor dropped out (a live quota mark and
+    its reset, an exclusion, or a local window too small), so the spawn fails at
+    once with that reason instead of starting a session that cannot run. Logged.
+    """
+    why = []
+    for vendor in offered:
+        mark = outs.get(vendor) or {}
+        if vendor in set(exclude_vendors):
+            why.append(f"{vendor}: excluded")
+        elif mark.get("until"):
+            until = time.strftime("%m-%d %H:%M", time.localtime(float(mark["until"])))
+            why.append(f"{vendor}: out of quota until {until}")
+        elif vendor == "local" and too_big:
+            why.append(f"local: window too small ({', '.join(sorted(set(too_big)))})")
+        else:
+            why.append(f"{vendor}: no usable candidate")
+    reason = "no route: " + "; ".join(why) if why else "no route: no candidate"
+    logger.warning("spawn.route %s: %s", route_id, reason)
+    return {"route_id": route_id, "refused": reason}
+
+
 async def routed_spawn(
     brief: str,
     *,
@@ -831,7 +870,9 @@ async def routed_spawn(
 ) -> dict[str, Any] | None:
     """The model -- and, for another vendor, the backend -- a model-less spawn should run on.
 
-    ``None`` leaves the seat's default. Otherwise ``{route_id, model, tier, vendor,
+    ``None`` leaves the seat's default. ``{route_id, refused}`` means candidates
+    existed and every one was removed (:func:`_refusal`): the spawn must fail with
+    that reason rather than start. Otherwise ``{route_id, model, tier, vendor,
     backend, runtime_agent, native_backend, p, reason, vendor_out, vendor_until,
     limit, low, out, latency_ms, trim, trim_budget, too_big}``: ``backend`` is ``""``
     for the parent's own seat;
@@ -864,10 +905,15 @@ async def routed_spawn(
         )
         from kiro_crew import vendor_limits as _vl
 
+        if not cands:
+            # Nothing to route between (no tiers pinned or advertised): the seat's
+            # default stands, as before.
+            return None
         outs = await asyncio.to_thread(_vl.quota_outs)
+        offered = sorted({c["vendor"] for c in cands})
         cands = drop_quota_outs(cands, outs, exclude_vendors)
         if not cands:
-            return None
+            return _refusal(route_id, offered, outs, exclude_vendors, too_big=[])
         ag_models = [c["model"] for c in cands if c["vendor"] == "antigravity"]
         limits = await asyncio.to_thread(limit_health, ag_models)
         health = _routing_health(limits)
@@ -875,8 +921,10 @@ async def routed_spawn(
         cands, fits, too_big = fit_local_candidates(
             cands, brief, health, groups=context_groups, pinned=pinned_groups, backends=backends
         )
+        if too_big:
+            logger.info("spawn.route %s: local roles not offered (window too small): %s", route_id, too_big)
         if not cands:
-            return None
+            return _refusal(route_id, offered, outs, exclude_vendors, too_big=too_big)
         if allow_default_effort:
             cands += await asyncio.to_thread(_advertised_max_variants, cands, config)
         state = build_state(
@@ -958,7 +1006,8 @@ def fit_local_candidates(
     drops to fit ``health.local.ctx[role]`` (or the role's known window). One
     whose minimal set (skills, project, spec, and every *pinned* group) still
     does not fit is removed, so the oracle only sees candidates that can carry
-    the run. Cloud candidates pass through untouched.
+    the run. A role whose window is unknown or below :data:`MIN_LOCAL_SPAWN_CTX`
+    is removed before any fitting. Cloud candidates pass through untouched.
     """
     from kiro_crew.subagent_manager.local_check import fit_local
 
@@ -975,6 +1024,10 @@ def fit_local_candidates(
         seat = (backends or {}).get(f"local/{role}", {})
         live_ctx = ctx_by_role.get(role)
         ctx = live_ctx if type(live_ctx) is int and live_ctx > 0 else seat.get("ctx")
+        if type(ctx) is not int or ctx < MIN_LOCAL_SPAWN_CTX:
+            # Too small for any tooled run whatever the brief: never offered.
+            too_big.append(role)
+            continue
         fit = fit_local(
             role,
             brief,
@@ -1062,7 +1115,7 @@ async def reroute_after_quota(
         execution=execution,
         allow_default_effort=allow_default_effort,
     )
-    if routed and routed.get("vendor") not in set(exclude_vendors):
+    if routed and not routed.get("refused") and routed.get("vendor") not in set(exclude_vendors):
         return routed
     started = time.monotonic()
     try:
