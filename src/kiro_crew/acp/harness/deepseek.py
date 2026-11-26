@@ -315,7 +315,13 @@ def _write_deepseek_gate_patch(sealed_extension: str, dsh_version: str = "") -> 
     profile's own layer, so the pin wins.
 
     The remaining rows reassert the stock approval service with policy ``ask`` and
-    the stock ACP bridge as enabled with its startup dependency. dsh applies this
+    the stock ACP bridge as enabled with its startup dependency. The approval row
+    also sets ``delegatedPolicy: inherit``: a dsh subagent (an Agent Team teammate)
+    then starts under the session's ``ask`` and its calls are forwarded through this
+    session to Kiro Crew's gate, instead of being pinned to ``never`` and rejected
+    unasked. The key is read only by a dsh carrying the delegated-children patch
+    (``nexus/docs/dsh-acp-delegated-children.md``); stock rc.5 accepts and ignores
+    it, so its children keep ``never`` and nothing reaches Kiro Crew unasked either way. dsh applies this
     overlay after the operator layer, and ``applyEntryPatches`` replaces these fields,
     so disabling either row, changing the approval policy or changing the ACP startup
     dependency does not survive. Its ``name`` is a match guard rather than an
@@ -335,6 +341,7 @@ def _write_deepseek_gate_patch(sealed_extension: str, dsh_version: str = "") -> 
         "  disabled: false\n"
         "  config:\n"
         "    policy: ask\n"
+        "    delegatedPolicy: inherit\n"
         "- id: acp\n"
         "  name: '@deepseek-ai/dsh-acp'\n"
         "  disabled: false\n"
