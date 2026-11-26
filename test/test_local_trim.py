@@ -202,18 +202,16 @@ class TestRouted:
         assert got["vendor"] == "local" and got["tier"] == "agent"
         assert got["trim"] == [] and "trimmed" not in sr.reason_line(got)
 
-    def test_cpu_pick_trims_memory_then_lessons(self, routed_env):
+    def test_the_cpu_lane_is_never_offered_to_a_spawn(self, routed_env):
+        """Delegation rule 4: a spawn is a tooled run, and the 32k CPU lane (``subagent``)
+        cannot carry its harness, so it is not a candidate however short the brief, and an
+        oracle that names it anyway picks nothing."""
         oracle = routed_env(_Oracle("local/subagent/0"))
         got = _route(SHORT, context_groups=frozenset({"memory", "project"}))
-        assert got["trim"] == ["memory"]
-        got = _route(MID, context_groups=ALL)
-        assert got["trim"] == ["memory", "lessons"]
-        assert "local: trimmed memory, lessons to fit 12.0k" in sr.reason_line(got)
-        # the oracle read the fitted size, not the untrimmed one
-        est = oracle.states[-1]["estimate_tokens"]["subagent"]
-        assert est == lc.brief_tokens(MID) + 4050 + lc.context_tokens(
-            frozenset({"project"}), "subagent"
-        )
+        keys = {c["key"] for c in oracle.states[-1]["candidates"]}
+        assert "local/subagent/0" not in keys
+        assert got is None or got.get("tier") != "subagent"
+        assert "subagent" in (got or {}).get("too_big", ["subagent"])
 
     def test_explicit_include_is_respected(self, routed_env):
         oracle = routed_env(_Oracle("local/subagent/0"))
@@ -285,3 +283,52 @@ class TestSuccessorScope:
         )
         assert seen["include_memory"] is False and seen["include_lessons"] is True
         assert seen["delegation"][lc.TRIMMED_KEY] == "memory"
+
+
+class TestNoCpuLaneForSpawns:
+    """Delegation rule 4 (2026-11-26): no spawn on a local window under 64k, and no hang."""
+
+    def _local(self, role):
+        return {"key": f"local/{role}/0", "vendor": "local", "tier": role, "model": role, "backend": ""}
+
+    @pytest.mark.parametrize("ctx", [32768, 65535, None, 0, True])
+    def test_a_small_or_unknown_window_is_never_offered(self, ctx):
+        health = {"local": {"ctx": {"subagent": ctx}}} if ctx is not None else {}
+        kept, fits, too_big = sr.fit_local_candidates([self._local("subagent")], "x", health)
+        assert kept == [] and fits == {} and too_big == ["subagent"]
+
+    def test_a_64k_window_is_offered(self):
+        kept, _fits, too_big = sr.fit_local_candidates(
+            [self._local("agent")], "x", {"local": {"ctx": {"agent": sr.MIN_LOCAL_SPAWN_CTX}}}
+        )
+        assert [c["tier"] for c in kept] == ["agent"] and too_big == []
+
+    def test_cloud_out_and_cpu_only_fails_fast_with_the_reason(self, routed_env, monkeypatch):
+        """Every cloud vendor out and only the CPU lane left: refused, never routed there."""
+        oracle = routed_env(_Oracle("local/subagent/0"))
+        monkeypatch.setattr(vl, "quota_outs", lambda now=None: {"claude": {"until": 4102444800.0}})
+        monkeypatch.setattr(
+            sr,
+            "limit_health",
+            lambda models=(), now=None: {"local": {"out": False, "ctx": {"subagent": 32768}}},
+        )
+        monkeypatch.setattr(
+            sr, "route_backends", lambda parent_vendor, cfg=None: {"local/subagent": BACKENDS["local/subagent"]}
+        )
+        got = _route(SHORT)
+        assert oracle.states == []  # nothing left to ask about
+        assert set(got) == {"route_id", "refused"}
+        assert got["refused"].startswith("no route: ")
+        assert "claude: out of quota until" in got["refused"]
+        assert "local: window too small (subagent)" in got["refused"]
+
+    def test_a_refusal_is_not_a_quota_fall_through_pick(self, routed_env, monkeypatch):
+        routed_env(_Oracle("local/subagent/0"))
+        monkeypatch.setattr(vl, "quota_outs", lambda now=None: {"claude": {"until": 4102444800.0}})
+        monkeypatch.setattr(
+            sr, "route_backends", lambda parent_vendor, cfg=None: {"local/subagent": BACKENDS["local/subagent"]}
+        )
+        got = asyncio.run(
+            sr.reroute_after_quota(SHORT, agent="crew-claude", exclude_vendors=("codex",), tier="small")
+        )
+        assert got is None

@@ -1394,3 +1394,32 @@ class TestSharedSessionCliDefaultModel:
         handle.set_model.assert_awaited_once_with("cli-default-model", inherit=True)
         assert info._shared_provider is provider
         await provider.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_refused_route_fails_the_spawn_before_any_session(monkeypatch):
+    """spawn.route removed every candidate (cloud out, local windows too small): the run
+    fails at once with ``no_route`` and the reason, and no provider session is started."""
+    sessions = _mock_sessions(sharing_eligible=False)
+    manager = SubagentManager(
+        sessions=sessions, ctx_builder=_mock_ctx_builder_auto(), is_yolo=lambda: True
+    )
+    reason = "no route: claude: out of quota until 11-29 19:00; local: window too small (subagent)"
+    monkeypatch.setattr(
+        type(manager._run_events),
+        "_route_spawn_model",
+        AsyncMock(return_value={"refused": reason, "line": reason}),
+    )
+    with (
+        _cfg_patch(session_sharing=False),
+        patch("kiro_crew.subagent.Stats"),
+        patch("kiro_crew.subagent.sel"),
+    ):
+        info = manager.spawn("build one module", parent_session_key="dashboard:slot1")
+        await _wait_until_done(info)
+
+    sessions.get_or_create.assert_not_awaited()
+    sessions.get_subagent_runtime.assert_not_awaited()
+    assert "no_route:" in (info.error or ""), info.error
+    assert "local: window too small (subagent)" in (info.error or "")
+    assert info.route_reason == reason

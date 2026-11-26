@@ -79,7 +79,7 @@ def test_declared_seat_metadata_reaches_routing_and_live_window_wins(monkeypatch
         "vendor": "local",
         "role": "agent",
         "account": "work",
-        "ctx": 40000,
+        "ctx": 70000,
         "overhead_tokens": 100,
         "metered": False,
     }
@@ -100,8 +100,8 @@ def test_declared_seat_metadata_reaches_routing_and_live_window_wins(monkeypatch
 
     _, fallback, _ = spawn_route.fit_local_candidates(candidates, "brief", {}, backends=backends)
     _, live, _ = spawn_route.fit_local_candidates(
-        candidates, "brief", {"local": {"ctx": {"agent": 50000}}}, backends=backends
+        candidates, "brief", {"local": {"ctx": {"agent": 90000}}}, backends=backends
     )
-    assert fallback["agent"].budget == 40000 - 8192
-    assert live["agent"].budget == 50000 - 8192
+    assert fallback["agent"].budget == 70000 - 8192
+    assert live["agent"].budget == 90000 - 8192
     assert live["agent"].overhead_tokens == 100
