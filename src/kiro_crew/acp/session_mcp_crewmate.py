@@ -112,7 +112,7 @@ def worker_deny_rules(
     ``mate_worker.merge_worker_spec``) and each whole ``@server``. Spelled as Claude
     Code names the tool (``claude_mcp_names``). A native or wildcard entry is not a
     rule: the session's ``tools`` list withholds a native tool
-    (``claude_worker_tools.claude_worker_builtin_tools``), and a worker whose crewmate
+    (``claude_worker_tools.claude_worker_denied_builtin_tools``), and a worker whose crewmate
     file sets any other is refused before this is read.
     """
     from kiro_crew.acp.claude_mcp_names import claude_mcp_server_rule, claude_mcp_tool_name

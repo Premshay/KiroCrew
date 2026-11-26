@@ -4938,8 +4938,8 @@ parts:
   `permissions.deny` rules read from the worker's own spec by its session
   (`acp.session_mcp_crewmate.crewmate_worker_deny_rules`), and, in
   `ACP_BACKENDS_MATE_WORKER_NATIVE_TOOL_LIMITS`, a native-tool exclude its built-in
-  table covers as a `tools` allow-list of the built-ins the worker keeps
-  (`agent_sdk.claude_worker_tools.claude_worker_builtin_tools`), so it refuses only another
+  table covers as a `disallowedTools` rule for the matching built-ins
+  (`agent_sdk.claude_worker_tools.claude_worker_denied_builtin_tools`), so it refuses only another
   native entry (a bare `@builtin`, `use_aws`), a wildcard, or a `disabledTools` that is not a list of tool
   names (`mate_worker.uncarried_tool_limits_of`). The worker's model pin is judged against the same backend
   (`mate_worker.crewmate_worker_backend`).

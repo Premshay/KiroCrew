@@ -447,17 +447,19 @@ def test_a_resumed_session_sends_its_own_envelope(harness, tmp_path):
 def test_a_named_agents_built_ins_reach_the_shared_sessions_envelope(
     harness, tmp_path, monkeypatch
 ):
-    """The built-ins the mirror's projection keeps (a named agent's ``tools`` list) ride
+    """The built-ins a named agent's spec omits ride
     session/new and session/load on a shared process, as on the per-session client."""
     from kiro_crew.providers.mirrors import claude_code as mirror_mod
 
-    kept = ("Read", "Grep", "Glob", "ToolSearch")
-    monkeypatch.setattr(mirror_mod, "_session_builtin_tools", lambda *_args: kept)
+    denied = ("Bash", "Write")
+    monkeypatch.setattr(mirror_mod, "_session_denied_builtin_tools", lambda *_args: denied)
     plane = _Plane({"sessionId": "s-1", "modes": {"currentModeId": "default"}})
     rt = _claude_runtime(plane)
     asyncio.run(rt.create_session(cwd=str(tmp_path), agent="kirocrew"))
     new = [p for m, p in plane.sent if m == "session/new"]
-    assert new[0]["_meta"]["claudeCode"]["options"]["tools"] == list(kept)
+    options = new[0]["_meta"]["claudeCode"]["options"]
+    assert options["disallowedTools"] == list(denied)
+    assert "tools" not in options
     asyncio.run(rt.terminate_session("s-1"))
 
     load_plane = _LoadPlane()
@@ -465,7 +467,9 @@ def test_a_named_agents_built_ins_reach_the_shared_sessions_envelope(
     load_rt._can_load_session = True
     asyncio.run(load_rt.load_session("", "s-5", cwd=str(tmp_path), agent="kirocrew"))
     loads = [p for m, p in load_plane.sent if m == "session/load"]
-    assert loads[0]["_meta"]["claudeCode"]["options"]["tools"] == list(kept)
+    options = loads[0]["_meta"]["claudeCode"]["options"]
+    assert options["disallowedTools"] == list(denied)
+    assert "tools" not in options
     asyncio.run(load_rt.terminate_session("s-5"))
 
 

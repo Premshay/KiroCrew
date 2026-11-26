@@ -451,7 +451,7 @@ def _resolve_session_mcp_servers(self: AcpClient) -> list[dict[str, Any]]:
         self._harness_read_back().disabled_servers = projection.disabled_servers
     self._session_harness_deny_rules = projection.harness_deny_rules
     self._spec_zero_tools = projection.zero_tools
-    self._note_worker_builtin_tools(projection.builtin_tools)
+    self._note_worker_builtin_tools(projection.denied_builtin_tools)
     # Kept beside the array it describes, so the post-consume check judges the
     # generation these elements were built from and not a later read of the file.
     self._session_mcp_snapshot = projection.derived_spec_snapshot

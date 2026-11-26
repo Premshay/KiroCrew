@@ -123,9 +123,9 @@ class ClaudeAcpClient(AcpClient, serves=ACP_BACKEND_CLAUDE):
         # this process does not have one. Per instance and never reset -- a client
         # that re-spawns is the same owner across spawns.
         self._seed_owner = uuid.uuid4().hex
-        # The built-ins a crewmate worker or a named agent keeps (``SessionProjection.builtin_tools``),
-        # carried as claude's ``tools`` option; None keeps the harness's preset.
-        self._claude_worker_builtin_tools: tuple[str, ...] | None = None
+        # Native tools denied for a worker or named agent by the session projection,
+        # carried as Claude's ``disallowedTools`` option.
+        self._claude_denied_builtin_tools: tuple[str, ...] | None = None
         # Set when the claude backend's "Compacting..." notice is seen inside a
         # turn and cleared by its terminal notice. Only a MANUAL /compact gets a
         # terminal from the adapter (see parse_claude_compaction_notice), so an

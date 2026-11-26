@@ -12,7 +12,7 @@ and a patch of the method on the class or on an instance reaches every caller.
 
 Instance fields written: ``_claude_settings_authored``, ``_claude_settings_claim_unrevoked``,
 ``_claude_settings_governed``, ``_claude_settings_shared``, ``_claude_settings_written``,
-``_claude_worker_builtin_tools``, ``_permission_surface_share_validated``.
+``_claude_denied_builtin_tools``, ``_permission_surface_share_validated``.
 
 Instance fields read: ``_agent``, ``_claude_tools_withheld_reason``, ``_seed_owner``,
 ``_session_key``, ``_session_mcp_excludes_local``, ``_session_mcp_inline_settings``,
@@ -731,7 +731,7 @@ def _reset_settings_seed_state(self: ClaudeAcpClient) -> None:
     self._claude_settings_shared = False
     self._claude_settings_governed = False
     self._permission_surface_share_validated = False
-    self._claude_worker_builtin_tools = None
+    self._claude_denied_builtin_tools = None
 
 
 async def _discard_settings_seed(self: ClaudeAcpClient) -> None:
