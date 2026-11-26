@@ -211,6 +211,10 @@ _DEEPSEEK_APPROVAL_POLICY = "ask"
 #: The one tool presentation under which every model action is a tool call the gate
 #: can read; ``ptc``/``both`` add a ``run_code`` transport whose programs are not.
 _DEEPSEEK_TOOLS_MODE = "native"
+#: The PTC executor package. dsh selects executors per scope, so a root-only
+#: ``native`` reading cannot rule out a nested row mounting this one; no enabled
+#: loader entry, at any depth, may name it.
+_DEEPSEEK_PTC_EXECUTOR_MODULE = "@deepseek-ai/dsh-tool-executor-ptc"
 
 #: Files re-exposed READ-ONLY inside a directory the mask hides, home-relative.
 #:
@@ -972,6 +976,9 @@ def gate_marker_issue(
                 f"as {_DEEPSEEK_TOOLS_MODE!r}, so the harness would expose a run_code "
                 "transport whose programs reach Node's own APIs around the gate"
             )
+        ptc_issue = _deepseek_ptc_executor_issue(marker.get("composition"))
+        if ptc_issue:
+            return ptc_issue
         return _deepseek_child_env_issue(marker.get("child_env"), child_scrub_names)
     if backend == ACP_BACKEND_STRANDS:
         # The Strands gate module proves the same property on a child of the local
@@ -983,6 +990,37 @@ def gate_marker_issue(
             mapping="agent.strands_env",
             quote_names=False,
         ) or _strands_keys_route_issue(marker.get("keys"), child_scrub_names)
+    return ""
+
+
+def _deepseek_ptc_executor_issue(composition: object) -> str:
+    """Why the marker's composition may mount the PTC executor somewhere, or ``""``.
+
+    ``tools.mode`` is read off the ROOT executor only, and dsh lets a preset or agent
+    scope mount its own (``tools.setExecutor`` in that scope shadows the root). The
+    loader's ``entries()`` walks every subtree, so the snapshot lists nested rows
+    too: an enabled row naming the PTC package, at any depth, is refused. A missing
+    or malformed entry list refuses as well, since nothing then rules one out. A
+    scope created after load is not in the snapshot; the plugin's own
+    ``tools/pre-execute`` refusal of ``run_code`` and of PTC sub-dispatches covers it.
+    """
+    entries = composition.get("entries") if isinstance(composition, dict) else None
+    if not isinstance(entries, list) or not all(isinstance(row, dict) for row in entries):
+        return (
+            "the gate's load marker does not list the composed plugins, so nothing rules "
+            "out a PTC executor mounted in a nested scope"
+        )
+    for row in entries:
+        module = row.get("module")
+        if not isinstance(module, str):
+            continue
+        if module == _DEEPSEEK_PTC_EXECUTOR_MODULE or module.startswith(
+            _DEEPSEEK_PTC_EXECUTOR_MODULE + "/"
+        ):
+            return (
+                f"the harness composes the PTC tool executor ({row.get('entry')!r}), whose "
+                "run_code programs reach Node's own APIs around the gate"
+            )
     return ""
 
 

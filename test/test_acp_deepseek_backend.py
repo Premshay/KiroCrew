@@ -211,6 +211,18 @@ def _good_gate_marker(module: str = "/sealed/gate.mjs", names: tuple[str, ...] =
             ],
         },
         "tools": {"mode": "native"},
+        # The stock root rows; the PTC executor row is disabled, so it is not listed.
+        "composition": {
+            "entries": [
+                {"entry": "tools", "module": "@deepseek-ai/dsh-tools", "state": 2},
+                {
+                    "entry": "tool-executor-native",
+                    "module": "@deepseek-ai/dsh-tool-executor-native",
+                    "state": 2,
+                },
+            ],
+            "tools": None,
+        },
         "child_env": {
             "version": "0.1.5-rc.2",
             "names": list(names),

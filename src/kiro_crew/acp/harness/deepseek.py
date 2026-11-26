@@ -115,7 +115,7 @@ _DSH_GATE_MARKER_MAX_BYTES = 64 * 1024
 # Same seal, same reason, for the DeepSeek Harness gate plugin. Pinned by
 # ``test_acp_deepseek_backend``, so editing the plugin is a deliberate two-file
 # edit.
-DEEPSEEK_GATE_EXTENSION_SHA256 = "35eed81b681c75e412f6805df38db5c0e7eab8bfb8145a32168d95f49eecb6c5"
+DEEPSEEK_GATE_EXTENSION_SHA256 = "e2b8b43c4212e5c8c673bdf910eae611cc69a2f850196c4323105d19b190d9df"
 
 # ── deepseek (ACP_BACKEND_DEEPSEEK) ──
 # DeepSeek Harness is a plugin host, and ACP is one of the profiles it boots. So the
