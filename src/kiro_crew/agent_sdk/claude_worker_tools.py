@@ -55,9 +55,15 @@ CLAUDE_WORKER_BUILTINS_BY_KIRO_TOOL: dict[str, tuple[str, ...]] = {
     "execute_bash": ("Bash", "Monitor", "PowerShell", "TaskStop"),
 }
 
-#: Built-ins such a worker keeps whatever it excludes: ``ToolSearch`` loads the
-#: MCP tools claude defers.
-CLAUDE_WORKER_KEPT_BUILTINS: tuple[str, ...] = ("ToolSearch",)
+#: ToolSearch loads deferred MCP tools. Claude Code controls whether the
+#: artifact and design tools are available to the session.
+CLAUDE_WORKER_KEPT_BUILTINS: tuple[str, ...] = (
+    "ToolSearch",
+    "Artifact",
+    "ArtifactComments",
+    "ArtifactData",
+    "DesignSync",
+)
 
 
 def excluded_builtin_rows(ref: str) -> tuple[str, ...]:
@@ -100,7 +106,8 @@ def claude_worker_builtin_tools(excluded: Iterable[str]) -> tuple[str, ...] | No
 #: ``fs_read`` also lists a directory, which claude's ``Read`` cannot.
 _AGENT_GRANT_EXTRAS: dict[str, tuple[str, ...]] = {"fs_read": ("Glob",)}
 
-# A bare tool name cannot select an MCP server named "builtin".
+# Keep old grant names so a spec listing every mapped tool stays restricted
+# when it also lists a Claude grant.
 _AGENT_CLAUDE_GRANTS: dict[str, tuple[str, ...]] = {
     "claude_artifact": ("Artifact", "ArtifactComments", "ArtifactData"),
     "claude_design_sync": ("DesignSync",),

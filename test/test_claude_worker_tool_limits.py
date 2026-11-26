@@ -417,7 +417,13 @@ def test_the_captured_tools_are_what_crew_derives_for_the_worker(pixel_worker):
         projection = mirror.session_projection(
             MATE_WORKER_AGENT, permission_surface_owned=owned, session_key=KEY
         )
-        assert projection.builtin_tools == tuple(meta["options"]["tools"])
+        assert projection.builtin_tools == (
+            *meta["options"]["tools"],
+            "Artifact",
+            "ArtifactComments",
+            "ArtifactData",
+            "DesignSync",
+        )
     # The MCP excludes alone keep claude's whole preset.
     (pixel_worker / "pixel.json").write_text(json.dumps(MATE), encoding="utf-8")
     projection = mirror.session_projection(

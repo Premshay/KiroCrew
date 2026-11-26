@@ -272,16 +272,13 @@ the built-ins of the kiro-cli tools it grants, read through the Bot worker's tab
 `Glob`; `fs_write` → `Write`, `Edit`, `MultiEdit`, `NotebookEdit`; `execute_bash` →
 `Bash`, `Monitor`, `PowerShell`, `TaskStop`; `web_fetch`, `web_search`;
 `use_subagent` → `Task`, `Agent`; tags such as `read` and `shell` select their
-tools), plus `ToolSearch`, which loads the MCP tools claude defers. An entry no
-row covers (`@server`, `use_aws`, `code`, `todo_list`) grants no built-in, and
-nothing is refused. Every built-in outside that table (`TodoWrite`,
-`AskUserQuestion`, `Skill`, `ExitPlanMode`, ...) is withheld from such an agent, as
-from a narrowed Bot worker. A Claude named agent can add
-`claude_artifact` to its `tools` list for `Artifact`,
-`ArtifactComments` and `ArtifactData`, or `claude_design_sync` for
-`DesignSync`. These entries select tools that Claude Code makes available to
-the session. A list with every Kiro row and no explicit Claude grant keeps
-Claude Code's preset. Like a
+tools). Restricted named agents and narrowed Bot workers also keep `ToolSearch`
+for deferred MCP tools, plus `Artifact`, `ArtifactComments`, `ArtifactData` and
+`DesignSync` when Claude Code offers them. Other unmapped native tools such as
+`TodoWrite`, `AskUserQuestion`, `Skill` and `ExitPlanMode` remain withheld.
+The old `claude_artifact` and `claude_design_sync` entries still work in existing
+specs. A list with every Kiro row and neither legacy entry keeps Claude Code's
+preset. Like a
 zero-tool session, such a session is stopped before its first prompt on an
 adapter below the session-options floor. Side Chat keeps its own read-only shape:
 it is the one session shape the list does not narrow. A new claude chat session

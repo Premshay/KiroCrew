@@ -3,7 +3,7 @@
 On ``acp_backend: claude`` a session of an agent whose spec Crew does not write,
 whose ``tools`` lists kiro-cli tools without one that grants every built-in, starts
 with ``_meta.claudeCode.options.tools`` listing only the claude built-ins of the tools
-it grants, plus ``ToolSearch``. A list that grants every built-in, an absent
+it grants, plus the default Claude tools. A list that grants every built-in, an absent
 ``tools``, an agent Crew writes and every other backend keep claude's whole preset.
 """
 
@@ -21,6 +21,7 @@ from kiro_crew.agent_sdk.claude_worker_tools import CLAUDE_WORKER_BUILTINS_BY_KI
 from kiro_crew.providers.mirrors.registry import MIRRORS, mirror_for
 
 _FORBIDDEN = {"Bash", "Edit", "Write", "MultiEdit", "NotebookEdit", "PowerShell"}
+_ARTIFACT_TOOLS = {"Artifact", "ArtifactComments", "ArtifactData", "DesignSync"}
 
 
 async def _session_new_options(client: AcpClient, tmp_path: Path, monkeypatch) -> dict:
@@ -103,7 +104,7 @@ async def test_a_named_agents_list_is_the_sessions_built_ins(
     _write_spec(agents_dir, servers={}, tools=tools, name="probe")
     client = AcpClient(work_dir=tmp_path, agent="probe", acp_backend=ACP_BACKEND_CLAUDE)
     options = await _session_new_options(client, tmp_path, monkeypatch)
-    assert set(options["tools"]) == kept
+    assert set(options["tools"]) == kept | _ARTIFACT_TOOLS
     if "execute_bash" not in tools:
         assert not _FORBIDDEN & set(options["tools"])
 
@@ -113,7 +114,7 @@ async def test_an_agent_an_app_publishes_is_held_to_its_list(tmp_path, agents_di
     _write_spec(agents_dir, servers={}, tools=["read"], name="someapp--reader")
     client = AcpClient(work_dir=tmp_path, agent="someapp--reader", acp_backend=ACP_BACKEND_CLAUDE)
     options = await _session_new_options(client, tmp_path, monkeypatch)
-    assert set(options["tools"]) == {"Read", "Grep", "Glob", "ToolSearch"}
+    assert set(options["tools"]) == {"Read", "Grep", "Glob", "ToolSearch"} | _ARTIFACT_TOOLS
 
 
 @pytest.mark.asyncio
@@ -160,7 +161,10 @@ def test_the_claude_mirror_projects_them_on_a_withheld_array_too(agents_dir):
     assert mirror is not None
     for owned in (True, False):
         projection = mirror.session_projection("probe", permission_surface_owned=owned)
-        assert set(projection.builtin_tools or ()) == {"Read", "Grep", "Glob", "ToolSearch"}
+        assert (
+            set(projection.builtin_tools or ())
+            == {"Read", "Grep", "Glob", "ToolSearch"} | _ARTIFACT_TOOLS
+        )
 
 
 @pytest.mark.parametrize("tools", [None, "read", [], [1]])
