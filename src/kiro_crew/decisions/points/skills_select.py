@@ -60,6 +60,7 @@ import concurrent.futures
 import importlib
 import logging
 import math
+import threading
 import time
 import uuid
 from collections.abc import Collection
@@ -147,8 +148,13 @@ def selected_skills(
     loop: asyncio.AbstractEventLoop | None = None,
     history_source: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
     unusable: Collection[str] = (),
+    agent: str = "",
+    harness: str = "",
 ) -> list[str] | None:
     """The oracle's selection for *text*, or ``None`` to keep the baseline.
+
+    *agent* and *harness* only label the outcome row, so the two arms can be
+    compared per seat and per harness.
 
     *unusable* is the matcher's own: skills the turn cannot use are not on the
     menu, so the pick and the baseline arm both leave them out.
@@ -250,6 +256,7 @@ def selected_skills(
             injected=injected,
             trace=trace,
             latency_ms=int((time.monotonic() - started) * 1000),
+            meta={"agent": agent, "harness": harness, "shadow": False},
         )
         return injected
     except Exception:
@@ -258,6 +265,141 @@ def selected_skills(
         # never cost a turn.
         logger.debug("skills.select: keeping the trigger-matched selection", exc_info=True)
         return None
+
+
+#: Shadow picks in flight. One at a time: a second turn while one waits is
+#: skipped, so the shadow arm never queues work on a busy decision server.
+_shadow_lock = threading.Lock()
+_shadow_in_flight = 0
+#: The most a shadow pick may wait for its answer. It is off the turn's path,
+#: so it may outlast the live budget, but never by an open-ended amount.
+SHADOW_WAIT_SECS = 30.0
+
+
+def shadow_select(
+    skills_loader: Any,
+    text: str,
+    project_dir: str | Path | None = None,
+    *,
+    session_key: str | None = None,
+    loop: asyncio.AbstractEventLoop | None = None,
+    unusable: Collection[str] = (),
+    agent: str = "",
+    harness: str = "",
+) -> bool:
+    """Run the pick for a turn that does not use it, and only log it. Never raises.
+
+    For a crewmate or a named seat (``is_custom``), whose skills come from its
+    own spec and are never trigger-matched. Both arms are recorded with
+    ``shadow: true``: the baseline is what word matching WOULD inject, the
+    ``jev`` arm what the model would pick. Nothing is injected, and the turn
+    never waits: the round is scheduled on *loop* and this returns at once.
+    Returns whether a round was scheduled. Skipped while another shadow round
+    is in flight.
+
+    Design for turning it on later (operator, 2026-11-27): for a crewmate the
+    pick is ADDED to the skills its charter pins through ``skill://``
+    resources. It never replaces or drops a pinned skill.
+    """
+    global _shadow_in_flight
+    try:
+        if loop is None or loop.is_closed() or not loop.is_running():
+            return False
+        if _this_thread_runs_a_loop():
+            return False
+        if not core.is_enabled(POINT, session_key=session_key):
+            return False
+        cap = _max_triggered(skills_loader)
+        if cap <= 0:
+            return False
+        with _shadow_lock:
+            if _shadow_in_flight:
+                return False
+            _shadow_in_flight += 1
+        scheduled = False
+        try:
+            baseline: list[str] = []
+            candidates = candidates_from_loader(
+                skills_loader,
+                text,
+                project_dir,
+                session_key=session_key,
+                baseline_out=baseline,
+                unusable=unusable,
+            )
+            rows = screen_candidates(candidates) if candidates else []
+            if not rows:
+                return False
+            coro = _shadow_round(
+                skills_loader,
+                text,
+                rows,
+                project_dir,
+                session_key=session_key,
+                baseline=baseline,
+                cap=cap,
+                meta={"agent": agent, "harness": harness, "shadow": True},
+            )
+            try:
+                asyncio.run_coroutine_threadsafe(coro, loop)
+            except BaseException:
+                coro.close()
+                raise
+            scheduled = True
+            return True
+        finally:
+            if not scheduled:
+                with _shadow_lock:
+                    _shadow_in_flight -= 1
+    except Exception:
+        logger.debug("skills.select: shadow pick not scheduled", exc_info=True)
+        return False
+
+
+async def _shadow_round(
+    skills_loader: Any,
+    text: str,
+    rows: Sequence[dict[str, str]],
+    project_dir: str | Path | None,
+    *,
+    session_key: str | None,
+    baseline: Sequence[str],
+    cap: int,
+    meta: Mapping[str, Any],
+) -> None:
+    """One shadow pick on the loop, then its outcome row off the loop. Never raises."""
+    global _shadow_in_flight
+    try:
+        trace: dict[str, Any] = {}
+        started = time.monotonic()
+        picked = await asyncio.wait_for(
+            select_skills(
+                text,
+                rows,
+                session_key=session_key,
+                turn_id=uuid.uuid4().hex[:16],
+                trace=trace,
+            ),
+            timeout=SHADOW_WAIT_SECS,
+        )
+        if picked is None:
+            return
+        await asyncio.to_thread(
+            _record_outcome,
+            skills_loader,
+            project_dir,
+            session_key=session_key,
+            baseline=baseline,
+            injected=list(picked)[:cap],
+            trace=trace,
+            latency_ms=int((time.monotonic() - started) * 1000),
+            meta=meta,
+        )
+    except Exception:
+        logger.debug("skills.select: shadow pick failed", exc_info=True)
+    finally:
+        with _shadow_lock:
+            _shadow_in_flight -= 1
 
 
 async def select_skills(
@@ -662,8 +804,13 @@ def _record_outcome(
     injected: Sequence[str],
     trace: Mapping[str, Any],
     latency_ms: int,
+    meta: Mapping[str, Any] | None = None,
 ) -> None:
     """One outcome row for the turn, then the publish hook. Never raises.
+
+    *meta* labels the row (``agent``, ``harness``, ``shadow``). A shadow row is
+    logged but not published: its turn showed no pick, so there is no strip for
+    it to describe.
 
     Guarded as a whole and separately from the selection: the pick is already
     decided by the time this runs, so neither a log failure nor a missing
@@ -685,6 +832,7 @@ def _record_outcome(
             injected=injected,
             trace=trace,
         )
+        outcome.update(meta or {})
         row = _log.build_row(
             point=POINT,
             session_key=session_key,
@@ -700,6 +848,8 @@ def _record_outcome(
         # nothing for a verdict against its turn id to be about. The log's own
         # WARNING already says why the write went.
         logger.debug("skills.select: outcome row was not written; not publishing it")
+        return
+    if (meta or {}).get("shadow"):
         return
     publish_outcome(session_key, row)
 
