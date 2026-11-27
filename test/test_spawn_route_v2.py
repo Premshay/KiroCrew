@@ -862,7 +862,8 @@ class TestDeepSeekRoutedEffort:
     """dsh takes effort on the session, not the model id: the router names it.
 
     Every DeepSeek candidate carries ``high``; each Pro rung also offers a ``max``
-    variant (``default_for`` its base key) the router takes only when it chooses to.
+    variant and each Flash rung a ``low`` one (``default_for`` its base key), which
+    the router takes only when it chooses to.
     A caller's own effort pin turns the router's effort off.
     """
 
@@ -898,6 +899,14 @@ class TestDeepSeekRoutedEffort:
         assert offered["deepseek/large/0-max"]["effort"] == "max"
         assert offered["deepseek/large/0-max"]["default_for"] == "deepseek/large/0"
         assert "deepseek/small/0-max" not in offered
+        assert offered["deepseek/small/0-low"]["effort"] == "low"
+        assert offered["deepseek/small/0-low"]["default_for"] == "deepseek/small/0"
+        assert "deepseek/large/0-low" not in offered
+
+    def test_the_low_variant_routes_flash_at_low(self, ds_env):
+        ds_env(_Oracle("deepseek/small/0-low"))
+        got = self._route()
+        assert (got["model"], got["effort"]) == ("deepseek-flash", "low")
 
     def test_the_max_variant_routes_pro_at_max(self, ds_env):
         ds_env(_Oracle("deepseek/large/0-max"))

@@ -509,27 +509,32 @@ def _advertised_max_variants(cands: list[dict[str, str]], config: Any) -> list[d
 
 #: The effort a routed DeepSeek child runs at. dsh's effort rides the session
 #: (``reasoning_effort`` config option), not the model id, so the candidate names
-#: it and the run applies it when the caller set none. Pro also gets a ``max``
-#: variant the router takes only for deep and risky work: max is opted into, and
-#: every 900 s stall seen on 2026-11-26/27 was Pro at max.
+#: it and the run applies it when the caller set none. Two variants are offered
+#: beside it, and the router takes one only for the work it suits (operator
+#: table, 2026-11-27): ``low`` on the Flash rungs for mechanical jobs whose steps
+#: the brief spells out, ``max`` on the Pro rungs for deep and risky work. Max is
+#: opted into: every 900 s stall seen on 2026-11-26/27 was Pro at max.
 DEEPSEEK_ROUTED_EFFORT = "high"
-DEEPSEEK_MAX_TIERS = frozenset({"top", "large"})
+DEEPSEEK_EFFORT_VARIANTS = {"max": frozenset({"top", "large"}), "low": frozenset({"mini", "small"})}
 
 
 def _deepseek_effort_variants(cands: list[dict[str, str]]) -> list[dict[str, str]]:
-    """Name an effort on each DeepSeek candidate; add a ``max`` variant per Pro rung.
+    """Name an effort on each DeepSeek candidate; add the rung's ``low``/``max`` variants.
 
     Mutates the DeepSeek candidates in *cands* (they gain ``effort``) and returns
-    the variants, keyed ``<key>-max`` with ``default_for`` the base key, the way
-    Codex's ``[max]`` ids are offered.
+    the variants, keyed ``<key>-<effort>`` with ``default_for`` the base key, the
+    way Codex's ``[max]`` ids are offered.
     """
     variants = []
     for c in cands:
         if c.get("vendor") != "deepseek" or c.get("default_for"):
             continue
         c["effort"] = DEEPSEEK_ROUTED_EFFORT
-        if c.get("tier") in DEEPSEEK_MAX_TIERS:
-            variants.append({**c, "key": f"{c['key']}-max", "effort": "max", "default_for": c["key"]})
+        for effort, tiers in DEEPSEEK_EFFORT_VARIANTS.items():
+            if c.get("tier") in tiers:
+                variants.append(
+                    {**c, "key": f"{c['key']}-{effort}", "effort": effort, "default_for": c["key"]}
+                )
     return variants
 
 
