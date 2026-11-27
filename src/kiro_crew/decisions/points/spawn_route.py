@@ -507,6 +507,37 @@ def _advertised_max_variants(cands: list[dict[str, str]], config: Any) -> list[d
     return variants
 
 
+#: The effort a routed DeepSeek child runs at. dsh's effort rides the session
+#: (``reasoning_effort`` config option), not the model id, so the candidate names
+#: it and the run applies it when the caller set none. Two variants are offered
+#: beside it, and the router takes one only for the work it suits (operator
+#: table, 2026-11-27): ``low`` on the Flash rungs for mechanical jobs whose steps
+#: the brief spells out, ``max`` on the Pro rungs for deep and risky work. Max is
+#: opted into: every 900 s stall seen on 2026-11-26/27 was Pro at max.
+DEEPSEEK_ROUTED_EFFORT = "high"
+DEEPSEEK_EFFORT_VARIANTS = {"max": frozenset({"top", "large"}), "low": frozenset({"mini", "small"})}
+
+
+def _deepseek_effort_variants(cands: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Name an effort on each DeepSeek candidate; add the rung's ``low``/``max`` variants.
+
+    Mutates the DeepSeek candidates in *cands* (they gain ``effort``) and returns
+    the variants, keyed ``<key>-<effort>`` with ``default_for`` the base key, the
+    way Codex's ``[max]`` ids are offered.
+    """
+    variants = []
+    for c in cands:
+        if c.get("vendor") != "deepseek" or c.get("default_for"):
+            continue
+        c["effort"] = DEEPSEEK_ROUTED_EFFORT
+        for effort, tiers in DEEPSEEK_EFFORT_VARIANTS.items():
+            if c.get("tier") in tiers:
+                variants.append(
+                    {**c, "key": f"{c['key']}-{effort}", "effort": effort, "default_for": c["key"]}
+                )
+    return variants
+
+
 def local_candidates(backends: Mapping[str, Mapping[str, str]]) -> list[dict[str, str]]:
     """The local fleet as its router roles, one per role that has a backend (``local/<role>``)."""
     out = []
@@ -935,6 +966,7 @@ async def routed_spawn(
             return _refusal(route_id, offered, outs, exclude_vendors, too_big=too_big)
         if allow_default_effort:
             cands += await asyncio.to_thread(_advertised_max_variants, cands, config)
+            cands += _deepseek_effort_variants(cands)
         state = build_state(
             brief,
             agent=agent,
@@ -979,6 +1011,7 @@ async def routed_spawn(
     return {
         "route_id": route_id,
         "model": chosen["model"],
+        "effort": chosen.get("effort", ""),
         "tier": chosen["tier"],
         "vendor": chosen["vendor"],
         "backend": backend,
@@ -1163,6 +1196,7 @@ async def reroute_after_quota(
     return {
         "route_id": uuid.uuid4().hex[:16],
         "model": chosen["model"],
+        "effort": chosen.get("effort", ""),
         "tier": chosen["tier"],
         "vendor": chosen["vendor"],
         "backend": backend,
@@ -1325,7 +1359,8 @@ def reason_line(routed: Mapping[str, Any]) -> str:
     r = routed.get("reason")
     head = f"{r[:80]} -> " if isinstance(r, str) and r else ""
     p = routed.get("p")
-    line = f"spawn.route: {head}{routed.get('vendor')} {routed.get('tier')} ({routed.get('model')})"
+    effort = f", {routed['effort']}" if routed.get("effort") else ""
+    line = f"spawn.route: {head}{routed.get('vendor')} {routed.get('tier')} ({routed.get('model')}{effort})"
     if routed.get("backend"):
         line += f" on {routed['backend']}"
     if isinstance(p, (int, float)):

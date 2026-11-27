@@ -394,6 +394,10 @@ async def _run_inner_impl(
             _spawn_route.apply_route_backend, info, routed, captured_execution
         ):
             plan = plan._replace(eff_model=routed["model"], shared=False)
+            if routed.get("effort") and not plan.eff_effort:
+                # A harness whose effort rides the session (DeepSeek) gets the
+                # routed level here; the caller's own pin always wins.
+                plan = plan._replace(eff_effort=routed["effort"])
             eff_model = plan.eff_model
             info.route_reason = routed["line"]
             info.route_tier = str(routed.get("tier") or "")

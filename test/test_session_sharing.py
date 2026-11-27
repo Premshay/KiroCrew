@@ -1397,6 +1397,36 @@ class TestSharedSessionCliDefaultModel:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pinned,expected", [("", "max"), ("low", "low")], ids=["routed", "pinned"])
+async def test_a_routed_effort_reaches_the_session_unless_the_caller_pinned_one(
+    monkeypatch, pinned, expected
+):
+    """A DeepSeek route names its effort (dsh takes it on the session). The run
+    starts with that level; a caller's own ``reasoning_effort`` still wins."""
+    sessions = _mock_sessions(sharing_eligible=False)
+    manager = SubagentManager(
+        sessions=sessions, ctx_builder=_mock_ctx_builder_auto(), is_yolo=lambda: True
+    )
+    route = AsyncMock(
+        return_value={"model": "deepseek-v4-pro", "effort": "max", "line": "routed"}
+    )
+    monkeypatch.setattr(type(manager._run_events), "_route_spawn_model", route)
+    with (
+        _cfg_patch(session_sharing=False),
+        patch("kiro_crew.subagent.Stats"),
+        patch("kiro_crew.subagent.sel"),
+    ):
+        info = manager.spawn(
+            "deep trace", parent_session_key="dashboard:slot1", reasoning_effort=pinned or None
+        )
+        await _wait_until_done(info)
+
+    kwargs = sessions.get_or_create.call_args.kwargs
+    assert kwargs["model"] == "deepseek-v4-pro"
+    assert kwargs.get("reasoning_effort_override") == expected
+
+
+@pytest.mark.asyncio
 async def test_a_refused_route_fails_the_spawn_before_any_session(monkeypatch):
     """spawn.route removed every candidate (cloud out, local windows too small): the run
     fails at once with ``no_route`` and the reason, and no provider session is started."""
