@@ -109,3 +109,27 @@ def test_codex_reading_newer_and_not_out_clears_codex_mark(home, monkeypatch):
         vl, "codex_health", lambda reading=None: {"out": False, "as_of": now, "used_pct": 40.0}
     )
     assert "codex" not in vl.quota_outs(now)
+
+
+def test_a_group_mark_covers_a_model_added_to_the_group_later(home):
+    """2026-11-27: a Gemini group mark listed its members before Carbon existed, so it
+    dropped Hydrogen and Neon and left Carbon as the only Antigravity offer."""
+    now = time.time()
+    _probe(home, now - 10, {"gemini-4-hydrogen-high": 0.0, "gemini-4-neon-high": 0.0})
+    _mark(now - 5)
+    _probe(
+        home,
+        now - 1,
+        {"gemini-4-hydrogen-high": 0.0, "gemini-4-neon-high": 0.0, "gemini-4-carbon-high": 0.0},
+    )
+    models = vl.quota_outs(now)["antigravity"]["models"]
+    assert "gemini-4-carbon-high" in models
+    assert vl.quota_out("antigravity", "gemini-4-carbon-high", now) is not None
+
+
+def test_a_new_group_member_with_room_is_not_covered(home):
+    now = time.time()
+    _probe(home, now - 10, {"gemini-4-hydrogen-high": 0.0})
+    _mark(now - 5)
+    _probe(home, now, {"gemini-4-hydrogen-high": 0.9, "gemini-4-carbon-high": 0.9})
+    assert vl.quota_out("antigravity", "gemini-4-carbon-high", now) is None

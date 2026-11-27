@@ -540,6 +540,23 @@ def _model_group(vendor: str, model: str, account: str) -> tuple[str, list[str]]
         return model, [model]
 
 
+def _group_members(vendor: str, group: str, account: str) -> list[str]:
+    """Every model the probe NOW puts in *group* for *account*; ``[]`` when unknown.
+
+    A group mark lists its members as they were when it was written. A model the
+    vendor adds to the group later (Gemini 4 Carbon, 2026-11-27) is held by the
+    same quota, so the mark must cover it too. Never raises.
+    """
+    try:
+        shape = _QUOTA_READERS[vendor]() if vendor in _QUOTA_READERS else {}
+        accounts = shape.get("accounts") or {}
+        acct = accounts.get(account) or accounts.get(DEFAULT_ACCOUNT) or {}
+        rows = acct.get("models") or {}
+        return sorted(m for m, r in rows.items() if isinstance(r, dict) and r.get("group") == group)
+    except Exception:
+        return []
+
+
 def _live_readings(vendor: str) -> dict[str, dict[str, Any]]:
     """Per account, the vendor's newest live reading as ``{as_of, out, room}``; ``{}`` when none.
 
@@ -624,7 +641,10 @@ def _covering(
                 if not _stale_against_live(mark, "", reading):
                     whole[acct] = mark
                 continue
-            for m in mark.get("models") or [group]:
+            members = set(mark.get("models") or [group])
+            if vendor in PER_MODEL_VENDORS:
+                members |= set(_group_members(vendor, group, acct))
+            for m in sorted(members):
                 if not _stale_against_live(mark, m, reading):
                     prev = per_model.setdefault(acct, {}).get(m)
                     if prev is None or float(prev["until"]) < float(mark["until"]):
