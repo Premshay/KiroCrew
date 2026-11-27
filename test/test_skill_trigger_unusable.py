@@ -212,6 +212,36 @@ class TestComputerUseSkill:
         assert seen["text"] == "the person's words"
 
 
+class TestShadowForCrewmates:
+    """A crewmate or named seat runs the picker in shadow only (operator, 2026-11-27)."""
+
+    def test_a_custom_agent_turn_shadows_and_never_asks_the_live_picker(
+        self, builder, gate, monkeypatch
+    ) -> None:
+        from kiro_crew.decisions.points import skills_select
+
+        live, shadow = [], []
+        monkeypatch.setattr(skills_select, "selected_skills", lambda *a, **k: live.append(k))
+        monkeypatch.setattr(
+            skills_select, "shadow_select", lambda *a, **k: shadow.append(k) or True
+        )
+        _warm(builder, APP_REQUEST, agent="plumb", provider_type="deepseek")
+        assert live == []
+        assert len(shadow) == 1
+        assert (shadow[0]["agent"], shadow[0]["harness"]) == ("plumb", "deepseek")
+
+    def test_the_default_agent_keeps_the_live_picker(self, builder, gate, monkeypatch) -> None:
+        from kiro_crew.decisions.points import skills_select
+
+        live, shadow = [], []
+        monkeypatch.setattr(
+            skills_select, "selected_skills", lambda *a, **k: live.append(k) or None
+        )
+        monkeypatch.setattr(skills_select, "shadow_select", lambda *a, **k: shadow.append(k))
+        _warm(builder, APP_REQUEST)
+        assert len(live) == 1 and shadow == []
+
+
 class TestTriggerText:
     """``skill_trigger_text`` is what the matcher reads, when a caller names it."""
 

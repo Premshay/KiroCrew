@@ -879,6 +879,21 @@ def build_message(
     # means the person wrote nothing this turn, so Kiro Crew's own words
     # ("do NOT restart from scratch") cannot load a skill.
     trigger_text = text if skill_trigger_text is None else skill_trigger_text
+    if is_custom and not minimal_context and trigger_text:
+        # A crewmate or named seat loads its skills from its own spec, so the
+        # picker runs in shadow: both arms are logged, nothing is injected, and
+        # this turn never waits on it (operator, 2026-11-27).
+        from kiro_crew.decisions.points.skills_select import shadow_select
+
+        shadow_select(
+            self.skills,
+            trigger_text,
+            project,
+            session_key=session_key,
+            loop=self._decisions_loop,
+            agent=agent or "",
+            harness=provider_type or "",
+        )
     if not is_custom and not minimal_context and trigger_text:
         # A skill for a feature the backend did not mount describes tools the turn
         # cannot call. Same per-session reading as the prompt's Computer Use block.
@@ -928,6 +943,8 @@ def build_message(
                 loop=self._decisions_loop,
                 history_source=prior_turns,
                 unusable=unusable,
+                agent=agent or "",
+                harness=provider_type or "",
             )
 
         triggered = self.skills.get_triggered_skills(
