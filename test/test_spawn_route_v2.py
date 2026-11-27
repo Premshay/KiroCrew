@@ -856,3 +856,57 @@ class TestCompanionSeats:
 
         for alias in ("crew-claude", "crew-codex", "crew-local", "kirocrew-heartbeat"):
             validate_member_execution_seat(alias, SimpleNamespace(member_id=None))
+
+
+class TestDeepSeekRoutedEffort:
+    """dsh takes effort on the session, not the model id: the router names it.
+
+    Every DeepSeek candidate carries ``high``; each Pro rung also offers a ``max``
+    variant (``default_for`` its base key) the router takes only when it chooses to.
+    A caller's own effort pin turns the router's effort off.
+    """
+
+    @pytest.fixture
+    def ds_env(self, routed_env, monkeypatch):
+        monkeypatch.setattr(
+            sr,
+            "effective_tiers",
+            lambda *args: {"large": ["deepseek-v4-pro"], "small": ["deepseek-flash"]},
+        )
+        monkeypatch.setattr(sr, "tier_map", lambda config: {})
+        return routed_env
+
+    def _route(self, **kw):
+        return asyncio.run(
+            sr.routed_spawn(
+                "Deep trace of the scheduler.",
+                agent="crew-deepseek",
+                start_vendor="deepseek",
+                cross_vendor=False,
+                **kw,
+            )
+        )
+
+    def test_candidates_carry_high_and_pro_offers_max(self, ds_env):
+        oracle = ds_env(_Oracle("deepseek/large/0"))
+        got = self._route()
+        assert got is not None and got["model"] == "deepseek-v4-pro"
+        assert got["effort"] == "high"
+        offered = {c["key"]: c for c in oracle.states[0]["candidates"]}
+        assert offered["deepseek/large/0"]["effort"] == "high"
+        assert offered["deepseek/small/0"]["effort"] == "high"
+        assert offered["deepseek/large/0-max"]["effort"] == "max"
+        assert offered["deepseek/large/0-max"]["default_for"] == "deepseek/large/0"
+        assert "deepseek/small/0-max" not in offered
+
+    def test_the_max_variant_routes_pro_at_max(self, ds_env):
+        ds_env(_Oracle("deepseek/large/0-max"))
+        got = self._route()
+        assert (got["model"], got["effort"]) == ("deepseek-v4-pro", "max")
+        assert "(deepseek-v4-pro, max)" in sr.reason_line(got)
+
+    def test_a_caller_effort_pin_turns_routed_effort_off(self, ds_env):
+        oracle = ds_env(_Oracle("deepseek/large/0"))
+        got = self._route(allow_default_effort=False)
+        assert got["effort"] == ""
+        assert all("effort" not in c for c in oracle.states[0]["candidates"])
