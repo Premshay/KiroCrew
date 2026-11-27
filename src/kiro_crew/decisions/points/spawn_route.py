@@ -255,21 +255,25 @@ FAMILY_TIERS: dict[str, dict[str, tuple[str, ...]]] = {
     "claude": {"top": ("fable",), "large": ("opus",), "small": ("sonnet",), "mini": ("haiku",)},
     "codex": {"top": ("astra",), "large": ("sol",), "small": ("terra",), "mini": ("luna",)},
     "deepseek": {"top": ("pro",), "large": ("pro",), "small": ("flash",), "mini": ("flash",)},
-    # Owner fit, corrected 2026-11-20 (Argon dropped): Flash for lookups and small
-    # edits (mini -> ``-medium``), Hydrogen medium for reads and traces (small),
-    # Hydrogen high for bounded builds and Neon high to step up or plan (large,
-    # ``-high``); Neon medium is the small step-up. Claude ids agy also serves are
-    # still Anthropic, not this vendor, and match no family here.
+    # Owner fit, corrected 2026-11-27 (operator): Hydrogen low for lookups and
+    # small edits (mini, ``-low``; Flash leaves agy 2026-11-30), Hydrogen medium
+    # for reads and traces (small), Hydrogen high for bounded builds and Neon
+    # high to step up or plan (large, ``-high``); Neon medium is the small
+    # step-up. Carbon high (top) is for deep traces and risky reviews only: it
+    # spends more tokens by design, so the decision server never builds on it.
+    # Claude ids agy also serves are still Anthropic and match no family here.
     "antigravity": {
+        "top": ("carbon",),
         "large": ("hydrogen", "neon"),
         "small": ("hydrogen", "neon"),
-        "mini": ("flash",),
+        "mini": ("hydrogen",),
     },
 }
 
 #: Families never offered for a vendor, whatever the adapter advertises or the
-#: owner pins.
-DROPPED_FAMILIES: dict[str, tuple[str, ...]] = {"antigravity": ("argon",)}
+#: owner pins: Argon (operator, 2026-11-20) and Gemini 3.8 Flash (leaves agy
+#: 2026-11-30; dropped now so no route can still name it).
+DROPPED_FAMILIES: dict[str, tuple[str, ...]] = {"antigravity": ("argon", "flash")}
 
 
 def _dropped(vendor: str, model_id: str) -> bool:
@@ -308,6 +312,8 @@ def _cross_vendors() -> tuple[str, ...]:
 #: Codex advertises one id per reasoning effort (``gpt-5.6-sol[high]``); the
 #: effort a tier runs at when the adapter offers no bare id.
 TIER_EFFORT = {"top": "high", "large": "high", "small": "medium", "mini": "medium"}
+#: A vendor's own tier effort where it differs: Antigravity's mini is Hydrogen low.
+VENDOR_TIER_EFFORT: dict[str, dict[str, str]] = {"antigravity": {"mini": "low"}}
 
 _EFFORT_SUFFIX = re.compile(r"\[(low|medium|high|xhigh|max|ultra)\]$")
 _DASH_EFFORT_SUFFIX = re.compile(r"-(low|medium|high|xhigh|max)$")
@@ -364,7 +370,7 @@ def advertised_tiers(vendor: str, advertised: list[str] | None = None) -> dict[s
             if base in ids:
                 picked.append(base)
             else:
-                effort = TIER_EFFORT[tier]
+                effort = VENDOR_TIER_EFFORT.get(vendor, {}).get(tier) or TIER_EFFORT[tier]
                 want = f"{base}-{effort}" if dash else f"{base}[{effort}]"
                 picked.append(want if want in ids else ids[0])
         out[tier] = picked
