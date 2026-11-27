@@ -9,7 +9,7 @@ Each function here whose first parameter is ``self`` is an ``AcpClient`` method:
 class binds it by name, so it reads and writes the session's own state on the instance,
 and a patch of the method on the class or on an instance reaches every caller.
 
-Instance fields written: ``_drain_mode_reports``, ``_mcp_notifications``,
+Instance fields written: ``_deepseek_started_ids``, ``_drain_mode_reports``, ``_mcp_notifications``,
 ``_mcp_report_frame_floor``, ``_mimocode_governed_stop``, ``_permission_gate_events``,
 ``_permission_options``, ``_pi_gate_asked_ids``, ``_pi_gate_denied_ids``,
 ``_pi_gate_request_tool``, ``_routing_answer_floor``, ``_turn_permission_denied``.
@@ -1025,6 +1025,10 @@ async def _tripwire_mimocode_governed_mcp(
         raise AcpToolGateUnroutable(str(exc)) from None
 
 
+#: Bound on the DeepSeek tool-call starts kept for the tripwire (one per open call).
+_MAX_STARTED_IDS = 4096
+
+
 async def _tripwire_pi_gate(self: AcpClient, msg: JsonRpcMessage) -> None:
     """Refuse to continue a gated session whose harness ran a tool the gate never saw.
 
@@ -1091,7 +1095,22 @@ async def _tripwire_pi_gate(self: AcpClient, msg: JsonRpcMessage) -> None:
         return
     params = msg.params if isinstance(msg.params, dict) else {}
     update = params.get("update")
-    if not isinstance(update, dict) or update.get("sessionUpdate") != "tool_call_update":
+    if not isinstance(update, dict):
+        return
+    deepseek = bool(getattr(self, "_deepseek_gate_nonce", ""))
+    started: set[str] | None = None
+    if deepseek:
+        started = getattr(self, "_deepseek_started_ids", None)
+        if started is None:
+            started = self._deepseek_started_ids = set()
+    if update.get("sessionUpdate") == "tool_call":
+        start_id = update.get("toolCallId")
+        if started is not None and isinstance(start_id, str) and start_id:
+            if len(started) >= _MAX_STARTED_IDS:
+                started.clear()
+            started.add(start_id)
+        return
+    if update.get("sessionUpdate") != "tool_call_update":
         return
     status = update.get("status")
     if status not in ("completed", "failed"):
@@ -1099,6 +1118,15 @@ async def _tripwire_pi_gate(self: AcpClient, msg: JsonRpcMessage) -> None:
     tool_call_id = update.get("toolCallId")
     if not isinstance(tool_call_id, str) or not tool_call_id:
         return
+    # DeepSeek Harness: dsh-acp sends a ``tool_call`` start for every call it runs
+    # (``onSessionEvent`` on ``tool/call``) before its result, so an unasked call
+    # always shows its start first. A terminal for an id this session never saw
+    # start is a stale frame, not a run: twice on 2026-11-27 a ``completed`` for a
+    # call asked about and run hours earlier arrived mid-turn and stopped a healthy
+    # session. Such a frame is logged, never judged.
+    seen_start = started is None or tool_call_id in started
+    if started is not None:
+        started.discard(tool_call_id)
     # The id's gate state is CONSUMED at its terminal frame, whichever way the
     # call ended, and the verdict below is read from what was consumed. Nothing
     # makes a tool-call id unique for the life of a session (see
@@ -1134,6 +1162,16 @@ async def _tripwire_pi_gate(self: AcpClient, msg: JsonRpcMessage) -> None:
         outcome, what = "ran_despite_deny", "after Kiro Crew's gate DENIED it"
     elif unanswered:
         outcome, what = "ran_before_answer", "before Kiro Crew answered its permission request"
+    elif not asked and not seen_start:
+        logger.warning(
+            "%s gate: a %s frame for tool call %s arrived with no start in this session; "
+            "treated as a stale frame, not an unasked call [session=%s]",
+            acp_tool_gate.label_for(self.backend),
+            status,
+            tool_call_id,
+            self._session_id,
+        )
+        return
     elif not asked:
         if (
             shell_only

@@ -482,6 +482,9 @@ class AcpClient:
         # of denied calls, which must never reach ``completed``.
         self._pi_gate_request_tool: dict[str, str] = {}
         self._pi_gate_denied_ids: set[str] = set()
+        # DeepSeek tool calls seen to start and not yet finished: the tripwire judges
+        # only a terminal whose start it saw (``client_permissions._tripwire_pi_gate``).
+        self._deepseek_started_ids: set[str] = set()
         self._session_key = session_key
         # Set by ``runtime_ownership.acquire_session_lease`` once the gateway
         # registers this client's session: the one tenant of its own process,

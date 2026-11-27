@@ -113,6 +113,7 @@ def test_a_denial_the_harness_reports_does_not_trip_the_ungated_call_guard() -> 
     # The guard still has teeth for the case it exists for.
     from kiro_crew.acp.client import AcpToolGateUnroutable
 
+    asyncio.run(client._tripwire_pi_gate(_deepseek_started("never-asked")))
     with pytest.raises(AcpToolGateUnroutable):
         asyncio.run(client._tripwire_pi_gate(update("never-asked", "completed")))
     assert client._kill_process.await_count == 1
@@ -254,6 +255,7 @@ def test_a_completed_call_the_gate_never_asked_about_stops_the_session() -> None
             },
         },
     )
+    asyncio.run(client._tripwire_pi_gate(_deepseek_started("never-asked")))
     with pytest.raises(AcpToolGateUnroutable) as refused:
         asyncio.run(client._tripwire_pi_gate(completed))
     assert "never-asked" in str(refused.value)
@@ -358,6 +360,19 @@ def _deepseek_permission_frame(tool_call_id: str, request_id: int):
     )
 
 
+def _deepseek_started(tool_call_id: str):
+    """dsh-acp's ``tool_call`` start, which precedes every call's terminal frame."""
+    from kiro_crew.acp.types import JsonRpcMessage
+
+    return JsonRpcMessage(
+        method="session/update",
+        params={
+            "sessionId": "s1",
+            "update": {"sessionUpdate": "tool_call", "toolCallId": tool_call_id},
+        },
+    )
+
+
 def _deepseek_completed(tool_call_id: str):
     from kiro_crew.acp.types import JsonRpcMessage
 
@@ -429,6 +444,7 @@ def test_a_completed_call_consumes_its_ask_so_a_reused_id_must_be_asked_again(mo
     assert "call_0" not in client._pi_gate_asked_ids, "the terminal frame consumed the ask"
 
     # The same id again, with NO fresh permission frame: an unasked call.
+    asyncio.run(client._tripwire_pi_gate(_deepseek_started("call_0")))
     with pytest.raises(AcpToolGateUnroutable) as refused:
         asyncio.run(client._tripwire_pi_gate(_deepseek_completed("call_0")))
     assert "without asking" in str(refused.value)
@@ -470,6 +486,7 @@ def test_a_failed_terminal_consumes_the_gate_state_too(monkeypatch) -> None:
     assert "call_0" not in client._pi_gate_asked_ids
 
     # The id, reused with no fresh ask, is now judged as UNASKED rather than as denied.
+    asyncio.run(client._tripwire_pi_gate(_deepseek_started("call_0")))
     with pytest.raises(AcpToolGateUnroutable) as refused:
         asyncio.run(client._tripwire_pi_gate(_deepseek_completed("call_0")))
     assert "without asking" in str(refused.value)
@@ -624,3 +641,44 @@ def test_the_credential_leaves_are_declared_with_their_override_spelling() -> No
     assert declaration.home_override_env_vars == ("DSH_HOME",)
     assert declaration.override_relative_leaves == (".credentials.yaml", ".env")
     assert declaration.host_logout_retires_children is False
+
+
+def test_a_terminal_with_no_start_in_this_session_is_a_stale_frame(monkeypatch, caplog) -> None:
+    """2026-11-27: twice a ``completed`` for a call asked about and run hours earlier
+    arrived mid-turn and stopped a healthy session. dsh-acp sends a ``tool_call`` start
+    before every result, so a terminal with no start here is logged, not judged."""
+    import asyncio
+    import logging
+
+    client, killed = _deepseek_tripwire_client(monkeypatch)
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(client._tripwire_pi_gate(_deepseek_completed("call_01_old")))
+    assert killed == []
+    assert "stale frame" in caplog.text
+
+
+def test_an_unasked_call_that_started_here_still_stops_the_session(monkeypatch) -> None:
+    import asyncio
+
+    from kiro_crew.acp.client import AcpToolGateUnroutable
+
+    client, killed = _deepseek_tripwire_client(monkeypatch)
+    asyncio.run(client._tripwire_pi_gate(_deepseek_started("call_00_new")))
+    with pytest.raises(AcpToolGateUnroutable):
+        asyncio.run(client._tripwire_pi_gate(_deepseek_completed("call_00_new")))
+    assert killed == [True]
+
+
+def test_a_denied_call_trips_even_without_a_seen_start(monkeypatch) -> None:
+    """The start rule only softens the UNASKED verdict; a denied call that ran still trips."""
+    import asyncio
+
+    from kiro_crew.acp.client import AcpToolGateUnroutable
+
+    client, killed = _deepseek_tripwire_client(monkeypatch)
+    denied = _deepseek_permission_frame("call_9", 1)
+    client._note_pi_gate_asked(denied)
+    asyncio.run(client.reject_tool(denied.id))
+    with pytest.raises(AcpToolGateUnroutable) as refused:
+        asyncio.run(client._tripwire_pi_gate(_deepseek_completed("call_9")))
+    assert "DENIED" in str(refused.value)
