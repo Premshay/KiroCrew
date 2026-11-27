@@ -28,6 +28,10 @@ AGY_IDS = [
     "gemini-4-hydrogen-xhigh",
     "gemini-4-hydrogen-medium",
     "gemini-4-hydrogen-low",
+    "gemini-4-carbon-medium",
+    "gemini-4-carbon-high",
+    "gemini-4-carbon-low",
+    "gemini-pro-orchestrator",
     "gemini-pro-orchestrator-neon",
     "gemini-pro-orchestrator-g1-pro",
     "gemini-3.8-flash-high",
@@ -317,14 +321,31 @@ class TestOtherVendors:
 
 
 class TestAntigravityTiers:
-    def test_flash_hydrogen_neon_and_never_argon(self):
+    def test_hydrogen_low_carbon_high_and_never_flash_or_argon(self):
         tiers = sr.advertised_tiers("antigravity", AGY_IDS)
-        assert tiers["mini"] == ["gemini-3.8-flash-medium"]
+        assert tiers["mini"] == ["gemini-4-hydrogen-low"]
         assert tiers["small"] == ["gemini-4-hydrogen-medium", "gemini-4-neon-medium"]
         assert tiers["large"] == ["gemini-4-hydrogen-high", "gemini-4-neon-high"]
-        assert "top" not in tiers
+        assert tiers["top"] == ["gemini-4-carbon-high"]
         offered = [m for ids in tiers.values() for m in ids]
-        assert not any("argon" in m or "claude" in m or "orchestrator" in m for m in offered)
+        assert not any(
+            word in m for m in offered for word in ("flash", "argon", "claude", "orchestrator")
+        )
+
+    def test_a_flash_pin_is_never_offered(self, monkeypatch):
+        monkeypatch.setattr(
+            sr,
+            "tier_map",
+            lambda config=None: {
+                "antigravity": {"mini": ["gemini-3.8-flash-medium", "gemini-4-hydrogen-low"]}
+            },
+        )
+        monkeypatch.setattr(sr, "advertised_tiers", lambda vendor, advertised=None: {})
+        assert sr.effective_tiers("antigravity")["mini"] == ["gemini-4-hydrogen-low"]
+
+    def test_codex_mini_keeps_its_own_effort(self):
+        tiers = sr.advertised_tiers("codex", ["gpt-6.1-luna[medium]", "gpt-6.1-luna[low]"])
+        assert tiers["mini"] == ["gpt-6.1-luna[medium]"]
 
     def test_an_argon_pin_is_never_offered(self, monkeypatch):
         monkeypatch.setattr(
